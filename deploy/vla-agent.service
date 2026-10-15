@@ -1,0 +1,21 @@
+[Unit]
+Description=VLA bare-metal agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=vla
+Group=vla
+WorkingDirectory=/opt/vla-platform
+ExecStart=/opt/vla-platform/.venv/bin/vla-agent --config /etc/vla-agent/config.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# Detached Runners must survive an Agent service restart.
+KillMode=process
+TimeoutStopSec=20
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

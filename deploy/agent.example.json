@@ -1,0 +1,22 @@
+{
+  "control_plane_url": "https://vla.example.internal",
+  "enrollment_token": "REPLACE_WITH_ENROLLMENT_TOKEN",
+  "name": "gpu-server-01",
+  "roots": ["/data/datasets", "/data/models", "/data/code", "/data/vla-runs"],
+  "output_root": "/data/vla-runs",
+  "state_dir": "/var/lib/vla-agent",
+  "poll_interval_seconds": 2,
+  "heartbeat_interval_seconds": 10,
+  "cancel_grace_seconds": 10,
+  "profiles": [{
+    "id": "openpi-sft-native",
+    "name": "OpenPI UMI 本机环境",
+    "code_dir": "/data/code/openpi-umi",
+    "python": "/data/code/openpi-umi/.venv/bin/python",
+    "adapter": "openpi-sft",
+    "recipe": "REPLACE_WITH_VALIDATED_LOCAL_RECIPE",
+    "execution_mode": "native",
+    "docker_image": null,
+    "metadata": {"validated": false}
+  }]
+}

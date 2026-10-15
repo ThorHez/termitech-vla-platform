@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: vla
+      POSTGRES_USER: vla
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vla"]
+      interval: 5s
+      retries: 10
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/control.Dockerfile
+    environment: &control_env
+      VLA_DATABASE_URL: postgresql+psycopg://vla:${POSTGRES_PASSWORD}@postgres/vla
+      VLA_ADMIN_TOKEN: ${VLA_ADMIN_TOKEN:?Set VLA_ADMIN_TOKEN}
+      VLA_ENROLLMENT_TOKEN: ${VLA_ENROLLMENT_TOKEN:?Set VLA_ENROLLMENT_TOKEN}
+      VLA_SCHEDULER_ENABLED: "false"
+      VLA_HOST: 0.0.0.0
+      VLA_WEB_DIST: /app/apps/web/dist
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 5s
+      retries: 10
+  scheduler:
+    build:
+      context: ..
+      dockerfile: deploy/control.Dockerfile
+    command: ["vla-scheduler"]
+    environment: *control_env
+    depends_on:
+      api:
+        condition: service_healthy
+volumes:
+  postgres_data:
