@@ -31,9 +31,16 @@ scripts/                       本地启动与隔离测试环境准备
 deploy/                        中央服务 Compose、Agent 配置与 systemd
 tests/                         API、Agent、适配器与跨进程集成测试
 docs/                          设计和接口约定
+third_party/openpi-umi/         独立 Git 子模块，UMI/SFT、ReCap、MEM 与推理源码
 ```
 
-openpi-umi 继续维护在独立代码库中，平台不拉取、切换或改写它。平台 Python 环境不安装 JAX/PyTorch；训练运行在 profile 指定的解释器中。
+OpenPI 训练源码通过 Git 子模块关联到 `git@github.com:ThorHez/openpi-umi.git`，固定版本由平台仓库中的 gitlink 记录。首次检出后执行：
+
+```bash
+git submodule update --init third_party/openpi-umi
+```
+
+训练源码仍保留独立提交历史，在子模块目录内开发和提交；发布时先推送 OpenPI 提交，再提交平台的子模块版本指针。统一开发分支为 `codex/unified-training`，从 `wbcd` 合入 MEM，保留各训练阶段的独立入口。平台 Python 环境不安装 JAX/PyTorch；训练运行在 profile 指定的解释器中。服务器上的已有代码目录不会随本地子模块更新，部署新的训练版本时应登记独立目录并重新预检。
 
 ## 本地启动
 

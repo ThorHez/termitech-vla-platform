@@ -1,0 +1,3 @@
+[submodule "openpi-umi"]
+	path = third_party/openpi-umi
+	url = git@github.com:ThorHez/openpi-umi.git
