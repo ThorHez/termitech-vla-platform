@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import logging
 import os
 import selectors
 import signal
@@ -14,12 +15,14 @@ from pathlib import Path
 import psutil
 from vla_adapters import build_launch
 
+from .artifacts import ArtifactMonitor
 from .config import load_config
 from .metrics import check_gpus, process_metrics
 from .preflight import validate_local_inputs
 from .safety import AgentError, allowed_path, identity_matches, process_identity, safe_identifier, signal_owned_group
 from .snapshots import capture_code, compare_code, git
 from .state import State, TERMINAL_STATES
+from .training_validation import prepare_launch, validate_training
 
 
 def verified_outputs(output_dir: Path, smoke: bool) -> list[dict]:
@@ -107,6 +110,7 @@ def execute(config: dict, attempt_id: str) -> int:
     output = None
     profile = None
     start_snapshot = None
+    launch_checks = []
     interrupted = False
 
     def interrupt(_signum, _frame):
@@ -125,8 +129,8 @@ def execute(config: dict, attempt_id: str) -> int:
             if asset_path == output or asset_path in output.parents or output in asset_path.parents:
                 raise AgentError("INVALID_PATH", "Attempt output must be separate from input assets")
         output.mkdir(parents=True, exist_ok=False)
-        start_snapshot = capture_code(profile, config["roots"], output / "provenance")
-        compare_code(payload["code_expectation"], start_snapshot)
+        start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+        compare_code(payload["code_expectation"], start_snapshot, compare_automatic=False)
         for uuid in sorted(payload.get("gpu_uuids", [])):
             # GPU UUIDs never become path components directly.
             from hashlib import sha256
@@ -137,9 +141,22 @@ def execute(config: dict, attempt_id: str) -> int:
                 gpu_lock.close()
                 raise AgentError("GPU_BUSY", f"GPU reserved by another local Runner: {uuid}") from exc
             gpu_locks.append(gpu_lock)
-        check_gpus(payload.get("gpu_uuids", []))
-        launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), str(output), payload.get("gpu_uuids", []))
+        launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), str(output),
+                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
         allowed_path(launch["cwd"], config["roots"])
+        if profile.get("adapter") != "smoke":
+            if not isinstance(payload["code_expectation"].get("automatic_preflight"), dict):
+                raise AgentError("AUTOMATIC_PREFLIGHT_REQUIRED", "正式训练缺少 Agent 自动预检记录，请重新执行预检")
+            launch = prepare_launch(launch, config, payload.get("inputs", {}))
+            automatic = validate_training(config, launch, launch_checks, assigned=payload.get("gpu_uuids", []))
+            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+            compare_code(start_snapshot, current, compare_automatic=False)
+            start_snapshot["automatic_preflight"] = automatic
+            compare_code(payload["code_expectation"], start_snapshot)
+            launch = prepare_launch(launch, config, payload.get("inputs", {}), expected_plan_digest=automatic["plan_digest"])
+            (output / "provenance" / "code-snapshot.json").write_text(json.dumps(start_snapshot, indent=2))
+        # Recheck assigned devices after the CPU probe, just before spawning.
+        check_gpus(payload.get("gpu_uuids", []))
         if state.attempt(attempt_id)["cancel_requested"] or interrupted:
             state.emit(attempt_id, "CANCELLED", {"exit_code": None, "process_started": False})
             return 0
@@ -224,14 +241,26 @@ def execute(config: dict, attempt_id: str) -> int:
                 record_line(buffer)
         code_changed = False
         try:
-            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end")
+            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+            if "automatic_preflight" in start_snapshot:
+                end_snapshot["automatic_preflight"] = start_snapshot["automatic_preflight"]
+                (output / "provenance" / "end" / "code-snapshot.json").write_text(json.dumps(end_snapshot, indent=2))
             try:
-                compare_code(start_snapshot, end_snapshot)
+                compare_code(start_snapshot, end_snapshot, compare_automatic=False)
             except AgentError:
                 code_changed = True
         except AgentError:
             code_changed = True
         common = {"exit_code": child.returncode, "code_changed_during_run": code_changed}
+        if profile.get("adapter") == "openpi-sft":
+            try:
+                # The last save can finish between periodic scans. Publish its
+                # checkpoint and confirmed retention removals before lifecycle
+                # completion closes the attempt's transactional outbox.
+                ArtifactMonitor(state, config["output_root"]).report(state.attempt(attempt_id))
+            except Exception:
+                logging.getLogger("vla_agent").warning(
+                    "Final checkpoint discovery failed for %s; preserving process exit result", attempt_id, exc_info=True)
         if cancelling:
             state.emit(attempt_id, "CANCELLED", common)
         elif child.returncode == 0:
@@ -253,7 +282,8 @@ def execute(config: dict, attempt_id: str) -> int:
                 return 2
         error = exc.as_dict() if isinstance(exc, AgentError) else {"code": "RUNNER_ERROR", "message": str(exc)}
         state.emit(attempt_id, "FAILED", {"exit_code": child.returncode if child else None, "error": error,
-                                           "process_started": child is not None, "code_snapshot": start_snapshot})
+                                           "process_started": child is not None, "code_snapshot": start_snapshot,
+                                           "checks": launch_checks})
         return 1
     finally:
         for sig, handler in old_signals.items():

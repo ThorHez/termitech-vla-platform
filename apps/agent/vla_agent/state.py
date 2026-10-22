@@ -31,6 +31,9 @@ class State:
                     last_seq INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS events (attempt_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL,
                     timestamp TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(attempt_id,seq));
+                CREATE TABLE IF NOT EXISTS artifact_receipts (attempt_id TEXT NOT NULL, identity TEXT NOT NULL,
+                    path TEXT NOT NULL, output TEXT NOT NULL, available INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY(attempt_id,identity));
             """)
         self.path.chmod(0o600)
 
@@ -124,6 +127,46 @@ class State:
     def pending_events(self, limit: int = 100) -> list[dict]:
         with self.connect() as db:
             return [{**dict(row), "data": json.loads(row["data"])} for row in db.execute("SELECT * FROM events ORDER BY attempt_id,seq LIMIT ?", (limit,))]
+
+    def available_artifacts(self, attempt_id: str, limit: int = 256) -> list[dict]:
+        with self.connect() as db:
+            return [json.loads(row[0]) for row in db.execute(
+                "SELECT output FROM artifact_receipts WHERE attempt_id=? AND available=1 LIMIT ?", (attempt_id, limit))]
+
+    def emit_artifacts(self, attempt_id: str, outputs: list[dict], removed_paths: list[str] | None = None) -> int:
+        """Persist discovery and its outbox event together, including across ACKs.
+
+        A terminal Runner event wins any race with a background scan. Discovery
+        never changes lifecycle state or authorizes releasing training resources.
+        """
+        if not outputs and not removed_paths:
+            return 0
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT state,last_seq FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+            if not row or row[0] in TERMINAL_STATES:
+                return 0
+            fresh = []
+            for output in outputs:
+                identity = json.dumps([output["kind"], output["path"], output["version"]], separators=(",", ":"))
+                inserted = db.execute("""INSERT INTO artifact_receipts VALUES(?,?,?,?,1)
+                    ON CONFLICT(attempt_id,identity) DO UPDATE SET output=excluded.output,available=1
+                    WHERE artifact_receipts.available=0""", (attempt_id, identity, output["path"], json.dumps(output)))
+                if inserted.rowcount:
+                    fresh.append(output)
+            removed = []
+            for path in removed_paths or []:
+                updated = db.execute("UPDATE artifact_receipts SET available=0 WHERE attempt_id=? AND path=? AND available=1",
+                                     (attempt_id, path))
+                if updated.rowcount:
+                    removed.append(path)
+            if not fresh and not removed:
+                return 0
+            seq, timestamp = row[1] + 1, utc_now()
+            db.execute("INSERT INTO events VALUES(?,?,?,?,?)", (attempt_id, seq, "ARTIFACT", timestamp,
+                                                              json.dumps({"outputs": fresh, "removed_paths": removed})))
+            db.execute("UPDATE attempts SET last_seq=?,updated_at=? WHERE id=?", (seq, timestamp, attempt_id))
+            return len(fresh) + len(removed)
 
     def acknowledge_events(self, events: list[dict]):
         with self.connect() as db:

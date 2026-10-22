@@ -11,22 +11,35 @@ import threading
 from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select, text
+from sqlalchemy import case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from vla_adapters import get_templates
 
 from . import schemas
-from .common import ACTIVE, APIError, TERMINAL, digest, now, offset_time, require_path, token_hash, uid
+from .auth import AuthManager, register_auth_routes
+from .authorization import permission_for, request_route_path
+from .common import ACTIVE, APIError, TERMINAL, digest, now, offset_time, require_path, token_hash, uid, valid_snapshot
 from .db import Database
 from .models import Allocation, Asset, Attempt, Command, Event, Idempotency, Node, Preview, Profile, Run, RunInput
+from .onboarding import generate_agent_config, resolve_agent_config_defaults
+from .path_suggestions import acknowledge as acknowledge_path_query, create_query, expire_pending as expire_path_queries, matching_profile as matching_path_profile, query_dict as path_query_dict
+from .recipe_suggestions import acknowledge as acknowledge_recipe_query, create_query as create_recipe_query, expire_pending as expire_recipe_queries, matching_profile as matching_recipe_profile, query_dict as recipe_query_dict
+from .recipe_details import acknowledge as acknowledge_recipe_detail
+from .data_processors import acknowledge as acknowledge_data_processors, register_routes as register_data_processor_routes
+from .recipe_library import register_recipe_routes
+from .recipe_writeback import acknowledge as acknowledge_recipe_writeback, register_routes as register_writeback_routes, require_no_pending_writeback
+from .remote_deployment import DeploymentManager, register_remote_routes
+from .remote_models import RemoteDeployment
 from .scheduler import enqueue, gpu_available, resolve_inputs, tick
 from .serialization import asset_dict, node_dict, preview_dict, profile_dict, run_dict
-from .service import apply_ack, get_required, ingest_events, sync_profiles, validate_request
+from .service import apply_ack, automatic_preflight_error, get_required, ingest_events, sync_profiles, validate_request
 from .settings import Settings
+from .transport_security import TransportSecurityMiddleware, uvicorn_options
 
 logger = logging.getLogger(__name__)
+RETIRED_NODE_STATES = {"DISCONNECTED", "REMOVED"}
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -34,6 +47,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings.validate()
     db = Database(settings.database_url)
     db.initialize()
+    auth = AuthManager(db, settings)
+    remote_manager = DeploymentManager(db, settings)
     stop = threading.Event()
 
     def scheduler_loop():
@@ -46,6 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_):
         worker = None
+        remote_manager.start()
         if settings.scheduler_enabled:
             worker = threading.Thread(target=scheduler_loop, name="vla-scheduler", daemon=True)
             worker.start()
@@ -53,13 +69,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             stop.set()
+            remote_manager.close()
             if worker:
                 worker.join(timeout=35)
             db.close()
 
-    app = FastAPI(title="Termitech VLA Control Plane", version="0.1.0", lifespan=lifespan)
+    def require_human(request: Request):
+        route_path = request_route_path(request)
+        if not route_path.startswith("/api/v1/"):
+            return
+        permission = permission_for(request.method, route_path)
+        if permission is not None:
+            return auth.require(request, permission)
+
+    app = FastAPI(title="Termitech VLA Control Plane", version="0.1.0", lifespan=lifespan,
+                  dependencies=[Depends(require_human)])
     app.state.db = db
     app.state.settings = settings
+    app.state.remote_manager = remote_manager
+    app.state.auth = auth
+
+    @app.middleware("http")
+    async def human_request_audit(request: Request, call_next):
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            if request_route_path(request).startswith("/api/v1/"):
+                response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Referrer-Policy"] = "same-origin"
+            response.headers["Content-Security-Policy"] = "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            return response
+        finally:
+            route_path = request_route_path(request)
+            if (route_path.startswith("/api/v1/")
+                    and (not route_path.startswith("/api/v1/auth/") or status >= 400)
+                    and request.method not in {"GET", "HEAD", "OPTIONS"}):
+                # Do not capture request bodies, query strings, passwords, Agent
+                # credentials or SSH secrets in the audit trail.
+                from starlette.concurrency import run_in_threadpool
+                await run_in_threadpool(auth.audit, request, "api.mutation", status)
+
+    app.add_middleware(TransportSecurityMiddleware, settings=settings)
+    register_auth_routes(app, auth)
 
     @app.exception_handler(APIError)
     async def api_error(_, exc):
@@ -80,10 +134,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise APIError(401, "UNAUTHORIZED", "Bearer authentication is required")
         return value[7:]
 
-    def require_admin(authorization: str | None = Header(default=None)):
-        if not hmac.compare_digest(bearer(authorization), settings.admin_token):
-            raise APIError(401, "UNAUTHORIZED", "Administrator credential is invalid")
-
     def require_enrollment(authorization: str | None = Header(default=None)):
         if not hmac.compare_digest(bearer(authorization), settings.enrollment_token):
             raise APIError(401, "UNAUTHORIZED", "Enrollment credential is invalid")
@@ -91,10 +141,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def require_agent(authorization: str | None = Header(default=None)) -> str:
         hashed = token_hash(bearer(authorization))
         with db.read() as session:
-            node_id = session.scalar(select(Node.id).where(Node.token_hash == hashed))
-        if not node_id:
+            node = session.scalar(select(Node).where(Node.token_hash == hashed))
+        if not node:
             raise APIError(401, "UNAUTHORIZED", "Node credential is invalid")
-        return node_id
+        assert_agent_connected(node)
+        return node.id
+
+    def assert_agent_connected(node):
+        if node.status in RETIRED_NODE_STATES:
+            raise APIError(401, "NODE_CONNECTION_REMOVED", "该机器连接已删除，请通过中台重新接入")
 
     def check_owner(actual: str, supplied: str):
         if actual != supplied:
@@ -105,7 +160,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise APIError(422, "IDEMPOTENCY_KEY_REQUIRED", "Provide an Idempotency-Key of 1 to 200 characters")
         return key
 
-    admin = [Depends(require_admin)]
+    admin = [Depends(require_human)]
+    register_remote_routes(app, admin, remote_manager)
+
+    def require_available_node(session, node_id):
+        node = session.scalar(select(Node).where(Node.id == node_id).with_for_update()
+                              .execution_options(populate_existing=True))
+        if node is None:
+            raise APIError(404, "NOT_FOUND", "Node not found")
+        if node.status != "ONLINE":
+            raise APIError(409, "NODE_OFFLINE", "机器当前不可用，请重新接入或等待节点恢复在线")
+        if session.scalar(select(RemoteDeployment.id).where(
+            RemoteDeployment.node_id == node_id,
+            RemoteDeployment.state.in_({"QUEUED", "RUNNING", "WAITING_AGENT"}),
+        ).limit(1)):
+            raise APIError(409, "NODE_MAINTENANCE", "该机器正在部署 Agent，请等待接入完成后再进行训练预检或提交")
+        return node
+
+    register_recipe_routes(app, admin, db, require_available_node, settings)
+    register_data_processor_routes(app, admin, db, require_available_node, settings)
+    register_writeback_routes(app, admin, db, require_available_node, settings)
 
     @app.get("/healthz")
     def health():
@@ -117,10 +191,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def templates():
         return get_templates()
 
+    def agent_config_defaults(request: Request):
+        return resolve_agent_config_defaults(os.getenv("VLA_AGENT_CONTROL_PLANE_URL"), str(request.base_url))
+
+    @app.get("/api/v1/agent-config-defaults", dependencies=admin)
+    def agent_config_defaults_get(request: Request):
+        return JSONResponse(content=agent_config_defaults(request), headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/v1/agent-configs", dependencies=admin, status_code=201)
+    def agent_config_create(body: schemas.AgentConfigInput, request: Request):
+        # An explicit advanced override need not use the platform default.
+        default_url = agent_config_defaults(request)["control_plane_url"] if body.control_plane_url is None else None
+        return JSONResponse(status_code=201, content=generate_agent_config(body, settings.enrollment_token, default_url),
+                            headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/v1/agent-package", dependencies=admin)
+    def agent_package():
+        package = Path(os.getenv("VLA_AGENT_BUNDLE", ".local/agent-dist/vla-agent-bundle.tar.gz"))
+        if not package.is_file():
+            raise APIError(503, "AGENT_PACKAGE_UNAVAILABLE", "Agent installation package is unavailable; ask the administrator to build the Agent bundle and configure VLA_AGENT_BUNDLE")
+        return FileResponse(package, media_type="application/gzip", filename="vla-agent-bundle.tar.gz",
+                            headers={"Cache-Control": "no-store"})
+
     @app.get("/api/v1/overview", dependencies=admin)
     def overview():
         with db.read() as session:
-            nodes = list(session.scalars(select(Node)))
+            nodes = list(session.scalars(select(Node).where(Node.status.not_in(RETIRED_NODE_STATES))))
             allocations = {(a.node_id, a.gpu_uuid) for a in session.scalars(select(Allocation))}
             return {"nodes_online": sum(n.status == "ONLINE" for n in nodes), "nodes_total": len(nodes),
                     "gpus_total": sum(len(n.gpus) for n in nodes),
@@ -130,9 +226,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "assets_total": session.scalar(select(func.count()).select_from(Asset).where(Asset.state != "ARCHIVED"))}
 
     @app.get("/api/v1/nodes", dependencies=admin)
-    def nodes():
+    def nodes(include_inactive: bool = False):
         with db.read() as session:
-            return [node_dict(session, node) for node in session.scalars(select(Node).order_by(Node.created_at))]
+            query = select(Node).order_by(Node.created_at)
+            if not include_inactive:
+                query = query.where(Node.status.not_in(RETIRED_NODE_STATES))
+            return [node_dict(session, node) for node in session.scalars(query)]
 
     @app.get("/api/v1/nodes/{node_id}", dependencies=admin)
     def node_detail(node_id: str):
@@ -150,6 +249,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node_id:
                 query = query.where(Profile.node_id == node_id)
             return [profile_dict(p) for p in session.scalars(query)]
+
+    def require_path_query_node(session, node_id):
+        node = require_available_node(session, node_id)
+        if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
+            raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法获取路径联想")
+        return node
+
+    @app.post("/api/v1/nodes/{node_id}/path-suggestions", dependencies=admin, status_code=202)
+    def path_suggestions_create(node_id: str, body: schemas.PathSuggestInput):
+        with db.write() as session:
+            node = require_path_query_node(session, node_id)
+            return create_query(session, node, body.prefix, body.limit, body.profile_id)
+
+    @app.get("/api/v1/nodes/{node_id}/path-suggestions/{query_id}", dependencies=admin)
+    def path_suggestions_get(node_id: str, query_id: str):
+        with db.write() as session:
+            node = require_path_query_node(session, node_id)
+            command = get_required(session, Command, query_id, "Path suggestion")
+            if command.node_id != node.id or command.type != "PATH_SUGGEST":
+                raise APIError(404, "NOT_FOUND", "Path suggestion not found")
+            expire_path_queries(session, node.id)
+            profile = session.get(Profile, (node.id, command.payload["profile_id"])) if command.payload.get("profile_id") else None
+            return path_query_dict(command, node.roots, profile)
+
+    @app.post("/api/v1/nodes/{node_id}/recipe-suggestions", dependencies=admin, status_code=202)
+    def recipe_suggestions_create(node_id: str, body: schemas.RecipeSuggestInput):
+        with db.write() as session:
+            node = require_available_node(session, node_id)
+            if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
+                raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法获取训练配方")
+            return create_recipe_query(session, node, body.profile_id, body.prefix, body.limit)
+
+    @app.get("/api/v1/nodes/{node_id}/recipe-suggestions/{query_id}", dependencies=admin)
+    def recipe_suggestions_get(node_id: str, query_id: str):
+        with db.write() as session:
+            node = require_available_node(session, node_id)
+            if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
+                raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法获取训练配方")
+            command = get_required(session, Command, query_id, "Recipe suggestion")
+            if command.node_id != node.id or command.type != "RECIPE_SUGGEST":
+                raise APIError(404, "NOT_FOUND", "Recipe suggestion not found")
+            expire_recipe_queries(session, node.id)
+            profile = session.get(Profile, (node.id, command.payload["profile_id"]))
+            return recipe_query_dict(command, profile, node.roots)
 
     @app.get("/api/v1/assets", dependencies=admin)
     def assets(node_id: str | None = None, kind: str | None = None):
@@ -187,7 +330,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def preview_create(body: schemas.PreviewInput):
         data = body.model_dump()
         with db.write() as session:
-            node, _, parameters = validate_request(session, data)
+            node, profile, parameters = validate_request(session, data)
+            require_available_node(session, node.id)
+            require_no_pending_writeback(session, node.id, profile.code_dir)
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             data["parameters"] = parameters
@@ -195,8 +340,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                               created_at=now(), expires_at=offset_time(settings.preview_ttl_seconds))
             session.add(preview)
             enqueue(session, node.id, "PREFLIGHT", {"preview_id": preview.id, "profile_id": body.profile_id,
-                "template_id": body.template_id, "inputs": resolve_inputs(session, data),
-                "parameters": parameters, "gpu_count": body.gpu_count})
+                "template_id": body.template_id, "recipe": data["recipe"], "inputs": resolve_inputs(session, data),
+                "parameters": parameters, "gpu_count": body.gpu_count, "entrypoint": data.get("entrypoint"),
+                **({"training_stage": data["training_stage"], "stage_config": data["stage_config"]} if data.get("training_stage") is not None else {}),
+                **({"dataset_bindings": data["dataset_bindings"]} if data.get("dataset_bindings") is not None else {}),
+                **({"recipe_definition": data["recipe_definition"], "node_id": node.id} if data.get("recipe_definition") else {})})
             return {"id": preview.id, "status": preview.status}
 
     @app.get("/api/v1/run-previews/{preview_id}", dependencies=admin)
@@ -238,12 +386,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if preview.status != "READY":
                 raise APIError(409, "PREFLIGHT_NOT_READY", "A successful preflight is required")
             data = preview.request
-            node, _, _ = validate_request(session, data)
+            if "recipe" not in data:
+                raise APIError(409, "AGENT_RECIPE_UNSUPPORTED", "旧版预检未绑定训练配方，请更新 Agent 后重新预检")
+            node, profile, _ = validate_request(session, data, frozen=True)
+            require_no_pending_writeback(session, node.id, profile.code_dir)
+            if not valid_snapshot(preview.code_snapshot):
+                raise APIError(409, "CODE_VERSION_UNAVAILABLE", "预检未记录完整代码版本，请重新预检")
+            if "recipe" not in preview.code_snapshot:
+                raise APIError(409, "AGENT_RECIPE_UNSUPPORTED", "预检未记录训练配方，请更新 Agent 后重新预检")
+            if preview.code_snapshot["recipe"] != data["recipe"]:
+                raise APIError(409, "RECIPE_MISMATCH", "预检记录的训练配方与所选配方不一致，请重新预检")
+            if preview.code_snapshot.get("recipe_definition") != data.get("recipe_definition"):
+                raise APIError(409, "RECIPE_DEFINITION_MISMATCH", "预检记录的自定义配方版本不一致，请重新预检")
+            preflight_error = automatic_preflight_error(session, data, preview.code_snapshot, preview.checks)
+            if preflight_error:
+                raise APIError(409, preflight_error["code"], preflight_error["message"])
             session.scalar(select(Node).where(Node.id == node.id).with_for_update())
+            require_available_node(session, node.id)
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             created = now()
-            run = Run(id=uid(), **data, state="QUEUED", code_expectation=preview.code_snapshot,
+            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "training_stage", "stage_config"}}
+            run = Run(id=uid(), **run_fields, state="QUEUED", code_expectation=preview.code_snapshot,
                       created_at=created, updated_at=created, queue_reason="AWAITING_SCHEDULER")
             session.add(run)
             session.flush()
@@ -333,6 +497,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if registration_key:
                 existing = session.scalar(select(Node).where(Node.registration_key == registration_key).with_for_update())
                 if existing:
+                    assert_agent_connected(existing)
                     if existing.registration_digest != body_digest:
                         raise APIError(409, "IDEMPOTENCY_CONFLICT", "Registration key was used with different node configuration")
                     token = registration_token(existing.id, registration_key)
@@ -359,6 +524,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise APIError(422, "DUPLICATE_GPU_UUID", "Reported GPU UUIDs must be unique")
         with db.write() as session:
             node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+            assert_agent_connected(node)
             node.last_seen, node.gpus, node.metrics = now(), [gpu.model_dump() for gpu in body.gpus], body.metrics
             reported_ids = {active.attempt_id for active in body.active_attempts}
 
@@ -399,18 +565,56 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def commands(node_id: str, owner: str = Depends(require_agent)):
         check_owner(owner, node_id)
         with db.read() as session:
-            rows = session.scalars(select(Command).where(Command.node_id == node_id, Command.status == "PENDING").order_by(Command.created_at, Command.id).limit(100))
+            # A slow preflight backlog must never hide lifecycle commands behind
+            # the delivery limit. Keep delivery stable and read-only within each
+            # priority, including START before its later CANCEL, so retries
+            # return the same unacknowledged commands.
+            priority = case((Command.type.in_(["START", "CANCEL"]), 0),
+                            (Command.type == "PREFLIGHT", 2), else_=1)
+            rows = session.scalars(select(Command).where(Command.node_id == node_id, Command.status == "PENDING")
+                                   .order_by(priority, Command.created_at, Command.id).limit(100))
             return [{"id": row.id, "type": row.type, "payload": row.payload} for row in rows]
 
     @app.post("/agent/v1/commands/{command_id}/ack")
     def command_ack(command_id: str, body: schemas.AckInput, node_id: str = Depends(require_agent)):
         check_owner(node_id, body.node_id)
         with db.write() as session:
-            session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+            node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+            assert_agent_connected(node)
             command = session.scalar(select(Command).where(Command.id == command_id).with_for_update())
             if command is None or command.node_id != node_id:
                 raise APIError(403, "NODE_OWNERSHIP_MISMATCH", "Command is not assigned to this node")
-            apply_ack(session, command, body.status, body.result)
+            if command.type == "PATH_SUGGEST":
+                expire_path_queries(session, node_id)
+                previous_error = command.result.get("error") if isinstance(command.result, dict) else None
+                if (command.status == "REJECTED" and isinstance(command.result, dict)
+                        and isinstance(previous_error, dict) and previous_error.get("code") == "PATH_SUGGEST_TIMEOUT"):
+                    return {"ok": True}
+                profile = session.get(Profile, (node_id, command.payload["profile_id"])) if command.payload.get("profile_id") else None
+                if (command.status != "PENDING" and command.payload.get("profile_id") is not None
+                        and not matching_path_profile(command, profile)):
+                    return {"ok": True}
+                status, result = acknowledge_path_query(command, node.roots, body.status, body.result, profile)
+                apply_ack(session, command, status, result)
+            elif command.type == "RECIPE_WRITE":
+                acknowledge_recipe_writeback(session, command, node, body.status, body.result)
+            elif command.type == "RECIPE_DETAIL":
+                acknowledge_recipe_detail(session, command, node, body.status, body.result)
+            elif command.type == "DATA_PROCESSORS":
+                acknowledge_data_processors(session, command, node, body.status, body.result)
+            elif command.type == "RECIPE_SUGGEST":
+                expire_recipe_queries(session, node_id)
+                profile = session.get(Profile, (node_id, command.payload["profile_id"]))
+                previous_error = command.result.get("error") if isinstance(command.result, dict) else None
+                if (command.status != "PENDING" and
+                        (not matching_recipe_profile(command, profile, node.roots)
+                         or isinstance(previous_error, dict) and previous_error.get("code") in {
+                             "RECIPE_SUGGEST_TIMEOUT", "RECIPE_PROFILE_CHANGED"})):
+                    return {"ok": True}
+                status, result = acknowledge_recipe_query(command, profile, node.roots, body.status, body.result)
+                apply_ack(session, command, status, result)
+            else:
+                apply_ack(session, command, body.status, body.result)
             return {"ok": True}
 
     @app.post("/agent/v1/events/batch")
@@ -418,6 +622,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         check_owner(node_id, body.node_id)
         with db.write() as session:
             node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+            assert_agent_connected(node)
             accepted = ingest_events(session, node, [event.model_dump() for event in body.events])
             session.flush()
             if node.status == "RECOVERING" and node.last_seen >= offset_time(-settings.heartbeat_timeout_seconds):
@@ -435,7 +640,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 def main():
     import uvicorn
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(create_app(), host=os.getenv("VLA_HOST", "127.0.0.1"), port=int(os.getenv("VLA_PORT", "8000")))
+    settings = Settings.from_env()
+    uvicorn.run(create_app(settings), host=os.getenv("VLA_HOST", "127.0.0.1"),
+                port=int(os.getenv("VLA_PORT", "8000")), **uvicorn_options(settings))
 
 
 if __name__ == "__main__":

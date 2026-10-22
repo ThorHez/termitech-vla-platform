@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+
+from vla_protocol import canonical_digest
 
 from .safety import AgentError, allowed_path
 from .state import utc_now
@@ -13,6 +16,23 @@ from .state import utc_now
 
 def digest(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _entrypoint_digest(path: Path) -> str:
+    """Read bounded source content and refuse a concurrently substituted link."""
+    maximum = 2 * 1024 * 1024
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > maximum:
+                raise AgentError("INVALID_ENTRYPOINT", "Selected training entrypoint must be a regular Python file no larger than 2 MiB")
+            content = source.read(maximum + 1)
+            if len(content) > maximum:
+                raise AgentError("INVALID_ENTRYPOINT", "Selected training entrypoint exceeds 2 MiB")
+    except OSError as exc:
+        raise AgentError("CODE_VERSION_UNAVAILABLE", "Selected training entrypoint cannot be read") from exc
+    return digest(content)
 
 
 def git(root: Path, *args: str) -> bytes:
@@ -33,8 +53,32 @@ def sanitize_remote(value: str) -> str:
     return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
 
 
-def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = None) -> dict:
+def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = None, *, recipe: str | None = None,
+                 recipe_definition: dict | None = None, entrypoint: str | None = None,
+                 dataset_bindings: list[dict] | None = None, training_stage: str | None = None,
+                 stage_config: dict | None = None) -> dict:
     root = allowed_path(profile["code_dir"], roots)
+    from vla_adapters.dataset_bindings import normalize_dataset_bindings
+    from vla_adapters.entrypoints import validate_entrypoint
+    from vla_adapters.recap import validate_training_stage
+    try:
+        training_stage, stage_config = validate_training_stage("recap" if training_stage is not None else profile.get("adapter"), training_stage, stage_config)
+    except ValueError as exc:
+        raise AgentError("TRAINING_STAGE_INVALID", str(exc)) from exc
+    try:
+        dataset_bindings = normalize_dataset_bindings(dataset_bindings)
+    except ValueError as exc:
+        raise AgentError("DATASET_BINDINGS_INVALID", str(exc)) from exc
+    try:
+        entrypoint = validate_entrypoint(entrypoint)
+    except ValueError as exc:
+        raise AgentError("INVALID_ENTRYPOINT", str(exc)) from exc
+    entrypoint_sha256 = None
+    if entrypoint is not None:
+        selected_entry = allowed_path(str(root / entrypoint), [str(root)])
+        if not selected_entry.is_file() or selected_entry.suffix != ".py":
+            raise AgentError("INVALID_ENTRYPOINT", "Selected training entrypoint must be a Python file inside the training project")
+        entrypoint_sha256 = _entrypoint_digest(selected_entry)
     repository_root = allowed_path(git(root, "rev-parse", "--show-toplevel").decode().strip(), roots)
     commit = git(root, "rev-parse", "--verify", "HEAD").decode().strip()
     if len(commit) not in (40, 64):
@@ -135,9 +179,35 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
                 changed_during_capture = True
         except (OSError, AgentError):
             changed_during_capture = True
+    if entrypoint is not None:
+        try:
+            current_entry = allowed_path(str(root / entrypoint), [str(root)])
+            if _entrypoint_digest(current_entry) != entrypoint_sha256:
+                changed_during_capture = True
+        except (OSError, AgentError):
+            changed_during_capture = True
     if changed_during_capture:
         complete = False
         missing.append("code changed during provenance capture")
+    runtime = {key: profile.get(key) for key in (
+        "python", "recipe", "adapter", "execution_mode", "docker_image", "metadata")}
+    # Preserve legacy digests for queued tasks without a per-task recipe. Bind both
+    # the original registered profile and task selection when one was frozen.
+    if recipe is not None:
+        runtime["training_recipe"] = recipe
+    if entrypoint is not None:
+        runtime["requested_entrypoint"] = entrypoint
+    if dataset_bindings is not None:
+        runtime["dataset_bindings"] = dataset_bindings
+    if training_stage is not None:
+        runtime.update(training_stage=training_stage, stage_config=stage_config)
+    if recipe_definition is not None:
+        from vla_adapters.recipe_definitions import validate_definition
+        recipe_definition = validate_definition(recipe_definition)
+        runtime["recipe_definition_digest"] = recipe_definition["digest"]
+    selected_recipe = recipe if recipe is not None else profile.get("recipe")
+    if recipe is None and profile.get("adapter") == "smoke":
+        selected_recipe = "smoke"
     snapshot = {
         "repo_url": remote, "code_dir": str(root), "repository_root": str(repository_root),
         "branch": branch, "commit_sha": commit,
@@ -146,13 +216,24 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         "dirty": bool(changed), "changes_digest": digest(b"STAGED\0" + staged + b"\0UNSTAGED\0" + unstaged),
         "untracked_digest": digest(json.dumps(untracked, sort_keys=True).encode()),
         "module_origin": str(origin), "captured_at": utc_now(), "complete": complete,
+        "recipe": selected_recipe,
+        "requested_entrypoint": entrypoint,
+        "requested_entrypoint_sha256": entrypoint_sha256,
         "missing": missing, "submodules": submodules,
-        "evidence_scope": "Git commit, staged/unstaged patches, and untracked file content at launch; ignored files and runtime dependencies are outside this snapshot",
+        "evidence_scope": ("Git commit, staged/unstaged patches, untracked file content, and selected entrypoint SHA-256 at launch; other ignored files and runtime dependencies are outside this snapshot"
+                           if entrypoint is not None else
+                           "Git commit, staged/unstaged patches, and untracked file content at launch; ignored files and runtime dependencies are outside this snapshot"),
         "untracked_contents_saved": evidence_dir is not None and complete,
-        "runtime_digest": digest(json.dumps({key: profile.get(key) for key in (
-            "python", "recipe", "adapter", "execution_mode", "docker_image", "metadata")},
-            sort_keys=True, separators=(",", ":")).encode()),
+        "runtime_digest": digest(json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()),
     }
+    if recipe_definition is not None:
+        from .recipe_execution import verify_recipe_source
+        verify_recipe_source(profile, roots, recipe_definition, snapshot)
+        snapshot["recipe_definition"] = recipe_definition
+    if dataset_bindings is not None:
+        snapshot["dataset_bindings"] = dataset_bindings
+    if training_stage is not None:
+        snapshot.update(training_stage=training_stage, stage_config=stage_config)
     if evidence_dir is not None:
         evidence_dir.mkdir(parents=True, exist_ok=True)
         (evidence_dir / "code.diff").write_bytes(diff)
@@ -172,10 +253,25 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
     return snapshot
 
 
-def compare_code(expected: dict, actual: dict):
+def compare_code(expected: dict, actual: dict, *, compare_automatic: bool = True):
     if not expected.get("complete") or not actual.get("complete"):
         raise AgentError("CODE_VERSION_UNAVAILABLE", "Code snapshot is incomplete; repeat preflight after resolving missing evidence")
-    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest")
+    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "training_stage", "stage_config")
     changed = [field for field in fields if expected.get(field) != actual.get(field)]
     if changed:
         raise AgentError("CODE_CHANGED_SINCE_PREFLIGHT", "Code changed after preflight: " + ", ".join(changed))
+    if compare_automatic and "automatic_preflight" in expected:
+        frozen = expected["automatic_preflight"]
+        current = actual.get("automatic_preflight")
+        try:
+            valid = isinstance(frozen, dict) and isinstance(current, dict)
+            valid = valid and frozen.get("schema_version") == current.get("schema_version") == 1
+            valid = valid and frozen.get("scope") == current.get("scope") == "configuration_and_local_assets"
+            valid = valid and isinstance(frozen.get("plan"), dict) and isinstance(current.get("plan"), dict)
+            valid = valid and frozen.get("plan_digest") == canonical_digest(frozen["plan"])
+            valid = valid and current.get("plan_digest") == canonical_digest(current["plan"])
+            valid = valid and frozen["plan_digest"] == current["plan_digest"]
+        except (KeyError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise AgentError("ASSETS_CHANGED_SINCE_PREFLIGHT", "训练配置或本机数据、归一化统计、模型在预检后发生变化，请重新预检")

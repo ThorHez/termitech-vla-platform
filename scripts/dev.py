@@ -1,23 +1,27 @@
 """Start the local API and smoke Agent. Training is CPU-only and clearly labeled."""
 
 import argparse
+from http.cookiejar import CookieJar
 import json
 import signal
 import subprocess
 import sys
 import time
 from urllib.error import URLError, HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from bootstrap_demo import ROOT, prepare_demo
 
 
-def request(url, token=None, body=None):
+browser = build_opener(HTTPCookieProcessor(CookieJar()))
+
+
+def request(url, csrf=None, body=None):
     headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = "Bearer " + token
+    if csrf:
+        headers["X-CSRF-Token"] = csrf
     data = None if body is None else json.dumps(body).encode()
-    with urlopen(Request(url, data=data, headers=headers), timeout=5) as response:
+    with browser.open(Request(url, data=data, headers=headers), timeout=5) as response:
         return json.load(response)
 
 
@@ -25,7 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-    fixture = prepare_demo(port=args.port)
+    fixture = prepare_demo(port=args.port, create_user=True)
     api = f"http://127.0.0.1:{args.port}"
     children = []
     try:
@@ -42,23 +46,28 @@ def main():
             raise RuntimeError("管理服务启动超时")
         children.append(subprocess.Popen([sys.executable, "-m", "vla_agent.main", "--config",
                                          str(fixture["config_file"])], cwd=ROOT))
-        token = fixture["credentials"]["admin_token"]
+        credentials = fixture["credentials"]
+        if not credentials.get("admin_password"):
+            raise RuntimeError("已有平台账户，请通过正常账号登录；该数据库未保留演示账号密码，不能自动登记演示资产")
+        authentication = request(api + "/api/v1/auth/login", body={
+            "username": credentials["admin_username"], "password": credentials["admin_password"]})
+        csrf = authentication["csrf_token"]
         for _ in range(100):
-            nodes = request(api + "/api/v1/nodes", token)
+            nodes = request(api + "/api/v1/nodes", csrf)
             node = next((n for n in nodes if n["name"] == fixture["config"]["name"]), None)
             if node:
                 break
             time.sleep(0.1)
         else:
             raise RuntimeError("Agent 登记超时")
-        existing = request(api + "/api/v1/assets", token)
+        existing = request(api + "/api/v1/assets", csrf)
         for kind, path in fixture["assets"].items():
             if not any(a["node_id"] == node["id"] and a["path"] == str(path) for a in existing):
-                request(api + "/api/v1/assets", token, {"name": "链路测试 / " + kind,
+                request(api + "/api/v1/assets", csrf, {"name": "链路测试 / " + kind,
                         "kind": kind.upper() if kind != "dataset" else "DATASET", "node_id": node["id"],
                         "path": str(path), "version": "demo-v1", "metadata": {"simulation": True}})
         print(f"\n平台已启动：{api}\n这是本地 CPU 链路测试环境。", flush=True)
-        print(f"登录令牌：{token}\nCtrl+C 停止本地管理服务和 Agent。", flush=True)
+        print(f"演示账号保存在 {fixture['base'] / 'dev-credentials.json'}；使用其中的 admin_username / admin_password。\nCtrl+C 停止本地管理服务和 Agent。", flush=True)
         while all(child.poll() is None for child in children):
             time.sleep(1)
     except KeyboardInterrupt:

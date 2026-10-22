@@ -1,10 +1,12 @@
 import dataclasses
+import copy
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from vla_adapters import build_launch, validate_parameters
+from vla_adapters import build_launch, resolve_recipe, validate_parameters
 from vla_adapters.openpi_entry import resolve_config
 
 
@@ -24,10 +26,52 @@ def test_reject_invalid_steps(value):
         validate_parameters("smoke", {"steps": value})
 
 
-def test_unvalidated_recipe_cannot_launch(tmp_path):
+def test_unvalidated_recipe_can_build_for_automatic_agent_preflight(tmp_path):
     profile = {"adapter": "openpi-sft", "code_dir": str(tmp_path), "python": "/usr/bin/python3", "recipe": "valid_recipe"}
+    inputs = {role: {"path": str(tmp_path / role)} for role in ("dataset", "model", "norm")}
+    launch = build_launch(profile, "openpi-sft", inputs, {}, str(tmp_path / "output"), ["GPU-a"])
+    assert json.loads(launch["argv"][-1])["recipe"] == "valid_recipe"
+    assert not profile.get("metadata")
+
+
+def test_task_recipe_can_use_multiple_explicitly_validated_configs_without_profile_default(tmp_path):
+    profile = {"adapter": "openpi-sft", "code_dir": str(tmp_path), "python": "/usr/bin/python3",
+               "recipe": None, "metadata": {"validated_recipes": ["first_config", "second-config"]}}
+    original = copy.deepcopy(profile)
+    inputs = {role: {"path": str(tmp_path / role)} for role in ("dataset", "model", "norm")}
+    for recipe in ("first_config", "second-config"):
+        launch = build_launch(profile, "openpi-sft", inputs, {}, str(tmp_path / "output"), ["GPU-a"], recipe=recipe)
+        assert json.loads(launch["argv"][-1])["recipe"] == recipe
+    assert profile == original
     with pytest.raises(ValueError, match="PROFILE_NOT_VALIDATED"):
-        build_launch(profile, "openpi-sft", {}, {}, str(tmp_path), ["GPU-a"])
+        resolve_recipe(profile, "unvalidated_config")
+    with pytest.raises(ValueError, match="RECIPE_REQUIRED"):
+        resolve_recipe(profile)
+
+
+def test_legacy_validation_only_authorizes_original_registered_recipe():
+    profile = {"adapter": "openpi-sft", "recipe": "original_config", "metadata": {"validated": True}}
+    assert resolve_recipe(profile) == "original_config"
+    assert resolve_recipe(profile, "original_config") == "original_config"
+    with pytest.raises(ValueError, match="PROFILE_NOT_VALIDATED"):
+        resolve_recipe(profile, "different_config")
+    profile["metadata"]["validated"] = "true"
+    with pytest.raises(ValueError, match="PROFILE_NOT_VALIDATED"):
+        resolve_recipe(profile)
+
+
+@pytest.mark.parametrize("recipe", ["配方", "config.name", "../config", "config name", "config\n", "a" * 256, 7])
+def test_task_recipe_requires_bounded_ascii_identifier(recipe):
+    with pytest.raises(ValueError, match="RECIPE_INVALID"):
+        resolve_recipe({"adapter": "openpi-sft", "metadata": {}}, recipe, require_validated=False)
+
+
+def test_smoke_recipe_defaults_without_validation_and_rejects_overrides():
+    assert resolve_recipe({"adapter": "smoke"}) == "smoke"
+    assert resolve_recipe({"adapter": "smoke", "recipe": "legacy_unused_name"}) == "smoke"
+    assert resolve_recipe({"adapter": "smoke"}, "smoke") == "smoke"
+    with pytest.raises(ValueError, match="RECIPE_INVALID"):
+        resolve_recipe({"adapter": "smoke"}, "other_config")
 
 
 def test_norm_file_must_be_the_actual_statistics_file(tmp_path):

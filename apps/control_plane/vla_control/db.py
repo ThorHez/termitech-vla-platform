@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -35,7 +35,26 @@ class Database:
 
     def initialize(self) -> None:
         from . import models  # noqa: F401
+        from . import remote_models  # noqa: F401
+        from . import recipe_models  # noqa: F401
+        from . import auth_models  # noqa: F401
         Base.metadata.create_all(self.engine)
+        # One stable row serializes administrator invariants across processes.
+        with self.engine.begin() as connection:
+            if self.engine.dialect.name == "sqlite":
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            connection.exec_driver_sql("INSERT INTO auth_guard (id) VALUES (1) ON CONFLICT (id) DO NOTHING")
+            # Authentication-only additive upgrade. Historical cookies cannot
+            # prove human activity under the new policy, so revoke those
+            # sessions while preserving users, Agents and all business data.
+            if self.engine.dialect.name == "postgresql":
+                connection.exec_driver_sql("SELECT id FROM auth_guard WHERE id = 1 FOR UPDATE")
+            columns = {column["name"] for column in inspect(connection).get_columns("user_sessions")}
+            missing = {"last_activity_at", "reauthenticated_at"} - columns
+            for column in sorted(missing):
+                connection.exec_driver_sql(f"ALTER TABLE user_sessions ADD COLUMN {column} VARCHAR(40)")
+            if missing:
+                connection.exec_driver_sql("DELETE FROM user_sessions")
 
     @contextmanager
     def read(self):

@@ -1,10 +1,8 @@
 # 本机中台与远端 Agent 联调
 
-`scripts/remote_agent_dev.py` 在本机运行 API、内嵌 Scheduler 和已构建的网页，通过 SSH 反向端口转发供远端 Agent 连接。它复用 `.local/control.db` 和 `.local/dev-credentials.json`，不创建演示资产，不调用 `prepare_demo()`，也不启动本机 Agent。
+`scripts/remote_agent_dev.py` 运行本机 API、内嵌 Scheduler 和已构建网页，复用 `.local/control.db` 与 `.local/dev-credentials.json`，不创建演示资产或启动本机 Agent。SSH 接入与隧道由中台管理，脚本不再绑定固定服务器或启动独立 SSH 命令。
 
 ## 启动
-
-先安装依赖并构建网页：
 
 ```bash
 uv sync --locked
@@ -12,44 +10,34 @@ cd apps/web
 pnpm install --frozen-lockfile
 pnpm build
 cd ../..
-```
-
-确认本机到目标服务器已有可用的非交互 SSH 认证和已确认的主机密钥，然后运行：
-
-```bash
+uv run python scripts/build_agent_bundle.py
+uv run python -m vla_control.users create-admin \
+  --database-url sqlite:///./.local/control.db --username admin
 uv run python scripts/remote_agent_dev.py
 ```
 
-默认连接目标为 `root@115.190.212.169`，本机管理入口为 `http://127.0.0.1:8000`，远端 Agent 的 `control_plane_url` 应设置为 `http://127.0.0.1:18000`。远端 Agent 服务的安装、配置和启动单独完成，本脚本不远程安装或修改服务。
+默认管理入口 `http://127.0.0.1:8000`，可用 `--local-port` 修改。使用独立管理员账号登录；账号已存在时跳过创建步骤。旧 `admin_token` 不再用于网页登录。仅本机 HTTP 联调显式允许非 Secure Cookie，生产入口须使用 HTTPS。若服务已迁移至另一台机器，不要再用迁移前本机数据库启动第二个中台。
 
-管理员登录使用 `.local/dev-credentials.json` 中的 `admin_token`。Agent 初次登记使用同一文件的 `enrollment_token`。脚本不打印这些值，不把它们加入命令行参数；中台凭据通过子进程环境传入。凭据不存在时生成两个不同的随机值，并以 `0600` 权限保存；已有凭据和数据库原样复用。
+## 从页面接入
 
-可覆盖连接目标和端口：
+1. 打开机器资源页，点击“接入机器”。
+2. 填裸金属 IP、SSH 端口、用户名、密码和 Agent 安装目录，测试 SSH。
+3. 若探测到同目录已有 Agent，使用它的状态目录、输出目录及训练环境，保留原机器身份。
+4. 配置实际训练 Python、代码目录和适配器，提交远程安装；配方在创建训练时选择。
+5. 中台自动上传安装包与私有配置、安装/更新并启动 Agent，页面显示阶段日志、节点上线及环境探测结果。
 
-```bash
-uv run python scripts/remote_agent_dev.py \
-  --ssh-target root@115.190.212.169 \
-  --ssh-port 22 \
-  --local-port 8000 \
-  --remote-port 18000
-```
+本机入口属于 loopback 时，中台通过该机器的 SSH 密码认证创建独立反向隧道。远端端口由 SSH 服务自动分配，只监听远端 `127.0.0.1`；实际端口写入 Agent 配置，不再复用固定 18000。转发目标由 `VLA_TUNNEL_TARGET_HOST` / `VLA_TUNNEL_TARGET_PORT` 指定，启动脚本自动配置为当前本机端口。
 
-SSH 使用 `-N -T -R 127.0.0.1:18000:127.0.0.1:8000`，设置 `BatchMode=yes`、`ExitOnForwardFailure=yes`、连接超时和保活，并通过 `ControlMaster=no`、`ControlPath=none` 创建本次独立连接。脚本不会提示输入密码，不修改 SSH 配置或密钥，也不会复用、关闭已有的 SSH 主连接。
+同一中台可管理多台服务器，无需手工启动多个隧道命令。断线后中台自动重连并复用原端口；中台重启后读取持久化部署记录恢复隧道。应用应运行一个 API worker 来持有隧道与部署后台线程。
 
-## 验证与日志
+## 持久化与日志
 
-终端输出本次日志目录 `.local/remote-agent-dev/<时间戳-PID>/`，其中 `control-plane.log` 保存中台输出，`ssh-tunnel.log` 保存 SSH 诊断。每次启动使用独立日志文件，权限为 `0600`。
+SSH 密码在数据库中加密存储；应用密钥、专属 SSH 主机指纹文件保存在 `.local/remote-management/`。应用不读取或改写用户 `~/.ssh`，密码不进入进程参数、明文配置、API 响应或部署日志。首次连接记录主机指纹，后续变更拒绝连接。
 
-本机健康检查通过后才启动隧道。SSH 进程创建成功不等于连接已建立，远端可用性应在服务器上检查：
+部署记录和安全阶段日志在页面可查询，关闭弹窗不会中止安装。启动器日志在 `.local/remote-agent-dev/<时间戳-PID>/control-plane.log`，权限 0600。部署成功必须由实际 Agent 新心跳及对应 onboarding ID 确认，并通过训练 Python 环境探测；不以 SSH 命令返回零就认定接入成功。
 
-```bash
-curl --fail http://127.0.0.1:18000/healthz
-```
+## 停止与生产部署
 
-返回 `{"status":"ok"}` 后，观察网页机器列表中的 Agent 心跳及资源数据。复用数据库时可能仍显示此前的本机演示节点，它不会由此脚本启动，最终会因心跳过期显示离线。
+Ctrl+C 关闭本机中台及其隧道，远端 Agent 的 systemd 服务继续运行。本机休眠或离线时远端无法上报，恢复后中台重连。原有训练进程不会因页面关闭或隧道中断被终止。
 
-## 停止与故障行为
-
-保持脚本在前台运行。`Ctrl+C` 或 `SIGTERM` 会结束本次启动的 API 和 SSH 隧道；远端 Agent 的 systemd 服务仍常驻，连接恢复后继续上报。联调期间本机休眠、网络中断或进程退出会让中台不可达，此方式用于开发验证，正式使用应部署长期在线中台。
-
-本机端口已占用时脚本拒绝启动，不结束已有服务。远端转发端口冲突时 SSH 退出，脚本随即清理自己的 API。API 或隧道异常退出也会结束另一进程，错误原因保存在日志中。清理范围限定于本次创建的子进程，不接触其他中台、SSH 或远端训练进程。
+长期中台设置 `VLA_AGENT_CONTROL_PLANE_URL` 为裸金属可访问的 HTTPS 基础 URL，Agent 即可直连，不需要 SSH 转发。特殊机器可在高级设置覆盖入口。数据库及 `VLA_REMOTE_STATE_DIR` 必须一起持久化；Compose 已挂载专属 `remote_state` 卷。

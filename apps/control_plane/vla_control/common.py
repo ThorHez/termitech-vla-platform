@@ -56,7 +56,7 @@ def require_path(path: str, roots: list[str] | None = None) -> None:
 
 
 def snapshot_identity(value: dict) -> dict:
-    return {key: value.get(key) for key in ("code_dir", "repository_root", "commit_sha", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest")}
+    return {key: value.get(key) for key in ("code_dir", "repository_root", "commit_sha", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "automatic_preflight", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "training_stage", "stage_config")}
 
 
 def valid_snapshot(value) -> bool:

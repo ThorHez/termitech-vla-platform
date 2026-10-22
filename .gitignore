@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .env
 .local/
+.state/
 node_modules/
 .pnpm-store/
 dist/

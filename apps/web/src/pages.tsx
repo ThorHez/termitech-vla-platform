@@ -20,12 +20,14 @@ import {
   Plus,
   Search,
   Server,
+  Settings2,
   ShieldCheck,
   Sparkles,
   Terminal,
   Workflow,
 } from 'lucide-react';
 import { date, displayNumber, navigate, post, useApi } from './api';
+import { useAuth } from './auth';
 import {
   Back,
   Badge,
@@ -41,6 +43,9 @@ import {
 } from './components';
 import { activeStates, assetKinds, gpuAverage, gpuIdle, requiredInputs, useData } from './data';
 import type { Asset, Gpu, Node, NodeDetail, Run } from './types';
+import { NodeOnboarding, RuntimeCheckView, runtimeCheckFor } from './NodeOnboarding';
+import { NodeManagement } from './NodeManagement';
+import { PathAutocomplete } from './PathAutocomplete';
 
 export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boolean }) {
   const { nodes, templates } = useData();
@@ -108,6 +113,7 @@ export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boo
 }
 
 export function OverviewPage({ createRun }: { createRun: () => void }) {
+  const { can } = useAuth();
   const { enabled, overview, nodes, runs, assets, alerts } = useData();
   const stats = overview.data;
   const recent = [...(runs.data || [])]
@@ -127,10 +133,12 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
                 ? `更新于 ${overview.updatedAt.toLocaleTimeString('zh-CN')}`
                 : '等待连接'}
             </span>
-            <button className="button primary" onClick={createRun} disabled={!enabled}>
-              <Plus size={17} />
-              新建训练
-            </button>
+            {can('training.write') && (
+              <button className="button primary" onClick={createRun} disabled={!enabled}>
+                <Plus size={17} />
+                新建训练
+              </button>
+            )}
           </>
         }
       />
@@ -141,7 +149,7 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
           </div>
           <div>
             <h3>连接你的训练基础设施</h3>
-            <p>配置管理服务访问令牌，查看已接入机器、本地资产和训练任务。</p>
+            <p>登录平台账号，查看已接入机器、本地资产和训练任务。</p>
           </div>
           <button className="button primary" onClick={() => navigate('/settings')}>
             连接管理服务
@@ -210,10 +218,12 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
               title="你的第一项训练，从这里开始"
               description="接入机器并登记本机资产后，选择模板即可启动训练。"
               action={
-                <button className="button outline small" disabled={!enabled} onClick={createRun}>
-                  <Plus size={15} />
-                  创建训练任务
-                </button>
+                can('training.write') && (
+                  <button className="button outline small" disabled={!enabled} onClick={createRun}>
+                    <Plus size={15} />
+                    创建训练任务
+                  </button>
+                )
               }
             />
           )}
@@ -402,9 +412,11 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
 }
 
 export function NodesPage() {
+  const { can } = useAuth();
   const { nodes, assets, profiles, enabled } = useData();
   const [query, setQuery] = useState('');
-  const [showHelp, setShowHelp] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [managing, setManaging] = useState<Node>();
   const filtered =
     nodes.data?.filter((node) =>
       `${node.name} ${node.hostname}`.toLowerCase().includes(query.toLowerCase()),
@@ -416,10 +428,16 @@ export function NodesPage() {
         title="机器资源"
         description="统一查看裸金属资源、本地资产和运行环境。"
         actions={
-          <button className="button primary" onClick={() => setShowHelp(true)}>
-            <Plus size={17} />
-            接入机器
-          </button>
+          can('machines.manage') && (
+            <button
+              className="button primary"
+              onClick={() => setShowOnboarding(true)}
+              disabled={!enabled}
+            >
+              <Plus size={17} />
+              接入机器
+            </button>
+          )
         }
       />
       <div className="toolbar">
@@ -444,53 +462,64 @@ export function NodesPage() {
       ) : filtered.length ? (
         <div className="machine-grid">
           {filtered.map((node) => (
-            <a href={`#/nodes/${node.id}`} className="machine-card" key={node.id}>
-              <div className="machine-header">
-                <div className="machine-symbol">
-                  <Server size={23} />
+            <div className="machine-card" key={node.id}>
+              <a href={`#/nodes/${node.id}`} className="machine-card-main">
+                <div className="machine-header">
+                  <div className="machine-symbol">
+                    <Server size={23} />
+                  </div>
+                  <div>
+                    <h2>{node.name}</h2>
+                    <p>{node.hostname}</p>
+                  </div>
+                  <Badge state={node.status} />
                 </div>
-                <div>
-                  <h2>{node.name}</h2>
-                  <p>{node.hostname}</p>
+                <div className="machine-gpu">
+                  <Cpu size={16} />
+                  <span>{node.gpus?.[0]?.name || '尚无 GPU 信息'}</span>
+                  <strong>× {node.gpus?.length || 0}</strong>
                 </div>
-                <Badge state={node.status} />
-              </div>
-              <div className="machine-gpu">
-                <Cpu size={16} />
-                <span>{node.gpus?.[0]?.name || '尚无 GPU 信息'}</span>
-                <strong>× {node.gpus?.length || 0}</strong>
-              </div>
-              <div className="machine-stats">
-                <div>
-                  <strong>
-                    {assets.data?.filter(
-                      (asset) =>
-                        asset.node_id === node.id && (asset.state || asset.status) !== 'ARCHIVED',
-                    ).length ?? '—'}
-                  </strong>
-                  <span>本地资产</span>
+                <div className="machine-stats">
+                  <div>
+                    <strong>
+                      {assets.data?.filter(
+                        (asset) =>
+                          asset.node_id === node.id && (asset.state || asset.status) !== 'ARCHIVED',
+                      ).length ?? '—'}
+                    </strong>
+                    <span>本地资产</span>
+                  </div>
+                  <div>
+                    <strong>
+                      {profiles.data?.filter((profile) => profile.node_id === node.id).length ??
+                        '—'}
+                    </strong>
+                    <span>运行环境</span>
+                  </div>
+                  <div>
+                    <strong>
+                      {node.status === 'ONLINE' ? node.gpus?.filter(gpuIdle).length || 0 : '—'}
+                    </strong>
+                    <span>空闲 GPU</span>
+                  </div>
                 </div>
-                <div>
-                  <strong>
-                    {profiles.data?.filter((profile) => profile.node_id === node.id).length ?? '—'}
-                  </strong>
-                  <span>运行环境</span>
+                <div className="machine-footer">
+                  <span>
+                    <span className={`status-dot ${node.status === 'ONLINE' ? 'online' : ''}`} />
+                    最近心跳 {date(node.last_seen)}
+                  </span>
+                  <ChevronRight size={16} />
                 </div>
-                <div>
-                  <strong>
-                    {node.status === 'ONLINE' ? node.gpus?.filter(gpuIdle).length || 0 : '—'}
-                  </strong>
-                  <span>空闲 GPU</span>
+              </a>
+              {can('machines.manage') && (
+                <div className="machine-card-management">
+                  <button className="text-link" onClick={() => setManaging(node)}>
+                    <Settings2 size={13} />
+                    管理连接
+                  </button>
                 </div>
-              </div>
-              <div className="machine-footer">
-                <span>
-                  <span className={`status-dot ${node.status === 'ONLINE' ? 'online' : ''}`} />
-                  最近心跳 {date(node.last_seen)}
-                </span>
-                <ChevronRight size={16} />
-              </div>
-            </a>
+              )}
+            </div>
           ))}
         </div>
       ) : (
@@ -504,9 +533,14 @@ export function NodesPage() {
                 : '在机器上安装 Agent，计算资源、运行环境及在线状态会自动汇报。'
             }
             action={
-              !query && (
-                <button className="button outline" onClick={() => setShowHelp(true)}>
-                  查看接入方式
+              !query &&
+              can('machines.manage') && (
+                <button
+                  className="button outline"
+                  onClick={() => setShowOnboarding(true)}
+                  disabled={!enabled}
+                >
+                  接入机器
                   <ArrowRight size={16} />
                 </button>
               )
@@ -514,56 +548,29 @@ export function NodesPage() {
           />
         </div>
       )}
-      {showHelp && (
-        <Modal
-          title="接入裸金属机器"
-          subtitle="Agent 在机器上运行，主动连接管理服务。"
-          close={() => setShowHelp(false)}
-          footer={
-            <button className="button primary" onClick={() => setShowHelp(false)}>
-              知道了
-            </button>
-          }
-        >
-          <div className="guide-steps">
-            <div>
-              <b>1</b>
-              <section>
-                <h3>准备 Agent 配置</h3>
-                <p>管理员在机器上填写管理服务地址、登记令牌、允许的本地目录和训练运行环境。</p>
-              </section>
-            </div>
-            <div>
-              <b>2</b>
-              <section>
-                <h3>启动 Agent 服务</h3>
-                <p>
-                  使用项目 README 中的部署命令启动
-                  Agent。首次登记后，机器身份与独立凭据会保存在本地。
-                </p>
-              </section>
-            </div>
-            <div>
-              <b>3</b>
-              <section>
-                <h3>查看资源与登记资产</h3>
-                <p>机器上线后，在这里查看 GPU、心跳与环境，并登记这台机器上的数据和模型路径。</p>
-              </section>
-            </div>
-          </div>
-          <div className="inline-note">
-            <ShieldCheck size={16} />
-            登记令牌只用于机器接入；请通过服务器配置管理，勿填写到前端管理员令牌中。
-          </div>
-        </Modal>
+      {can('machines.manage') && showOnboarding && (
+        <NodeOnboarding close={() => setShowOnboarding(false)} />
+      )}
+      {can('machines.manage') && managing && (
+        <NodeManagement
+          node={managing}
+          close={() => setManaging(undefined)}
+          reconnect={() => {
+            setManaging(undefined);
+            setShowOnboarding(true);
+          }}
+        />
       )}
     </>
   );
 }
 
 export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: string) => void }) {
+  const { can } = useAuth();
   const { nodes, assets, profiles, runs } = useData();
   const details = useApi<NodeDetail | { node: Node; assets: Asset[] }>(`/nodes/${id}`);
+  const [showManagement, setShowManagement] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   const raw = details.data;
   const node =
     (raw && 'node' in raw ? raw.node : (raw as NodeDetail | undefined)) ||
@@ -582,14 +589,28 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
         title={node?.name || '机器详情'}
         description={node?.hostname || '查看机器资源与本地资产关联'}
         actions={
-          <button
-            className="button primary"
-            disabled={node?.status !== 'ONLINE'}
-            onClick={() => createRun(id)}
-          >
-            <Plus size={16} />
-            在此机器训练
-          </button>
+          <>
+            {can('machines.manage') && (
+              <button
+                className="button outline"
+                disabled={!node}
+                onClick={() => setShowManagement(true)}
+              >
+                <Settings2 size={16} />
+                管理连接
+              </button>
+            )}
+            {can('training.write') && (
+              <button
+                className="button primary"
+                disabled={node?.status !== 'ONLINE'}
+                onClick={() => createRun(id)}
+              >
+                <Plus size={16} />
+                在此机器训练
+              </button>
+            )}
+          </>
         }
       />
       <ErrorNotice error={details.error} retry={details.refresh} />
@@ -599,10 +620,35 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
         ) : null
       ) : (
         <>
+          {['DISCONNECTED', 'REMOVED'].includes(node.status) && (
+            <div className="node-retired-banner">
+              <div>
+                <strong>
+                  {node.status === 'REMOVED' ? '此机器的 Agent 已卸载' : '此机器已断开连接'}
+                </strong>
+                <p>历史训练及资产关联保留。重新接入后才能创建新的训练任务。</p>
+              </div>
+              {can('machines.manage') && (
+                <button className="button outline small" onClick={() => setShowOnboarding(true)}>
+                  <Plus size={14} />
+                  重新接入机器
+                </button>
+              )}
+            </div>
+          )}
           <div className="node-summary">
             <div>
               <span>连接状态</span>
-              <Badge state={node.status} />
+              <Badge
+                state={node.status}
+                label={
+                  node.status === 'DISCONNECTED'
+                    ? '已断开'
+                    : node.status === 'REMOVED'
+                      ? '已卸载'
+                      : undefined
+                }
+              />
             </div>
             <div>
               <span>最近心跳</span>
@@ -691,15 +737,18 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                               <code>{profile.python}</code>
                             </dd>
                           </div>
-                          {profile.recipe && (
-                            <div>
-                              <dt>配方</dt>
-                              <dd>
+                          <div>
+                            <dt>默认训练配方</dt>
+                            <dd>
+                              {profile.recipe ? (
                                 <code>{profile.recipe}</code>
-                              </dd>
-                            </div>
-                          )}
+                              ) : (
+                                '创建训练任务时选择'
+                              )}
+                            </dd>
+                          </div>
                         </dl>
+                        <RuntimeCheckView check={runtimeCheckFor(node, profile.id)} />
                       </div>
                     ))}
                   </div>
@@ -766,11 +815,26 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
           </Panel>
         </>
       )}
+      {can('machines.manage') && showManagement && node && (
+        <NodeManagement
+          node={node}
+          close={() => setShowManagement(false)}
+          changed={details.refresh}
+          reconnect={() => {
+            setShowManagement(false);
+            setShowOnboarding(true);
+          }}
+        />
+      )}
+      {can('machines.manage') && showOnboarding && (
+        <NodeOnboarding close={() => setShowOnboarding(false)} />
+      )}
     </>
   );
 }
 
 export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
+  const { can } = useAuth();
   const { assets, nodes, enabled, refresh } = useData();
   const [kind, setKind] = useState('ALL');
   const [nodeId, setNodeId] = useState(nodeFilter || '');
@@ -794,14 +858,16 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         title="数据与模型"
         description="统一登记本地资产，清晰关联机器、训练与产出。"
         actions={
-          <button
-            className="button primary"
-            disabled={!enabled || !nodes.data?.length}
-            onClick={() => setRegister(true)}
-          >
-            <Plus size={17} />
-            登记资产
-          </button>
+          can('assets.write') && (
+            <button
+              className="button primary"
+              disabled={!enabled || !nodes.data?.length}
+              onClick={() => setRegister(true)}
+            >
+              <Plus size={17} />
+              登记资产
+            </button>
+          )
         }
       />
       <div className="info-strip">
@@ -914,7 +980,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                       <Badge state={asset.status || asset.state || 'REGISTERED'} />
                     </td>
                     <td>
-                      {(asset.status || asset.state) !== 'ARCHIVED' && (
+                      {can('assets.write') && (asset.status || asset.state) !== 'ARCHIVED' && (
                         <button
                           className="icon-button"
                           aria-label={`归档 ${asset.name}`}
@@ -942,20 +1008,24 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                 : '登记已有数据集和模型的本机路径。预检时，Agent 会验证它们是否可用。'
             }
             action={
-              <button
-                className="button outline small"
-                disabled={!enabled || !nodes.data?.length}
-                onClick={() => setRegister(true)}
-              >
-                <Plus size={15} />
-                登记资产
-              </button>
+              can('assets.write') && (
+                <button
+                  className="button outline small"
+                  disabled={!enabled || !nodes.data?.length}
+                  onClick={() => setRegister(true)}
+                >
+                  <Plus size={15} />
+                  登记资产
+                </button>
+              )
             }
           />
         )}
       </div>
-      {register && <RegisterAsset initialNode={nodeId} close={() => setRegister(false)} />}
-      {archiving && (
+      {can('assets.write') && register && (
+        <RegisterAsset initialNode={nodeId} close={() => setRegister(false)} />
+      )}
+      {can('assets.write') && archiving && (
         <Modal
           title="归档资产登记"
           close={() => {
@@ -974,6 +1044,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                 className="button danger"
                 disabled={busy}
                 onClick={async () => {
+                  if (!can('assets.write')) return;
                   setBusy(true);
                   setError(undefined);
                   try {
@@ -1000,7 +1071,18 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   );
 }
 
-function RegisterAsset({ close, initialNode }: { close: () => void; initialNode?: string }) {
+function RegisterAsset(props: { close: () => void; initialNode?: string }) {
+  const { can } = useAuth();
+  if (!can('assets.write'))
+    return (
+      <Modal title="权限不足" close={props.close}>
+        登记资产需要操作员或管理员权限。
+      </Modal>
+    );
+  return <RegisterAssetContent {...props} />;
+}
+
+function RegisterAssetContent({ close, initialNode }: { close: () => void; initialNode?: string }) {
   const { nodes, refresh } = useData();
   const [form, setForm] = useState({
     name: '',
@@ -1083,24 +1165,13 @@ function RegisterAsset({ close, initialNode }: { close: () => void; initialNode?
             ))}
           </select>
         </Field>
-        <Field
-          label="本地绝对路径"
-          required
-          hint={
-            node?.roots?.length
-              ? `允许目录：${node.roots.join('、')}`
-              : '填写机器上已经存在的完整路径，Agent 将在预检时验证。'
-          }
-        >
-          <input
-            required
-            pattern="/.*"
-            className="mono"
-            placeholder="/data/datasets/shellgame"
-            value={form.path}
-            onChange={(event) => set('path', event.target.value)}
-          />
-        </Field>
+        <PathAutocomplete
+          key={form.node_id}
+          node={node}
+          value={form.path}
+          onChange={(value) => set('path', value)}
+          disabled={busy}
+        />
         <Field label="资产版本" required hint="用于区分资产内容的版本标识。">
           <input
             required
@@ -1128,6 +1199,7 @@ export function TemplatesPage({
 }: {
   createRun: (nodeId?: string, templateId?: string) => void;
 }) {
+  const { can } = useAuth();
   const { templates, enabled } = useData();
   return (
     <>
@@ -1157,11 +1229,23 @@ export function TemplatesPage({
                   <div className={`template-icon ${info.color}`}>
                     <Icon size={25} strokeWidth={1.7} />
                   </div>
-                  <Badge state={template.status} />
+                  <Badge
+                    state={template.status}
+                    label={template.status === 'PLANNED' ? '待接入' : undefined}
+                  />
                 </div>
                 <span className="template-eyebrow">{info.text}</span>
                 <h2>{template.name}</h2>
                 <p>{template.description}</p>
+                {template.id === 'recap' && !!template.stages?.length && (
+                  <div className="template-stage-list">
+                    {template.stages.map((stage, index) => (
+                      <span key={stage.id}>
+                        {index + 1}. {stage.name}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <div className="template-inputs">
                   {requiredInputs(template).map((input) => (
                     <span key={input}>
@@ -1178,20 +1262,22 @@ export function TemplatesPage({
                 </div>
                 <footer>
                   <span className="tag mono">{template.id}</span>
-                  <button
-                    className={`button small ${template.status === 'AVAILABLE' ? 'outline' : 'ghost'}`}
-                    disabled={template.status !== 'AVAILABLE'}
-                    onClick={() => createRun(undefined, template.id)}
-                  >
-                    {template.status === 'AVAILABLE' ? (
-                      <>
-                        使用模板
-                        <ArrowRight size={14} />
-                      </>
-                    ) : (
-                      '等待验收'
-                    )}
-                  </button>
+                  {can('training.write') && (
+                    <button
+                      className={`button small ${template.status === 'AVAILABLE' ? 'outline' : 'ghost'}`}
+                      disabled={template.status !== 'AVAILABLE'}
+                      onClick={() => createRun(undefined, template.id)}
+                    >
+                      {template.status === 'AVAILABLE' ? (
+                        <>
+                          使用模板
+                          <ArrowRight size={14} />
+                        </>
+                      ) : (
+                        '待接入'
+                      )}
+                    </button>
+                  )}
                 </footer>
               </article>
             );
@@ -1216,6 +1302,7 @@ export function TemplatesPage({
 }
 
 export function RunsPage({ createRun }: { createRun: () => void }) {
+  const { can } = useAuth();
   const { runs, enabled } = useData();
   const [filter, setFilter] = useState('ALL');
   const [query, setQuery] = useState('');
@@ -1238,10 +1325,12 @@ export function RunsPage({ createRun }: { createRun: () => void }) {
         title="训练任务"
         description="追踪训练状态、资源消耗与实际执行代码。"
         actions={
-          <button className="button primary" disabled={!enabled} onClick={createRun}>
-            <Plus size={17} />
-            新建训练
-          </button>
+          can('training.write') && (
+            <button className="button primary" disabled={!enabled} onClick={createRun}>
+              <Plus size={17} />
+              新建训练
+            </button>
+          )
         }
       />
       <div className="toolbar wrap">
@@ -1288,10 +1377,12 @@ export function RunsPage({ createRun }: { createRun: () => void }) {
                 : '选择机器和训练模板，平台将检查本地资产、运行环境及代码版本。'
             }
             action={
-              <button className="button outline" disabled={!enabled} onClick={createRun}>
-                <Plus size={16} />
-                新建训练
-              </button>
+              can('training.write') && (
+                <button className="button outline" disabled={!enabled} onClick={createRun}>
+                  <Plus size={16} />
+                  新建训练
+                </button>
+              )
             }
           />
         )}

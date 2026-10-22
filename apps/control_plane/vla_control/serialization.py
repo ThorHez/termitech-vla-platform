@@ -42,6 +42,12 @@ def run_dict(session, run):
               "state", "created_at", "updated_at", "finished_at", "inputs", "parameters", "gpu_count",
               "code_expectation", "queue_reason", "error")}
     attempts = list(session.scalars(select(Attempt).where(Attempt.run_id == run.id).order_by(Attempt.number)))
+    result["recipe"] = run.code_expectation.get("recipe")
+    result["recipe_definition"] = run.code_expectation.get("recipe_definition")
+    result["entrypoint"] = run.code_expectation.get("requested_entrypoint")
+    result["dataset_bindings"] = run.code_expectation.get("dataset_bindings")
+    result["training_stage"] = run.code_expectation.get("training_stage")
+    result["stage_config"] = run.code_expectation.get("stage_config")
     result["attempts"] = [attempt_dict(a) for a in attempts]
     ids = [a.id for a in attempts]
     result["outputs"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.origin_attempt_id.in_(ids)))] if ids else []

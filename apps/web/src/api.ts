@@ -1,14 +1,69 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-const TOKEN_KEY = 'termitech.admin-token';
-export function getToken() {
-  return sessionStorage.getItem(TOKEN_KEY) || '';
+const LEGACY_TOKEN_KEY = 'termitech.admin-token';
+const SESSION_EXPIRED = 'termitech:session-expired';
+let csrfToken: string | undefined;
+let sessionGeneration = 0;
+let reauthenticate: ((signal?: AbortSignal | null) => Promise<void>) | undefined;
+
+// Human sessions live in HttpOnly cookies. Only the CSRF value is kept in memory.
+export function setSessionCsrf(token?: string) {
+  if (csrfToken !== token) sessionGeneration += 1;
+  csrfToken = token;
 }
-export function saveToken(token: string) {
-  sessionStorage.setItem(TOKEN_KEY, token.trim());
+export function discardLegacyToken() {
+  try {
+    window.sessionStorage.removeItem(LEGACY_TOKEN_KEY);
+  } catch {
+    // Storage can be disabled; authentication does not depend on browser storage.
+  }
 }
-export function clearToken() {
-  sessionStorage.removeItem(TOKEN_KEY);
+export function subscribeSessionExpiry(listener: () => void) {
+  window.addEventListener(SESSION_EXPIRED, listener);
+  return () => window.removeEventListener(SESSION_EXPIRED, listener);
+}
+export function notifySessionExpired() {
+  setSessionCsrf();
+  if (typeof window !== 'undefined') window.dispatchEvent(new Event(SESSION_EXPIRED));
+}
+export function registerReauthentication(handler: (signal?: AbortSignal | null) => Promise<void>) {
+  reauthenticate = handler;
+  return () => {
+    if (reauthenticate === handler) reauthenticate = undefined;
+  };
+}
+
+export async function authenticatedFetch(path: string, options: RequestInit = {}) {
+  const headers = new Headers(options.headers);
+  headers.set('Accept', 'application/json');
+  headers.delete('Authorization');
+  const method = (options.method || 'GET').toUpperCase();
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && csrfToken) {
+    headers.set('X-CSRF-Token', csrfToken);
+  }
+  if (options.body) headers.set('Content-Type', 'application/json');
+  const generation = sessionGeneration;
+  let response: Response;
+  try {
+    response = await fetch(`/api/v1${path}`, {
+      ...options,
+      credentials: 'same-origin',
+      headers,
+      signal: options.signal ?? AbortSignal.timeout(20000),
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') throw error;
+    throw new ApiError('NETWORK_ERROR', '无法连接管理服务，请检查服务是否启动及网络连接。', 0);
+  }
+  if (
+    response.status === 401 &&
+    path !== '/auth/login' &&
+    path !== '/auth/me' &&
+    generation === sessionGeneration
+  ) {
+    notifySessionExpired();
+  }
+  return response;
 }
 
 export class ApiError extends Error {
@@ -22,41 +77,56 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const headers = new Headers(options.headers);
-  headers.set('Accept', 'application/json');
-  headers.set('Authorization', `Bearer ${getToken()}`);
-  if (options.body) headers.set('Content-Type', 'application/json');
-  let response: Response;
-  try {
-    response = await fetch(`/api/v1${path}`, {
-      ...options,
-      headers,
-      signal: options.signal ?? AbortSignal.timeout(20000),
-    });
-  } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') throw error;
-    throw new ApiError('NETWORK_ERROR', '无法连接管理服务，请检查服务是否启动及网络连接。', 0);
-  }
-  const body = await response.text();
-  let data: unknown;
-  try {
-    data = body ? JSON.parse(body) : null;
-  } catch {
-    throw new ApiError(
-      'INVALID_RESPONSE',
-      '服务返回了无效响应，请检查 API 代理配置。',
-      response.status,
-    );
-  }
-  if (!response.ok) {
+  const generation = sessionGeneration;
+  // The server rejects the first sensitive request before applying any change.
+  // Retry it once after password confirmation, only in the same browser session.
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await authenticatedFetch(path, options);
+    const body = await response.text();
+    let data: unknown;
+    try {
+      data = body ? JSON.parse(body) : null;
+    } catch {
+      throw new ApiError(
+        'INVALID_RESPONSE',
+        '服务返回了无效响应，请检查 API 代理配置。',
+        response.status,
+      );
+    }
+    if (response.ok) return data as T;
     const detail = data as { error?: { code?: string; message?: string }; detail?: string } | null;
+    const code = detail?.error?.code || `HTTP_${response.status}`;
+    const handler = reauthenticate;
+    if (
+      attempt === 0 &&
+      response.status === 403 &&
+      code === 'REAUTH_REQUIRED' &&
+      !path.startsWith('/auth/') &&
+      !['GET', 'HEAD', 'OPTIONS'].includes((options.method || 'GET').toUpperCase()) &&
+      handler &&
+      csrfToken &&
+      generation === sessionGeneration
+    ) {
+      options.signal?.throwIfAborted();
+      await handler(options.signal);
+      options.signal?.throwIfAborted();
+      if (generation !== sessionGeneration || !csrfToken) {
+        throw new ApiError('SESSION_CHANGED', '登录状态已改变，请重新执行此操作。', 401);
+      }
+      continue;
+    }
     throw new ApiError(
-      detail?.error?.code || `HTTP_${response.status}`,
-      detail?.error?.message || detail?.detail || `请求失败（${response.status}）`,
+      code,
+      detail?.error?.message ||
+        detail?.detail ||
+        (response.status === 403
+          ? '当前账号没有执行此操作的权限。'
+          : response.status === 401
+            ? '登录已失效，请重新登录。'
+            : `请求失败（${response.status}）`),
       response.status,
     );
   }
-  return data as T;
 }
 
 export const post = <T>(path: string, body: unknown = {}, headers?: Record<string, string>) =>

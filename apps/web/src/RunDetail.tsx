@@ -17,6 +17,7 @@ import {
   Workflow,
 } from 'lucide-react';
 import { date, displayNumber, post, useApi, useRunFeed } from './api';
+import { useAuth } from './auth';
 import {
   Back,
   Badge,
@@ -29,9 +30,22 @@ import {
   Panel,
 } from './components';
 import { activeStates, assetKinds, inputRoles, useData } from './data';
+import { DatasetBindingSummary } from './DatasetBindings';
+import { datasetInputLabel } from './datasetBindingHelpers';
+import { stageParameterLabels, trainingStageLabels } from './recap';
 import type { Asset, Logs, Run, RunEvent } from './types';
 
+function outputRemoved(output: Asset) {
+  return output.state === 'UNAVAILABLE' || output.metadata?.availability === 'removed';
+}
+
+function outputStep(output: Asset) {
+  const step = output.metadata?.step;
+  return typeof step === 'number' && Number.isFinite(step) ? step : -1;
+}
+
 export default function RunDetail({ id }: { id: string }) {
+  const { can } = useAuth();
   const { nodes, templates, assets, profiles, refresh } = useData();
   const detail = useApi<Run>(`/runs/${id}`, 3000);
   const events = useRunFeed<RunEvent>(`/runs/${id}/events`, 'events');
@@ -42,6 +56,17 @@ export default function RunDetail({ id }: { id: string }) {
   const [error, setError] = useState<Error>();
   const run = detail.data;
   const attempt = run?.attempts?.[run.attempts.length - 1];
+  const outputs = useMemo(
+    () =>
+      [...(run?.outputs || [])].sort((left, right) => {
+        const availability = Number(outputRemoved(left)) - Number(outputRemoved(right));
+        if (availability) return availability;
+        const step = outputStep(right) - outputStep(left);
+        if (step) return step;
+        return (right.created_at || '').localeCompare(left.created_at || '');
+      }),
+    [run?.outputs],
+  );
   const metricEvents = useMemo(
     () => events.data?.filter((event) => event.type === 'METRIC') || [],
     [events.data],
@@ -62,7 +87,27 @@ export default function RunDetail({ id }: { id: string }) {
   const node = nodes.data?.find((item) => item.id === run?.node_id);
   const template = templates.data?.find((item) => item.id === run?.template_id);
   const profile = profiles.data?.find((item) => item.id === run?.profile_id);
+  const trainingStage =
+    run?.training_stage ||
+    attempt?.code_snapshot?.training_stage ||
+    run?.code_expectation?.training_stage;
+  const stageConfig =
+    run?.stage_config ||
+    attempt?.code_snapshot?.stage_config ||
+    run?.code_expectation?.stage_config;
   const resource = attempt?.resources;
+  const recipe = run?.recipe || attempt?.code_snapshot?.recipe || run?.code_expectation?.recipe;
+  const requestedEntrypoint =
+    run?.entrypoint ||
+    attempt?.code_snapshot?.requested_entrypoint ||
+    run?.code_expectation?.requested_entrypoint;
+  const actualEntrypoint =
+    attempt?.code_snapshot?.automatic_preflight?.plan.entrypoint ||
+    run?.code_expectation?.automatic_preflight?.plan.entrypoint;
+  const recipeDefinition =
+    run?.recipe_definition ||
+    attempt?.code_snapshot?.recipe_definition ||
+    run?.code_expectation?.recipe_definition;
   const downloadLogs = () => {
     const url = URL.createObjectURL(
       new Blob([logs.data.map((item) => `${item.timestamp || ''} ${item.text}`).join('\n') || ''], {
@@ -86,7 +131,7 @@ export default function RunDetail({ id }: { id: string }) {
           run && (
             <>
               <Badge state={run.state} />
-              {activeStates.has(run.state) && (
+              {can('training.write') && activeStates.has(run.state) && (
                 <button
                   className="button outline danger-text"
                   disabled={run.state === 'CANCELLING'}
@@ -242,10 +287,35 @@ export default function RunDetail({ id }: { id: string }) {
                         <dt>运行环境</dt>
                         <dd>{profile?.name || run.profile_id}</dd>
                       </div>
+                      {trainingStage && (
+                        <div>
+                          <dt>训练阶段</dt>
+                          <dd>{trainingStageLabels[trainingStage] || trainingStage}</dd>
+                        </div>
+                      )}
+                      <div>
+                        <dt>训练配方</dt>
+                        <dd>
+                          {recipeDefinition && (
+                            <span className="recipe-frozen-label">
+                              {recipeDefinition.name} · v{recipeDefinition.revision}
+                            </span>
+                          )}
+                          {recipe ? <code>{recipe}</code> : '未记录'}
+                        </dd>
+                      </div>
                       <div>
                         <dt>执行次数</dt>
                         <dd>{run.attempts?.length || 0}</dd>
                       </div>
+                      {(requestedEntrypoint || actualEntrypoint) && (
+                        <div>
+                          <dt>训练入口</dt>
+                          <dd>
+                            <code>{actualEntrypoint || requestedEntrypoint}</code>
+                          </dd>
+                        </div>
+                      )}
                       <div>
                         <dt>训练进程</dt>
                         <dd>{attempt?.pid ? `PID ${attempt.pid}` : '—'}</dd>
@@ -400,6 +470,66 @@ export default function RunDetail({ id }: { id: string }) {
                 </div>
                 <Panel title="冻结训练配置">
                   <dl className="detail-list padded">
+                    {requestedEntrypoint && (
+                      <div>
+                        <dt>所选训练入口</dt>
+                        <dd>
+                          <code>{requestedEntrypoint}</code>
+                        </dd>
+                      </div>
+                    )}
+                    {actualEntrypoint && (
+                      <div>
+                        <dt>实际训练入口</dt>
+                        <dd>
+                          <code>{actualEntrypoint}</code>
+                        </dd>
+                      </div>
+                    )}
+                    <div>
+                      <dt>训练配方</dt>
+                      <dd>
+                        {recipeDefinition && (
+                          <span className="recipe-frozen-label">
+                            {recipeDefinition.name} · v{recipeDefinition.revision}
+                          </span>
+                        )}
+                        {recipe ? <code>{recipe}</code> : '未记录'}
+                      </dd>
+                    </div>
+                    {recipeDefinition && (
+                      <>
+                        <div>
+                          <dt>配方摘要</dt>
+                          <dd>
+                            <code title={recipeDefinition.digest}>
+                              {recipeDefinition.digest.slice(0, 16)}
+                            </code>
+                          </dd>
+                        </div>
+                        <div>
+                          <dt>配方源文件</dt>
+                          <dd>
+                            <code>
+                              {recipeDefinition.source.path}:{recipeDefinition.source.line}
+                            </code>
+                          </dd>
+                        </div>
+                        {Object.entries(recipeDefinition.overrides).map(([path, value]) => (
+                          <div key={path}>
+                            <dt>
+                              <code>{path}</code>
+                            </dt>
+                            <dd>
+                              <code>
+                                {typeof value === 'string' ? value : JSON.stringify(value)}
+                              </code>
+                              <small className="recipe-value-caption">配方版本覆盖值</small>
+                            </dd>
+                          </div>
+                        ))}
+                      </>
+                    )}
                     {Object.entries(run.parameters || {}).map(([key, value]) => (
                       <div key={key}>
                         <dt>
@@ -412,7 +542,21 @@ export default function RunDetail({ id }: { id: string }) {
                           )[key] || key}
                         </dt>
                         <dd>
-                          <code>{value}</code>
+                          <code>{typeof value === 'string' ? value : JSON.stringify(value)}</code>
+                        </dd>
+                      </div>
+                    ))}
+                    {trainingStage && (
+                      <div>
+                        <dt>训练阶段</dt>
+                        <dd>{trainingStageLabels[trainingStage] || trainingStage}</dd>
+                      </div>
+                    )}
+                    {Object.entries(stageConfig || {}).map(([key, value]) => (
+                      <div key={`stage-${key}`}>
+                        <dt>{stageParameterLabels[key] || key}</dt>
+                        <dd>
+                          <code>{JSON.stringify(value)}</code>
                         </dd>
                       </div>
                     ))}
@@ -438,6 +582,17 @@ export default function RunDetail({ id }: { id: string }) {
             )}
             {tab === 'assets' && (
               <>
+                {!!run.dataset_bindings?.length && (
+                  <Panel
+                    title="数据集与归一化参数"
+                    subtitle="本次训练冻结的配对、采样权重和数据处理配置"
+                  >
+                    <DatasetBindingSummary
+                      bindings={run.dataset_bindings}
+                      assets={assets.data || []}
+                    />
+                  </Panel>
+                )}
                 <div className="lineage-strip">
                   <span>
                     <Server size={18} />
@@ -469,10 +624,14 @@ export default function RunDetail({ id }: { id: string }) {
                           return (
                             <div className="run-asset" key={role}>
                               <div className="row-icon">
-                                {role === 'dataset' ? <Database size={17} /> : <Box size={17} />}
+                                {role === 'dataset' || role.startsWith('dataset_') ? (
+                                  <Database size={17} />
+                                ) : (
+                                  <Box size={17} />
+                                )}
                               </div>
                               <div>
-                                <span>{inputRoles[role] || role}</span>
+                                <span>{inputRoles[role] || datasetInputLabel(role) || role}</span>
                                 <strong>
                                   {asset?.name ||
                                     (typeof value === 'object' ? value.name || assetId : value)}
@@ -497,28 +656,70 @@ export default function RunDetail({ id }: { id: string }) {
                       />
                     )}
                   </Panel>
-                  <Panel title="训练产出" subtitle="产出保存在执行机器上并登记来源关系">
-                    {run.outputs?.length ? (
-                      <div className="run-asset-list">
-                        {run.outputs.map((output: Asset, index) => (
-                          <div className="run-asset" key={output.id || index}>
-                            <div className="row-icon teal">
-                              <Box size={17} />
+                  <Panel
+                    title="训练产出"
+                    subtitle={
+                      activeStates.has(run.state)
+                        ? '自动更新已保存的检查点，产出保存在执行机器上'
+                        : '产出保存在执行机器上并登记来源关系'
+                    }
+                  >
+                    {outputs.length ? (
+                      <div className="run-asset-list" aria-live="polite">
+                        {outputs.map((output: Asset, index) => {
+                          const step = output.metadata?.step;
+                          const savedAt = output.metadata?.saved_at;
+                          const removedAt = output.metadata?.removed_at;
+                          const removed = outputRemoved(output);
+                          return (
+                            <div className="run-asset" key={output.id || index}>
+                              <div className={`row-icon${removed ? '' : ' teal'}`}>
+                                <Box size={17} />
+                              </div>
+                              <div>
+                                <span>
+                                  {assetKinds[output.kind] || output.kind}
+                                  {typeof step === 'number' && Number.isFinite(step)
+                                    ? ` · 第 ${step.toLocaleString('zh-CN')} 步`
+                                    : ''}
+                                </span>
+                                <strong>{output.name}</strong>
+                                {removed || output.state === 'READY' ? (
+                                  <Badge
+                                    state={removed ? 'UNAVAILABLE' : 'READY'}
+                                    label={removed ? '已清理' : '可用'}
+                                  />
+                                ) : null}
+                                <code>{output.path}</code>
+                                <small>{output.version}</small>
+                                {typeof savedAt === 'string' ? (
+                                  <small>保存于 {date(savedAt)}</small>
+                                ) : output.created_at ? (
+                                  <small>登记于 {date(output.created_at)}</small>
+                                ) : null}
+                                {removed ? (
+                                  <small>
+                                    {typeof removedAt === 'string'
+                                      ? `清理于 ${date(removedAt)}，仅保留产出记录`
+                                      : '文件已清理，仅保留产出记录'}
+                                  </small>
+                                ) : null}
+                              </div>
                             </div>
-                            <div>
-                              <span>{assetKinds[output.kind] || output.kind}</span>
-                              <strong>{output.name}</strong>
-                              <code>{output.path}</code>
-                              <small>{output.version}</small>
-                            </div>
-                          </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     ) : (
                       <Empty
                         icon={Box}
-                        title="尚无训练产出"
-                        description="进程成功退出并上报产物后，将在这里展示。"
+                        title={activeStates.has(run.state) ? '等待首个检查点' : '尚无训练产出'}
+                        description={
+                          run.state === 'RUNNING'
+                            ? '训练正在进行，首个检查点保存完成后会自动出现在这里。'
+                            : activeStates.has(run.state)
+                              ? '训练保存并上报首个检查点后，会自动出现在这里。'
+                              : '此任务尚未上报可用的训练产出。'
+                        }
                       />
                     )}
                   </Panel>
@@ -528,7 +729,7 @@ export default function RunDetail({ id }: { id: string }) {
           </>
         )
       )}
-      {confirmCancel && (
+      {can('training.write') && confirmCancel && (
         <Modal
           title="取消这项训练？"
           close={() => {
@@ -547,6 +748,7 @@ export default function RunDetail({ id }: { id: string }) {
                 className="button danger"
                 disabled={busy}
                 onClick={async () => {
+                  if (!can('training.write')) return;
                   setBusy(true);
                   setError(undefined);
                   try {

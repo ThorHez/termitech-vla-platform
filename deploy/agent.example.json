@@ -14,9 +14,9 @@
     "code_dir": "/data/code/openpi-umi",
     "python": "/data/code/openpi-umi/.venv/bin/python",
     "adapter": "openpi-sft",
-    "recipe": "REPLACE_WITH_VALIDATED_LOCAL_RECIPE",
+    "recipe": null,
     "execution_mode": "native",
     "docker_image": null,
-    "metadata": {"validated": false}
+    "metadata": {"validated": false, "validated_recipes": []}
   }]
 }

@@ -13,12 +13,15 @@ import {
   X,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import { date, navigate } from './api';
+import { ApiError, date, navigate } from './api';
 import type { CodeSnapshot } from './types';
 
 const states: Record<string, [string, string]> = {
   ONLINE: ['在线', 'green'],
   OFFLINE: ['离线', 'gray'],
+  DISCONNECTED: ['已断开', 'gray'],
+  REMOVED: ['已卸载', 'gray'],
+  UNINSTALLED: ['已卸载', 'gray'],
   DEGRADED: ['异常', 'amber'],
   QUEUED: ['排队中', 'amber'],
   STARTING: ['启动中', 'blue'],
@@ -69,14 +72,28 @@ export function Empty({
     </div>
   );
 }
-export function ErrorNotice({ error, retry }: { error?: Error; retry?: () => void }) {
+export function ErrorNotice({
+  error,
+  retry,
+  title = '数据获取失败',
+  hint,
+}: {
+  error?: Error;
+  retry?: () => void;
+  title?: string;
+  hint?: string;
+}) {
   if (!error) return null;
   return (
     <div className="error-notice" role="alert">
       <AlertCircle size={18} />
       <div>
-        <strong>数据获取失败</strong>
-        <p>{error.message}</p>
+        <strong>{title}</strong>
+        <p>
+          {error instanceof ApiError && <code>{error.code} · </code>}
+          {error.message}
+        </p>
+        {hint && <p>{hint}</p>}
       </div>
       {retry && (
         <button className="button small ghost" onClick={retry}>
@@ -217,6 +234,8 @@ export function Modal({
     document.body.style.overflow = 'hidden';
     ref.current?.focus();
     const handleKey = (event: KeyboardEvent) => {
+      const dialogs = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
+      if (dialogs[dialogs.length - 1] !== ref.current) return;
       if (event.key === 'Escape') closeRef.current();
       if (event.key === 'Tab') {
         const elements = ref.current?.querySelectorAll<HTMLElement>(
@@ -242,9 +261,13 @@ export function Modal({
     };
     window.addEventListener('keydown', handleKey);
     return () => {
-      document.body.style.overflow = '';
+      const remainingDialog = document.querySelector<HTMLElement>(
+        '[role="dialog"][aria-modal="true"]',
+      );
+      document.body.style.overflow = remainingDialog ? 'hidden' : '';
       window.removeEventListener('keydown', handleKey);
-      last?.focus();
+      if (last?.isConnected) last.focus();
+      else remainingDialog?.focus();
     };
   }, []);
   return (

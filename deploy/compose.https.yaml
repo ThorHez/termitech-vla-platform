@@ -1,0 +1,50 @@
+# Explicit opt-in: docker compose --env-file deploy/.env -f deploy/compose.yaml -f deploy/compose.https.yaml up -d
+# First render Caddyfile with scripts/configure_https.py --upstream http://api:8000.
+services:
+  api:
+    environment:
+      VLA_REQUIRE_HTTPS: "true"
+      VLA_PUBLIC_URL: ${VLA_PUBLIC_URL:?Set the canonical HTTPS origin}
+      VLA_TLS_CERT_FILE: ""
+      VLA_TLS_KEY_FILE: ""
+      # Trust exactly this proxy, never every Docker/private-network client.
+      VLA_FORWARDED_ALLOW_IPS: ${VLA_HTTPS_PROXY_IP:-172.29.239.2}
+    networks:
+      default:
+      https_proxy:
+        ipv4_address: ${VLA_HTTPS_API_IP:-172.29.239.3}
+  https:
+    image: caddy:2.11.7-alpine
+    restart: unless-stopped
+    ports:
+      - "${VLA_HTTPS_BIND:-0.0.0.0}:80:80"
+      - "${VLA_HTTPS_BIND:-0.0.0.0}:443:443"
+    volumes:
+      - ${VLA_HTTPS_CONFIG_DIR:?Render HTTPS configuration first}/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Provided mode paths can use /etc/caddy/certs/fullchain.pem and /etc/caddy/certs/privkey.pem.
+      - ${VLA_HTTPS_CERTS_DIR:-./certs}:/etc/caddy/certs:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      https_proxy:
+        ipv4_address: ${VLA_HTTPS_PROXY_IP:-172.29.239.2}
+networks:
+  https_proxy:
+    ipam:
+      config:
+        - subnet: ${VLA_HTTPS_PROXY_SUBNET:-172.29.239.0/28}
+volumes:
+  caddy_data:
+  caddy_config:

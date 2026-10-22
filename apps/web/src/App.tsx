@@ -3,14 +3,10 @@ import {
   ArrowRight,
   Bell,
   ChevronDown,
-  CircleHelp,
-  Cpu,
   Database,
-  KeyRound,
   LayoutDashboard,
   Layers3,
   LoaderCircle,
-  LockKeyhole,
   LogOut,
   Menu,
   RefreshCw,
@@ -18,16 +14,20 @@ import {
   Server,
   Settings2,
   ShieldCheck,
+  UserRound,
+  Users,
   Terminal,
   Workflow,
 } from 'lucide-react';
-import { api, clearToken, getToken, navigate, saveToken, useRoute } from './api';
+import { navigate, useRoute } from './api';
+import { AuthProvider, roleLabels, useAuth } from './auth';
+import { AccountIdentity, UserManagement, UserManagementLink } from './UserManagement';
+import './auth.css';
 import { Badge, ErrorNotice, Field, PageHeading, Panel } from './components';
 import { DataProvider, useData } from './data';
 import { AssetsPage, NodePage, NodesPage, OverviewPage, RunsPage, TemplatesPage } from './pages';
 import RunDetail from './RunDetail';
 import RunWizard from './RunWizard';
-import type { Overview } from './types';
 
 const navigation = [
   { path: '/overview', label: '训练工作台', icon: LayoutDashboard },
@@ -38,29 +38,51 @@ const navigation = [
 ];
 
 export default function App() {
-  const [token, setToken] = useState(getToken());
   return (
-    <DataProvider enabled={!!token} key={token}>
-      <Shell authenticated={!!token} onAuth={() => setToken(getToken())} />
+    <AuthProvider>
+      <SessionGate />
+    </AuthProvider>
+  );
+}
+
+function SessionGate() {
+  const { user, loading } = useAuth();
+  if (loading && !user)
+    return (
+      <div className="auth-loading" role="status">
+        <LoaderCircle className="spin" size={24} />
+        正在验证登录状态…
+      </div>
+    );
+  if (!user) return <LoginPage />;
+  if (user.must_change_password) return <RequiredPasswordChange />;
+  return (
+    <DataProvider enabled key={user.id}>
+      <Shell />
     </DataProvider>
   );
 }
 
-function Shell({ authenticated, onAuth }: { authenticated: boolean; onAuth: () => void }) {
+function Shell() {
+  const { user, can, error: sessionError } = useAuth();
   const route = useRoute();
   const path = route.split('?')[0];
   const queryParams = new URLSearchParams(route.split('?')[1] || '');
   const [mobileNav, setMobileNav] = useState(false);
   const [wizard, setWizard] = useState<{ nodeId?: string; templateId?: string }>();
   const { overview, alerts, runs, refresh } = useData();
-  const section = navigation.find((item) => path.startsWith(item.path));
+  const section =
+    navigation.find((item) => path.startsWith(item.path)) ||
+    (path === '/users' ? { label: '用户与权限' } : undefined);
   const contentRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     setMobileNav(false);
     contentRef.current?.scrollTo(0, 0);
     document.title = `${section?.label || '平台设置'} · Termitech VLA`;
   }, [path, section?.label]);
-  const createRun = (nodeId?: string, templateId?: string) => setWizard({ nodeId, templateId });
+  const createRun = (nodeId?: string, templateId?: string) => {
+    if (can('training.write')) setWizard({ nodeId, templateId });
+  };
   return (
     <div className="app-shell">
       <a
@@ -133,22 +155,24 @@ function Shell({ authenticated, onAuth }: { authenticated: boolean; onAuth: () =
               <ArrowRight size={13} />
             </a>
           </div>
+          {can('users.manage') && (
+            <a className={`nav-item ${path === '/users' ? 'active' : ''}`} href="#/users">
+              <Users size={19} strokeWidth={1.7} />
+              <span>用户与权限</span>
+            </a>
+          )}
           <a className={`nav-item ${path === '/settings' ? 'active' : ''}`} href="#/settings">
             <Settings2 size={19} strokeWidth={1.7} />
             <span>平台设置</span>
           </a>
           <div className="sidebar-status">
-            <span
-              className={`status-dot ${authenticated && overview.data && !overview.error ? 'online' : ''}`}
-            />
+            <span className={`status-dot ${overview.data && !overview.error ? 'online' : ''}`} />
             <span>
-              {authenticated
-                ? overview.error
-                  ? '管理服务连接异常'
-                  : overview.data
-                    ? '管理服务已连接'
-                    : '正在连接服务'
-                : '尚未连接管理服务'}
+              {overview.error
+                ? '管理服务连接异常'
+                : overview.data
+                  ? '管理服务已连接'
+                  : '正在连接服务'}
             </span>
             <small>v0.1</small>
           </div>
@@ -192,13 +216,19 @@ function Shell({ authenticated, onAuth }: { authenticated: boolean; onAuth: () =
               <Bell size={18} />
               {!!alerts.data?.length && <span />}
             </a>
-            <a className="avatar" href="#/settings" title="管理员设置">
-              AD
+            <a
+              className="avatar"
+              href="#/settings"
+              title={`${user?.display_name || user?.username} · ${user ? roleLabels[user.role] : ''}`}
+              aria-label="当前账号设置"
+            >
+              {(user?.display_name || user?.username || '?').slice(0, 2).toUpperCase()}
             </a>
           </div>
         </header>
         <div className="content-scroll" ref={contentRef}>
           <main id="main-content" tabIndex={-1} className="main-content">
+            <ErrorNotice error={sessionError} title="会话验证暂时不可用" />
             {path === '/overview' ? (
               <OverviewPage createRun={() => createRun()} />
             ) : path === '/nodes' ? (
@@ -220,7 +250,9 @@ function Shell({ authenticated, onAuth }: { authenticated: boolean; onAuth: () =
             ) : path.startsWith('/runs/') ? (
               <RunDetail key={path} id={decodeURIComponent(path.slice('/runs/'.length))} />
             ) : path === '/settings' ? (
-              <SettingsPage authenticated={authenticated} onAuth={onAuth} />
+              <SettingsPage />
+            ) : path === '/users' ? (
+              <UserManagement />
             ) : (
               <>
                 <PageHeading title="页面不存在" description="这个页面可能已移动，请返回工作台。" />
@@ -238,7 +270,7 @@ function Shell({ authenticated, onAuth }: { authenticated: boolean; onAuth: () =
           </footer>
         </div>
       </div>
-      {wizard && (
+      {wizard && can('training.write') && (
         <RunWizard
           initialNode={wizard.nodeId}
           initialTemplate={wizard.templateId}
@@ -344,43 +376,248 @@ function GlobalSearch() {
   );
 }
 
-function SettingsPage({ authenticated, onAuth }: { authenticated: boolean; onAuth: () => void }) {
-  const { overview } = useData();
-  const [token, setToken] = useState('');
+export function LoginPage() {
+  const { login, error: connectionError, refresh, expired } = useAuth();
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<Error>();
+  return (
+    <div className="login-page">
+      <div className="login-card">
+        <div className="auth-brand">
+          <span className="mini-icon">
+            <ShieldCheck size={26} />
+          </span>
+          <span>TERMiTECH VLA</span>
+        </div>
+        <div className="eyebrow">TRAINING PLATFORM</div>
+        <h1>登录训练平台</h1>
+        <p className="login-description">使用管理员为你分配的账号访问工作空间。</p>
+        {expired && (
+          <div className="inline-note" role="status">
+            登录已失效，请重新登录。
+          </div>
+        )}
+        <ErrorNotice
+          error={connectionError}
+          title="无法验证登录状态"
+          retry={() => void refresh()}
+        />
+        <form
+          className="auth-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setBusy(true);
+            setError(undefined);
+            try {
+              await login(username.trim(), password);
+              setPassword('');
+            } catch (cause) {
+              setError(cause instanceof Error ? cause : new Error(String(cause)));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <Field label="用户名" required>
+            <input
+              name="username"
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
+              autoFocus
+              required
+              maxLength={80}
+              disabled={busy}
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+            />
+          </Field>
+          <Field label="密码" required>
+            <input
+              name="password"
+              type="password"
+              autoComplete="current-password"
+              required
+              maxLength={256}
+              disabled={busy}
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+            />
+          </Field>
+          <ErrorNotice error={error} title="登录失败" />
+          <button className="button primary login-submit" disabled={busy}>
+            {busy ? <LoaderCircle size={17} className="spin" /> : <UserRound size={17} />}
+            {busy ? '正在登录' : '登录'}
+          </button>
+        </form>
+        <p className="login-help">
+          不开放公开注册。首次部署请由服务维护人员使用初始化管理员命令创建账号。
+        </p>
+      </div>
+      <div className="login-footer">TERMiTECH VLA · 让训练更清晰</div>
+    </div>
+  );
+}
+
+export function PasswordChangeForm({ requiredChange = false }: { requiredChange?: boolean }) {
+  const { changePassword } = useAuth();
+  const [current, setCurrent] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmation, setConfirmation] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [success, setSuccess] = useState(false);
   return (
+    <form
+      className="auth-form"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setSuccess(false);
+        setError(undefined);
+        if (password !== confirmation) {
+          setError(new Error('两次输入的新密码不一致。'));
+          return;
+        }
+        if (password === current) {
+          setError(new Error('新密码必须与当前密码不同。'));
+          return;
+        }
+        setBusy(true);
+        try {
+          await changePassword(current, password);
+          setCurrent('');
+          setPassword('');
+          setConfirmation('');
+          setSuccess(true);
+        } catch (cause) {
+          setError(cause instanceof Error ? cause : new Error(String(cause)));
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      {requiredChange && (
+        <p className="muted">此账号需要先修改初始或临时密码，完成后即可进入工作空间。</p>
+      )}
+      <Field label="当前密码" required>
+        <input
+          name="current-password"
+          type="password"
+          autoComplete="current-password"
+          maxLength={256}
+          required
+          disabled={busy}
+          value={current}
+          onChange={(event) => setCurrent(event.target.value)}
+        />
+      </Field>
+      <Field label="新密码" required hint="至少 12 个字符，请使用独立且难以猜测的密码。">
+        <input
+          name="new-password"
+          type="password"
+          autoComplete="new-password"
+          minLength={12}
+          maxLength={256}
+          required
+          disabled={busy}
+          value={password}
+          onChange={(event) => setPassword(event.target.value)}
+        />
+      </Field>
+      <Field label="确认新密码" required>
+        <input
+          name="confirm-password"
+          type="password"
+          autoComplete="new-password"
+          minLength={12}
+          maxLength={256}
+          required
+          disabled={busy}
+          value={confirmation}
+          onChange={(event) => setConfirmation(event.target.value)}
+        />
+      </Field>
+      <ErrorNotice error={error} title="修改密码失败" />
+      {success && (
+        <div className="inline-note green" role="status">
+          密码已修改，其他会话已注销。
+        </div>
+      )}
+      <div>
+        <button className="button primary" disabled={busy}>
+          {busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+          {requiredChange ? '更新密码并进入平台' : '修改密码'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function LogoutButton() {
+  const { logout } = useAuth();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<Error>();
+  return (
+    <div>
+      <button
+        type="button"
+        className="button ghost"
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true);
+          setError(undefined);
+          try {
+            await logout();
+          } catch (cause) {
+            setError(cause instanceof Error ? cause : new Error(String(cause)));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? <LoaderCircle size={16} className="spin" /> : <LogOut size={16} />}退出登录
+      </button>
+      <ErrorNotice error={error} title="退出失败" />
+    </div>
+  );
+}
+
+export function RequiredPasswordChange() {
+  return (
+    <div className="login-page">
+      <div className="login-card">
+        <div className="auth-brand">
+          <ShieldCheck size={26} />
+          TERMiTECH VLA
+        </div>
+        <h1>更新登录密码</h1>
+        <AccountIdentity />
+        <PasswordChangeForm requiredChange />
+        <div className="auth-forced-logout">
+          <LogoutButton />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsPage() {
+  const { overview } = useData();
+  return (
     <>
       <PageHeading
         eyebrow="PLATFORM SETTINGS"
-        title="平台设置"
-        description="管理当前浏览器与控制面的连接。"
+        title="账号与平台设置"
+        description="查看当前账号并管理登录密码。"
       />
       <div className="settings-grid">
-        <Panel title="管理服务连接" subtitle="首个版本使用单项目管理员令牌">
-          <form
-            className="settings-form"
-            onSubmit={async (event) => {
-              event.preventDefault();
-              const previous = getToken();
-              setBusy(true);
-              setError(undefined);
-              setSuccess(false);
-              saveToken(token);
-              try {
-                await api<Overview>('/overview');
-                setSuccess(true);
-                onAuth();
-              } catch (err) {
-                if (previous) saveToken(previous);
-                else clearToken();
-                setError(err as Error);
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
+        <Panel title="当前账号">
+          <div className="settings-form">
+            <AccountIdentity />
+            <UserManagementLink />
+            <LogoutButton />
             <div className="connection-state">
               <span className="mini-icon">
                 <Terminal size={20} />
@@ -389,91 +626,15 @@ function SettingsPage({ authenticated, onAuth }: { authenticated: boolean; onAut
                 <strong>控制面 API</strong>
                 <code>{window.location.origin}/api/v1</code>
               </div>
-              <Badge
-                state={authenticated && overview.data && !overview.error ? 'ONLINE' : 'OFFLINE'}
-              />
-            </div>
-            <Field
-              label="管理员访问令牌"
-              required
-              hint="填写管理服务配置的 VLA_ADMIN_TOKEN；与 Agent 登记令牌不同。"
-            >
-              <div className="input-icon">
-                <KeyRound size={17} />
-                <input
-                  autoComplete="off"
-                  type="password"
-                  required
-                  minLength={1}
-                  placeholder={authenticated ? '输入新令牌以更新连接' : '输入管理员访问令牌'}
-                  value={token}
-                  onChange={(event) => setToken(event.target.value)}
-                />
-              </div>
-            </Field>
-            <div className="inline-note">
-              <LockKeyhole size={16} />
-              <span>令牌仅保存在当前标签页会话中，通过请求头发送到同源管理服务。</span>
-            </div>
-            <ErrorNotice error={error} />
-            {success && <div className="inline-note green">连接成功，已载入管理服务数据。</div>}
-            <div className="settings-form-actions">
-              <button className="button primary" disabled={busy} type="submit">
-                {busy ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
-                {authenticated ? '更新并验证连接' : '验证并连接'}
-              </button>
-              {authenticated && (
-                <button
-                  className="button ghost"
-                  type="button"
-                  onClick={() => {
-                    clearToken();
-                    onAuth();
-                  }}
-                >
-                  <LogOut size={16} />
-                  退出当前连接
-                </button>
-              )}
-            </div>
-          </form>
-        </Panel>
-        <div>
-          <Panel title="部署说明">
-            <div className="deployment-summary">
-              <div>
-                <Server size={19} />
-                <section>
-                  <strong>一个管理控制面</strong>
-                  <p>提供资源目录、训练任务、调度与可视化。</p>
-                </section>
-              </div>
-              <div>
-                <Cpu size={19} />
-                <section>
-                  <strong>每台机器一个 Agent</strong>
-                  <p>汇报资源与心跳，执行本机预检和训练。</p>
-                </section>
-              </div>
-              <div>
-                <Database size={19} />
-                <section>
-                  <strong>数据与模型保留本地</strong>
-                  <p>仅在同一台机器上选择输入资产进行训练。</p>
-                </section>
-              </div>
-            </div>
-          </Panel>
-          <div className="settings-help">
-            <CircleHelp size={19} />
-            <div>
-              <strong>服务无法连接？</strong>
-              <p>
-                开发模式请确认 API 服务运行于 127.0.0.1:8000。正式部署请为 /api 配置同源反向代理。
-              </p>
+              <Badge state={overview.data && !overview.error ? 'ONLINE' : 'OFFLINE'} />
             </div>
           </div>
-        </div>
+        </Panel>
+        <Panel title="修改密码" subtitle="保存后保留当前登录，注销该账号的其他会话。">
+          <div className="settings-form">
+            <PasswordChangeForm />
+          </div>
+        </Panel>
       </div>
     </>
   );

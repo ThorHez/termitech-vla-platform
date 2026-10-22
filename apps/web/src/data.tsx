@@ -59,7 +59,7 @@ export function gpuAverage(gpus?: Gpu[]) {
   if (!gpus?.length || gpus.some((gpu) => gpu.utilization_pct == null)) return undefined;
   return gpus.reduce((sum, gpu) => sum + (gpu.utilization_pct as number), 0) / gpus.length;
 }
-export function requiredInputs(template?: Template) {
+export function requiredInputs(template?: Pick<Template, 'required_inputs'>) {
   return Array.isArray(template?.required_inputs)
     ? template.required_inputs
     : Object.keys(template?.required_inputs || {});

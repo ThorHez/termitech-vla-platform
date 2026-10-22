@@ -1,4 +1,4 @@
-"""Run the local control plane and an SSH reverse tunnel for a remote Agent."""
+"""Run the local control plane with UI-managed SSH deployment and tunnels."""
 
 import argparse
 from contextlib import ExitStack
@@ -7,7 +7,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
 import signal
 import socket
 import subprocess
@@ -120,15 +119,8 @@ def wait_for_api(child: subprocess.Popen, url: str, stop: threading.Event) -> bo
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ssh-target", default="root@115.190.212.169")
-    parser.add_argument("--ssh-port", type=port_number, default=22)
     parser.add_argument("--local-port", type=port_number, default=8000)
-    parser.add_argument("--remote-port", type=port_number, default=18000)
     args = parser.parse_args()
-    if not args.ssh_target or args.ssh_target.startswith("-") or any(
-        character.isspace() for character in args.ssh_target
-    ):
-        parser.error("--ssh-target 必须是 SSH 主机名或 user@host")
 
     stop = threading.Event()
     children: list[subprocess.Popen] = []
@@ -141,9 +133,6 @@ def main() -> int:
         web_dist = ROOT / "apps" / "web" / "dist"
         if not (web_dist / "index.html").is_file():
             raise RuntimeError("缺少网页构建产物；请先在 apps/web 执行 pnpm build")
-        ssh = shutil.which("ssh")
-        if not ssh:
-            raise RuntimeError("找不到 ssh，请先安装 OpenSSH 客户端")
         LOCAL.mkdir(parents=True, exist_ok=True)
         credentials_path = LOCAL / "dev-credentials.json"
         credentials = load_credentials(credentials_path)
@@ -151,10 +140,11 @@ def main() -> int:
         log_dir = LOCAL / "remote-agent-dev" / run_id
         log_dir.mkdir(parents=True, mode=0o700)
         local_url = f"http://127.0.0.1:{args.local_port}"
-        remote_url = f"http://127.0.0.1:{args.remote_port}"
         api_env = {
             **os.environ,
             "VLA_ADMIN_TOKEN": credentials["admin_token"],
+            "VLA_LEGACY_ADMIN_ENABLED": "false",
+            "VLA_SESSION_COOKIE_SECURE": "false",  # loopback HTTP development only
             "VLA_ENROLLMENT_TOKEN": credentials["enrollment_token"],
             "VLA_DATABASE_URL": f"sqlite:///{LOCAL / 'control.db'}",
             "VLA_SCHEDULER_ENABLED": "true",
@@ -162,12 +152,16 @@ def main() -> int:
             "VLA_HOST": "127.0.0.1",
             "VLA_PORT": str(args.local_port),
             "VLA_WEB_DIST": str(web_dist),
+            "VLA_AGENT_BUNDLE": str(LOCAL / "agent-dist/vla-agent-bundle.tar.gz"),
+            "VLA_AGENT_CONTROL_PLANE_URL": local_url,
+            "VLA_REMOTE_STATE_DIR": str(LOCAL / "remote-management"),
+            "VLA_TUNNEL_TARGET_HOST": "127.0.0.1",
+            "VLA_TUNNEL_TARGET_PORT": str(args.local_port),
             "PYTHONUNBUFFERED": "1",
         }
         print(f"本次日志目录：{log_dir}", flush=True)
         with ExitStack() as stack:
             api_log = stack.enter_context(private_log(log_dir / "control-plane.log"))
-            ssh_log = stack.enter_context(private_log(log_dir / "ssh-tunnel.log"))
             # Cleanup runs before the log streams close, including startup failures.
             stack.callback(stop_children, children)
             if stop.is_set():
@@ -180,35 +174,17 @@ def main() -> int:
             children.append(api)
             if not wait_for_api(api, local_url, stop):
                 return 0
-            forward = f"127.0.0.1:{args.remote_port}:127.0.0.1:{args.local_port}"
-            tunnel = subprocess.Popen(
-                [ssh, "-N", "-T", "-p", str(args.ssh_port),
-                 "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
-                 "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
-                 "-o", "ConnectTimeout=10", "-o", "ConnectionAttempts=1",
-                 "-o", "ControlMaster=no", "-o", "ControlPath=none",
-                 "-R", forward, args.ssh_target],
-                cwd=ROOT, stdin=subprocess.DEVNULL,
-                stdout=ssh_log, stderr=subprocess.STDOUT, start_new_session=True,
-            )
-            children.append(tunnel)
             print(
                 f"本机中台已就绪：{local_url}\n"
-                f"SSH 隧道正在连接 {args.ssh_target}；远端 Agent 应使用 {remote_url}。\n"
-                f"登录令牌请从 {credentials_path} 的 admin_token 字段读取。\n"
-                "连接是否完成以远端健康检查和 Agent 心跳为准；本脚本不启动本机 Agent。\n"
-                "保持本进程运行；Ctrl+C 停止本次启动的中台和隧道。",
+                "在机器资源页填写远端 IP、用户名、密码和安装目录；中台自动安装 Agent 并维护 SSH 隧道。\n"
+                "网页使用独立账号登录；首次启动前请通过 python -m vla_control.users create-admin 创建管理员。\n"
+                "本脚本不启动本机 Agent。保持本进程运行；Ctrl+C 停止本次中台及其管理的隧道。",
                 flush=True,
             )
             while not stop.wait(0.25):
                 if api.poll() is not None:
                     raise RuntimeError("本机中台已退出，请查看 control-plane.log")
-                if tunnel.poll() is not None:
-                    raise RuntimeError(
-                        "SSH 隧道已退出，请查看 ssh-tunnel.log。需要已可用的非交互 SSH 认证；"
-                        "远端端口冲突也会导致退出。"
-                    )
-        print("已停止本次启动的中台和隧道；远端 Agent 服务未被修改。", flush=True)
+        print("已停止本次中台及其隧道；远端 Agent 服务继续运行。", flush=True)
         return 0
     except (OSError, RuntimeError) as exc:
         print(f"启动或运行失败：{exc}", file=sys.stderr, flush=True)

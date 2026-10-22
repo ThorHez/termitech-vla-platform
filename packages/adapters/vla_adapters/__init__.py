@@ -2,7 +2,12 @@
 
 import json
 import math
+import re
 from pathlib import Path
+
+from .entrypoints import validate_entrypoint
+from .dataset_bindings import validate_binding_assets
+from .recap import recap_stages, runtime_adapter_for, validate_training_stage
 
 
 def get_templates() -> list[dict]:
@@ -17,12 +22,14 @@ def get_templates() -> list[dict]:
          "parameters": {**parameters, "steps": {**parameters["steps"], "default": 30, "max": 10000}},
          "required_inputs": [], "min_gpus": 0},
         {"id": "openpi-sft", "name": "OpenPI / UMI 监督微调", "algorithm": "SFT", "status": "AVAILABLE",
-         "description": "使用管理员已验证的本机 recipe 和环境，显式绑定数据、初始权重和归一化统计。需完成对应机器训练验收。",
+         "description": "绑定本机配方、数据、初始权重与归一化统计，由 Agent 自动检查配置和资产，通过后可提交训练。",
          "parameters": parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
         {"id": "mem", "name": "MEM 记忆训练", "algorithm": "MEM", "status": "PLANNED",
          "description": "待接入 mem_exp 两阶段训练与记忆产物选择。", "parameters": {}, "required_inputs": []},
-        {"id": "recap", "name": "ReCap 策略提升", "algorithm": "RECAP", "status": "PLANNED",
-         "description": "待接入价值训练、本机派生标注和 ACP 训练。", "parameters": {}, "required_inputs": []},
+        {"id": "recap", "name": "ReCap 策略提升", "algorithm": "RECAP", "status": "AVAILABLE",
+         "description": "先选择价值函数训练或离线强化学习阶段，再配置对应的配方、数据、权重与参数。两阶段之间需完成离线优势标注。",
+         "runtime_adapter": "openpi-sft", "stages": recap_stages(),
+         "parameters": parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
         {"id": "rlt", "name": "RLT 离线训练", "algorithm": "RLT", "status": "PLANNED",
          "description": "待确认代码入口与 replay 数据协议。", "parameters": {}, "required_inputs": []},
     ]
@@ -48,14 +55,55 @@ def validate_parameters(template_id: str, parameters: dict) -> dict:
     return result
 
 
+def resolve_recipe(profile: dict, requested: str | None = None, require_validated: bool = True) -> str:
+    """Resolve a task recipe without changing the registered runtime or its trust boundary."""
+    recipe = requested if requested is not None else profile.get("recipe")
+    if profile.get("adapter") == "smoke" and requested is None:
+        recipe = "smoke"
+    if recipe is None or recipe == "":
+        raise ValueError("RECIPE_REQUIRED: select a training recipe for this task")
+    if not isinstance(recipe, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,255}", recipe) is None:
+        raise ValueError("RECIPE_INVALID: recipe must be an ASCII named configuration")
+    if profile.get("adapter") == "smoke":
+        if recipe != "smoke":
+            raise ValueError("RECIPE_INVALID: the smoke adapter only supports the smoke recipe")
+        return recipe
+    if profile.get("adapter") != "openpi-sft":
+        raise ValueError("PROFILE_TEMPLATE_MISMATCH: unsupported training adapter")
+    if require_validated:
+        metadata = profile.get("metadata") or {}
+        validated = metadata.get("validated_recipes", [])
+        listed = isinstance(validated, list) and recipe in validated
+        # A legacy flag authorizes its original recipe, never a task override.
+        legacy = metadata.get("validated") is True and recipe == profile.get("recipe")
+        if not (listed or legacy):
+            raise ValueError("PROFILE_NOT_VALIDATED: administrator must validate this local recipe first")
+    return recipe
+
+
 def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict,
-                 output_dir: str, gpu_uuids: list[str]) -> dict:
-    """Build argv without shell expansion; only trusted profile recipes can execute."""
-    parameters = validate_parameters(template_id, parameters)
-    if profile.get("adapter") != template_id:
+                 output_dir: str, gpu_uuids: list[str], recipe: str | None = None,
+                 recipe_definition: dict | None = None, entrypoint: str | None = None,
+                 dataset_bindings: list[dict] | None = None,
+                 training_stage: str | None = None, stage_config: dict | None = None) -> dict:
+    """Build argv; Agent preflight and launch recheck validate the selected recipe."""
+    from .recipe_definitions import recipe_parameters, resolve_definition
+    parameters = validate_parameters(template_id, {**recipe_parameters(recipe_definition), **parameters})
+    training_stage, stage_config = validate_training_stage(template_id, training_stage, stage_config)
+    entrypoint = validate_entrypoint(entrypoint)
+    dataset_bindings = validate_binding_assets(dataset_bindings, inputs)
+    if template_id not in {"openpi-sft", "recap"} and dataset_bindings is not None:
+        raise ValueError("DATASET_BINDINGS_INVALID: 该训练模板不支持多数据集绑定")
+    if template_id == "recap" and dataset_bindings is None:
+        raise ValueError("DATASET_BINDINGS_INVALID: ReCap 每组数据集必须明确绑定归一化参数")
+    if template_id == "smoke" and entrypoint is not None:
+        raise ValueError("INVALID_ENTRYPOINT: 平台链路测试使用固定测试入口")
+    if profile.get("adapter") != runtime_adapter_for(template_id):
         raise ValueError("PROFILE_TEMPLATE_MISMATCH")
     if profile.get("execution_mode", "native") != "native":
         raise ValueError("EXECUTION_MODE_UNSUPPORTED: this release uses registered native environments")
+    recipe = (resolve_definition(profile, recipe_definition, recipe, require_validated=False)
+              if recipe_definition is not None else resolve_recipe(profile, recipe, require_validated=False))
     code_dir = Path(profile["code_dir"]).resolve(strict=True)
     python = str(Path(profile["python"]).absolute())
     output = Path(output_dir).resolve()
@@ -69,12 +117,7 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
     else:
         if not gpu_uuids:
             raise ValueError("GPU_REQUIRED")
-        recipe = profile.get("recipe")
-        if not isinstance(recipe, str) or not recipe or not all(c.isalnum() or c in "_-" for c in recipe):
-            raise ValueError("Registered recipe must be a named openpi config")
-        if not profile.get("metadata", {}).get("validated", False):
-            raise ValueError("PROFILE_NOT_VALIDATED: administrator must validate the local recipe first")
-        for role in ("dataset", "model", "norm"):
+        for role in (("model",) if dataset_bindings is not None else ("dataset", "model", "norm")):
             if not inputs.get(role, {}).get("path"):
                 raise ValueError(f"Missing required {role} asset")
         if parameters["batch_size"] % len(gpu_uuids):
@@ -83,6 +126,14 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
         wrapper = Path(__file__).with_name("openpi_entry.py").resolve()
         spec = {"code_dir": str(code_dir), "recipe": recipe, "inputs": inputs,
                 "parameters": parameters, "output_dir": str(output), "gpu_count": len(gpu_uuids)}
+        if template_id == "recap":
+            spec.update({"template_id": "recap", "training_stage": training_stage, "stage_config": stage_config})
+        if dataset_bindings is not None:
+            spec["dataset_bindings"] = dataset_bindings
+        if entrypoint is not None:
+            spec["entrypoint"] = entrypoint
+        if recipe_definition is not None:
+            spec["recipe_definition"] = recipe_definition
         argv = [python, "-u", str(wrapper), "--spec-json", json.dumps(spec, ensure_ascii=False)]
     return {"argv": argv, "cwd": str(code_dir), "env": {
         "CUDA_VISIBLE_DEVICES": ",".join(gpu_uuids), "PYTHONUNBUFFERED": "1",

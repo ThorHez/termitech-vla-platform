@@ -17,13 +17,26 @@ services:
       dockerfile: deploy/control.Dockerfile
     environment: &control_env
       VLA_DATABASE_URL: postgresql+psycopg://vla:${POSTGRES_PASSWORD}@postgres/vla
-      VLA_ADMIN_TOKEN: ${VLA_ADMIN_TOKEN:?Set VLA_ADMIN_TOKEN}
       VLA_ENROLLMENT_TOKEN: ${VLA_ENROLLMENT_TOKEN:?Set VLA_ENROLLMENT_TOKEN}
+      VLA_LEGACY_ADMIN_ENABLED: "false"
+      VLA_SESSION_COOKIE_SECURE: "true"
+      VLA_SESSION_TTL_SECONDS: ${VLA_SESSION_TTL_SECONDS:-7200}
+      VLA_SESSION_IDLE_SECONDS: ${VLA_SESSION_IDLE_SECONDS:-900}
+      VLA_SESSION_REAUTH_SECONDS: ${VLA_SESSION_REAUTH_SECONDS:-300}
+      VLA_REQUIRE_HTTPS: "true"
+      VLA_PUBLIC_URL: ${VLA_PUBLIC_URL:-}
+      VLA_FORWARDED_ALLOW_IPS: ""
+      VLA_AGENT_CONTROL_PLANE_URL: ${VLA_AGENT_CONTROL_PLANE_URL:-}
+      VLA_REMOTE_STATE_DIR: /var/lib/vla/remote-management
+      VLA_TUNNEL_TARGET_HOST: 127.0.0.1
+      VLA_TUNNEL_TARGET_PORT: "8000"
       VLA_SCHEDULER_ENABLED: "false"
       VLA_HOST: 0.0.0.0
       VLA_WEB_DIST: /app/apps/web/dist
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - remote_state:/var/lib/vla
     depends_on:
       postgres:
         condition: service_healthy
@@ -42,3 +55,4 @@ services:
         condition: service_healthy
 volumes:
   postgres_data:
+  remote_state:
