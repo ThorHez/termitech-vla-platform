@@ -1,11 +1,21 @@
 """HTTPS preparation is offline, explicit and keeps private control transport."""
 
 import importlib.util
+from datetime import datetime, timedelta, timezone
+import ipaddress
 import json
 import os
 from pathlib import Path
+import socket
+import ssl
 import subprocess
 import sys
+import time
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 import pytest
 
@@ -35,9 +45,15 @@ def test_public_ip_uses_explicit_shortlived_acme_without_requesting_a_certificat
     assert "profile shortlived" in config
     assert "tls internal" not in config
     assert "strict_sni_host insecure_off" in config
+    assert "    default_sni 115.190.212.169\n" in config
+    assert result["default_sni"] == "115.190.212.169"
     assert result["controller_and_proxy_started"] is False
     assert result["system_trust_modified"] is False
     assert result["certificate_issuance"] == "on-explicit-service-start"
+    assert "request_body {\n        max_size 10MB\n    }" in config
+    assert result["max_request_body_bytes"] == 10_000_000
+    assert "        protocols h1\n" in config
+    assert result["http_protocols"] == ["h1"]
     assert not (tmp_path / "rendered/cert.pem").exists()
 
 
@@ -49,6 +65,8 @@ def test_domain_and_staging_are_explicit(tmp_path):
     assert "profile shortlived" not in config
     assert "email ops@example.com" in config
     assert "strict_sni_host on" in config
+    assert "default_sni" not in config
+    assert result["default_sni"] is None
     assert result["certificate_trust"] == "ACME-staging-untrusted"
 
 
@@ -208,6 +226,22 @@ def test_proxy_rejects_unknown_hosts_and_never_preserves_spoofed_forwarded_heade
     assert config.index("respond @unsafe_method") < config.index("redir https://")
 
 
+def test_agent_proxy_is_preserved_unless_internal_only_is_explicit(tmp_path):
+    default = tmp_path / "default"
+    result = deployment.render(arguments(default))
+    assert result["internal_agents_only"] is False
+    assert "@internal_only" not in (default / "Caddyfile").read_text()
+    protected = tmp_path / "internal-only"
+    result = deployment.render(arguments(protected, "--internal-agents-only"))
+    config = (protected / "Caddyfile").read_text()
+    assert result["internal_agents_only"] is True
+    assert config.count("@internal_only path /agent /agent/* /docs /docs/* /redoc /redoc/* /openapi.json") == 2
+    assert config.count("respond @internal_only 404") == 2
+    assert config.index("respond @internal_only 404") < config.index("reverse_proxy ")
+    assert config.rindex("respond @internal_only 404") < config.index("respond @plain_api")
+    assert "VLA_AGENT_CONTROL_PLANE_URL=http://127.0.0.1:8000" in (protected / "control-https.env").read_text()
+
+
 def test_service_is_unprivileged_with_private_durable_state_and_no_activation(tmp_path):
     deployment.render(arguments(tmp_path))
     unit = (tmp_path / "termitech-vla-https.service").read_text()
@@ -247,11 +281,99 @@ def test_compose_only_publishes_api_on_loopback_and_trusts_one_proxy_address():
 
 @pytest.mark.skipif(not os.getenv("VLA_TEST_CADDY_BINARY"), reason="Optional pinned Caddy adapter validation")
 @pytest.mark.parametrize("site", ["https://115.190.212.169", "https://train.example.com", "https://[2606:4700:4700::1111]"])
-def test_caddy_adapter_accepts_config_and_uses_public_acme(tmp_path, site):
-    deployment.render(arguments(tmp_path, "--site", site))
+@pytest.mark.parametrize("internal_only", [False, True])
+def test_caddy_adapter_accepts_config_and_uses_public_acme(tmp_path, site, internal_only):
+    deployment.render(arguments(tmp_path, "--site", site, *(["--internal-agents-only"] if internal_only else [])))
     result = subprocess.run([os.environ["VLA_TEST_CADDY_BINARY"], "adapt", "--adapter", "caddyfile",
                              "--config", str(tmp_path / "Caddyfile")], text=True, capture_output=True, check=True)
     value = json.loads(result.stdout)
     tls = value["apps"]["tls"]["automation"]["policies"]
     assert any(issuer.get("module") == "acme" for policy in tls for issuer in policy.get("issuers", []))
     assert not any(issuer.get("module") == "internal" for policy in tls for issuer in policy.get("issuers", []))
+    _, host, _, is_ip = deployment.origin(site, scheme="https")
+    policies = [policy for server in value["apps"]["http"]["servers"].values()
+                for policy in server.get("tls_connection_policies", [])]
+    assert bool(policies) is is_ip
+    assert all(policy.get("default_sni") == (host if is_ip else None) for policy in policies)
+
+    def handlers(node):
+        if isinstance(node, dict):
+            if "handler" in node:
+                yield node
+            for child in node.values():
+                yield from handlers(child)
+        elif isinstance(node, list):
+            for child in node:
+                yield from handlers(child)
+
+    hidden = [handler for handler in handlers(value) if handler.get("handler") == "static_response"
+              and handler.get("status_code") == 404]
+    assert len(hidden) == (2 if internal_only else 0)
+
+
+@pytest.mark.skipif(not os.getenv("VLA_TEST_CADDY_BINARY"), reason="Optional real Caddy IP/NAT regression")
+def test_ip_certificate_without_sni_works_when_public_ip_differs_from_listener(tmp_path):
+    # Python omits SNI for IP server_hostname. Connect to loopback while
+    # validating a different IP SAN, as happens when public IPs are NATed.
+    public_ip = "115.190.212.169"
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Isolated IP/NAT regression")])
+    now = datetime.now(timezone.utc)
+    certificate = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+                   .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                   .not_valid_before(now - timedelta(minutes=1)).not_valid_after(now + timedelta(days=1))
+                   .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+                   .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address(public_ip))]), critical=False)
+                   .sign(key, hashes.SHA256()))
+    cert_path, key_path = tmp_path / "certificate.pem", tmp_path / "private.pem"
+    cert_path.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                          serialization.NoEncryption()))
+    key_path.chmod(0o600)
+
+    def free_port():
+        with socket.socket() as stream:
+            stream.bind(("127.0.0.1", 0))
+            return stream.getsockname()[1]
+
+    http_port, tls_port = free_port(), free_port()
+    while http_port == tls_port:
+        tls_port = free_port()
+    deployment.render(arguments(tmp_path / "proxy", "--mode", "provided", "--site", f"https://{public_ip}:{tls_port}",
+                                "--bind", "127.0.0.1", "--http-port", str(http_port), "--https-port", str(tls_port),
+                                "--cert-file", str(cert_path), "--key-file", str(key_path), "--internal-agents-only"))
+    verification = ssl.create_default_context(cafile=str(cert_path))
+    environment = {**os.environ, "XDG_DATA_HOME": str(tmp_path / "caddy-data"),
+                   "XDG_CONFIG_HOME": str(tmp_path / "caddy-config")}
+    with (tmp_path / "caddy.log").open("w") as log:
+        process = subprocess.Popen([os.environ["VLA_TEST_CADDY_BINARY"], "run", "--adapter", "caddyfile",
+                                    "--config", str(tmp_path / "proxy/Caddyfile")],
+                                   env=environment, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                assert process.poll() is None, "Isolated Caddy exited; inspect its test log"
+                try:
+                    connection = socket.create_connection(("127.0.0.1", tls_port), timeout=1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        pytest.fail("Isolated Caddy did not bind")
+                    time.sleep(.05)
+            with connection, verification.wrap_socket(connection, server_hostname=public_ip) as secured:
+                secured.sendall(f"GET /agent/v1/enroll HTTP/1.1\r\nHost: {public_ip}:{tls_port}\r\nConnection: close\r\n\r\n".encode())
+                assert secured.recv(1024).split(b"\r\n", 1)[0] == b"HTTP/1.1 404 Not Found"
+            with socket.create_connection(("127.0.0.1", tls_port), timeout=1) as connection:
+                with verification.wrap_socket(connection, server_hostname=public_ip) as secured:
+                    secured.sendall(b"GET /healthz HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n")
+                    assert secured.recv(1024).split(b"\r\n", 1)[0] == b"HTTP/1.1 421 Misdirected Request"
+            with socket.create_connection(("127.0.0.1", http_port), timeout=1) as connection:
+                connection.sendall(f"GET /docs HTTP/1.1\r\nHost: {public_ip}:{http_port}\r\nConnection: close\r\n\r\n".encode())
+                assert connection.recv(1024).split(b"\r\n", 1)[0] == b"HTTP/1.1 404 Not Found"
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()

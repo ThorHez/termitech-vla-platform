@@ -94,6 +94,14 @@ def _execute_preflight_command(config: dict, command: dict):
         state.save_command(command["id"], status, result)
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Every Agent endpoint has a stable address. urllib's default redirect
+        # handler forwards Authorization to a different host and even from
+        # HTTPS to HTTP; reject instead of transferring a node credential.
+        return None
+
+
 class Client:
     def __init__(self, config: dict):
         self.url = config["control_plane_url"].rstrip("/")
@@ -103,12 +111,13 @@ class Client:
         if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise ValueError("Remote control planes require HTTPS to protect node credentials")
         self.timeout = config["http_timeout_seconds"]
+        self._opener = urllib.request.build_opener(_RejectRedirects())
 
     def request(self, method: str, path: str, token: str, body: dict | None = None, headers: dict | None = None):
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(self.url + path, data=data, method=method,
                                          headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", **(headers or {})})
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with self._opener.open(request, timeout=self.timeout) as response:
             return json.loads(response.read())
 
 

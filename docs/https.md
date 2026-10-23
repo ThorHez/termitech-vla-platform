@@ -2,7 +2,7 @@
 
 网页和管理 API 支持 HTTPS，可由 Caddy 终止 TLS，也可由中台直接加载 PEM 证书。用户会话保留 `Secure`、`HttpOnly` 和 `SameSite=Strict` Cookie。网页与 API 使用同一来源，不需要将凭据发送到另一域名。
 
-**本次增加功能及本地验收，不重新开放公网服务。** `115.190.212.169` 上原中台继续保持停止、禁用自启，业务数据库和 Agent 配置保留。生成配置不会安装服务、申请公网证书、修改防火墙或启动中台。
+配置生成与服务启用是两个独立步骤：渲染器不会安装服务、申请公网证书、修改防火墙或启动中台。`115.190.212.169` 已于 2026-10-23 按用户授权启用 HTTPS，实际服务状态应从目标机核实；不能从配置文件存在推断服务已经启动或停止。
 
 ## 本机测试证书
 
@@ -77,7 +77,17 @@ Let's Encrypt 已支持公网 IP 证书，使用 `shortlived` 配置档，证书
 
 ACME 模式由持续运行的 Caddy 负责续期，保留其状态目录，不要只复制一份短期证书后停止客户端。检查服务日志中的申请、续期失败以及客户端实际收到的到期时间。`provided` 模式的续期由证书管理方负责；更新 PEM 文件后重启代理加载新证书。当前生成的 systemd 服务关闭 Caddy 管理 API，不提供 `systemctl reload`；重启前执行配置校验并安排短暂入口中断。
 
+IP 客户端通常不发送 TLS SNI；公网 IP 经 NAT 映射到私网网卡时，按本地连接地址选择证书可能找不到公网 IP 证书。渲染器仅对字面 IPv4/IPv6 入口设置全局 `default_sni` 为入口 IP，确保无 SNI 的连接也选择该证书；域名入口仍要求 SNI 与 Host 一致，未知 Host 仍被拒绝。[Caddy default_sni 官方说明](https://caddyserver.com/docs/caddyfile/options#default-sni)。
+
 ## 中台配置与 Agent 连通性
+
+当前固定 Caddy 2.11.7 所带 Go/x/net 版本存在 HTTP/2 拒绝服务公告，渲染器暂时仅启用 `h1`（HTTPS 上的 HTTP/1.1），保留流式响应。升级到经过审计的修复版二进制并复验前，不应直接重新开放 HTTP/2/3。此项缓解不等于所有 Go 组件漏洞均已修复。[Go 公告示例](https://pkg.go.dev/vuln/GO-2026-6603)。
+
+生成配置显式限制请求头为 16 KiB、请求体为 10 MB。读取请求头最长 15 秒，读取请求体最长 60 秒，正文停顿期限为 15 秒并要求平均每秒至少 1024 字节；这适合管理 API 的 JSON 请求，训练数据仍保留在执行机器本地。代理连接上游最长等待 3 秒，等待首个上游响应头最长 90 秒，留出已有 SSH 探测和数据库忙等的余量。该响应头期限不会截断已经开始的日志流；没有配置统一的响应总时长。
+
+这些期限和大小上限是资源耗尽防护的一部分，不是全局请求限速或 DDoS 容量承诺。登录的账号/IP 失败次数限制也不能替代边缘限流、连接准入、服务资源配额、审计保留策略和云端流量清洗。部署时先在隔离环境验证正常 SSH 检查、目录联想与日志下载，再检查目标服务实际加载的配置。[Caddy 请求期限](https://caddyserver.com/docs/caddyfile/options#timeouts)、[上游响应头期限](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#the-http-transport)、[OWASP DoS 指引](https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html)。
+
+2026-10-23 的生产修复另通过 systemd `security-audit-runtime.conf` drop-in 对控制台和 Caddy 指定进程局部的 `SSL_CERT_FILE=/etc/termitech-vla/https/trusted-ca-20261019.pem` 与空的 `SSL_CERT_DIR=/etc/termitech-vla/https/empty-ca`，避免重新合并旧系统 CA；信任包来自锁定的 certifi 2026.10.19，并已验证 ACME 目录的正常 HTTPS 访问。该文件不是渲染器自动生成的内容，后续更新 certifi 时需同步替换、记录摘要并复验这份局部副本，不能只升级 Python 包。不要替换共享 Conda 或全局 CA 来代替进程隔离；保留原服务 drop-in 及证书续期状态。完整续期周期仍需持续观察。
 
 反向代理后的中台配置如下，另保留现有数据库及 Agent 凭据：
 
@@ -96,6 +106,8 @@ VLA_TUNNEL_TARGET_PORT=8000
 `VLA_PUBLIC_URL` 只接受 HTTPS 来源（协议、主机及可选端口），不能包含用户名、路径、查询串或片段。管理页面及 API 校验 Host；明文页面导航跳转至配置的 HTTPS 入口，明文管理 API 在处理凭据和正文前拒绝请求。只有明确配置的代理来源可以影响协议和客户端地址识别；不可将可信代理设置成 `*` 或所有地址网段。代理与中台不在同一主机时，应据实际地址调整可信代理，并保持上游网络受限。
 
 `/healthz` 与 `/agent/v1/` 保留内部 HTTP，Agent 协议仍使用独立节点凭据。现有节点通过 SSH 加密隧道回连，不需要重装或修改身份。中台由原 80 端口迁到 8000 时，将隧道的**中台端转发目标**改为 8000；远端机器上原有的回环监听端口不变。此前三个节点使用的 35071、36569、44003 不能被统一改成 8000。原先的 `VLA_AGENT_CONTROL_PLANE_URL` 若指定 `http://127.0.0.1:80`，同步调整为新的内部回环入口，避免新配置沿用旧默认值。
+
+所有 Agent 均经内部 SSH 隧道访问时，生成配置加 `--internal-agents-only`：公网 HTTP 和 HTTPS 入口对 `/agent`、`/agent/*`、`/docs`、`/redoc` 及 `/openapi.json` 返回 404，内部回环接口与节点身份不变。该选项默认关闭，以兼容直接连接 HTTPS 的 Agent；启用前确认没有节点依赖公网代理访问 Agent 协议。
 
 反向代理方案下不要再设置 `VLA_TLS_CERT_FILE`、`VLA_TLS_KEY_FILE`；中台与本机代理之间使用回环 HTTP。如选择由中台直接提供 TLS，则两项需同时设置为可读、匹配的 PEM 文件绝对路径，`VLA_PORT` 改为 TLS 监听端口，并保留 `VLA_REQUIRE_HTTPS=true`、`VLA_SESSION_COOKIE_SECURE=true`。原生 TLS 不负责申请或续期证书，也不会额外创建 HTTP 跳转监听器。现有 SSH HTTP 隧道依赖明文回环上游，生产迁移优先采用反向代理方案。
 

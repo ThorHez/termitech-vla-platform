@@ -132,6 +132,20 @@ def render(args: argparse.Namespace) -> dict:
         issuer.extend(("        }", "    }"))
         tls = "\n".join(issuer)
     address = f"[{host}]" if ":" in host else host
+    # IP clients omit SNI; behind NAT the local socket IP differs from the
+    # certificate's public IP. Explicitly select the configured IP certificate.
+    default_sni = f"    default_sni {host}\n" if is_ip else ""
+    internal_paths = "/agent /agent/* /docs /docs/* /redoc /redoc/* /openapi.json"
+    internal_only = (
+        f"    @internal_only path {internal_paths}\n"
+        "    respond @internal_only 404\n"
+        if args.internal_agents_only else ""
+    )
+    internal_only_http = (
+        f"        @internal_only path {internal_paths}\n"
+        "        respond @internal_only 404\n"
+        if args.internal_agents_only else ""
+    )
     # Defer the replacement until the upstream response arrives, so a backend
     # HSTS header is replaced rather than duplicated into an invalid value.
     hsts = '' if args.mode == "internal" else '    header >Strict-Transport-Security "max-age=31536000"\n'
@@ -144,12 +158,20 @@ def render(args: argparse.Namespace) -> dict:
         "    skip_install_trust\n"
         f"    http_port {args.http_port}\n"
         f"    https_port {args.https_port}\n"
+        f"{default_sni}"
         "    servers {\n"
+        # The pinned upstream Caddy binary currently embeds Go/x/net HTTP/2
+        # versions affected by DoS advisories. Keep the public protocol surface
+        # to HTTP/1.1 until a patched binary is pinned and independently checked.
+        "        protocols h1\n"
         # IP HTTPS clients legitimately omit SNI. Fixed Host routes below still
         # reject unknown Hosts; domain endpoints additionally bind SNI to Host.
         f"        strict_sni_host {'insecure_off' if is_ip else 'on'}\n"
+        "        max_header_size 16KiB\n"
         "        timeouts {\n"
         "            read_header 15s\n"
+        "            read_body 60s\n"
+        "            read_body_idle 15s 1024\n"
         "            idle 2m\n"
         "        }\n"
         "    }\n"
@@ -158,6 +180,10 @@ def render(args: argparse.Namespace) -> dict:
         f"    bind {bind}\n"
         f"{tls}\n"
         f"{hsts}"
+        "    request_body {\n"
+        "        max_size 10MB\n"
+        "    }\n"
+        f"{internal_only}"
         # Caddy HeaderOps applies Set before Delete within one reverse_proxy
         # header_up operation. Strip client values in a separate handler so a
         # wildcard deletion cannot also erase the authoritative proxy values.
@@ -169,6 +195,13 @@ def render(args: argparse.Namespace) -> dict:
         "        header_up X-Forwarded-Host {hostport}\n"
         "        header_up Host {hostport}\n"
         "        flush_interval -1\n"
+        # Bound waiting for the first upstream response while allowing the
+        # existing 18-second SSH checks and database busy-timeout margin.
+        # This is not a total response deadline: log streams may continue.
+        "        transport http {\n"
+        "            dial_timeout 3s\n"
+        "            response_header_timeout 90s\n"
+        "        }\n"
         "    }\n"
         "}\n\n"
         f"https://:{args.https_port} {{\n"
@@ -180,6 +213,7 @@ def render(args: argparse.Namespace) -> dict:
         "    route {\n"
         f"        @unknown_host not host {host}\n"
         '        respond @unknown_host "Unknown host" 421\n'
+        f"{internal_only_http}"
         "        @plain_api path /api/v1 /api/v1/*\n"
         '        respond @plain_api "HTTPS required" 426\n'
         "        @unsafe_method not method GET HEAD\n"
@@ -240,6 +274,17 @@ def render(args: argparse.Namespace) -> dict:
         ),
         "acme_profile": "shortlived" if args.mode == "acme" and is_ip else None,
         "acme_staging": bool(args.acme_staging),
+        "default_sni": host if is_ip else None,
+        "internal_agents_only": bool(args.internal_agents_only),
+        "max_request_body_bytes": 10_000_000,
+        "max_header_bytes": 16_384,
+        "request_header_timeout_seconds": 15,
+        "request_body_timeout_seconds": 60,
+        "request_body_idle_timeout_seconds": 15,
+        "request_body_min_bytes_per_second": 1024,
+        "upstream_dial_timeout_seconds": 3,
+        "upstream_response_header_timeout_seconds": 90,
+        "http_protocols": ["h1"],
         "deployment_kind": "compose" if compose else "native",
         "controller_environment_is_patch": not compose, "systemd_service_applicable": not compose,
         "controller_and_proxy_started": False, "system_trust_modified": False,
@@ -272,6 +317,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--key-file")
     value.add_argument("--email")
     value.add_argument("--acme-staging", action="store_true", help="Explicitly use untrusted Let's Encrypt staging certificates")
+    value.add_argument("--internal-agents-only", action="store_true",
+                       help="Hide Agent protocol and API documentation on the public proxy; Agents use the internal SSH tunnel")
     value.add_argument("--config-dir", default="/etc/termitech-vla/https")
     value.add_argument("--state-dir", default="/var/lib/termitech-vla-caddy",
                        help="Hardened systemd state path (fixed at /var/lib/termitech-vla-caddy)")
