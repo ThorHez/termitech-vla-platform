@@ -590,3 +590,61 @@ def test_generated_onboarding_config_is_checked_by_the_real_agent(platform, tmp_
         finally:
             child.terminate()
             child.wait(timeout=10)
+
+
+def test_demo_bootstrap_identity_survives_machine_rename_and_real_cpu_agent_restart(platform, tmp_path, monkeypatch):
+    from vla_agent.state import State
+
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    dev_spec = importlib.util.spec_from_file_location("vla_dev_rename_fixture", ROOT / "scripts/dev.py")
+    dev = importlib.util.module_from_spec(dev_spec)
+    dev_spec.loader.exec_module(dev)
+    client, fixture, *_ = platform
+    config = {**fixture["config"], "name": "restart-bootstrap-agent", "state_dir": str(tmp_path / "state"),
+              "poll_interval_seconds": 0.2, "heartbeat_interval_seconds": 0.2,
+              "profiles": [fixture["config"]["profiles"][0]]}
+    config_file = tmp_path / "agent.json"
+    config_file.write_text(json.dumps(config))
+    config_file.chmod(0o600)
+    state = State(config["state_dir"])
+    assert dev.registered_demo_node(client.get("/api/v1/nodes").json(), state) is None
+    child = None
+    with (tmp_path / "restart-agent.log").open("w") as log:
+        try:
+            def start_agent():
+                return subprocess.Popen([sys.executable, "-m", "vla_agent.main", "--config", str(config_file)],
+                                        cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+
+            def current_node():
+                # A matching old label must never substitute for this Agent's
+                # saved ID, including while registration is still pending.
+                nodes = [{"id": "unrelated-machine", "name": config["name"]},
+                         *client.get("/api/v1/nodes").json()]
+                return dev.registered_demo_node(nodes, state)
+
+            child = start_agent()
+            node = eventually(current_node, lambda value: value and value["status"] == "ONLINE")
+            node_id = node["id"]
+            assert state.credentials()["node_id"] == node_id
+            response = client.patch(f"/api/v1/nodes/{node_id}", json={"name": "已改名的 CPU 节点"})
+            assert response.status_code == 200, response.text
+            renamed = current_node()
+            assert renamed["id"] == node_id and renamed["name"] == "已改名的 CPU 节点"
+            child.terminate()
+            child.wait(timeout=10)
+            last_seen = current_node()["last_seen"]
+            machine_ids = {item["id"] for item in client.get("/api/v1/nodes").json()}
+            child = start_agent()
+            restarted = eventually(current_node, lambda value: value and value["last_seen"] > last_seen)
+            assert restarted["id"] == node_id and restarted["name"] == "已改名的 CPU 节点"
+            assert state.credentials()["node_id"] == node_id
+            assert {item["id"] for item in client.get("/api/v1/nodes").json()} == machine_ids
+            assert json.loads(config_file.read_text())["name"] == "restart-bootstrap-agent"
+        finally:
+            if child is not None and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()

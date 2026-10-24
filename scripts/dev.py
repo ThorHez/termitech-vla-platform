@@ -10,6 +10,8 @@ import time
 from urllib.error import URLError, HTTPError
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
+from vla_agent.state import State
+
 from bootstrap_demo import ROOT, prepare_demo
 
 
@@ -23,6 +25,14 @@ def request(url, csrf=None, body=None):
     data = None if body is None else json.dumps(body).encode()
     with browser.open(Request(url, data=data, headers=headers), timeout=5) as response:
         return json.load(response)
+
+
+def registered_demo_node(nodes, state):
+    """Find this Agent by its persisted identity; console labels are editable."""
+    credentials = state.credentials()
+    if credentials is None:
+        return None
+    return next((node for node in nodes if node["id"] == credentials["node_id"]), None)
 
 
 def main():
@@ -52,9 +62,10 @@ def main():
         authentication = request(api + "/api/v1/auth/login", body={
             "username": credentials["admin_username"], "password": credentials["admin_password"]})
         csrf = authentication["csrf_token"]
+        agent_state = State(fixture["config"]["state_dir"])
         for _ in range(100):
             nodes = request(api + "/api/v1/nodes", csrf)
-            node = next((n for n in nodes if n["name"] == fixture["config"]["name"]), None)
+            node = registered_demo_node(nodes, agent_state)
             if node:
                 break
             time.sleep(0.1)

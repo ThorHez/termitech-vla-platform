@@ -60,6 +60,7 @@ _allow("machines.manage", "POST", "/agent-configs", "/ssh-connections/test", "/s
        "/ssh-connections/{connection_id}/path-suggestions", "/ssh-connections/{connection_id}/test",
        "/nodes/{node_id}/disconnect", "/nodes/{node_id}/uninstall",
        "/remote-deployments", "/remote-deployments/{job_id}/retry")
+_allow("machines.manage", "PATCH", "/nodes/{node_id}")
 _allow("users.manage", "GET", "/users")
 _allow("users.manage", "POST", "/users", "/users/{user_id}/reset-password")
 _allow("users.manage", "PATCH", "/users/{user_id}")
@@ -67,12 +68,14 @@ _allow("audit.read", "GET", "/audit")
 
 # Reauthentication supplements role authorization and never replaces it.
 # Directory suggestions and ordinary training/asset writes do not grant
-# management access and are not sensitive account/machine mutations.
+# management access and are not sensitive account/machine mutations. Changing a
+# display label does not modify SSH credentials, Agent config or machine access.
 SENSITIVE_ROUTES = {
     (method, path) for (method, path), permission in PERMISSIONS.items()
     if method not in {"GET", "HEAD", "OPTIONS"} and (
         permission in {"users.manage", "recipes.writeback"}
-        or permission == "machines.manage" and not path.endswith("/path-suggestions"))
+        or permission == "machines.manage" and not path.endswith("/path-suggestions")
+        and (method, path) != ("PATCH", "/api/v1/nodes/{node_id}"))
 }
 
 

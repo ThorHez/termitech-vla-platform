@@ -242,6 +242,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             result["runs"] = [run_dict(session, r) for r in session.scalars(select(Run).where(Run.node_id == node_id).order_by(Run.created_at.desc()).limit(100))]
             return result
 
+    @app.patch("/api/v1/nodes/{node_id}", dependencies=admin)
+    def node_update(node_id: str, body: schemas.NodeUpdateInput):
+        with db.write() as session:
+            node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
+            if node is None:
+                raise APIError(404, "NOT_FOUND", "Node not found")
+            node.display_name = body.name
+            session.flush()
+            return node_dict(session, node)
+
     @app.get("/api/v1/profiles", dependencies=admin)
     def profiles(node_id: str | None = None):
         with db.read() as session:
@@ -471,7 +481,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             result = []
             for node in session.scalars(select(Node).where(Node.status.in_(["OFFLINE", "RECOVERING"]))):
                 result.append({"id": "node:" + node.id, "severity": "error", "code": "NODE_" + node.status,
-                               "node_id": node.id, "run_id": None, "message": f"{node.name}: {node.status}", "timestamp": node.last_seen})
+                               "node_id": node.id, "run_id": None, "message": f"{node.effective_name}: {node.status}", "timestamp": node.last_seen})
             for run in session.scalars(select(Run).where(Run.state.in_(["FAILED", "UNKNOWN"])).order_by(Run.updated_at.desc()).limit(100)):
                 error = run.error or {"code": "EXECUTION_UNKNOWN", "message": "Awaiting agent reconciliation; GPU reservation is retained"}
                 result.append({"id": "run:" + run.id, "severity": "error", "code": error.get("code", "TRAINING_FAILED"),

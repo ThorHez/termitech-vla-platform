@@ -56,6 +56,22 @@ class RegisterInput(InputModel):
     profiles: list[ProfileInput] = Field(default_factory=list, max_length=100)
 
 
+class NodeUpdateInput(InputModel):
+    name: str = Field(min_length=1, max_length=200, strict=True)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def trim_name(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("name")
+    @classmethod
+    def reject_control_characters(cls, value):
+        if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise ValueError("机器名称不能包含控制字符")
+        return value
+
+
 class GPUInput(InputModel):
     uuid: str = Field(min_length=1, max_length=200)
     name: str | None = None

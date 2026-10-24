@@ -13,6 +13,8 @@ class Node(Base):
     registration_key: Mapped[str | None] = mapped_column(String(64), unique=True)
     registration_digest: Mapped[str | None] = mapped_column(String(64))
     name: Mapped[str] = mapped_column(String(200))
+    # Human label is separate from the Agent's reported/configured identity.
+    display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     hostname: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="REGISTERED")
     last_seen: Mapped[str] = mapped_column(String(40))
@@ -21,6 +23,10 @@ class Node(Base):
     output_root: Mapped[str] = mapped_column(Text)
     gpus: Mapped[list] = mapped_column(JSON, default=list)
     metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+
+    @property
+    def effective_name(self) -> str:
+        return self.display_name if self.display_name is not None else self.name
 
 
 class Profile(Base):

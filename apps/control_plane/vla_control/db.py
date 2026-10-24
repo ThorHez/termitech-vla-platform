@@ -55,6 +55,12 @@ class Database:
                 connection.exec_driver_sql(f"ALTER TABLE user_sessions ADD COLUMN {column} VARCHAR(40)")
             if missing:
                 connection.exec_driver_sql("DELETE FROM user_sessions")
+            # Keep custom labels independent of Agent registration and upgrade
+            # fields. The same guard serializes this additive migration without
+            # revoking current sessions or changing historical business rows.
+            node_columns = {column["name"] for column in inspect(connection).get_columns("nodes")}
+            if "display_name" not in node_columns:
+                connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN display_name VARCHAR(200)")
 
     @contextmanager
     def read(self):

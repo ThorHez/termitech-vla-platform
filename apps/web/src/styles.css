@@ -530,6 +530,10 @@ input[type='checkbox'] {
   gap: 25px;
   margin-bottom: 27px;
 }
+.page-heading > div:first-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .eyebrow {
   font-size: 9px;
   font-weight: 650;
@@ -1236,6 +1240,8 @@ tbody tr:hover {
 .machine-card-management {
   display: flex;
   justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 18px;
   padding: 10px 18px;
   border-top: 1px solid #edf2f5;
   background: #fcfefe;
@@ -1359,6 +1365,10 @@ tbody tr:hover {
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
+}
+.machine-header > div:nth-child(2) {
+  min-width: 0;
 }
 .machine-header h2 {
   font-size: 12px;
@@ -1369,9 +1379,11 @@ tbody tr:hover {
   font-size: 9px;
   color: #9aacb7;
   margin-top: 6px;
+  overflow-wrap: anywhere;
 }
 .machine-header > .badge {
   margin-left: auto;
+  flex-shrink: 0;
 }
 .machine-gpu {
   display: flex;
@@ -4107,6 +4119,7 @@ tbody tr:hover {
     margin-bottom: 23px;
     gap: 12px;
     align-items: flex-start;
+    flex-wrap: wrap;
   }
   .page-heading h1 {
     font-size: 22px;
@@ -4124,6 +4137,7 @@ tbody tr:hover {
     margin-top: 11px;
     flex-wrap: wrap;
     justify-content: flex-end;
+    max-width: 100%;
   }
   .heading-actions > .button {
     font-size: 10px;

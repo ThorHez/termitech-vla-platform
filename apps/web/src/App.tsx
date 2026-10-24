@@ -235,6 +235,7 @@ function Shell() {
               <NodesPage />
             ) : path.startsWith('/nodes/') ? (
               <NodePage
+                key={path}
                 id={decodeURIComponent(path.slice('/nodes/'.length))}
                 createRun={createRun}
               />

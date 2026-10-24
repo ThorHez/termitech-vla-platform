@@ -5,7 +5,7 @@ from .models import Allocation, Asset, Attempt
 
 def node_dict(session, node):
     reserved = {item.gpu_uuid: item.attempt_id for item in session.scalars(select(Allocation).where(Allocation.node_id == node.id))}
-    return {"id": node.id, "name": node.name, "hostname": node.hostname, "status": node.status,
+    return {"id": node.id, "name": node.effective_name, "hostname": node.hostname, "status": node.status,
             "last_seen": node.last_seen, "roots": node.roots, "output_root": node.output_root,
             "gpus": [{**gpu, "reserved_by": reserved.get(gpu["uuid"])} for gpu in node.gpus],
             "metrics": node.metrics, "created_at": node.created_at}

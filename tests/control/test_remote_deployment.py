@@ -263,6 +263,29 @@ def test_direct_install_requires_matching_fresh_agent_and_runtime_ready(remote, 
         assert node.output_root == "/data2/vla-agent/outputs"
 
 
+def test_agent_upgrade_confirmation_preserves_console_label_and_historical_agent_config(remote):
+    platform, manager = remote
+    tested = connection(platform).json()
+    job = create(platform, payload(tested["connection_id"])).json()
+    FakeRemote.installer = lambda config: agent_online(platform, config)
+    manager._execute(job["id"])
+    completed = manager.get(job["id"])
+    assert completed["state"] == "SUCCEEDED"
+    node_id = completed["node_id"]
+    historical_agent = completed["agent"]
+    response = platform.client.patch(f"/api/v1/nodes/{node_id}", headers=ADMIN, json={"name": "一号训练服务器"})
+    assert response.status_code == 200, response.text
+    # Reconnection/upgrade writes Agent fields after authenticated fresh proof.
+    # It must leave the independently stored human label untouched.
+    assert manager._confirm_agent(job["id"])
+    detail = platform.client.get(f"/api/v1/nodes/{node_id}", headers=ADMIN).json()
+    assert detail["name"] == "一号训练服务器" and detail["hostname"] == "gpu-host"
+    assert manager.get(job["id"])["agent"] == historical_agent
+    with platform.app.state.db.read() as session:
+        node = session.get(Node, node_id)
+        assert node.name == "remote-test" and node.display_name == "一号训练服务器"
+
+
 @pytest.mark.parametrize("stale,wrong", [(True, False), (False, True)])
 def test_old_heartbeat_or_wrong_onboarding_cannot_claim_success(remote, stale, wrong):
     platform, manager = remote

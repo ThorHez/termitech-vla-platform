@@ -17,6 +17,7 @@ import {
   Layers3,
   LoaderCircle,
   Network,
+  Pencil,
   Plus,
   Search,
   Server,
@@ -45,6 +46,7 @@ import { activeStates, assetKinds, gpuAverage, gpuIdle, requiredInputs, useData 
 import type { Asset, Gpu, Node, NodeDetail, Run } from './types';
 import { NodeOnboarding, RuntimeCheckView, runtimeCheckFor } from './NodeOnboarding';
 import { NodeManagement } from './NodeManagement';
+import { NodeRename } from './NodeRename';
 import { PathAutocomplete } from './PathAutocomplete';
 
 export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boolean }) {
@@ -417,6 +419,7 @@ export function NodesPage() {
   const [query, setQuery] = useState('');
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [managing, setManaging] = useState<Node>();
+  const [renaming, setRenaming] = useState<Node>();
   const filtered =
     nodes.data?.filter((node) =>
       `${node.name} ${node.hostname}`.toLowerCase().includes(query.toLowerCase()),
@@ -513,6 +516,10 @@ export function NodesPage() {
               </a>
               {can('machines.manage') && (
                 <div className="machine-card-management">
+                  <button className="text-link" onClick={() => setRenaming(node)}>
+                    <Pencil size={13} />
+                    重命名
+                  </button>
                   <button className="text-link" onClick={() => setManaging(node)}>
                     <Settings2 size={13} />
                     管理连接
@@ -561,6 +568,9 @@ export function NodesPage() {
           }}
         />
       )}
+      {can('machines.manage') && renaming && (
+        <NodeRename node={renaming} close={() => setRenaming(undefined)} />
+      )}
     </>
   );
 }
@@ -571,6 +581,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
   const details = useApi<NodeDetail | { node: Node; assets: Asset[] }>(`/nodes/${id}`);
   const [showManagement, setShowManagement] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [showRename, setShowRename] = useState(false);
   const raw = details.data;
   const node =
     (raw && 'node' in raw ? raw.node : (raw as NodeDetail | undefined)) ||
@@ -591,14 +602,24 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
         actions={
           <>
             {can('machines.manage') && (
-              <button
-                className="button outline"
-                disabled={!node}
-                onClick={() => setShowManagement(true)}
-              >
-                <Settings2 size={16} />
-                管理连接
-              </button>
+              <>
+                <button
+                  className="button outline"
+                  disabled={!node}
+                  onClick={() => setShowRename(true)}
+                >
+                  <Pencil size={16} />
+                  重命名
+                </button>
+                <button
+                  className="button outline"
+                  disabled={!node}
+                  onClick={() => setShowManagement(true)}
+                >
+                  <Settings2 size={16} />
+                  管理连接
+                </button>
+              </>
             )}
             {can('training.write') && (
               <button
@@ -828,6 +849,9 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
       )}
       {can('machines.manage') && showOnboarding && (
         <NodeOnboarding close={() => setShowOnboarding(false)} />
+      )}
+      {can('machines.manage') && showRename && node && (
+        <NodeRename node={node} close={() => setShowRename(false)} changed={details.refresh} />
       )}
     </>
   );
