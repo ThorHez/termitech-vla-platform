@@ -32,6 +32,13 @@ from .state import State, TERMINAL_STATES, utc_now
 
 
 LOG = logging.getLogger("vla_agent")
+CAPABILITIES = ["PATH_SUGGEST", "RECIPE_SUGGEST", "RECIPE_DETAIL", "DATA_PROCESSORS", "DATASET_INSPECT",
+                "RECIPE_WRITE", "PROFILE_REBIND", "STORAGE_CONFIGURE", "PREFLIGHT", "START", "CANCEL",
+                "POLICY_DEPLOY_START", "POLICY_DEPLOY_STATUS", "POLICY_DEPLOY_STOP", "POLICY_DEPLOY_TEST",
+                "POLICY_DEPLOY_PORTABLE_V1", "POLICY_DEPLOY_SHARED_GPU_V1", "POLICY_CHECKPOINT_SOURCE_WARNING_V1",
+                "POLICY_CHECKPOINT_INFERENCE_CONTENTS_V1",
+                "POLICY_DEPLOY_RESTART_V1", "POLICY_DEPLOY_BACKEND_V1",
+                "POLICY_EXPORT", "POLICY_EXPORT_STATUS", "POLICY_EXPORT_CANCEL"]
 
 
 def _execute_preflight_command(config: dict, command: dict):
@@ -74,12 +81,21 @@ def _execute_preflight_command(config: dict, command: dict):
         if state.command(command["id"]):
             return
         try:
-            if command["type"] == "RECIPE_WRITE":
+            if command["type"] == "POLICY_EXPORT":
+                from .policy_export import execute_export_command
+                result = execute_export_command(config, command["type"], command["payload"])
+            elif command["type"] == "POLICY_DEPLOY_START":
+                from .policy_deployment import execute_policy_command
+                result = execute_policy_command(config, command["type"], command["payload"])
+            elif command["type"] == "RECIPE_WRITE":
                 from .recipe_writeback import write_recipe
                 result = write_recipe(config, command["payload"], state)
             elif command["type"] == "DATA_PROCESSORS":
                 from .data_processors import data_processors
                 result = data_processors(config, command["payload"])
+            elif command["type"] == "DATASET_INSPECT":
+                from .dataset_inspection import inspect_dataset
+                result = inspect_dataset(config, command["payload"])
             else:
                 result = run_preflight(config, command["payload"])
             status = "REJECTED" if result.get("error") else "APPLIED"
@@ -89,7 +105,7 @@ def _execute_preflight_command(config: dict, command: dict):
                 LOG.warning("Recipe commit %s needs recovery; leaving its command unacknowledged", command["id"])
                 return
             result = {"error": exc.as_dict() if isinstance(exc, AgentError) else {
-                "code": "RECIPE_WRITE_FAILED" if command["type"] == "RECIPE_WRITE" else "PREFLIGHT_FAILED", "message": str(exc)}}
+                "code": "RECIPE_WRITE_FAILED" if command["type"] == "RECIPE_WRITE" else "DATASET_INSPECT_FAILED" if command["type"] == "DATASET_INSPECT" else "PREFLIGHT_FAILED", "message": str(exc)}}
             status = "REJECTED"
         state.save_command(command["id"], status, result)
 
@@ -130,7 +146,8 @@ class Agent:
         self.runners: dict[str, subprocess.Popen] = {}
         self.last_profile_sync = None
         self.runtime_monitor = RuntimeMonitor(config["roots"])
-        self.artifact_monitor = ArtifactMonitor(self.state, config["output_root"])
+        self.artifact_monitor = ArtifactMonitor(self.state, config["output_root"],
+                                                output_roots=config.get("_output_root_history", []))
         self._preflight_worker = None
         self._preflight_command_id: str | None = None
         self._closed = False
@@ -143,6 +160,7 @@ class Agent:
             instance_path.write_text(str(uuid.uuid4()))
             instance_path.chmod(0o600)
         registration = {key: self.config[key] for key in ("name", "roots", "output_root", "profiles")}
+        registration["cache_root"] = self.config.get("cache_root")
         registration["hostname"] = socket.gethostname()
         credentials = self.client.request("POST", "/agent/v1/register", self.config.get("enrollment_token", ""),
                                           registration, headers={"Idempotency-Key": instance_path.read_text().strip()})
@@ -171,25 +189,49 @@ class Agent:
             elif command["type"] == "DATA_PROCESSORS":
                 from .data_processors import data_processors
                 result, status = data_processors(self.config, payload), "APPLIED"
+            elif command["type"] == "DATASET_INSPECT":
+                from .dataset_inspection import inspect_dataset
+                result, status = inspect_dataset(self.config, payload), "APPLIED"
             elif command["type"] == "RECIPE_WRITE":
                 from .recipe_writeback import write_recipe
                 result, status = write_recipe(self.config, payload, self.state), "APPLIED"
+            elif command["type"] == "PROFILE_REBIND":
+                from .profile_rebinding import rebind_profile
+                result, status = rebind_profile(self.config, self.state, payload, operation_id=command["id"]), "APPLIED"
+            elif command["type"] == "STORAGE_CONFIGURE":
+                from .storage_configuration import StorageConfigurationError, configure_storage
+                if self._preflight_worker is not None and self._preflight_worker.is_alive():
+                    raise StorageConfigurationError("STORAGE_CONFIGURE_BUSY", "机器仍有后台预检或代码操作，请等待完成")
+                result = configure_storage(self.config, self.state, payload, operation_id=command["id"])
+                self.artifact_monitor.set_output_roots(self.config["output_root"], self.config.get("_output_root_history", []))
+                status = "APPLIED"
             elif command["type"] == "PREFLIGHT":
                 result = run_preflight(self.config, payload)
                 status = "REJECTED" if result.get("error") else "APPLIED"
+            elif command["type"] in {"POLICY_DEPLOY_START", "POLICY_DEPLOY_STATUS", "POLICY_DEPLOY_STOP", "POLICY_DEPLOY_TEST"}:
+                from .policy_deployment import execute_policy_command
+                result = execute_policy_command(self.config, command["type"], payload)
+                status = "REJECTED" if result.get("error") else "APPLIED"
+            elif command["type"] in {"POLICY_EXPORT", "POLICY_EXPORT_STATUS", "POLICY_EXPORT_CANCEL"}:
+                from .policy_export import execute_export_command
+                result = execute_export_command(self.config, command["type"], payload)
+                status = "APPLIED" if command["type"] == "POLICY_EXPORT_CANCEL" and (result.get("error") or {}).get("code") == "POLICY_EXPORT_CANCELLED" else "REJECTED" if result.get("error") else "APPLIED"
             elif command["type"] == "START":
                 attempt_id = safe_identifier(payload["attempt_id"])
                 if not payload.get("execution_token"):
                     raise AgentError("INVALID_COMMAND", "START requires an execution token")
-                output = str(Path(self.config["output_root"]) / attempt_id)
-                profile = next((item for item in self.config["profiles"] if item["id"] == payload.get("profile_id")), None)
-                if profile is None:
-                    raise AgentError("PROFILE_UNAVAILABLE", "START requires a configured training environment")
+                from .profile_rebinding import profile_configuration_lock
                 from .recipe_writeback import checkout_lock
                 # Serialize the durable attempt registration with source writes.
-                # A writer then sees this STARTING attempt before it can edit.
-                with checkout_lock(self.config, profile["code_dir"], require_git=profile.get("adapter") == "openpi-sft"):
-                    created = self.state.create_attempt(payload, output)
+                # Bind lookup and registration together so a rebind cannot leave
+                # START holding a stale profile after its checkout lock releases.
+                with profile_configuration_lock(self.config, busy_code="RECIPE_WRITE_BUSY"):
+                    output = str(Path(self.config["output_root"]) / attempt_id)
+                    profile = next((item for item in self.config["profiles"] if item["id"] == payload.get("profile_id")), None)
+                    if profile is None:
+                        raise AgentError("PROFILE_UNAVAILABLE", "START requires a configured training environment")
+                    with checkout_lock(self.config, profile["code_dir"], require_git=profile.get("adapter") == "openpi-sft"):
+                        created = self.state.create_attempt(payload, output)
                 if created:
                     logs = Path(self.config["state_dir"]) / "runner-logs"
                     logs.mkdir(parents=True, exist_ok=True)
@@ -210,6 +252,10 @@ class Agent:
             else:
                 raise AgentError("COMMAND_UNSUPPORTED", f"Unknown command type: {command['type']}")
         except Exception as exc:
+            if command["type"] == "PROFILE_REBIND" and isinstance(exc, AgentError) and exc.code == "PROFILE_REBIND_RECOVERY_PENDING":
+                raise  # Recover its persisted config marker before acknowledging.
+            if command["type"] == "STORAGE_CONFIGURE" and isinstance(exc, AgentError) and exc.code == "STORAGE_CONFIGURE_RECOVERY_PENDING":
+                raise
             if command["type"] == "RECIPE_WRITE" and (isinstance(exc, OSError)
                     or isinstance(exc, AgentError) and exc.code == "RECIPE_WRITE_RECOVERY_PENDING"):
                 raise
@@ -225,7 +271,7 @@ class Agent:
         commands = self.api("GET", "/agent/v1/commands?" + urllib.parse.urlencode({"node_id": self.credentials["node_id"]}))
         for command in commands:
             acknowledgement = self.state.command(command["id"])
-            if acknowledgement is None and command["type"] in {"PREFLIGHT", "RECIPE_WRITE", "DATA_PROCESSORS"}:
+            if acknowledgement is None and command["type"] in {"PREFLIGHT", "RECIPE_WRITE", "DATA_PROCESSORS", "DATASET_INSPECT", "POLICY_DEPLOY_START", "POLICY_EXPORT"}:
                 if self._preflight_worker is None and not self._closed:
                     worker = multiprocessing.get_context("spawn").Process(
                         target=_execute_preflight_command, args=(self.config, command),
@@ -242,7 +288,9 @@ class Agent:
                     acknowledgement = self.handle_command(command)
                 except AgentError as exc:
                     if ((command["type"] == "START" and exc.code == "RECIPE_WRITE_BUSY")
-                            or command["type"] == "RECIPE_WRITE" and exc.code == "RECIPE_WRITE_RECOVERY_PENDING"):
+                            or command["type"] == "RECIPE_WRITE" and exc.code == "RECIPE_WRITE_RECOVERY_PENDING"
+                            or command["type"] == "PROFILE_REBIND" and exc.code == "PROFILE_REBIND_RECOVERY_PENDING"
+                            or command["type"] == "STORAGE_CONFIGURE" and exc.code == "STORAGE_CONFIGURE_RECOVERY_PENDING"):
                         continue
                     raise
             self.api("POST", f"/agent/v1/commands/{urllib.parse.quote(command['id'], safe='')}/ack",
@@ -324,7 +372,10 @@ class Agent:
                     process["ownership"] = "platform" if process["attempt_id"] else "external"
         metrics = {**system_metrics(self.config["output_root"]), "gpu_monitoring": availability,
                    "attempt_processes": process_samples, "sampled_at": utc_now(),
-                   "runtime_checks": self.runtime_monitor.snapshot(self.config["profiles"])}
+                   "runtime_checks": self.runtime_monitor.snapshot(self.config["profiles"]),
+                   "capabilities": CAPABILITIES,
+                   "storage_configuration": {"output_root": self.config["output_root"],
+                                             "cache_root": self.config.get("cache_root")}}
         response = self.api("POST", "/agent/v1/heartbeat", {"node_id": self.credentials["node_id"], "gpus": gpus,
                                                             "metrics": metrics, "active_attempts": active,
                                                             "profiles": self.config["profiles"]})

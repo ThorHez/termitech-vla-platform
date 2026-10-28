@@ -24,8 +24,8 @@ def test_user_deployment_does_not_require_shared_admin_token_and_defaults_privat
     environment = (output / 'control.env').read_text()
     assert 'VLA_HOST="127.0.0.1"' in environment
     assert 'VLA_SESSION_COOKIE_SECURE="true"' in environment
-    assert 'VLA_SESSION_TTL_SECONDS="7200"' in environment
-    assert 'VLA_SESSION_IDLE_SECONDS="900"' in environment
+    assert 'VLA_SESSION_TTL_SECONDS="28800"' in environment
+    assert 'VLA_SESSION_IDLE_SECONDS="3600"' in environment
     assert 'VLA_SESSION_REAUTH_SECONDS="300"' in environment
     assert 'VLA_LEGACY_ADMIN_ENABLED="false"' in environment
     assert 'isolated-enrollment-test' not in result.stdout

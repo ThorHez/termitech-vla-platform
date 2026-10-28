@@ -88,6 +88,14 @@ def test_operator_training_asset_recipe_requests_reach_validation(secured):
     for (method, path), permission in PERMISSIONS.items():
         if permission in {"training.write", "assets.write", "recipes.write"}:
             result = client.request(method, concrete(path), json={})
+            if (method, path) == ("GET", "/api/v1/training-draft"):
+                assert result.status_code == 200
+                assert result.json() == {"content": None, "revision": 0, "updated_at": None}
+                continue
+            if (method, path) == ("GET", "/api/v1/training-templates"):
+                assert result.status_code == 200
+                assert result.json() == []
+                continue
             assert result.status_code in {404, 409, 422}, (method, path, result.text)
 
 

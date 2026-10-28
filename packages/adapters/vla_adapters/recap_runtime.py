@@ -12,9 +12,11 @@ import time
 from pathlib import Path
 
 if __package__:
+    from .composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
     from .cache_contract import _managed_path
     from .recap import validate_training_stage
 else:
+    from composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
     from cache_contract import _managed_path
     from recap import validate_training_stage
 
@@ -22,6 +24,15 @@ else:
 def stage_request(spec):
     return validate_training_stage(spec.get("template_id", "openpi-sft"),
                                    spec.get("training_stage"), spec.get("stage_config"))
+
+
+def _factory_mapping(factory):
+    if type(factory).__name__ != COMPOSABLE_PROCESSOR:
+        return getattr(factory, "mapping", None)
+    spec = normalize_composition(factory.composition)
+    keys = [field["key"] for field in spec["state_fields"] + spec["cameras"]]
+    keys += [spec["action_key"], spec["prompt_key"], *spec["aux_keys"]]
+    return {key: key for key in keys}
 
 
 def apply_stage(config, spec):
@@ -34,8 +45,8 @@ def apply_stage(config, spec):
     if stage == "value":
         if model_type != "Pi0ValueConfig":
             raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数阶段必须使用 Pi0ValueConfig 配方")
-        if any(not isinstance(getattr(factory, "mapping", None), dict) or
-               "value_target" not in factory.mapping for factory in factories):
+        if any(not isinstance(_factory_mapping(factory), dict) or
+               "value_target" not in _factory_mapping(factory) for factory in factories):
             raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方必须保留 value_target")
         if any(not hasattr(config, key) for key in overrides):
             raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方缺少所选验证参数")
@@ -47,8 +58,8 @@ def apply_stage(config, spec):
         return config
     if model_type == "Pi0ValueConfig" or any(
             not hasattr(factory, "acp_dropout") or
-            not isinstance(getattr(factory, "mapping", None), dict) or
-            "is_positive" not in factory.mapping for factory in factories):
+            not isinstance(_factory_mapping(factory), dict) or
+            "is_positive" not in _factory_mapping(factory) for factory in factories):
         raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 离线强化学习阶段必须使用读取 is_positive 的 ACP 策略配方")
     if overrides:
         factories = [dataclasses.replace(factory, **overrides) for factory in factories]
@@ -205,9 +216,10 @@ def inspect_stage(config, spec, factories, datasets):
                 not isinstance(factory.acp_dropout, (int, float)) or not math.isfinite(factory.acp_dropout) or
                 not 0 <= factory.acp_dropout <= 1):
             raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 配方中的 ACP 条件 dropout 必须在 0 到 1 之间")
-        required = _mapping_columns(factory.mapping)
+        mapping = _factory_mapping(factory)
+        required = _mapping_columns(mapping)
         required_supervision = "value_target" if stage == "value" else "is_positive"
-        if factory.mapping.get(required_supervision) != required_supervision:
+        if mapping.get(required_supervision) != required_supervision:
             raise ValueError("RECAP_DATA_SCHEMA_UNSUPPORTED: 阶段监督字段必须保留标准列名")
         supervised = [key for key in ("value_target", "is_positive") if key in required]
         row = {"path": dataset["path"], "required_columns": required,

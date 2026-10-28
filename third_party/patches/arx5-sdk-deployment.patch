@@ -1,0 +1,1134 @@
+diff --git a/include/app/cartesian_controller.h b/include/app/cartesian_controller.h
+index 356ebf5b64d8a39e5b6bac1c3eb90422523ce844..fd420feb04f31dcc7730d528ae16b75116cf1271 100644
+--- a/include/app/cartesian_controller.h
++++ b/include/app/cartesian_controller.h
+@@ -28,6 +28,8 @@ class Arx5CartesianController : public Arx5ControllerBase
+     void set_eef_cmd(EEFState new_cmd);
+     void set_eef_traj(std::vector<EEFState> new_traj);
+     EEFState get_eef_cmd();
++    // 仅更新夹爪力矩前馈（init_fixed 当前关节），用于拖拽手捏，不扰动手臂轨迹
++    void set_gripper_torque(double gripper_torque);
+ 
+     std::tuple<int, Eigen::VectorXd> multi_trial_ik(Eigen::Matrix<double, 6, 1> target_pose_6d,
+                                                     Eigen::VectorXd current_joint_pos, int additional_trial_num = 5);
+diff --git a/python/arx5_pybind.cpp b/python/arx5_pybind.cpp
+index 7649afe246071ddabf815f55e43b779199aae028..7d57be95eece59e00f07df249034d9c3c02425c4 100644
+--- a/python/arx5_pybind.cpp
++++ b/python/arx5_pybind.cpp
+@@ -85,6 +85,7 @@ PYBIND11_MODULE(arx5_interface, m)
+         .def(py::init<RobotConfig, ControllerConfig, const std::string &>())
+         .def("set_eef_cmd", &Arx5CartesianController::set_eef_cmd)
+         .def("set_eef_traj", &Arx5CartesianController::set_eef_traj)
++        .def("set_gripper_torque", &Arx5CartesianController::set_gripper_torque)
+         .def("get_joint_cmd", &Arx5CartesianController::get_joint_cmd)
+         .def("get_eef_cmd", &Arx5CartesianController::get_eef_cmd)
+         .def("get_eef_state", &Arx5CartesianController::get_eef_state)
+diff --git a/python/communication/robot_latency_server.py b/python/communication/robot_latency_server.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffe19bac4739df490c4a95a347f10004bf44a695
+--- /dev/null
++++ b/python/communication/robot_latency_server.py
+@@ -0,0 +1,115 @@
++"""Opt-in timestamps for the existing ARX ZMQ state replies.
++
++This measures SDK cache age, not physical encoder sampling or CAN latency.
++Nothing here creates a controller, reads another state sample, or issues motion.
++"""
++
++import math
++from pathlib import Path
++import time
++import uuid
++
++
++PROTOCOL_VERSION = 1
++SOURCE_KIND = "SDK_cache_update"
++SDK_QUANTIZATION_NS = 1_000
++SCOPE = (
++    "SDK state-cache update to client receipt; excludes encoder sampling and "
++    "CAN/cache delay before the SDK timestamp. EEF and joint snapshots retain "
++    "their own timestamps. This is not command-to-motion latency."
++)
++
++
++def linux_clock_id():
++    """Only Linux boot identity establishes a shared monotonic clock domain."""
++    try:
++        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
++        return "linux:" + str(uuid.UUID(boot_id))
++    except (OSError, ValueError):
++        return "server:" + uuid.uuid4().hex
++
++
++class RobotLatencyServer:
++    def __init__(self, *, clock_ns=None, clock_id=None):
++        self.clock_ns = time.monotonic_ns if clock_ns is None else clock_ns
++        self.clock_id = linux_clock_id() if clock_id is None else clock_id
++        self.sdk_instance_id = None
++
++    def new_sdk_instance(self):
++        """Call once after each successful construction of the actual SDK."""
++        self.sdk_instance_id = uuid.uuid4().hex
++
++    def info(self):
++        return {
++            "protocol_version": PROTOCOL_VERSION,
++            "clock_id": self.clock_id,
++            "sdk_instance_id": self.sdk_instance_id,
++            "source_kind": SOURCE_KIND,
++            "scope": SCOPE,
++        }
++
++    def decorate_reply(
++        self, request, reply, controller, server_received_ns,
++        *, eef_state=None, joint_state=None,
++    ):
++        """Append timing to an existing reply, preserving its ordinary payload.
++
++        Missing/broken timing metadata never changes whether a command executes
++        or what state is returned. No SDK timing call occurs without opt-in.
++        Call immediately before send_pyobj; server_send_ns excludes serialization.
++        """
++        if (request.get("cmd") not in ("GET_STATE", "SET_EE_POSE")
++                or "_robot_latency" not in request):
++            return reply
++        probe = request["_robot_latency"]
++        request_id = probe.get("request_id") if isinstance(probe, dict) else None
++        timing = {
++            "version": PROTOCOL_VERSION,
++            "request_id": request_id if isinstance(request_id, str) else None,
++            "clock_id": self.clock_id,
++            "sdk_instance_id": self.sdk_instance_id,
++            "source_kind": SOURCE_KIND,
++            "server_received_ns": server_received_ns,
++        }
++        try:
++            if not isinstance(probe, dict):
++                raise ValueError("_robot_latency must be a dictionary")
++            if type(probe.get("version")) is not int or probe["version"] != PROTOCOL_VERSION:
++                raise ValueError("unsupported _robot_latency version")
++            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 256:
++                raise ValueError("request_id must contain 1 to 256 characters")
++            if self.sdk_instance_id is None:
++                raise ValueError("no identified SDK controller instance")
++            if eef_state is None or joint_state is None:
++                raise ValueError("ordinary reply has no state snapshots")
++            eef_s = float(eef_state.timestamp)
++            joint_s = float(joint_state.timestamp)
++            if not all(math.isfinite(value) and value > 0 for value in (eef_s, joint_s)):
++                raise ValueError("uninitialized or invalid SDK state timestamp")
++
++            # Both returned snapshots were already read. Bracket a clock query
++            # per request; neither a common SDK epoch nor long-term drift is assumed.
++            before_ns = self.clock_ns()
++            sdk_s = float(controller.get_timestamp())
++            after_ns = self.clock_ns()
++            if not math.isfinite(sdk_s) or sdk_s < 0 or after_ns < before_ns:
++                raise ValueError("invalid SDK clock sample")
++            if max(eef_s, joint_s) > sdk_s + 1e-6:
++                raise ValueError("state timestamp is newer than the SDK clock sample")
++            sdk_ns = round(sdk_s * 1_000_000_000)
++            offset_mid_ns = (before_ns + after_ns) // 2 - sdk_ns
++            # Conservatively allow 1us for each of the reference timestamp and
++            # a state timestamp, plus the full host call-bracket uncertainty.
++            uncertainty_ns = (after_ns - before_ns + 1) // 2 + 2 * SDK_QUANTIZATION_NS
++            timing.update({
++                "eef_source_ns": offset_mid_ns + round(eef_s * 1_000_000_000),
++                "joint_source_ns": offset_mid_ns + round(joint_s * 1_000_000_000),
++                "clock_uncertainty_ns": uncertainty_ns,
++                "eef_sdk_timestamp_s": eef_s,
++                "joint_sdk_timestamp_s": joint_s,
++            })
++        except Exception as error:
++            timing["error"] = f"{type(error).__name__}: {error}"
++        reply["robot_latency"] = timing
++        timing["server_send_ns"] = self.clock_ns()
++        return reply
+diff --git a/python/communication/zmq_server.py b/python/communication/zmq_server.py
+index 7ba69d239fcca1949e42b7392b7d34189ef3d3d8..eec6a3c10ae7ba21a7049b5119a67b6c2e6a3b12 100644
+--- a/python/communication/zmq_server.py
++++ b/python/communication/zmq_server.py
+@@ -1,18 +1,62 @@
++'''
++# Bring up CAN first (once per boot / after plug):
++sudo slcand -o -f -s8 /dev/arxcan0 can0 && sudo ifconfig can0 up
++sudo slcand -o -f -s8 /dev/arxcan1 can1 && sudo ifconfig can1 up
++
++conda activate arx-py310
++# Single arm:
++python python/communication/zmq_server.py X5 can0
++# Two arms (separate terminals, different ports).
++# For data collection: disable blocking idle reset_to_home (default idle is 60s
++# and reset_to_home in the ZMQ thread makes GET_STATE hang until reboot-feeling).
++conda activate arx-py310
++python python/communication/zmq_server.py X5_umi can0 --port 8765 
++
++conda activate arx-py310
++python python/communication/zmq_server.py X5_umi can1 --port 8766 
++
++# Kai0 joint control — start in joint mode; disable idle drop (avoids spdlog recreate bug):
++conda activate arx-py310
++python python/communication/zmq_server.py X5_umi can0 --port 8765 --joint --no-idle-reset-home --no_cmd_timeout 0
++
++conda activate arx-py310
++python python/communication/zmq_server.py X5_umi can1 --port 8766 --joint --no-idle-reset-home --no_cmd_timeout 0
++
++
++
++# UMI / lingbot keep default cartesian (omit --joint).
++
++'''
+ import sys
+ import os
++import gc
+ import numpy as np
+ 
+ ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
+ sys.path.append(ROOT_DIR)
+ os.chdir(ROOT_DIR)
+ import time
+-from typing import Any, cast
++from typing import Any, Optional, Union, cast
+ 
+ import arx5_interface as arx5
++import numpy.typing as npt
+ import zmq
+ import click
+ import sys
+ import traceback
++import importlib.util
++
++# The standalone helper is installed beside this file; launch arguments stay unchanged.
++_LATENCY_HELPER_PATH = os.environ.get(
++    "ARX_ROBOT_LATENCY_HELPER",
++    os.path.join(os.path.dirname(os.path.abspath(__file__)), "robot_latency_server.py"),
++)
++_latency_spec = importlib.util.spec_from_file_location("arx_robot_latency_server", _LATENCY_HELPER_PATH)
++if _latency_spec is None or _latency_spec.loader is None:
++    raise ImportError(f"Cannot load robot latency helper: {_LATENCY_HELPER_PATH}")
++_latency_module = importlib.util.module_from_spec(_latency_spec)
++_latency_spec.loader.exec_module(_latency_module)
++RobotLatencyServer = _latency_module.RobotLatencyServer
+ 
+ 
+ def echo_exception():
+@@ -32,90 +76,435 @@ class Arx5Server:
+         model: str,
+         interface: str,
+         no_cmd_timeout: float = 60.0,
++        idle_reset_home: bool = True,
++        control_mode: str = "cartesian",
+     ):
++        if control_mode not in ("cartesian", "joint"):
++            raise ValueError(f"control_mode must be cartesian|joint, got {control_mode}")
++        self.robot_latency = RobotLatencyServer()
+         self.model = model
+         self.interface = interface
+-        self.arx5_cartesian_controller = arx5.Arx5CartesianController(model, interface)
+-        print(f"Arx5Server is initialized with {model} on {interface}")
++        # Prefer starting in the mode you need. Hot-swap works poorly because the
++        # SDK spdlog logger name "{model}_{interface}" survives until the C++
++        # destructor finishes (RuntimeError: logger ... already exists).
++        self.control_mode = control_mode
++        self.startup_mode = control_mode
++        self.arx5_cartesian_controller: Optional[arx5.Arx5CartesianController] = None
++        self.arx5_joint_controller: Optional[arx5.Arx5JointController] = None
++        if control_mode == "joint":
++            self.arx5_joint_controller = self._create_joint_controller()
++        else:
++            self.arx5_cartesian_controller = self._create_cartesian_controller()
++        print(
++            f"Arx5Server is initialized with {model} on {interface} "
++            f"mode={control_mode}"
++        )
+         self.context = zmq.Context()
+-        self.socket = self.context.socket(zmq.REP)
+-        self.socket.bind(f"tcp://{zmq_ip}:{zmq_port}")
+-        self.poller = zmq.Poller()
+-        self.poller.register(self.socket, zmq.POLLIN)
+-
+         self.zmq_ip = zmq_ip
+         self.zmq_port = zmq_port
++        self.poller = zmq.Poller()
++        self.socket: zmq.Socket
++        self._bind_rep_socket()
+         self.last_cmd_time = time.monotonic()
+-        self.no_cmd_timeout = no_cmd_timeout
++        # <=0: never idle-timeout. Otherwise seconds without ZMQ cmds.
++        self.no_cmd_timeout = float(no_cmd_timeout)
++        # If True, idle timeout calls reset_to_home() in the ZMQ thread (can
++        # block the REP socket for a long time → clients hang on GET_STATE).
++        # For data collection, prefer --no-idle-reset-home.
++        self.idle_reset_home = bool(idle_reset_home)
++        self.is_reset_to_home = False
++        self.last_eef_cmd: Optional[npt.NDArray[np.float64]] = None
++        print(
++            f"Arx5Server idle: timeout={self.no_cmd_timeout}s "
++            f"reset_home={self.idle_reset_home}"
++        )
++
++    def _robot_config(self):
++        robot_config = arx5.RobotConfigFactory.get_instance().get_config(self.model)
++        # From calibrate_gripper(): fully-open motor readout (this arm is not reversed)
++        robot_config.gripper_open_readout = 5.15507
++        # Default 1.5Nm trips easily when opening against end-stop with imperfect calibration
++        robot_config.gripper_torque_max = 2.5
++        return robot_config
++
++    def _create_cartesian_controller(self) -> arx5.Arx5CartesianController:
++        robot_config = self._robot_config()
++        controller_config = arx5.ControllerConfigFactory.get_instance().get_config(
++            "cartesian_controller", robot_config.joint_dof
++        )
++        controller_config.default_gripper_kp = 2.0
++        controller = arx5.Arx5CartesianController(
++            robot_config, controller_config, self.interface
++        )
++        self.robot_latency.new_sdk_instance()
++        return controller
++
++    def _create_joint_controller(self) -> arx5.Arx5JointController:
++        robot_config = self._robot_config()
++        controller_config = arx5.ControllerConfigFactory.get_instance().get_config(
++            "joint_controller", robot_config.joint_dof
++        )
++        controller_config.default_gripper_kp = 2.0
++        controller_config.background_send_recv = True
++        controller = arx5.Arx5JointController(
++            robot_config, controller_config, self.interface
++        )
++        self.robot_latency.new_sdk_instance()
++        return controller
++
++    def _create_controller(self) -> arx5.Arx5CartesianController:
++        """Back-compat alias used by idle recreate paths."""
++        return self._create_cartesian_controller()
++
++    def _bind_rep_socket(self) -> None:
++        """Create/bind a fresh REP socket (also used to recover from REQ/REP desync)."""
++        sock = self.context.socket(zmq.REP)
++        # Drop queued peer state quickly on close/rebind.
++        sock.setsockopt(zmq.LINGER, 0)
++        sock.bind(f"tcp://{self.zmq_ip}:{self.zmq_port}")
++        self.socket = sock
++        self.poller = zmq.Poller()
++        self.poller.register(self.socket, zmq.POLLIN)
++
++    def _reset_rep_socket(self, reason: str) -> None:
++        """REP must send after every recv; if that fails, the socket stays wedged."""
++        print(f"[Arx5Server] Resetting REP socket on :{self.zmq_port}: {reason}")
++        try:
++            self.poller.unregister(self.socket)
++        except Exception:
++            pass
++        try:
++            self.socket.close(linger=0)
++        except Exception:
++            pass
++        # Brief pause so TIME_WAIT / bind conflicts clear.
++        time.sleep(0.05)
++        self._bind_rep_socket()
++
++    def _send_reply(self, reply_msg: dict[str, Any]) -> bool:
++        """Send REP reply. On failure, reset socket so the server is not wedged."""
++        try:
++            self.socket.send_pyobj(reply_msg)
++            return True
++        except Exception as send_exc:
++            print(f"[Arx5Server] send_pyobj failed: {send_exc}")
++            self._reset_rep_socket("send_pyobj failed after recv")
++            return False
++
++    def _active_controller(
++        self,
++    ) -> Union[arx5.Arx5CartesianController, arx5.Arx5JointController]:
++        if self.control_mode == "joint":
++            assert self.arx5_joint_controller is not None
++            return self.arx5_joint_controller
++        assert self.arx5_cartesian_controller is not None
++        return self.arx5_cartesian_controller
++
++    def _any_controller_alive(self) -> bool:
++        return (
++            self.arx5_cartesian_controller is not None
++            or self.arx5_joint_controller is not None
++        )
++
++    def _destroy_controller(self, attr: str) -> None:
++        ctrl = getattr(self, attr, None)
++        if ctrl is None:
++            return
++        try:
++            ctrl.set_to_damping()
++        except Exception:
++            pass
++        setattr(self, attr, None)
++        del ctrl
++        gc.collect()
++        # Wait for C++ background thread join + spdlog::drop(logger name).
++        time.sleep(0.4)
++
++    def _drop_controllers(self) -> None:
++        self._destroy_controller("arx5_cartesian_controller")
++        self._destroy_controller("arx5_joint_controller")
++        self.control_mode = self.startup_mode
++        self.last_eef_cmd = None
++
++    def _ensure_cartesian_mode(self) -> arx5.Arx5CartesianController:
++        if (
++            self.control_mode == "cartesian"
++            and self.arx5_cartesian_controller is not None
++        ):
++            return self.arx5_cartesian_controller
++        if self.startup_mode == "joint":
++            raise RuntimeError(
++                "Server started with --joint; SET_EE_POSE needs a cartesian "
++                "server. Restart without --joint, or keep Kai0 on --joint."
++            )
++        print("[Arx5Server] Switching to cartesian controller (releases joint CAN)")
++        self._destroy_controller("arx5_joint_controller")
++        try:
++            self.arx5_cartesian_controller = self._create_cartesian_controller()
++        except RuntimeError as exc:
++            if "already exists" in str(exc):
++                raise RuntimeError(
++                    "spdlog logger still held after joint teardown. "
++                    "Restart zmq_server without hot-swap "
++                    "(use default cartesian, or --joint for Kai0)."
++                ) from exc
++            raise
++        self.control_mode = "cartesian"
++        self.last_eef_cmd = None
+         self.is_reset_to_home = False
+-        self.last_eef_cmd: npt.NDArray[np.float64] | None = None
++        return self.arx5_cartesian_controller
++
++    def _ensure_joint_mode(self) -> arx5.Arx5JointController:
++        if self.control_mode == "joint" and self.arx5_joint_controller is not None:
++            return self.arx5_joint_controller
++        # One-way hot-swap cartesian → joint (Kai0 after Cartesian init).
++        print("[Arx5Server] Switching to joint controller (releases cartesian CAN)")
++        self._destroy_controller("arx5_cartesian_controller")
++        try:
++            self.arx5_joint_controller = self._create_joint_controller()
++        except RuntimeError as exc:
++            if "already exists" in str(exc):
++                raise RuntimeError(
++                    "spdlog logger still held after cartesian teardown. "
++                    "Restart zmq_server (prefer start cartesian, let Kai0 eval "
++                    "switch once; or start with --joint and skip Cartesian init)."
++                ) from exc
++            raise
++        self.control_mode = "joint"
++        self.last_eef_cmd = None
++        self.is_reset_to_home = False
++        return self.arx5_joint_controller
++
++    def _state_dict(self, controller) -> dict:
++        eef_state = controller.get_eef_state()
++        low_state = controller.get_joint_state()
++        return {
++            "timestamp": eef_state.timestamp,
++            "ee_pose": eef_state.pose_6d().copy(),
++            "joint_pos": low_state.pos().copy(),
++            "joint_vel": low_state.vel().copy(),
++            "joint_torque": low_state.torque().copy(),
++            "gripper_pos": low_state.gripper_pos,
++            "gripper_vel": low_state.gripper_vel,
++            "gripper_torque": low_state.gripper_torque,
++        }
++
+     def run(self):
+         print(f"Arx5ZmqServer is running on {self.zmq_ip}:{self.zmq_port}")
++        # Short poll so idle handling cannot starve ZMQ forever; idle is
++        # tracked with last_cmd_time instead of using poll() as the timer.
++        poll_ms = 200
+         while True:
+             try:
+-                socks = dict(self.poller.poll(int(self.no_cmd_timeout * 1000)))
+-                if self.socket in socks and socks[self.socket] == zmq.POLLIN:
++                socks = dict(self.poller.poll(poll_ms))
++                events = int(socks.get(self.socket, 0))
++                if events & zmq.POLLIN:
+                     msg: dict[str, Any] = self.socket.recv_pyobj()
+-                    if self.arx5_cartesian_controller is None:
+-                        print(f"Reestablishing high level controller")
+-                        self.arx5_cartesian_controller = arx5.Arx5CartesianController(
+-                            self.model, self.interface
++                    self.last_cmd_time = time.monotonic()
++                    server_received_ns = time.monotonic_ns()
++                    # A protocol capability query must never recreate hardware.
++                    latency_info_only = isinstance(msg, dict) and msg.get("cmd") == "GET_LATENCY_INFO"
++                    latency_state_only = (
++                        isinstance(msg, dict) and msg.get("cmd") == "GET_STATE"
++                        and "_robot_latency" in msg
++                    )
++                    if (not self._any_controller_alive()) and latency_state_only:
++                        self._send_reply({
++                            "cmd": "GET_STATE",
++                            "data": "ERROR: Robot controller is inactive; read-only latency queries do not initialize hardware",
++                        })
++                        continue
++                    if (not self._any_controller_alive()) and not latency_info_only:
++                        print(
++                            f"Reestablishing high level controller "
++                            f"(mode={self.startup_mode})"
+                         )
++                        # Ensure previous C++ logger was dropped before recreate.
++                        gc.collect()
++                        time.sleep(0.4)
++                        try:
++                            if self.startup_mode == "joint":
++                                self.arx5_joint_controller = (
++                                    self._create_joint_controller()
++                                )
++                                self.control_mode = "joint"
++                            else:
++                                self.arx5_cartesian_controller = (
++                                    self._create_cartesian_controller()
++                                )
++                                self.control_mode = "cartesian"
++                        except RuntimeError as exc:
++                            if "already exists" in str(exc):
++                                err = (
++                                    "spdlog logger still held after controller drop. "
++                                    "Restart this zmq_server process "
++                                    f"(mode={self.startup_mode})."
++                                )
++                                print(err)
++                                self._send_reply(
++                                    {"cmd": msg.get("cmd", "UNKNOWN"), "data": f"ERROR: {err}"}
++                                )
++                                continue
++                            raise
+                 else:
+-
+-                    if self.arx5_cartesian_controller is not None:
+-                        print(
+-                            f"Timeout: No command received for {self.no_cmd_timeout} sec. ARX5 arm is reset to home position."
++                    # REP wedged after recv-without-send: POLLOUT stuck, POLLIN never
++                    # fires again. Detect via ZMQ_EVENTS (do not register POLLOUT on
++                    # the poller — that caused constant false resets on some builds).
++                    try:
++                        zev = int(self.socket.getsockopt(zmq.EVENTS))
++                    except Exception:
++                        zev = 0
++                    if (zev & zmq.POLLOUT) and not (zev & zmq.POLLIN):
++                        self._reset_rep_socket(
++                            "ZMQ_EVENTS POLLOUT-only (recv without reply)"
+                         )
+-                        self.arx5_cartesian_controller.reset_to_home()
+-                        self.arx5_cartesian_controller.set_to_damping()
+-                        self.last_eef_cmd = None
+-                        del self.arx5_cartesian_controller
+-                        self.arx5_cartesian_controller = None
++                        continue
++                    idle_s = time.monotonic() - self.last_cmd_time
++                    if (
++                        self.no_cmd_timeout > 0
++                        and idle_s >= self.no_cmd_timeout
++                        and self._any_controller_alive()
++                    ):
++                        ctrl = self._active_controller()
++                        if self.idle_reset_home:
++                            print(
++                                f"Timeout: No command for {idle_s:.1f}s "
++                                f"(limit {self.no_cmd_timeout}s). "
++                                "Calling reset_to_home() — ZMQ blocked until done."
++                            )
++                            try:
++                                ctrl.reset_to_home()
++                                ctrl.set_to_damping()
++                            except Exception:
++                                print(f"Error during idle reset_to_home:\n{echo_exception()}")
++                            self._drop_controllers()
++                        else:
++                            # --no-idle-reset-home: keep hardware alive. Destroying
++                            # then recreating hits spdlog "logger already exists".
++                            print(
++                                f"Timeout: No command for {idle_s:.1f}s "
++                                f"(limit {self.no_cmd_timeout}s). "
++                                "Keeping controller (--no-idle-reset-home); "
++                                "use --no_cmd_timeout 0 to silence this."
++                            )
++                        # Avoid immediately re-entering idle with a stale clock.
++                        self.last_cmd_time = time.monotonic()
+                     continue
+             except KeyboardInterrupt:
+                 break
+             except Exception as e:
+                 exception_str = echo_exception()
+                 print(f"Error: {exception_str}")
++                # If we already recv'd, REP requires a reply or the socket sticks.
++                try:
++                    self._send_reply(
++                        {"cmd": "UNKNOWN", "data": f"ERROR: {exception_str}"}
++                    )
++                except Exception:
++                    self._reset_rep_socket("exception path could not reply")
+                 continue
+             try:
+                 if not isinstance(msg, dict):
+                     print(f"Error: Received invalid Message {msg}, ignored")
+-                    self.socket.send_pyobj(
++                    self._send_reply(
+                         {
+                             "cmd": "UNKNOWN",
+                             "data": f"ERROR: Received invalid Message {msg}",
+                         }
+                     )
+                     continue
+-                if msg["cmd"] == "GET_STATE":
+-                    # print(f"Received GET_STATE message")
+-                    eef_pose_cmd = self.arx5_cartesian_controller.get_eef_cmd()
+-                    eef_state = self.arx5_cartesian_controller.get_eef_state()
+-
+-                    print(f"{eef_pose_cmd}")
+-                    print(f"{eef_state.pose_6d()}")
+-                    low_state = self.arx5_cartesian_controller.get_joint_state()
++                if msg["cmd"] == "GET_LATENCY_INFO":
++                    latency_info = self.robot_latency.info()
++                    latency_info["controller_active"] = self._any_controller_alive()
++                    latency_info["control_mode"] = self.control_mode
++                    self._send_reply({
++                        "cmd": "GET_LATENCY_INFO",
++                        "data": latency_info,
++                    })
++                elif msg["cmd"] == "GET_STATE":
++                    ctrl = self._active_controller()
+                     reply_msg = {
+                         "cmd": "GET_STATE",
+-                        "data": {
+-                            "timestamp": eef_state.timestamp,
+-                            "ee_pose": eef_state.pose_6d().copy(),
+-                            "joint_pos": low_state.pos().copy(),
+-                            "joint_vel": low_state.vel().copy(),
+-                            "joint_torque": low_state.torque().copy(),
+-                            "gripper_pos": low_state.gripper_pos,
+-                            "gripper_vel": low_state.gripper_vel,
+-                            "gripper_torque": low_state.gripper_torque,
+-                        },
++                        "data": self._state_dict(ctrl),
++                    }
++                    self.robot_latency.decorate_reply(
++                        msg,
++                        reply_msg,
++                        ctrl,
++                        server_received_ns,
++                        eef_state=ctrl.get_eef_state(),
++                        joint_state=ctrl.get_joint_state(),
++                    )
++                    self._send_reply(reply_msg)
++                elif msg["cmd"] == "SET_JOINT_POSITION":
++                    # Kai0 / joint policies: absolute q6 + gripper (shape 7).
++                    joint_ctrl = self._ensure_joint_mode()
++                    joint_pos = np.asarray(
++                        msg["data"]["joint_pos"], dtype=np.float64
++                    ).reshape(-1)
++                    if joint_pos.shape != (7,):
++                        raise ValueError(
++                            f"SET_JOINT_POSITION expects joint_pos shape (7,), "
++                            f"got {joint_pos.shape}"
++                        )
++                    dof = int(joint_ctrl.get_robot_config().joint_dof)
++                    cmd = arx5.JointState(dof)
++                    cmd.pos()[:] = joint_pos[:dof]
++                    cmd.gripper_pos = float(joint_pos[6])
++                    joint_ctrl.set_joint_cmd(cmd)
++                    reply_msg = {
++                        "cmd": "SET_JOINT_POSITION",
++                        "data": self._state_dict(joint_ctrl),
+                     }
+-                    self.socket.send_pyobj(reply_msg)
++                    self._send_reply(reply_msg)
++                    self.is_reset_to_home = False
++                elif msg["cmd"] == "SET_JOINT_TRAJECTORY":
++                    joint_ctrl = self._ensure_joint_mode()
++                    joint_traj = np.asarray(
++                        msg["data"]["joint_traj"], dtype=np.float64
++                    )
++                    timestamps = np.asarray(
++                        msg["data"]["timestamps"], dtype=np.float64
++                    )
++                    gripper_traj = msg["data"].get("gripper_traj", None)
++                    if joint_traj.ndim != 2 or joint_traj.shape[1] != 7:
++                        raise ValueError(
++                            f"SET_JOINT_TRAJECTORY expects (T,7), got {joint_traj.shape}"
++                        )
++                    if len(timestamps) != len(joint_traj):
++                        raise ValueError("timestamps length must match joint_traj")
++                    # Client sends wall-clock Unix times; joint controller uses
++                    # its own get_timestamp() clock. Remap so the first future
++                    # waypoint is ~preview ahead of now.
++                    dof = int(joint_ctrl.get_robot_config().joint_dof)
++                    preview = float(
++                        joint_ctrl.get_controller_config().default_preview_time
++                    )
++                    t_ctrl0 = float(joint_ctrl.get_timestamp()) + preview
++                    t_wall0 = float(timestamps[0])
++                    traj = []
++                    for i in range(len(joint_traj)):
++                        js = arx5.JointState(dof)
++                        js.pos()[:] = joint_traj[i, :dof]
++                        if gripper_traj is not None:
++                            js.gripper_pos = float(gripper_traj[i])
++                        else:
++                            js.gripper_pos = float(joint_traj[i, 6])
++                        js.timestamp = t_ctrl0 + (float(timestamps[i]) - t_wall0)
++                        traj.append(js)
++                    joint_ctrl.set_joint_traj(traj)
++                    reply_msg = {
++                        "cmd": "SET_JOINT_TRAJECTORY",
++                        "data": self._state_dict(joint_ctrl),
++                    }
++                    self._send_reply(reply_msg)
++                    self.is_reset_to_home = False
+                 elif msg["cmd"] == "SET_EE_POSE":
++                    cart = self._ensure_cartesian_mode()
+                     if self.last_eef_cmd is None:
+                         error_str = "Error: Cannot set EE pose before RESET_TO_HOME. Please check the input."
+                         print(error_str)
+-                        self.socket.send_pyobj(
++                        self._send_reply(
+                             {
+                                 "cmd": "SET_EE_POSE",
+                                 "data": error_str,
+@@ -128,7 +517,7 @@ class Arx5Server:
+                     if np.linalg.norm(target_ee_pose - self.last_eef_cmd) > 0.1:
+                         error_str = f"Error: Cannot set EE pose {target_ee_pose} far away from last command: {self.last_eef_cmd}. Please check the input."
+                         print(error_str)
+-                        self.socket.send_pyobj(
++                        self._send_reply(
+                             {
+                                 "cmd": "SET_EE_POSE",
+                                 "data": error_str,
+@@ -141,20 +530,17 @@ class Arx5Server:
+                         target_gripper_pos = cast(float, msg["data"]["gripper_pos"])
+                     else:
+                         # Maintain the current gripper position
+-                        target_gripper_pos = (
+-                            self.arx5_cartesian_controller.get_eef_state().gripper_pos
+-                        )
++                        target_gripper_pos = cart.get_eef_state().gripper_pos
+                     if self.is_reset_to_home:
+                         if (
+                             np.linalg.norm(
+-                                target_ee_pose
+-                                - self.arx5_cartesian_controller.get_home_pose()
++                                target_ee_pose - cart.get_home_pose()
+                             )
+                             > 0.1
+                         ):
+                             error_str = f"Error: Cannot set EE pose far away from home: {target_ee_pose} after RESET_TO_HOME. Please check the input."
+                             print(error_str)
+-                            self.socket.send_pyobj(
++                            self._send_reply(
+                                 {
+                                     "cmd": "SET_EE_POSE",
+                                     "data": error_str,
+@@ -162,48 +548,136 @@ class Arx5Server:
+                             )
+                             continue
+ 
+-                    self.arx5_cartesian_controller.set_eef_cmd(
+-                        arx5.EEFState(target_ee_pose, target_gripper_pos)
+-                    )
+-                    eef_state = self.arx5_cartesian_controller.get_eef_state()
+-                    low_state = self.arx5_cartesian_controller.get_joint_state()
++                    eef_cmd = arx5.EEFState(target_ee_pose, target_gripper_pos)
++                    # 可选力矩前馈（拖拽时夹爪力补偿 / 惯性辅助）
++                    if (
++                        isinstance(msg["data"], dict)
++                        and msg["data"].get("gripper_torque") is not None
++                    ):
++                        eef_cmd.gripper_torque = float(msg["data"]["gripper_torque"])
++                    cart.set_eef_cmd(eef_cmd)
+                     reply_msg = {
+                         "cmd": "SET_EE_POSE",
+-                        "data": {
+-                            "timestamp": eef_state.timestamp,
+-                            "ee_pose": eef_state.pose_6d().copy(),
+-                            "joint_pos": low_state.pos().copy(),
+-                            "joint_vel": low_state.vel().copy(),
+-                            "joint_torque": low_state.torque().copy(),
+-                            "gripper_pos": low_state.gripper_pos,
+-                            "gripper_vel": low_state.gripper_vel,
+-                            "gripper_torque": low_state.gripper_torque,
+-                        },
++                        "data": self._state_dict(cart),
+                     }
+-                    self.socket.send_pyobj(reply_msg)
++                    self.robot_latency.decorate_reply(
++                        msg,
++                        reply_msg,
++                        cart,
++                        server_received_ns,
++                        eef_state=cart.get_eef_state(),
++                        joint_state=cart.get_joint_state(),
++                    )
++                    self._send_reply(reply_msg)
+                     self.is_reset_to_home = False
+                 elif msg["cmd"] == "RESET_TO_HOME":
+                     print(f"Received RESET_TO_HOME message")
+-                    self.arx5_cartesian_controller.reset_to_home()
++                    # JointController also has reset_to_home; do not force
++                    # cartesian when server was started with --joint.
++                    if self.startup_mode == "joint":
++                        joint = self._ensure_joint_mode()
++                        joint.reset_to_home()
++                        try:
++                            self.last_eef_cmd = (
++                                joint.get_eef_state().pose_6d().copy()
++                            )
++                        except Exception:
++                            self.last_eef_cmd = None
++                    else:
++                        cart = self._ensure_cartesian_mode()
++                        cart.reset_to_home()
++                        self.last_eef_cmd = cart.get_eef_cmd().pose_6d().copy()
+                     reply_msg = {
+                         "cmd": "RESET_TO_HOME",
+                         "data": "OK",
+                     }
+-                    self.last_eef_cmd = self.arx5_cartesian_controller.get_eef_cmd().pose_6d().copy()
+-                    self.socket.send_pyobj(reply_msg)
++                    self._send_reply(reply_msg)
+                     self.is_reset_to_home = True
+                 elif msg["cmd"] == "SET_TO_DAMPING":
+                     print(f"Received SET_TO_DAMPING message")
+-                    self.arx5_cartesian_controller.set_to_damping()
++                    self._active_controller().set_to_damping()
+                     reply_msg = {
+                         "cmd": "SET_TO_DAMPING",
+                         "data": "OK",
+                     }
+-                    self.socket.send_pyobj(reply_msg)
++                    self._send_reply(reply_msg)
++                    self.is_reset_to_home = False
++                elif msg["cmd"] == "EVAN_SYNC_AFTER_DRAG":
++                    # 拖拽后钉住实测 setpoint，避免随后指令因距离检查被拒。
++                    # --joint / Kai0: pin via SET_JOINT_POSITION semantics (no EE).
++                    # cartesian: pin last_eef_cmd + set_eef_cmd.
++                    print("Received EVAN_SYNC_AFTER_DRAG message")
++                    if self.startup_mode == "joint" or self.control_mode == "joint":
++                        joint_ctrl = self._ensure_joint_mode()
++                        js = joint_ctrl.get_joint_state()
++                        dof = int(joint_ctrl.get_robot_config().joint_dof)
++                        cmd = arx5.JointState(dof)
++                        cmd.pos()[:] = js.pos().copy()
++                        cmd.gripper_pos = float(js.gripper_pos)
++                        joint_ctrl.set_joint_cmd(cmd)
++                    else:
++                        cart = self._ensure_cartesian_mode()
++                        eef_state = cart.get_eef_state()
++                        pose = eef_state.pose_6d().copy()
++                        grip = float(eef_state.gripper_pos)
++                        self.last_eef_cmd = pose
++                        try:
++                            cart.set_eef_cmd(arx5.EEFState(pose, grip))
++                        except Exception as sync_exc:
++                            print(
++                                f"EVAN_SYNC_AFTER_DRAG set_eef_cmd warning: {sync_exc}"
++                            )
++                    reply_msg = {
++                        "cmd": "EVAN_SYNC_AFTER_DRAG",
++                        "data": "OK",
++                    }
++                    self._send_reply(reply_msg)
++                    self.is_reset_to_home = False
++                elif msg["cmd"] == "SET_GRIPPER_TORQUE":
++                    # 拖拽：只改夹爪力矩。近闭限位禁止再推闭合（负力矩）；
++                    # 允许正力矩把夹爪顶离 0，避免读数 < -0.005 急停。
++                    # Joint (--joint Kai0): hold measured q + gripper_torque feedforward
++                    # (no cartesian switch). Cartesian: set_gripper_torque API.
++                    torque = float(msg["data"])
++                    if self.startup_mode == "joint" or self.control_mode == "joint":
++                        joint_ctrl = self._ensure_joint_mode()
++                        js = joint_ctrl.get_joint_state()
++                        try:
++                            gpos = float(js.gripper_pos)
++                            width = float(joint_ctrl.get_robot_config().gripper_width)
++                            if gpos < 0.012 and torque < 0:
++                                torque = 0.0
++                            if gpos > width - 0.010 and torque > 0:
++                                torque = 0.0
++                        except Exception:
++                            pass
++                        dof = int(joint_ctrl.get_robot_config().joint_dof)
++                        cmd = arx5.JointState(dof)
++                        cmd.pos()[:] = js.pos().copy()
++                        cmd.gripper_pos = float(js.gripper_pos)
++                        cmd.gripper_torque = float(torque)
++                        joint_ctrl.set_joint_cmd(cmd)
++                    else:
++                        cart = self._ensure_cartesian_mode()
++                        try:
++                            gpos = float(cart.get_joint_state().gripper_pos)
++                            width = float(cart.get_robot_config().gripper_width)
++                            if gpos < 0.012 and torque < 0:
++                                torque = 0.0
++                            if gpos > width - 0.010 and torque > 0:
++                                torque = 0.0
++                        except Exception:
++                            pass
++                        cart.set_gripper_torque(float(torque))
++                    reply_msg = {
++                        "cmd": "SET_GRIPPER_TORQUE",
++                        "data": "OK",
++                    }
++                    self._send_reply(reply_msg)
+                     self.is_reset_to_home = False
+                 elif msg["cmd"] == "GET_GAIN":
+                     print(f"Received GET_GAIN message")
+-                    gain = self.arx5_cartesian_controller.get_gain()
++                    gain = self._active_controller().get_gain()
+                     reply_msg = {
+                         "cmd": "GET_GAIN",
+                         "data": {
+@@ -213,7 +687,7 @@ class Arx5Server:
+                             "gripper_kd": gain.gripper_kd,
+                         },
+                     }
+-                    self.socket.send_pyobj(reply_msg)
++                    self._send_reply(reply_msg)
+                 elif msg["cmd"] == "SET_GAIN":
+                     print(f"Received SET_GAIN message, data: {msg['data']}")
+                     assert isinstance(msg["data"], dict)
+@@ -222,23 +696,28 @@ class Arx5Server:
+                     kd = cast(np.ndarray, msg["data"]["kd"])
+                     gripper_kp = cast(float, msg["data"]["gripper_kp"])
+                     gripper_kd = cast(float, msg["data"]["gripper_kd"])
+-                    self.arx5_cartesian_controller.set_gain(
++                    self._active_controller().set_gain(
+                         arx5.Gain(kp, kd, gripper_kp, gripper_kd)
+                     )
+                     reply_msg = {
+                         "cmd": "SET_GAIN",
+                         "data": "OK",
+                     }
+-                    self.socket.send_pyobj(reply_msg)
++                    self._send_reply(reply_msg)
+                 else:
+                     raise ValueError(f"Unknown message type: {msg['cmd']}")
+             except KeyboardInterrupt:
++                # Leaving without a reply wedges REP for all future clients.
++                self._reset_rep_socket("KeyboardInterrupt during command handler")
+                 break
+             except Exception as e:
+                 exception_str = echo_exception()
+-                self.socket.send_pyobj(
+-                    {"cmd": msg["cmd"], "data": f"ERROR: {exception_str}"}
+-                )
++                try:
++                    self._send_reply(
++                        {"cmd": msg["cmd"], "data": f"ERROR: {exception_str}"}
++                    )
++                except Exception:
++                    self._reset_rep_socket("handler exception could not reply")
+                 print(f"Error: {exception_str}")
+                 continue
+ 
+@@ -251,12 +730,43 @@ class Arx5Server:
+ @click.command()
+ @click.argument("model")  # ARX arm model: X5 or L5
+ @click.argument("interface")  # can bus name (can0 etc.)
+-def main(model: str, interface: str):
++@click.option("--port", default=8765, show_default=True, help="ZMQ bind port")
++@click.option(
++    "--no_cmd_timeout",
++    default=60.0,
++    type=float,
++    show_default=True,
++    help="Idle seconds before releasing controller; <=0 disables idle timeout",
++)
++@click.option(
++    "--idle-reset-home/--no-idle-reset-home",
++    default=True,
++    show_default=True,
++    help="On idle timeout, call reset_to_home (blocks ZMQ). "
++    "For collect, use --no-idle-reset-home",
++)
++@click.option(
++    "--joint/--cartesian",
++    default=False,
++    show_default=True,
++    help="Start Arx5JointController (Kai0). Default is cartesian (UMI/lingbot).",
++)
++def main(
++    model: str,
++    interface: str,
++    port: int,
++    no_cmd_timeout: float,
++    idle_reset_home: bool,
++    joint: bool,
++):
+     server = Arx5Server(
+         model=model,
+         interface=interface,
+         zmq_ip="0.0.0.0",
+-        zmq_port=8765,
++        zmq_port=port,
++        no_cmd_timeout=no_cmd_timeout,
++        idle_reset_home=idle_reset_home,
++        control_mode="joint" if joint else "cartesian",
+     )
+     server.run()
+ 
+diff --git a/python/examples/1 b/python/examples/1
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6a742fbcaba7905b4b3055fb9a7f3ae0b2ad7de
+--- /dev/null
++++ b/python/examples/1
+@@ -0,0 +1,7 @@
++cansend can0 7FF#00010003
++cansend can0 7FF#00020003
++cansend can0 7FF#00040003
++cansend can0 005#FFFFFFFFFFFFFFFE
++cansend can0 006#FFFFFFFFFFFFFFFE
++cansend can0 007#FFFFFFFFFFFFFFFE
++cansend can0 008#FFFFFFFFFFFFFFFE
+diff --git a/python/examples/calibrate.py b/python/examples/calibrate.py
+index 93d35b058d5acfd3ae23729b066f30b7bc04b08b..3a1633ed54aaaa389de6308af496dddd863d924f 100644
+--- a/python/examples/calibrate.py
++++ b/python/examples/calibrate.py
+@@ -1,3 +1,7 @@
++'''
++conda activate arx-py310
++python python/examples/calibrate.py X5 can0
++'''
+ import os
+ import sys
+ import time
+@@ -69,7 +73,6 @@ def check_motor_movements(model: str, interface: str):
+ 
+ 
+ if __name__ == "__main__":
+-    check_motor_movements()
+-    ## To actually calibrate, uncomment one of the following lines
++    # check_motor_movements()
+     # calibrate_joint()
+-    # calibrate_gripper()
++    calibrate_gripper()
+diff --git a/python/examples/test_joint_control.py b/python/examples/test_joint_control.py
+index 1bfbda8aab5c4069aad456b9dc737e4d1fdff1e8..e8d04c2665df5adaa0d95f8108f7b7821156ec3a 100644
+--- a/python/examples/test_joint_control.py
++++ b/python/examples/test_joint_control.py
+@@ -28,9 +28,16 @@ def main(model: str, interface: str):
+     # To initialize robot with different configurations,
+     # you can create RobotConfig and ControllerConfig by yourself and modify based on it
+     robot_config = arx5.RobotConfigFactory.get_instance().get_config(model)
++    # Reversed gripper motor (common on newer X5)
++    robot_config.gripper_open_readout = -3.4
++    robot_config.gripper_width = 0.082
++    # Default 1.5Nm trips easily when opening against end-stop with imperfect calibration
++    robot_config.gripper_torque_max = 2.5
+     controller_config = arx5.ControllerConfigFactory.get_instance().get_config(
+         "joint_controller", robot_config.joint_dof
+     )
++    # Softer gripper so home-open is less likely to hard-stall
++    controller_config.default_gripper_kp = 2.0
+     # Modify the default configuration here
+     # controller_config.controller_dt = 0.01 # etc.
+ 
+@@ -59,7 +66,7 @@ def main(model: str, interface: str):
+ 
+     arx5_joint_controller.reset_to_home()
+ 
+-    target_joint_poses = np.array([1.0, 2.0, 2.0, 1.5, 1.5, -1.57])
++    target_joint_poses = np.array([0.3, 0.3, 0.3, 0.5, 0.5, -1.57])
+ 
+     for i in range(step_num):
+         cmd = arx5.JointState(robot_config.joint_dof)
+diff --git a/setup_arxcan1.sh b/setup_arxcan1.sh
+new file mode 100755
+index 0000000000000000000000000000000000000000..f76d1c73853e89846c2b70d586db3f53e5963662
+--- /dev/null
++++ b/setup_arxcan1.sh
+@@ -0,0 +1,35 @@
++#!/bin/bash
++# Setup arxcan1 / can1 for arm2 USB2CAN (serial 0021002B5330530320323656)
++set -euo pipefail
++
++RULES=/etc/udev/rules.d/arx_can.rules
++SERIAL0=004B00295330530320323656
++SERIAL1=0021002B5330530320323656
++
++sudo tee "$RULES" >/dev/null <<EOF
++SUBSYSTEM=="tty", ATTRS{idVendor}=="16d0", ATTRS{idProduct}=="117e", ATTRS{serial}=="${SERIAL0}", SYMLINK+="arxcan0"
++SUBSYSTEM=="tty", ATTRS{idVendor}=="16d0", ATTRS{idProduct}=="117e", ATTRS{serial}=="${SERIAL1}", SYMLINK+="arxcan1"
++EOF
++
++sudo udevadm control --reload-rules
++sudo udevadm trigger
++sleep 1
++
++echo "=== /dev/arxcan* ==="
++ls -l /dev/arxcan* || true
++
++if [ ! -e /dev/arxcan1 ]; then
++  echo "ERROR: /dev/arxcan1 missing. Unplug/replug arm2 CAN, then re-run."
++  exit 1
++fi
++
++if ! ip link show can1 >/dev/null 2>&1; then
++  if ! pgrep -af 'slcand.*arxcan1' >/dev/null; then
++    sudo slcand -o -f -s8 /dev/arxcan1 can1
++  fi
++fi
++sudo ip link set can1 up
++
++echo "=== CAN interfaces ==="
++ip link show type can
++echo "Done. Use: python python/communication/zmq_server.py X5 can1"
+diff --git a/src/app/cartesian_controller.cpp b/src/app/cartesian_controller.cpp
+index 66f3e5ce12c8d730b4bae40ada451c0a8fd8cd32..72195f998fab024ca4a10798302a7960d257aad9 100644
+--- a/src/app/cartesian_controller.cpp
++++ b/src/app/cartesian_controller.cpp
+@@ -37,8 +37,9 @@ void Arx5CartesianController::set_eef_cmd(EEFState new_cmd)
+     ik_results = multi_trial_ik(new_cmd.pose_6d, joint_state_.pos);
+     int ik_status = std::get<0>(ik_results);
+ 
++    double current_time = get_timestamp();
+     if (new_cmd.timestamp == 0)
+-        new_cmd.timestamp = get_timestamp() + controller_config_.default_preview_time;
++        new_cmd.timestamp = current_time + controller_config_.default_preview_time;
+ 
+     JointState target_joint_state{robot_config_.joint_dof};
+     target_joint_state.pos = std::get<1>(ik_results);
+@@ -47,10 +48,14 @@ void Arx5CartesianController::set_eef_cmd(EEFState new_cmd)
+     target_joint_state.gripper_torque = new_cmd.gripper_torque;
+     target_joint_state.timestamp = new_cmd.timestamp;
+ 
+-    double current_time = get_timestamp();
+     // TODO: include velocity
+     std::lock_guard<std::mutex> guard(cmd_mutex_);
+-    interpolator_.override_waypoint(get_timestamp(), target_joint_state);
++    // 与 joint_controller 一致：时间戳贴近当前则 init_fixed，避免拖拽时每拍
++    // override_waypoint(preview) 把臂拉进轨迹、表现为突然下落。
++    if (std::abs(new_cmd.timestamp - current_time) < 1e-3)
++        interpolator_.init_fixed(target_joint_state);
++    else
++        interpolator_.override_waypoint(current_time, target_joint_state);
+ 
+     if (ik_status != 0)
+     {
+@@ -58,6 +63,19 @@ void Arx5CartesianController::set_eef_cmd(EEFState new_cmd)
+     }
+ }
+ 
++void Arx5CartesianController::set_gripper_torque(double gripper_torque)
++{
++    // 拖拽采数：只改夹爪力矩前馈，钉住当前关节，不走 EE 轨迹插值。
++    JointState js = get_joint_state();
++    js.vel = VecDoF::Zero(robot_config_.joint_dof);
++    js.torque = VecDoF::Zero(robot_config_.joint_dof);
++    js.gripper_vel = 0.0;
++    js.gripper_torque = gripper_torque;
++    js.timestamp = get_timestamp();
++    std::lock_guard<std::mutex> guard(cmd_mutex_);
++    interpolator_.init_fixed(js);
++}
++
+ void Arx5CartesianController::set_eef_traj(std::vector<EEFState> new_traj)
+ {
+     double start_time = get_timestamp();

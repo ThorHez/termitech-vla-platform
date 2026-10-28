@@ -238,8 +238,8 @@ def render(args: argparse.Namespace) -> dict:
             # A controller that previously served native TLS must switch its
             # upstream socket back to HTTP, even if old PEM settings remain.
             "VLA_TLS_CERT_FILE=", "VLA_TLS_KEY_FILE=",
-            "VLA_SESSION_COOKIE_SECURE=true", "VLA_SESSION_TTL_SECONDS=7200",
-            "VLA_SESSION_IDLE_SECONDS=900", "VLA_SESSION_REAUTH_SECONDS=300",
+            "VLA_SESSION_COOKIE_SECURE=true", "VLA_SESSION_TTL_SECONDS=28800",
+            "VLA_SESSION_IDLE_SECONDS=3600", "VLA_SESSION_REAUTH_SECONDS=300",
             "VLA_REQUIRE_HTTPS=true", f"VLA_PUBLIC_URL={site}",
             "VLA_FORWARDED_ALLOW_IPS=127.0.0.1,::1", "",
         ))

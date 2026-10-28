@@ -1,0 +1,7 @@
+{
+  "features": {
+    "state": {"dtype": "float32", "shape": [14]},
+    "actions": {"dtype": "float32", "shape": [20]},
+    "observation.image": {"dtype": "image", "shape": [3, 224, 3]}
+  }
+}

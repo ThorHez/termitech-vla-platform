@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, inspect
+from sqlalchemy import create_engine, delete, event, inspect, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -38,6 +38,9 @@ class Database:
         from . import remote_models  # noqa: F401
         from . import recipe_models  # noqa: F401
         from . import auth_models  # noqa: F401
+        from . import policy_deployment_models  # noqa: F401
+        from . import checkpoint_transfer_models  # noqa: F401
+        from . import deployment_record_models  # noqa: F401
         Base.metadata.create_all(self.engine)
         # One stable row serializes administrator invariants across processes.
         with self.engine.begin() as connection:
@@ -61,6 +64,41 @@ class Database:
             node_columns = {column["name"] for column in inspect(connection).get_columns("nodes")}
             if "display_name" not in node_columns:
                 connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN display_name VARCHAR(200)")
+            if "cache_root" not in node_columns:
+                connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN cache_root TEXT")
+            policy_columns = {column["name"] for column in inspect(connection).get_columns("policy_deployments")}
+            if "inference_backend" not in policy_columns:
+                connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN inference_backend VARCHAR(16) NOT NULL DEFAULT 'auto'")
+            if "resolved_backend" not in policy_columns:
+                connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN resolved_backend VARCHAR(16)")
+            if "gpu_mode" not in policy_columns:
+                connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN gpu_mode VARCHAR(16) NOT NULL DEFAULT 'exclusive'")
+            if "gpu_memory_mb" not in policy_columns:
+                connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN gpu_memory_mb INTEGER")
+            # Old versions permitted duplicate template names. Keep the latest
+            # content, break timestamp ties by id, and invalidate every old CAS
+            # revision before enforcing per-account uniqueness. The auth guard
+            # above serializes this migration on SQLite and PostgreSQL alike.
+            from .models import TrainingTemplate
+            table = TrainingTemplate.__table__
+            grouped = {}
+            rows = connection.execute(select(table.c.id, table.c.user_id, table.c.name,
+                                             table.c.revision, table.c.updated_at)).mappings()
+            for row in rows:
+                grouped.setdefault((row["user_id"], row["name"]), []).append(row)
+            for duplicates in grouped.values():
+                if len(duplicates) < 2:
+                    continue
+                newest = max(row["updated_at"] for row in duplicates)
+                winner = min((row for row in duplicates if row["updated_at"] == newest), key=lambda row: row["id"])
+                connection.execute(delete(table).where(table.c.id.in_([
+                    row["id"] for row in duplicates if row["id"] != winner["id"]])))
+                connection.execute(update(table).where(table.c.id == winner["id"]).values(
+                    revision=max(row["revision"] for row in duplicates) + 1))
+            connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_training_templates_user_name "
+                                       "ON training_templates (user_id, name)")
+            from .deployment_records import backfill_deployment_records
+            backfill_deployment_records(connection)
 
     @contextmanager
     def read(self):

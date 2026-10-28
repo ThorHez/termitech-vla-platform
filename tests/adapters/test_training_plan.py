@@ -132,6 +132,23 @@ def test_single_dataset_binding_uses_selected_dataset_and_single_entry(training)
     assert training_entrypoint(config, spec).name == "train.py"
 
 
+@pytest.mark.parametrize("count", [1, 2])
+def test_rebound_multi_recipe_keeps_compatible_entry_for_actual_selected_count(training, count):
+    base, spec, module, loaders = training
+    original = copy.deepcopy(base)
+    spec["dataset_bindings"] = spec["dataset_bindings"][:count]
+    roles = {"model", *(f"dataset_{i}" for i in range(count)), *(f"norm_{i}" for i in range(count))}
+    spec["inputs"] = {key: value for key, value in spec["inputs"].items() if key in roles}
+    config = resolve_config(base, spec, module, loaders)
+    plan = inspect_training_config(config, spec, checks=[])
+    assert len(config.data.datasets) == len(plan["datasets"]) == count
+    assert config.data.weights == [row["weight"] for row in spec["dataset_bindings"]]
+    # A one-child MultiDataConfigFactory still needs the multi loader; the
+    # effective container cannot be consumed by the built-in single loader.
+    assert plan["entrypoint"] == str(Path(spec["code_dir"]) / "scripts/train_multi_dataset.py")
+    assert base == original
+
+
 @pytest.mark.parametrize("case", ["one_match", "no_match", "multiple_matches"])
 def test_multi_requires_explicit_bindings_even_if_one_default_path_matches(training, case):
     base, spec, module, loaders = training

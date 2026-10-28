@@ -1,0 +1,1021 @@
+{
+  "ambiguous": {
+    "schema_version": 1,
+    "path": "/fixture/ambiguous",
+    "source": {
+      "info_sha256": "07b4204985088631fe48907b26727df12adfbfd1b3de4171ecc9277724e5c194",
+      "tasks_sha256": null
+    },
+    "features": [
+      {
+        "key": "state",
+        "dtype": "float32",
+        "shape": [
+          14
+        ],
+        "names": []
+      },
+      {
+        "key": "actions",
+        "dtype": "float32",
+        "shape": [
+          20
+        ],
+        "names": []
+      },
+      {
+        "key": "observation.image",
+        "dtype": "image",
+        "shape": [
+          3,
+          224,
+          3
+        ],
+        "names": []
+      }
+    ],
+    "suggestions": {
+      "format": "lerobot",
+      "feature_keys": [
+        "state",
+        "actions",
+        "observation.image"
+      ],
+      "action_dim": 20,
+      "state_dim": 14,
+      "cameras": [
+        {
+          "key": "observation.image",
+          "kind": "rgb",
+          "name": "image"
+        }
+      ],
+      "field_annotations": [
+        {
+          "key": "state",
+          "role": "state",
+          "representation": "unknown",
+          "value_mode": "unknown",
+          "component": "other",
+          "arm": "unknown",
+          "shape": [
+            14
+          ],
+          "dtype": "float32",
+          "names": []
+        },
+        {
+          "key": "actions",
+          "role": "action",
+          "representation": "unknown",
+          "value_mode": "unknown",
+          "component": "other",
+          "arm": "unknown",
+          "shape": [
+            20
+          ],
+          "dtype": "float32",
+          "names": []
+        }
+      ]
+    },
+    "processing": {
+      "action_key": "actions",
+      "state_fields": [
+        {
+          "width": 14,
+          "arm": "shared",
+          "kind": "other",
+          "key": "state"
+        }
+      ],
+      "state_history": 1
+    },
+    "evidence": [
+      {
+        "field": "format",
+        "kind": "metadata",
+        "reason": "已读取 LeRobot meta/info.json 的特征声明",
+        "keys": []
+      },
+      {
+        "field": "feature_keys",
+        "kind": "metadata",
+        "reason": "实际元信息中的有效字段名",
+        "keys": [
+          "state",
+          "actions",
+          "observation.image"
+        ]
+      },
+      {
+        "field": "processing.action_key",
+        "kind": "inferred",
+        "reason": "动作字段名明确且具有一维或预分块二维数值形状",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "action_dim",
+        "kind": "metadata",
+        "reason": "动作形状末轴直接给出每步宽度；维数不证明控制语义",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "processing.state_fields",
+        "kind": "inferred",
+        "reason": "优先选择统一状态向量，否则列出语义明确的机器人数值字段；顺序是元信息原顺序",
+        "keys": [
+          "state"
+        ]
+      },
+      {
+        "field": "processing.state_history",
+        "kind": "inferred",
+        "reason": "由状态特征形状给出历史轴候选，需要确认二维首轴确为时间",
+        "keys": [
+          "state"
+        ]
+      },
+      {
+        "field": "state_dim",
+        "kind": "metadata",
+        "reason": "统一状态字段末轴给出原始宽度，不含历史轴展开",
+        "keys": [
+          "state"
+        ]
+      },
+      {
+        "field": "cameras",
+        "kind": "inferred",
+        "reason": "图像/视频 dtype 提供视觉字段证据；depth 名称或标记只用于保守语义提示",
+        "keys": [
+          "observation.image"
+        ]
+      },
+      {
+        "field": "field_annotations",
+        "kind": "inferred",
+        "reason": "仅标记原始状态与动作字段及其语义，不定义拼接顺序、归一化或模型映射",
+        "keys": [
+          "state",
+          "actions"
+        ]
+      }
+    ],
+    "warnings": [
+      "未读取可选任务文本，可能未提供或超过固定读取预算。",
+      "动作维数不能证明 EEF/Joint 或单/双臂；请确认动作坐标名及控制语义。",
+      "状态拼接顺序、历史轴和每个字段的归一化策略必须与统计参数核对，不能仅凭字段名确认。",
+      "部分视觉字段无法唯一判断 CHW/HWC 布局，请手动核对。",
+      "单位、坐标系、夹爪范围及归一化策略不会从维数或机器人名称自动推断。",
+      "部分源字段的 EEF/Joint 或绝对/增量语义无法从元信息确定，已标为未知，请确认标签；不会按维数猜测。"
+    ]
+  },
+  "complete": {
+    "schema_version": 1,
+    "path": "/fixture/complete",
+    "source": {
+      "info_sha256": "b0773a3b7be3095e9a30c33112ce30716d5f947ef34497a20af8c5fc2d4238a2",
+      "tasks_sha256": "5453334d8df2d863ce81528ef425f774f0b2e48af36f67765f285d5d44e5a0c5"
+    },
+    "features": [
+      {
+        "key": "observation.state",
+        "dtype": "float32",
+        "shape": [
+          7
+        ],
+        "names": [
+          "left_joint_0",
+          "left_joint_1",
+          "left_joint_2",
+          "left_joint_3",
+          "left_joint_4",
+          "left_joint_5",
+          "left_gripper"
+        ]
+      },
+      {
+        "key": "actions",
+        "dtype": "float32",
+        "shape": [
+          7
+        ],
+        "names": [
+          "left_joint_0",
+          "left_joint_1",
+          "left_joint_2",
+          "left_joint_3",
+          "left_joint_4",
+          "left_joint_5",
+          "left_gripper"
+        ]
+      },
+      {
+        "key": "observation.images.left_wrist",
+        "dtype": "video",
+        "shape": [
+          3,
+          224,
+          224
+        ],
+        "names": []
+      },
+      {
+        "key": "task_index",
+        "dtype": "int64",
+        "shape": [
+          1
+        ],
+        "names": []
+      }
+    ],
+    "suggestions": {
+      "format": "lerobot",
+      "feature_keys": [
+        "observation.state",
+        "actions",
+        "observation.images.left_wrist",
+        "task_index"
+      ],
+      "robot_type": "ARX5",
+      "fps": 30.0,
+      "task_description": "将红色方块放入盒子\n将蓝色方块放入盒子",
+      "action_dim": 7,
+      "action_representation": "joint",
+      "arm_mode": "single",
+      "rotation_representation": "none",
+      "state_dim": 7,
+      "cameras": [
+        {
+          "key": "observation.images.left_wrist",
+          "kind": "rgb",
+          "name": "left_wrist"
+        }
+      ],
+      "field_annotations": [
+        {
+          "key": "observation.state",
+          "role": "state",
+          "representation": "joint",
+          "value_mode": "unknown",
+          "component": "other",
+          "arm": "unknown",
+          "shape": [
+            7
+          ],
+          "dtype": "float32",
+          "names": [
+            "left_joint_0",
+            "left_joint_1",
+            "left_joint_2",
+            "left_joint_3",
+            "left_joint_4",
+            "left_joint_5",
+            "left_gripper"
+          ]
+        },
+        {
+          "key": "actions",
+          "role": "action",
+          "representation": "joint",
+          "value_mode": "unknown",
+          "component": "other",
+          "arm": "unknown",
+          "shape": [
+            7
+          ],
+          "dtype": "float32",
+          "names": [
+            "left_joint_0",
+            "left_joint_1",
+            "left_joint_2",
+            "left_joint_3",
+            "left_joint_4",
+            "left_joint_5",
+            "left_gripper"
+          ]
+        }
+      ]
+    },
+    "processing": {
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "width": 6,
+          "arm": "left",
+          "kind": "joint"
+        },
+        {
+          "width": 1,
+          "arm": "left",
+          "kind": "gripper"
+        }
+      ],
+      "prompt_key": "task",
+      "state_fields": [
+        {
+          "width": 7,
+          "arm": "shared",
+          "kind": "other",
+          "key": "observation.state"
+        }
+      ],
+      "state_history": 1,
+      "state_representation": "joint",
+      "cameras": [
+        {
+          "key": "observation.images.left_wrist",
+          "kind": "rgb",
+          "layout": "chw"
+        }
+      ]
+    },
+    "evidence": [
+      {
+        "field": "format",
+        "kind": "metadata",
+        "reason": "已读取 LeRobot meta/info.json 的特征声明",
+        "keys": []
+      },
+      {
+        "field": "feature_keys",
+        "kind": "metadata",
+        "reason": "实际元信息中的有效字段名",
+        "keys": [
+          "observation.state",
+          "actions",
+          "observation.images.left_wrist",
+          "task_index"
+        ]
+      },
+      {
+        "field": "robot_type",
+        "kind": "metadata",
+        "reason": "元信息直接声明机器人类型",
+        "keys": []
+      },
+      {
+        "field": "fps",
+        "kind": "metadata",
+        "reason": "元信息直接声明采样频率",
+        "keys": []
+      },
+      {
+        "field": "task_description",
+        "kind": "metadata",
+        "reason": "从任务元信息提取的任务文本示例，不能代替逐样本 prompt",
+        "keys": []
+      },
+      {
+        "field": "processing.action_key",
+        "kind": "inferred",
+        "reason": "动作字段名明确且具有一维或预分块二维数值形状",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "action_dim",
+        "kind": "metadata",
+        "reason": "动作形状末轴直接给出每步宽度；维数不证明控制语义",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "action_representation",
+        "kind": "inferred",
+        "reason": "完整动作坐标名明确标注了关节或末端字段",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "processing.action_layout",
+        "kind": "inferred",
+        "reason": "完整动作坐标名按原顺序连续分组；未重排或转换数值",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "arm_mode",
+        "kind": "inferred",
+        "reason": "完整动作字段明确标注了参与控制的机械臂",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "rotation_representation",
+        "kind": "inferred",
+        "reason": "完整动作坐标名明确声明旋转编码，未根据维数猜测",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "processing.prompt_key",
+        "kind": "inferred",
+        "reason": "明确的文本字段或 task_index/tasks 元信息支持任务文本映射",
+        "keys": [
+          "task_index"
+        ]
+      },
+      {
+        "field": "processing.state_fields",
+        "kind": "inferred",
+        "reason": "优先选择统一状态向量，否则列出语义明确的机器人数值字段；顺序是元信息原顺序",
+        "keys": [
+          "observation.state"
+        ]
+      },
+      {
+        "field": "processing.state_history",
+        "kind": "inferred",
+        "reason": "由状态特征形状给出历史轴候选，需要确认二维首轴确为时间",
+        "keys": [
+          "observation.state"
+        ]
+      },
+      {
+        "field": "state_dim",
+        "kind": "metadata",
+        "reason": "统一状态字段末轴给出原始宽度，不含历史轴展开",
+        "keys": [
+          "observation.state"
+        ]
+      },
+      {
+        "field": "processing.state_representation",
+        "kind": "inferred",
+        "reason": "状态字段或坐标名明确标注了表示方式；与动作表示分开推断",
+        "keys": [
+          "observation.state"
+        ]
+      },
+      {
+        "field": "cameras",
+        "kind": "inferred",
+        "reason": "图像/视频 dtype 提供视觉字段证据；depth 名称或标记只用于保守语义提示",
+        "keys": [
+          "observation.images.left_wrist"
+        ]
+      },
+      {
+        "field": "processing.cameras",
+        "kind": "inferred",
+        "reason": "仅在通道轴唯一时给出布局候选；槽位、深度范围和选帧需人工确认",
+        "keys": [
+          "observation.images.left_wrist"
+        ]
+      },
+      {
+        "field": "field_annotations",
+        "kind": "inferred",
+        "reason": "仅标记原始状态与动作字段及其语义，不定义拼接顺序、归一化或模型映射",
+        "keys": [
+          "observation.state",
+          "actions"
+        ]
+      }
+    ],
+    "warnings": [
+      "状态拼接顺序、历史轴和每个字段的归一化策略必须与统计参数核对，不能仅凭字段名确认。",
+      "单位、坐标系、夹爪范围及归一化策略不会从维数或机器人名称自动推断。",
+      "部分源字段的 EEF/Joint 或绝对/增量语义无法从元信息确定，已标为未知，请确认标签；不会按维数猜测。"
+    ]
+  },
+  "history": {
+    "schema_version": 1,
+    "path": "/fixture/history",
+    "source": {
+      "info_sha256": "098f96952d96eb8dbeab7fccf4547fc1a8c3270625b8ca5afbf54b2da0e75906",
+      "tasks_sha256": null
+    },
+    "features": [
+      {
+        "key": "robot0_eef_pos",
+        "dtype": "float32",
+        "shape": [
+          2,
+          3
+        ],
+        "names": []
+      },
+      {
+        "key": "robot0_eef_rotation_6d",
+        "dtype": "float32",
+        "shape": [
+          2,
+          6
+        ],
+        "names": []
+      },
+      {
+        "key": "robot0_gripper_width",
+        "dtype": "float32",
+        "shape": [
+          2,
+          1
+        ],
+        "names": []
+      },
+      {
+        "key": "robot1_eef_pos",
+        "dtype": "float32",
+        "shape": [
+          2,
+          3
+        ],
+        "names": []
+      },
+      {
+        "key": "robot1_eef_rotation_6d",
+        "dtype": "float32",
+        "shape": [
+          2,
+          6
+        ],
+        "names": []
+      },
+      {
+        "key": "robot1_gripper_width",
+        "dtype": "float32",
+        "shape": [
+          2,
+          1
+        ],
+        "names": []
+      },
+      {
+        "key": "actions",
+        "dtype": "float32",
+        "shape": [
+          16,
+          20
+        ],
+        "names": [
+          "left_eef_pos_x",
+          "left_eef_pos_y",
+          "left_eef_pos_z",
+          "left_eef_rotation_6d_0",
+          "left_eef_rotation_6d_1",
+          "left_eef_rotation_6d_2",
+          "left_eef_rotation_6d_3",
+          "left_eef_rotation_6d_4",
+          "left_eef_rotation_6d_5",
+          "left_gripper_width",
+          "right_eef_pos_x",
+          "right_eef_pos_y",
+          "right_eef_pos_z",
+          "right_eef_rotation_6d_0",
+          "right_eef_rotation_6d_1",
+          "right_eef_rotation_6d_2",
+          "right_eef_rotation_6d_3",
+          "right_eef_rotation_6d_4",
+          "right_eef_rotation_6d_5",
+          "right_gripper_width"
+        ]
+      },
+      {
+        "key": "observation.images.left",
+        "dtype": "image",
+        "shape": [
+          2,
+          3,
+          224,
+          224
+        ],
+        "names": []
+      },
+      {
+        "key": "observation.images.right_depth",
+        "dtype": "image",
+        "shape": [
+          224,
+          224,
+          1
+        ],
+        "names": []
+      },
+      {
+        "key": "prompt",
+        "dtype": "string",
+        "shape": [],
+        "names": []
+      }
+    ],
+    "suggestions": {
+      "format": "lerobot",
+      "feature_keys": [
+        "robot0_eef_pos",
+        "robot0_eef_rotation_6d",
+        "robot0_gripper_width",
+        "robot1_eef_pos",
+        "robot1_eef_rotation_6d",
+        "robot1_gripper_width",
+        "actions",
+        "observation.images.left",
+        "observation.images.right_depth",
+        "prompt"
+      ],
+      "fps": 20.0,
+      "action_dim": 20,
+      "action_representation": "eef",
+      "arm_mode": "bimanual",
+      "rotation_representation": "rotation_6d",
+      "cameras": [
+        {
+          "key": "observation.images.left",
+          "kind": "rgb",
+          "name": "left"
+        },
+        {
+          "key": "observation.images.right_depth",
+          "kind": "depth",
+          "name": "right_depth"
+        }
+      ],
+      "field_annotations": [
+        {
+          "key": "robot0_eef_pos",
+          "role": "state",
+          "representation": "eef",
+          "value_mode": "unknown",
+          "component": "position",
+          "arm": "left",
+          "shape": [
+            2,
+            3
+          ],
+          "dtype": "float32",
+          "names": []
+        },
+        {
+          "key": "robot0_eef_rotation_6d",
+          "role": "state",
+          "representation": "eef",
+          "value_mode": "unknown",
+          "component": "rotation",
+          "arm": "left",
+          "shape": [
+            2,
+            6
+          ],
+          "dtype": "float32",
+          "names": []
+        },
+        {
+          "key": "robot0_gripper_width",
+          "role": "state",
+          "representation": "unknown",
+          "value_mode": "unknown",
+          "component": "gripper",
+          "arm": "left",
+          "shape": [
+            2,
+            1
+          ],
+          "dtype": "float32",
+          "names": []
+        },
+        {
+          "key": "robot1_eef_pos",
+          "role": "state",
+          "representation": "eef",
+          "value_mode": "unknown",
+          "component": "position",
+          "arm": "right",
+          "shape": [
+            2,
+            3
+          ],
+          "dtype": "float32",
+          "names": []
+        },
+        {
+          "key": "robot1_eef_rotation_6d",
+          "role": "state",
+          "representation": "eef",
+          "value_mode": "unknown",
+          "component": "rotation",
+          "arm": "right",
+          "shape": [
+            2,
+            6
+          ],
+          "dtype": "float32",
+          "names": []
+        },
+        {
+          "key": "robot1_gripper_width",
+          "role": "state",
+          "representation": "unknown",
+          "value_mode": "unknown",
+          "component": "gripper",
+          "arm": "right",
+          "shape": [
+            2,
+            1
+          ],
+          "dtype": "float32",
+          "names": []
+        },
+        {
+          "key": "actions",
+          "role": "action",
+          "representation": "eef",
+          "value_mode": "unknown",
+          "component": "other",
+          "arm": "unknown",
+          "shape": [
+            16,
+            20
+          ],
+          "dtype": "float32",
+          "names": [
+            "left_eef_pos_x",
+            "left_eef_pos_y",
+            "left_eef_pos_z",
+            "left_eef_rotation_6d_0",
+            "left_eef_rotation_6d_1",
+            "left_eef_rotation_6d_2",
+            "left_eef_rotation_6d_3",
+            "left_eef_rotation_6d_4",
+            "left_eef_rotation_6d_5",
+            "left_gripper_width",
+            "right_eef_pos_x",
+            "right_eef_pos_y",
+            "right_eef_pos_z",
+            "right_eef_rotation_6d_0",
+            "right_eef_rotation_6d_1",
+            "right_eef_rotation_6d_2",
+            "right_eef_rotation_6d_3",
+            "right_eef_rotation_6d_4",
+            "right_eef_rotation_6d_5",
+            "right_gripper_width"
+          ]
+        }
+      ]
+    },
+    "processing": {
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "width": 3,
+          "arm": "left",
+          "kind": "position"
+        },
+        {
+          "width": 6,
+          "arm": "left",
+          "kind": "rotation"
+        },
+        {
+          "width": 1,
+          "arm": "left",
+          "kind": "gripper"
+        },
+        {
+          "width": 3,
+          "arm": "right",
+          "kind": "position"
+        },
+        {
+          "width": 6,
+          "arm": "right",
+          "kind": "rotation"
+        },
+        {
+          "width": 1,
+          "arm": "right",
+          "kind": "gripper"
+        }
+      ],
+      "prompt_key": "prompt",
+      "state_fields": [
+        {
+          "width": 3,
+          "arm": "left",
+          "kind": "position",
+          "key": "robot0_eef_pos"
+        },
+        {
+          "width": 6,
+          "arm": "left",
+          "kind": "rotation",
+          "key": "robot0_eef_rotation_6d"
+        },
+        {
+          "width": 1,
+          "arm": "left",
+          "kind": "gripper",
+          "key": "robot0_gripper_width"
+        },
+        {
+          "width": 3,
+          "arm": "right",
+          "kind": "position",
+          "key": "robot1_eef_pos"
+        },
+        {
+          "width": 6,
+          "arm": "right",
+          "kind": "rotation",
+          "key": "robot1_eef_rotation_6d"
+        },
+        {
+          "width": 1,
+          "arm": "right",
+          "kind": "gripper",
+          "key": "robot1_gripper_width"
+        }
+      ],
+      "state_history": 2,
+      "state_representation": "eef",
+      "cameras": [
+        {
+          "key": "observation.images.left",
+          "kind": "rgb",
+          "layout": "chw"
+        },
+        {
+          "key": "observation.images.right_depth",
+          "kind": "depth",
+          "layout": "hwc"
+        }
+      ]
+    },
+    "evidence": [
+      {
+        "field": "format",
+        "kind": "metadata",
+        "reason": "已读取 LeRobot meta/info.json 的特征声明",
+        "keys": []
+      },
+      {
+        "field": "feature_keys",
+        "kind": "metadata",
+        "reason": "实际元信息中的有效字段名",
+        "keys": [
+          "robot0_eef_pos",
+          "robot0_eef_rotation_6d",
+          "robot0_gripper_width",
+          "robot1_eef_pos",
+          "robot1_eef_rotation_6d",
+          "robot1_gripper_width",
+          "actions",
+          "observation.images.left",
+          "observation.images.right_depth",
+          "prompt"
+        ]
+      },
+      {
+        "field": "fps",
+        "kind": "metadata",
+        "reason": "元信息直接声明采样频率",
+        "keys": []
+      },
+      {
+        "field": "processing.action_key",
+        "kind": "inferred",
+        "reason": "动作字段名明确且具有一维或预分块二维数值形状",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "action_dim",
+        "kind": "metadata",
+        "reason": "动作形状末轴直接给出每步宽度；维数不证明控制语义",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "action_representation",
+        "kind": "inferred",
+        "reason": "完整动作坐标名明确标注了关节或末端字段",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "processing.action_layout",
+        "kind": "inferred",
+        "reason": "完整动作坐标名按原顺序连续分组；未重排或转换数值",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "arm_mode",
+        "kind": "inferred",
+        "reason": "完整动作字段明确标注了参与控制的机械臂",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "rotation_representation",
+        "kind": "inferred",
+        "reason": "完整动作坐标名明确声明旋转编码，未根据维数猜测",
+        "keys": [
+          "actions"
+        ]
+      },
+      {
+        "field": "processing.prompt_key",
+        "kind": "inferred",
+        "reason": "明确的文本字段或 task_index/tasks 元信息支持任务文本映射",
+        "keys": [
+          "prompt"
+        ]
+      },
+      {
+        "field": "processing.state_fields",
+        "kind": "inferred",
+        "reason": "优先选择统一状态向量，否则列出语义明确的机器人数值字段；顺序是元信息原顺序",
+        "keys": [
+          "robot0_eef_pos",
+          "robot0_eef_rotation_6d",
+          "robot0_gripper_width",
+          "robot1_eef_pos",
+          "robot1_eef_rotation_6d",
+          "robot1_gripper_width"
+        ]
+      },
+      {
+        "field": "processing.state_history",
+        "kind": "inferred",
+        "reason": "由状态特征形状给出历史轴候选，需要确认二维首轴确为时间",
+        "keys": [
+          "robot0_eef_pos",
+          "robot0_eef_rotation_6d",
+          "robot0_gripper_width",
+          "robot1_eef_pos",
+          "robot1_eef_rotation_6d",
+          "robot1_gripper_width"
+        ]
+      },
+      {
+        "field": "processing.state_representation",
+        "kind": "inferred",
+        "reason": "状态字段或坐标名明确标注了表示方式；与动作表示分开推断",
+        "keys": [
+          "robot0_eef_pos",
+          "robot0_eef_rotation_6d",
+          "robot0_gripper_width",
+          "robot1_eef_pos",
+          "robot1_eef_rotation_6d",
+          "robot1_gripper_width"
+        ]
+      },
+      {
+        "field": "cameras",
+        "kind": "inferred",
+        "reason": "图像/视频 dtype 提供视觉字段证据；depth 名称或标记只用于保守语义提示",
+        "keys": [
+          "observation.images.left",
+          "observation.images.right_depth"
+        ]
+      },
+      {
+        "field": "processing.cameras",
+        "kind": "inferred",
+        "reason": "仅在通道轴唯一时给出布局候选；槽位、深度范围和选帧需人工确认",
+        "keys": [
+          "observation.images.left",
+          "observation.images.right_depth"
+        ]
+      },
+      {
+        "field": "field_annotations",
+        "kind": "inferred",
+        "reason": "仅标记原始状态与动作字段及其语义，不定义拼接顺序、归一化或模型映射",
+        "keys": [
+          "robot0_eef_pos",
+          "robot0_eef_rotation_6d",
+          "robot0_gripper_width",
+          "robot1_eef_pos",
+          "robot1_eef_rotation_6d",
+          "robot1_gripper_width",
+          "actions"
+        ]
+      }
+    ],
+    "warnings": [
+      "未读取可选任务文本，可能未提供或超过固定读取预算。",
+      "状态拼接顺序、历史轴和每个字段的归一化策略必须与统计参数核对，不能仅凭字段名确认。",
+      "视觉元信息包含额外时间轴，需要显式选择图像帧；本次不会自动丢帧。",
+      "单位、坐标系、夹爪范围及归一化策略不会从维数或机器人名称自动推断。",
+      "部分源字段的 EEF/Joint 或绝对/增量语义无法从元信息确定，已标为未知，请确认标签；不会按维数猜测。"
+    ]
+  }
+}

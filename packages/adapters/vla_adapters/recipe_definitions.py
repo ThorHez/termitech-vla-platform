@@ -22,11 +22,16 @@ OVERRIDE_RULES = {
 }
 PARAMETER_PATHS = {"steps": "num_train_steps", "batch_size": "batch_size", "learning_rate": "lr_schedule.peak_lr"}
 SOURCE_PATHS = {"src/openpi/training/config.py", "openpi/training/config.py"}
+# Discovery still starts at the compatibility facade. Only these explicit
+# recipe parts may provide a saved definition or receive a source writeback.
+RECIPE_PART_PATHS = {f"{prefix}openpi/training/recipes/{method}.py"
+                     for prefix in ("src/", "") for method in ("sft", "recap", "mem", "rlt", "uot")}
+RECIPE_SOURCE_PATHS = SOURCE_PATHS | RECIPE_PART_PATHS
 LITERAL_ROOTS = {"data", "model", "optimizer", "lr_schedule"}
 _PROTECTED_FIELDS = {"name", "code_dir", "python", "entrypoint", "output_dir", "output_root", "checkpoint_base_dir",
                      "exp_name", "resume", "overwrite", "wandb_enabled"}
 _FIELD_PATH = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:(?:\.[A-Za-z][A-Za-z0-9_]*)|(?:\[(?:0|[1-9][0-9]?)\]))*")
-_ASSET_FIELDS = {"repo_id", "repo_ids", "assets", "assets_dir", "asset_id", "asset_ids",
+_ASSET_FIELDS = {"repo_id", "repo_ids", "assets", "assets_dir", "asset_id", "asset_ids", "composition",
                  "norm_stats", "norm_stats_path", "norm_stats_dir", "norm_path", "norm_dir",
                  "normalization_path", "normalization_dir", "dataset_path", "dataset_dir",
                  "data_path", "data_dir", "rlds_data_dir", "filter_dict_path", "weight_loader", "weight_loaders", "init_weights",
@@ -183,7 +188,7 @@ def validate_definition(definition: dict) -> dict:
             or not isinstance(definition["base_recipe"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,255}", definition["base_recipe"])):
         raise ValueError("RECIPE_DEFINITION_INVALID: invalid base recipe or revision")
     source = definition["source"]
-    if not isinstance(source, dict) or not isinstance(source.get("path"), str) or source["path"] not in SOURCE_PATHS:
+    if not isinstance(source, dict) or not isinstance(source.get("path"), str) or source["path"] not in RECIPE_SOURCE_PATHS:
         raise ValueError("RECIPE_DEFINITION_INVALID: invalid source path")
     for key, pattern in [("sha256", r"[a-f0-9]{64}"), ("changes_digest", r"[a-f0-9]{64}"), ("commit_sha", r"[a-f0-9]{40}|[a-f0-9]{64}")]:
         if not isinstance(source.get(key), str) or re.fullmatch(pattern, source[key]) is None:

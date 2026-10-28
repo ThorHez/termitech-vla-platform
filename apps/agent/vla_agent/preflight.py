@@ -45,32 +45,45 @@ def validate_local_inputs(config: dict, payload: dict) -> tuple[dict, dict]:
 
 
 def run_preflight(config: dict, payload: dict) -> dict:
+    from .profile_rebinding import profile_configuration_lock
+    try:
+        with profile_configuration_lock(config, busy_code="STORAGE_CONFIGURE_BUSY"):
+            return _run_preflight(config, payload)
+    except AgentError as exc:
+        error = exc.as_dict()
+        return {"code_snapshot": None, "checks": [{"name": "validation", "ok": False, "message": error["message"]}],
+                "error": error}
+
+
+def _run_preflight(config: dict, payload: dict) -> dict:
     checks = []
     snapshot = None
     try:
         profile, inputs = validate_local_inputs(config, payload)
         checks.append({"name": "runtime", "ok": True, "message": "Training Python executable and adapter environment are available"})
         checks.append({"name": "local_paths", "ok": True, "message": "Input assets and code exist inside configured roots"})
-        snapshot = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+        snapshot = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
         if not snapshot["complete"]:
             raise AgentError("CODE_VERSION_UNAVAILABLE", "Incomplete code snapshot: " + "; ".join(snapshot["missing"]))
         checks.append({"name": "code_version", "ok": True, "message": snapshot["commit_sha"]})
         output = str(Path(config["output_root"]) / "preflight-placeholder")
         count = payload.get("gpu_count", 0)
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), output,
-                              [f"preflight-gpu-{i}" for i in range(count)], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+                              [f"preflight-gpu-{i}" for i in range(count)], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
         checks.append({"name": "adapter", "ok": True, "message": "Template and trusted runtime configuration validated"})
         if profile.get("adapter") != "smoke":
             launch = prepare_launch(launch, config, payload.get("inputs", {}))
             automatic = validate_training(config, launch, checks)
             # A CPU probe imports registered code. Capture again so concurrent
             # edits cannot turn its result into authorization for different code.
-            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
             compare_code(snapshot, current)
             snapshot["automatic_preflight"] = automatic
         return {"code_snapshot": snapshot, "checks": checks}
     except Exception as exc:
         error = exc.as_dict() if isinstance(exc, AgentError) else {"code": "PREFLIGHT_FAILED", "message": str(exc)}
-        checks.append({"name": "validation", "ok": False, "message": error["message"]})
+        failure = {"name": "validation", "ok": False, "message": error["message"]}
+        if failure not in checks:
+            checks.append(failure)
         return {"code_snapshot": snapshot, "checks": checks, "error": error}
 

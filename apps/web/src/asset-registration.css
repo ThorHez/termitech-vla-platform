@@ -1,0 +1,174 @@
+.modal.wide.asset-register-modal {
+  width: 1320px;
+}
+
+.modal.wide.asset-register-modal.asset-register-simple {
+  width: 780px;
+}
+
+.asset-register-modal .modal-heading {
+  padding: 14px 20px;
+}
+
+.asset-register-modal .modal-heading h2 {
+  font-size: 18px;
+}
+
+.asset-register-modal .modal-heading p {
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.asset-register-modal .modal-body {
+  padding: 14px 20px;
+}
+
+.asset-register-modal .modal-footer {
+  padding: 12px 20px;
+}
+
+.asset-registration-layout.with-dataset-config {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.37fr) minmax(0, 1fr);
+  align-items: start;
+  gap: 20px;
+}
+
+.asset-registration-basics,
+.asset-registration-features {
+  min-width: 0;
+}
+
+.with-dataset-config > .asset-registration-basics {
+  padding-right: 20px;
+  border-right: 1px solid var(--border);
+}
+
+.asset-registration-basics > h3 {
+  margin: 0 0 10px;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.asset-registration-basics .field {
+  margin-bottom: 10px;
+}
+
+.asset-registration-basics .field-label {
+  margin-bottom: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.asset-registration-basics .field-hint {
+  margin-top: 4px;
+  line-height: 1.4;
+}
+
+.asset-registration-basics .form-grid {
+  gap: 0 10px;
+}
+
+.asset-registration-basics .field input,
+.asset-registration-basics .field select {
+  height: 34px;
+}
+
+.asset-registration-basics textarea {
+  display: block;
+  width: 100%;
+  min-height: 56px;
+  padding: 7px 9px;
+  border: 1px solid var(--border-default, #dfe6eb);
+  border-radius: 7px;
+  background: var(--bg-input, #fff);
+  color: var(--text-primary, #2b3b47);
+  font-size: 11px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.asset-registration-basics .dataset-profile-toggle {
+  margin: 8px 0;
+  font-size: 11px;
+}
+
+.asset-registration-layout > .error-notice {
+  grid-column: 1 / -1;
+}
+
+.asset-register-modal .path-autocomplete,
+.asset-register-modal .robot-type-field {
+  position: relative;
+}
+
+.asset-register-modal .path-autocomplete > .path-suggestion-panel,
+.asset-register-modal .robot-type-field > .path-suggestion-panel {
+  position: absolute;
+  z-index: 10;
+  top: 54px;
+  right: 0;
+  left: 0;
+  margin-top: 0;
+}
+
+@media (min-width: 1101px) and (max-height: 820px) {
+  .asset-register-modal .modal-heading,
+  .asset-register-modal .modal-body {
+    padding-top: 10px;
+    padding-bottom: 10px;
+  }
+
+  .asset-register-modal .modal-footer {
+    padding-top: 8px;
+    padding-bottom: 8px;
+  }
+
+  .asset-register-modal .dataset-profile-form.compact {
+    padding-top: 8px;
+    padding-bottom: 6px;
+  }
+
+  .asset-register-modal .dataset-profile-form.compact > .field-hint,
+  .asset-register-modal .dataset-profile-camera + .dataset-profile-camera .field-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .asset-register-modal .dataset-profile-form.compact .dataset-profile-cameras {
+    margin-bottom: 6px;
+  }
+
+  .asset-register-modal .dataset-profile-form.compact .dataset-profile-camera {
+    margin-top: 5px;
+  }
+}
+
+@media (max-width: 1100px) {
+  .asset-registration-layout.with-dataset-config {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+
+  .with-dataset-config > .asset-registration-basics {
+    padding-right: 0;
+    border-right: 0;
+  }
+}
+
+@media (max-width: 600px) {
+  .asset-register-modal .modal-heading,
+  .asset-register-modal .modal-body {
+    padding: 12px;
+  }
+
+  .asset-register-modal .modal-footer {
+    padding: 10px 12px;
+  }
+}

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import copy
 import os
 import signal
@@ -14,6 +15,8 @@ from vla_agent import preflight, runner, training_validation
 from vla_agent.safety import AgentError
 from vla_agent.snapshots import capture_code, compare_code
 from vla_agent.state import State
+
+from tests.agent.conftest import bind_config_confirmation
 
 
 @pytest.fixture
@@ -35,6 +38,9 @@ def probe_fixture(agent_fixture, monkeypatch):
             "model": {"path": inputs["model"]["path"], "parameter_bytes": 16},
             "datasets": [{"path": inputs["dataset"]["path"], "norm_sha256": "a" * 64}],
             "storage": {"required_bytes": 64, "reference_checkpoint_bytes": 32, "model_params_bytes": 16}}
+    source = "CONFIG = {\"fixture\": True}\n"
+    plan["generated_config"] = {"schema_version": 1, "language": "python", "filename": "training_config.py",
+                                "source": source, "sha256": hashlib.sha256(source.encode()).hexdigest()}
     cache = str(root / "cache/datasets")
     plan["training_cache"] = {"datasets_cache": cache, "paths": {"HF_DATASETS_CACHE": cache},
                               "builders": [{"path": inputs["dataset"]["path"], "cache_dir": cache + "/parquet/default"}]}
@@ -77,6 +83,51 @@ def test_cpu_probe_strips_credentials_and_returns_bound_plan_without_outputs(pro
     assert list(Path(fixture["config"]["output_root"]).iterdir()) == []
 
 
+def test_explicit_cache_root_reaches_cpu_probe_and_is_bound_to_its_evidence(probe_fixture, monkeypatch):
+    from vla_agent.storage_configuration import cache_environment
+    fixture = probe_fixture
+    config = fixture['config']
+    config['cache_root'] = str(fixture['root'] / 'new-cache')
+    environment = cache_environment(config)
+    cache = environment['HF_DATASETS_CACHE']
+    fixture['plan']['training_cache'] = {'datasets_cache': cache, 'paths': environment,
+                                       'builders': [{'path': fixture['inputs']['dataset']['path'],
+                                                     'cache_dir': cache + '/parquet/default'}]}
+    response = {'schema_version': 1, 'scope': 'configuration_and_local_assets', 'plan': fixture['plan'],
+                'checks': [{'name': name, 'ok': True, 'message': 'verified'} for name in
+                           ('recipe_configuration', 'data_contract', 'norm_contract', 'model_checkpoint',
+                            'training_entrypoint', 'training_cache')]}
+    fixture['script'].write_text('import os,json\nfrom pathlib import Path\n'
+                                f'Path({str(fixture["marker"])!r}).write_text(json.dumps(dict(os.environ)))\n'
+                                f'print("VLA_PREFLIGHT:"+json.dumps({response!r}))\n')
+    monkeypatch.setenv('HF_DATASETS_CACHE', '/old/inherited/cache')
+    launch = training_validation.prepare_launch(fixture['launch'], config, fixture['inputs'])
+    assert all(launch['env'][key] == value for key, value in environment.items())
+    evidence = training_validation.validate_training(config, launch, [])
+    child = json.loads(fixture['marker'].read_text())
+    assert all(child[key] == value for key, value in environment.items())
+    assert evidence['storage_configuration'] == {'output_root': config['output_root'], 'cache_root': config['cache_root']}
+    # A wrapper cannot claim it adopted the root while reporting the old cache.
+    response['plan']['training_cache']['paths'] = {'HF_DATASETS_CACHE': cache}
+    fixture['script'].write_text('import json\nprint("VLA_PREFLIGHT:"+json.dumps(' + repr(response) + '))\n')
+    with pytest.raises(AgentError, match='training cache evidence differs'):
+        training_validation.validate_training(config, launch, [])
+
+
+def test_output_directory_change_invalidates_the_frozen_preflight_even_with_identical_inputs(agent_fixture):
+    baseline = agent_fixture['payload']['code_expectation']
+    plan = {'unchanged': True}
+    evidence = {'schema_version': 1, 'scope': 'configuration_and_local_assets', 'plan': plan,
+                'plan_digest': canonical_digest(plan), 'storage_configuration': {
+                    'output_root': agent_fixture['config']['output_root'], 'cache_root': None}}
+    expected = {**baseline, 'automatic_preflight': evidence}
+    changed = copy.deepcopy(expected)
+    changed['automatic_preflight']['storage_configuration']['output_root'] += '-different-disk'
+    with pytest.raises(AgentError) as error:
+        compare_code(expected, changed)
+    assert error.value.code == 'ASSETS_CHANGED_SINCE_PREFLIGHT'
+
+
 def test_output_space_and_gpu_inventory_fail_with_specific_checks(probe_fixture, monkeypatch):
     fixture = probe_fixture
     monkeypatch.setattr(training_validation.shutil, "disk_usage", lambda _: SimpleNamespace(free=63))
@@ -112,6 +163,75 @@ def test_wrapper_detailed_failure_is_preserved(probe_fixture):
         training_validation.validate_training(fixture["config"], fixture["launch"], checks)
     assert error.value.code == "NORM_CONTRACT"
     assert checks == response["checks"]
+
+
+def fps_warning():
+    return {"name": "dataset_fps", "ok": True, "severity": "warning", "code": "DATASET_FPS_MISMATCH",
+            "message": "Dataset registration FPS 30 differs from metadata FPS 60"}
+
+
+def write_probe_response(fixture, checks, plan=None):
+    response = {"schema_version": 1, "scope": "configuration_and_local_assets",
+                "plan": fixture["plan"] if plan is None else plan, "checks": checks}
+    fixture["script"].write_text("import json\nprint('VLA_PREFLIGHT:'+json.dumps(" + repr(response) + "))\n")
+
+
+def test_fps_warning_survives_wrapper_validation_and_plan_digest(probe_fixture):
+    fixture = probe_fixture
+    plan = copy.deepcopy(fixture["plan"])
+    warning = fps_warning()
+    plan["datasets"][0]["warnings"] = [{"code": warning["code"], "supplied": 30, "metadata": 60,
+        "dataset_path": fixture["inputs"]["dataset"]["path"], "message": warning["message"]}]
+    wrapper_checks = [{"name": name, "ok": True, "message": "verified"} for name in
+                      ("recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]
+    write_probe_response(fixture, [*wrapper_checks, warning], plan)
+    checks = []
+    evidence = training_validation.validate_training(fixture["config"], fixture["launch"], checks)
+    assert checks[:len(wrapper_checks) + 1] == [*wrapper_checks, warning]
+    assert evidence["plan"] == plan
+    assert evidence["plan_digest"] == canonical_digest(plan)
+    assert evidence["plan_digest"] != canonical_digest(fixture["plan"])
+
+
+@pytest.mark.parametrize("failure", [
+    {"name": "norm_contract", "ok": False, "message": "norm dimension mismatch"},
+    {"name": "data_contract", "ok": False, "severity": "warning", "message": "invalid dataset shape"},
+])
+def test_wrapper_fps_warning_never_overrides_false_check(probe_fixture, failure):
+    checks = [fps_warning(), failure]
+    write_probe_response(probe_fixture, checks)
+    observed = []
+    with pytest.raises(AgentError) as error:
+        training_validation.validate_training(probe_fixture["config"], probe_fixture["launch"], observed)
+    assert error.value.code == "RECIPE_VALIDATION_FAILED"
+    assert observed == checks
+
+
+@pytest.mark.parametrize("inner,expected_count", [
+    ({"name": "validation", "ok": False, "message": "probe failed"}, 1),
+    ({"name": "norm_contract", "ok": False, "message": "probe failed"}, 2),
+    ({"name": "validation", "ok": False, "message": "another failure"}, 2),
+    ({"name": "validation", "ok": False, "message": "probe failed", "phase": "dataset"}, 2),
+])
+def test_preflight_only_deduplicates_identical_validation_failure(agent_fixture, monkeypatch, inner, expected_count):
+    profile = {**agent_fixture["config"]["profiles"][0], "adapter": "openpi-sft"}
+    monkeypatch.setattr(preflight, "validate_local_inputs", lambda *args: (profile, {}))
+    monkeypatch.setattr(preflight, "capture_code", lambda *args, **kwargs: dict(agent_fixture["payload"]["code_expectation"]))
+    monkeypatch.setattr(preflight, "build_launch", lambda *args, **kwargs: {})
+    monkeypatch.setattr(preflight, "prepare_launch", lambda *args, **kwargs: {})
+
+    def fail_probe(config, launch, checks):
+        checks.extend([fps_warning(), inner])
+        raise AgentError("RECIPE_VALIDATION_FAILED", "probe failed")
+
+    monkeypatch.setattr(preflight, "validate_training", fail_probe)
+    result = preflight.run_preflight(agent_fixture["config"], agent_fixture["payload"])
+    failures = [check for check in result["checks"] if check["ok"] is False]
+    assert len(failures) == expected_count
+    assert inner in failures
+    assert {"name": "validation", "ok": False, "message": "probe failed"} in failures
+    assert fps_warning() in result["checks"]
+    assert result["error"]["code"] == "RECIPE_VALIDATION_FAILED"
 
 
 @pytest.mark.parametrize("mutation", ["missing_check", "missing_evidence", "missing_builder", "different_dataset",
@@ -223,7 +343,12 @@ def test_probe_timeout_kills_descendant_even_if_parent_exits(tmp_path):
     deadline = time.monotonic() + 2
     pid = int(pid_file.read_text())
     while time.monotonic() < deadline:
-        if not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            # Successful cleanup can reap the process between construction and
+            # status lookup; a vanished descendant meets the same assertion.
             break
         time.sleep(0.02)
     else:
@@ -268,6 +393,7 @@ def test_runner_rechecks_plan_and_never_spawns_changed_assets(agent_fixture, mon
     changed["plan_digest"] = canonical_digest(changed["plan"])
     baseline = payload["code_expectation"]
     payload["code_expectation"] = {**baseline, "automatic_preflight": frozen}
+    bind_config_confirmation(payload, frozen)
     payload["gpu_uuids"] = []
     state = State(config["state_dir"])
     output = Path(config["output_root"]) / payload["attempt_id"]
@@ -292,6 +418,7 @@ def test_runner_records_automatic_evidence_on_started_and_saved_provenance(agent
     automatic["plan_digest"] = canonical_digest(automatic["plan"])
     baseline = payload["code_expectation"]
     payload["code_expectation"] = {**baseline, "automatic_preflight": automatic}
+    bind_config_confirmation(payload, automatic)
     state = State(config["state_dir"])
     output = Path(config["output_root"]) / payload["attempt_id"]
     state.create_attempt(payload, str(output))
@@ -325,3 +452,62 @@ def test_runner_records_automatic_evidence_on_started_and_saved_provenance(agent
     assert frozen_digests == [automatic["plan_digest"]]
     for path in (output / "provenance" / "code-snapshot.json", output / "provenance" / "end" / "code-snapshot.json"):
         assert json.loads(path.read_text())["automatic_preflight"] == automatic
+
+
+@pytest.mark.parametrize("mutation", ["missing", "digest", "syntax", "auto_config"])
+def test_wrapper_requires_valid_generated_code_and_exact_automatic_settings(probe_fixture, mutation):
+    fixture = probe_fixture
+    plan = copy.deepcopy(fixture["plan"])
+    if mutation == "missing":
+        plan.pop("generated_config")
+    elif mutation == "digest":
+        plan["generated_config"]["source"] += "# changed without a new digest\n"
+    elif mutation == "syntax":
+        plan["generated_config"]["source"] = "CONFIG = (\n"
+        plan["generated_config"]["sha256"] = hashlib.sha256(plan["generated_config"]["source"].encode()).hexdigest()
+    else:
+        plan["auto_config"] = {"model_type": "pi05", "finetune_mode": "full", "action_horizon": 50, "action_dim": 32}
+    response = {"schema_version": 1, "scope": "configuration_and_local_assets", "plan": plan,
+                "checks": [{"name": name, "ok": True, "message": "verified"} for name in
+                           ("recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]}
+    fixture["script"].write_text("import json\nprint('VLA_PREFLIGHT:'+json.dumps(" + repr(response) + "))\n")
+    with pytest.raises(AgentError) as failure:
+        training_validation.validate_training(fixture["config"], fixture["launch"], [])
+    assert failure.value.code == "PREFLIGHT_INVALID_RESPONSE"
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ("missing_code", "CONFIG_CONFIRMATION_REQUIRED"),
+    ("invalid_code", "CONFIG_CONFIRMATION_REQUIRED"),
+    ("missing_confirmation", "CONFIG_CONFIRMATION_REQUIRED"),
+    ("wrong_confirmation", "CONFIG_CONFIRMATION_MISMATCH"),
+    ("missing_payload_confirmation", "CONFIG_CONFIRMATION_MISMATCH"),
+    ("wrong_payload_confirmation", "CONFIG_CONFIRMATION_MISMATCH"),
+])
+def test_runner_never_spawns_without_the_exact_user_config_confirmation(agent_fixture, monkeypatch, mutation, expected):
+    config, payload = agent_fixture["config"], agent_fixture["payload"]
+    profile = {**config["profiles"][0], "adapter": "openpi-sft"}
+    automatic = {"schema_version": 1, "scope": "configuration_and_local_assets", "plan": {}}
+    bind_config_confirmation(payload, automatic)
+    if mutation == "missing_code":
+        automatic["plan"].pop("generated_config")
+    elif mutation == "invalid_code":
+        automatic["plan"]["generated_config"]["source"] += "# tampered\n"
+    elif mutation == "missing_confirmation":
+        payload["code_expectation"].pop("confirmed_config_sha256")
+    elif mutation == "wrong_confirmation":
+        payload["code_expectation"]["confirmed_config_sha256"] = "0" * 64
+    elif mutation == "missing_payload_confirmation":
+        payload.pop("confirmed_config_sha256")
+    else:
+        payload["confirmed_config_sha256"] = "0" * 64
+    state = State(config["state_dir"])
+    state.create_attempt(payload, str(Path(config["output_root"]) / payload["attempt_id"]))
+    monkeypatch.setattr(runner, "validate_local_inputs", lambda *_: (profile, {}))
+    monkeypatch.setattr(runner, "build_launch", lambda *args, **kwargs: pytest.fail("unconfirmed config reached launch builder"))
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("unconfirmed config spawned training"))
+    assert runner.execute(config, payload["attempt_id"]) == 1
+    final = state.pending_events()[-1]
+    assert final["type"] == "FAILED" and final["data"]["process_started"] is False
+    assert final["data"]["error"]["code"] == expected
+    assert not (Path(config["output_root"]) / payload["attempt_id"]).exists()

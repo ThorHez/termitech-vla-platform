@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -36,3 +37,17 @@ def agent_fixture(tmp_path):
                "profile_id": "smoke-profile", "template_id": "smoke", "inputs": {},
                "parameters": {"steps": 4}, "gpu_uuids": [], "code_expectation": baseline}
     return {"config": loaded, "repo": repo, "payload": payload, "root": tmp_path}
+
+
+def bind_config_confirmation(payload, automatic):
+    """Explicitly confirm a synthetic OpenPI plan in tests that reach the runner."""
+    from vla_protocol import canonical_digest
+    source = "CONFIG = {\"fixture\": True}\n"
+    generated = {"schema_version": 1, "language": "python", "filename": "training_config.py",
+                 "source": source, "sha256": hashlib.sha256(source.encode()).hexdigest()}
+    automatic["plan"]["generated_config"] = generated
+    automatic["plan_digest"] = canonical_digest(automatic["plan"])
+    payload["code_expectation"] = {**payload["code_expectation"], "automatic_preflight": automatic,
+                                   "confirmed_config_sha256": generated["sha256"]}
+    payload["confirmed_config_sha256"] = generated["sha256"]
+    return generated

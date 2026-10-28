@@ -33,15 +33,25 @@ def gpu_inventory() -> tuple[list[dict], dict]:
             processes = None
             if compute is not None and graphics is not None:
                 by_pid = {}
-                for process in [*compute, *graphics]:
-                    used = getattr(process, "usedGpuMemory", None)
-                    unknown = used is None or used >= (1 << 60)
-                    by_pid[process.pid] = {"pid": process.pid, "memory_mb": None if unknown else round(used / 2**20, 2)}
+                for kind, entries in (("compute", compute), ("graphics", graphics)):
+                    for process in entries:
+                        used = getattr(process, "usedGpuMemory", None)
+                        unknown = used is None or used >= (1 << 60)
+                        memory_mb = None if unknown else round(used / 2**20, 2)
+                        previous = by_pid.get(process.pid)
+                        if previous is None:
+                            by_pid[process.pid] = {"pid": process.pid, "memory_mb": memory_mb, "kind": kind}
+                        else:
+                            if previous["kind"] != kind:
+                                previous["kind"] = "compute_graphics"
+                            values = [value for value in (previous["memory_mb"], memory_mb) if value is not None]
+                            previous["memory_mb"] = max(values) if values else None
                 processes = list(by_pid.values())
             rows.append({"uuid": uuid.decode() if isinstance(uuid, bytes) else uuid,
                          "name": name.decode() if isinstance(name, bytes) else name,
                          "memory_total_mb": round(memory.total / 2**20, 2) if memory else None,
                          "memory_used_mb": round(memory.used / 2**20, 2) if memory else None,
+                         "memory_free_mb": round(memory.free / 2**20, 2) if memory else None,
                          "utilization_pct": utilization.gpu if utilization else None,
                          "processes": processes})
         return rows, {"available": True, "reason": None}
@@ -120,3 +130,23 @@ def check_gpus(requested: list[str], *, inventory: tuple[list[dict], dict] | Non
             raise AgentError("GPU_UNAVAILABLE", f"Cannot verify processes on GPU: {uuid}")
         if row["processes"]:
             raise AgentError("GPU_BUSY", f"GPU has an existing process: {uuid}")
+
+
+def check_deployment_gpu(uuid: str, mode="exclusive", memory_mb=None, *, inventory=None):
+    """Inference admission is separate from the training Runner's exclusivity."""
+    from vla_protocol.gpu_policy import gpu_deployment_error, normalize_gpu_policy
+
+    try:
+        policy = normalize_gpu_policy(mode, memory_mb)
+    except (TypeError, ValueError) as exc:
+        raise AgentError("GPU_POLICY_INVALID", str(exc)) from exc
+    rows, availability = inventory if inventory is not None else gpu_inventory()
+    if availability.get("available") is not True:
+        raise AgentError("GPU_TELEMETRY_UNAVAILABLE", "无法通过 NVML 确认部署 GPU 的当前状态")
+    row = next((item for item in rows if item.get("uuid") == uuid), None)
+    if row is None:
+        raise AgentError("GPU_UNAVAILABLE", "所选部署 GPU 不存在")
+    error = gpu_deployment_error(row, mode, memory_mb)
+    if error is not None:
+        raise AgentError(error["code"], error["message"])
+    return policy

@@ -1,0 +1,15 @@
+{
+  "fps": 20.0,
+  "features": {
+    "robot0_eef_pos": {"dtype": "float32", "shape": [2, 3]},
+    "robot0_eef_rotation_6d": {"dtype": "float32", "shape": [2, 6]},
+    "robot0_gripper_width": {"dtype": "float32", "shape": [2, 1]},
+    "robot1_eef_pos": {"dtype": "float32", "shape": [2, 3]},
+    "robot1_eef_rotation_6d": {"dtype": "float32", "shape": [2, 6]},
+    "robot1_gripper_width": {"dtype": "float32", "shape": [2, 1]},
+    "actions": {"dtype": "float32", "shape": [16, 20], "names": ["left_eef_pos_x","left_eef_pos_y","left_eef_pos_z","left_eef_rotation_6d_0","left_eef_rotation_6d_1","left_eef_rotation_6d_2","left_eef_rotation_6d_3","left_eef_rotation_6d_4","left_eef_rotation_6d_5","left_gripper_width","right_eef_pos_x","right_eef_pos_y","right_eef_pos_z","right_eef_rotation_6d_0","right_eef_rotation_6d_1","right_eef_rotation_6d_2","right_eef_rotation_6d_3","right_eef_rotation_6d_4","right_eef_rotation_6d_5","right_gripper_width"]},
+    "observation.images.left": {"dtype": "image", "shape": [2, 3, 224, 224]},
+    "observation.images.right_depth": {"dtype": "image", "shape": [224, 224, 1], "semantic": "depth"},
+    "prompt": {"dtype": "string", "shape": []}
+  }
+}

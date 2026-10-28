@@ -10,7 +10,8 @@ from sqlalchemy import select
 
 from .common import APIError, now, offset_time, uid, under_root
 from .models import Command
-from .recipe_suggestions import matching_profile, profile_digest, require_profile, SOURCES
+from .recipe_suggestions import matching_profile, profile_digest, require_profile
+from vla_adapters.recipe_definitions import RECIPE_SOURCE_PATHS
 from .schemas import InputModel
 
 
@@ -104,7 +105,7 @@ def validated_result(command, roots, result):
     if not isinstance(source, dict):
         return invalid
     path, code_dir, line, end_line = source.get("path"), source.get("code_dir"), source.get("line"), source.get("end_line")
-    if (not isinstance(path, str) or path not in SOURCES or not _safe_text(code_dir, 4096)
+    if (not isinstance(path, str) or path not in RECIPE_SOURCE_PATHS or not _safe_text(code_dir, 4096)
             or not code_dir.startswith("/") or ".." in PurePosixPath(code_dir).parts or not under_root(code_dir, roots)
             or type(line) is not int or type(end_line) is not int or not 1 <= line <= end_line <= 1_000_000
             or not _hex(source.get("sha256"), {64}) or not _hex(source.get("commit_sha"), {40, 64})

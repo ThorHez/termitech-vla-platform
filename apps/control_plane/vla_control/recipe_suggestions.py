@@ -121,7 +121,7 @@ def acknowledge(command: Command, profile: Profile | None, roots: list[str], sta
     return ("REJECTED" if "error" in clean else "APPLIED"), clean
 
 
-def query_dict(command: Command, profile: Profile | None, roots: list[str]) -> dict:
+def query_dict(command: Command, profile: Profile | None, roots: list[str], *, code_only: bool = False) -> dict:
     result = {"id": command.id, "node_id": command.node_id, "profile_id": command.payload["profile_id"],
               "prefix": command.payload["prefix"], "status": "PENDING", "entries": [], "truncated": False,
               "source": None, "warnings": [], "error": None}
@@ -142,7 +142,7 @@ def query_dict(command: Command, profile: Profile | None, roots: list[str]) -> d
         registered.update(name for name in validated if _valid_name(name))
     keyword = command.payload["prefix"]
     registered = {name for name in registered if recipe_matches(name, keyword)}
-    merged = sorted(known | registered, key=lambda name: recipe_sort_key(name, keyword))
+    merged = sorted(known if code_only else known | registered, key=lambda name: recipe_sort_key(name, keyword))
     entries = []
     serialized_profile = profile_dict(profile)
     for name in merged[:command.payload["limit"]]:
@@ -158,7 +158,7 @@ def query_dict(command: Command, profile: Profile | None, roots: list[str]) -> d
     return result
 
 
-def create_query(session, node, profile_id: str, prefix: str, limit: int) -> dict:
+def create_query(session, node, profile_id: str, prefix: str, limit: int, *, code_only: bool = False) -> dict:
     if not isinstance(prefix, str) or re.fullmatch(r"[A-Za-z0-9_-]{0,255}", prefix) is None:
         raise APIError(422, "INVALID_RECIPE_PREFIX", "训练配方关键字只能包含英文字母、数字、下划线和连字符")
     profile = require_profile(session, node.id, profile_id)
@@ -171,7 +171,7 @@ def create_query(session, node, profile_id: str, prefix: str, limit: int) -> dic
     for command in session.scalars(recent):
         if (command.payload.get("profile_digest") == snapshot and command.payload.get("prefix") == prefix
                 and command.payload.get("limit") == limit and command.payload.get("match_mode") == MATCH_MODE):
-            value = query_dict(command, profile, node.roots)
+            value = query_dict(command, profile, node.roots, code_only=code_only)
             if value["status"] in {"PENDING", "READY"}:
                 return value
     pending = select(Command.id).where(
@@ -184,4 +184,4 @@ def create_query(session, node, profile_id: str, prefix: str, limit: int) -> dic
                                "limit": limit, "match_mode": MATCH_MODE,
                                "expires_at": offset_time(QUERY_TTL_SECONDS)}, created_at=now())
     session.add(command)
-    return query_dict(command, profile, node.roots)
+    return query_dict(command, profile, node.roots, code_only=code_only)

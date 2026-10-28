@@ -162,8 +162,9 @@ class ArtifactMonitor:
     """One daemon worker; scheduling never waits for disk scanning or weights."""
 
     def __init__(self, state: State, output_root: str, *, interval: float = 10,
-                 scanner=discover_openpi_outputs, clock=time.monotonic):
+                 scanner=discover_openpi_outputs, clock=time.monotonic, output_roots: list[str] | None = None):
         self.state, self.output_root = state, output_root
+        self.output_roots = tuple(dict.fromkeys([output_root, *(output_roots or [])]))
         self.interval, self.scanner, self.clock = interval, scanner, clock
         self._lock = threading.Lock()
         self._wake, self._stopping = threading.Event(), threading.Event()
@@ -171,6 +172,12 @@ class ArtifactMonitor:
         self._pending: OrderedDict[str, dict] = OrderedDict()
         self._inflight: set[str] = set()
         self._next_due: dict[str, float] = {}
+
+    def set_output_roots(self, output_root: str, history: list[str]):
+        """Retain trusted old roots for detached attempts and historical reports."""
+        with self._lock:
+            self.output_root = output_root
+            self.output_roots = tuple(dict.fromkeys([output_root, *history]))
 
     def schedule(self, attempts: list[dict]):
         eligible = {attempt["id"]: attempt for attempt in attempts
@@ -223,9 +230,10 @@ class ArtifactMonitor:
         # A newly accepted START can wait on preflight before its Runner creates
         # the owned output directory. The background worker retries this later.
         Path(attempt["output_dir"]).lstat()
-        output = allowed_path(attempt["output_dir"], [self.output_root])
-        expected = Path(self.output_root).resolve() / attempt_id
-        if output != expected:
+        with self._lock:
+            roots = tuple(self.output_roots)
+        output = allowed_path(attempt["output_dir"], list(roots))
+        if not any(output == Path(root).resolve() / attempt_id for root in roots):
             raise ValueError("Attempt output directory does not match its identity")
         payload = attempt["payload"]
         recipe = payload.get("recipe") or payload.get("code_expectation", {}).get("recipe")

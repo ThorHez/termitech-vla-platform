@@ -1,6 +1,7 @@
 """Database-backed scheduling; multiple workers share the same reservation locks."""
 
 import logging
+from copy import deepcopy
 import secrets
 import time
 
@@ -9,9 +10,12 @@ from sqlalchemy import select
 from .common import ACTIVE, now, offset_time, uid
 from .db import Database
 from .models import Allocation, Asset, Attempt, Command, Node, Preview, Run
+from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
+from .policy_deployments import queue_status_checks
 from .path_suggestions import expire_pending as expire_path_queries
 from .recipe_suggestions import expire_pending as expire_recipe_queries
 from .recipe_details import expire_pending as expire_recipe_details
+from .dataset_inspections import expire_pending as expire_dataset_inspections
 from .recipe_writeback import pending_for_checkout
 from .remote_models import RemoteDeployment
 from .settings import Settings
@@ -39,10 +43,14 @@ def enqueue(session, node_id: str, kind: str, payload: dict) -> Command:
 
 def resolve_inputs(session, run_or_request) -> dict:
     inputs = run_or_request.inputs if hasattr(run_or_request, "inputs") else run_or_request["inputs"]
+    source = getattr(run_or_request, "code_expectation", {}) if hasattr(run_or_request, "inputs") else run_or_request
+    profiles = source.get("dataset_profiles", {})
     result = {}
     for role, asset_id in inputs.items():
         asset = session.get(Asset, asset_id)
         result[role] = {"id": asset.id, "path": asset.path, "kind": asset.kind}
+        if role in profiles:
+            result[role]["dataset_profile"] = deepcopy(profiles[role])
     return result
 
 
@@ -79,7 +87,10 @@ def tick(db: Database, settings: Settings) -> int:
                 for run in queued:
                     run.queue_reason = "NODE_RECOVERING" if node.status == "RECOVERING" else "NODE_OFFLINE"
                 continue
+            queue_status_checks(session, node, settings)
             reserved = {row.gpu_uuid for row in session.scalars(select(Allocation).where(Allocation.node_id == node_id))}
+            reserved.update(row.gpu_uuid for row in session.scalars(select(PolicyDeployment).where(
+                PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES))) if row.gpu_uuid)
             free = [gpu["uuid"] for gpu in node.gpus if gpu["uuid"] not in reserved and gpu_available(gpu)]
             for run in queued:
                 if pending_for_checkout(session, node_id, run.code_expectation.get("code_dir")):
@@ -110,6 +121,8 @@ def tick(db: Database, settings: Settings) -> int:
                     "inputs": resolve_inputs(session, run), "parameters": run.parameters,
                     "gpu_uuids": chosen, "code_expectation": run.code_expectation,
                     "entrypoint": run.code_expectation.get("requested_entrypoint"),
+                    **({"auto_config": run.code_expectation["auto_config"]} if run.code_expectation.get("auto_config") is not None else {}),
+                    **({"confirmed_config_sha256": run.code_expectation["confirmed_config_sha256"]} if run.code_expectation.get("confirmed_config_sha256") else {}),
                     **({"training_stage": run.code_expectation["training_stage"], "stage_config": run.code_expectation.get("stage_config", {})} if run.code_expectation.get("training_stage") is not None else {}),
                     **({"dataset_bindings": run.code_expectation["dataset_bindings"]} if run.code_expectation.get("dataset_bindings") is not None else {}),
                     **({"recipe": run.code_expectation["recipe"]} if "recipe" in run.code_expectation else {}),
@@ -122,6 +135,7 @@ def tick(db: Database, settings: Settings) -> int:
         expire_path_queries(session)
         expire_recipe_queries(session)
         expire_recipe_details(session)
+        expire_dataset_inspections(session)
         for preview in session.scalars(select(Preview).where(Preview.status.in_(["PENDING", "READY"]), Preview.expires_at < now()).with_for_update()):
             preview.status = "EXPIRED"
             preview.error = {"code": "PREFLIGHT_EXPIRED", "message": "Preflight expired; request a new check"}

@@ -21,6 +21,16 @@ def load_config(path: str | Path) -> dict[str, Any]:
     output = Path(value["output_root"])
     if not any(output == Path(root) or Path(root) in output.parents for root in value["roots"]):
         raise ValueError("output_root must be inside a configured root so produced assets can be reused")
+    value.setdefault("cache_root", None)
+    if value["cache_root"] is not None:
+        cache = value["cache_root"]
+        if (not isinstance(cache, str) or not Path(cache).is_absolute() or ".." in Path(cache).parts
+                or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in cache)):
+            raise ValueError("cache_root must be an absolute directory or null")
+        cache = Path(cache).resolve()
+        if cache == Path("/") or not any(cache.is_relative_to(Path(root)) for root in value["roots"]):
+            raise ValueError("cache_root must be inside a configured root")
+        value["cache_root"] = str(cache)
     value["config_path"] = str(source)
     value.setdefault("poll_interval_seconds", 2)
     value.setdefault("heartbeat_interval_seconds", 10)

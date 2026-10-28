@@ -1,6 +1,7 @@
 """HTTP API for local-data training orchestration."""
 
 from contextlib import asynccontextmanager
+from copy import deepcopy
 import hmac
 import logging
 import os
@@ -28,15 +29,26 @@ from .path_suggestions import acknowledge as acknowledge_path_query, create_quer
 from .recipe_suggestions import acknowledge as acknowledge_recipe_query, create_query as create_recipe_query, expire_pending as expire_recipe_queries, matching_profile as matching_recipe_profile, query_dict as recipe_query_dict
 from .recipe_details import acknowledge as acknowledge_recipe_detail
 from .data_processors import acknowledge as acknowledge_data_processors, register_routes as register_data_processor_routes
+from .dataset_inspections import acknowledge as acknowledge_dataset_inspection, expire_pending as expire_dataset_inspections, register_routes as register_dataset_inspection_routes
 from .recipe_library import register_recipe_routes
 from .recipe_writeback import acknowledge as acknowledge_recipe_writeback, register_routes as register_writeback_routes, require_no_pending_writeback
+from .profile_rebindings import acknowledge as acknowledge_profile_rebind, register_routes as register_profile_rebinding_routes
+from .storage_configurations import acknowledge as acknowledge_storage_configuration, register_routes as register_storage_configuration_routes
+from .policy_deployments import acknowledge as acknowledge_policy_deployment, register_routes as register_policy_deployment_routes, COMMANDS as POLICY_DEPLOYMENT_COMMANDS
+from .checkpoint_transfers import (CheckpointTransferManager, acknowledge_export,
+                                  register_routes as register_checkpoint_transfer_routes, EXPORT_COMMANDS)
+from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES as POLICY_RESOURCE_STATES
 from .remote_deployment import DeploymentManager, register_remote_routes
 from .remote_models import RemoteDeployment
 from .scheduler import enqueue, gpu_available, resolve_inputs, tick
 from .serialization import asset_dict, node_dict, preview_dict, profile_dict, run_dict
-from .service import apply_ack, automatic_preflight_error, get_required, ingest_events, sync_profiles, validate_request
+from .service import apply_ack, automatic_preflight_error, config_confirmation_error, get_required, ingest_events, sync_profiles, validate_request
 from .settings import Settings
 from .transport_security import TransportSecurityMiddleware, uvicorn_options
+from .training_drafts import register_routes as register_training_draft_routes
+from .training_templates import register_routes as register_training_template_routes
+from .resource_history import capture_sample, register_routes as register_resource_history_routes
+from .deployment_records import register_routes as register_deployment_record_routes
 
 logger = logging.getLogger(__name__)
 RETIRED_NODE_STATES = {"DISCONNECTED", "REMOVED"}
@@ -49,6 +61,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     db.initialize()
     auth = AuthManager(db, settings)
     remote_manager = DeploymentManager(db, settings)
+    transfer_manager = CheckpointTransferManager(db, settings, remote_manager)
     stop = threading.Event()
 
     def scheduler_loop():
@@ -62,6 +75,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_):
         worker = None
         remote_manager.start()
+        transfer_manager.start()
         if settings.scheduler_enabled:
             worker = threading.Thread(target=scheduler_loop, name="vla-scheduler", daemon=True)
             worker.start()
@@ -69,6 +83,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             stop.set()
+            transfer_manager.close()
             remote_manager.close()
             if worker:
                 worker.join(timeout=35)
@@ -87,6 +102,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db = db
     app.state.settings = settings
     app.state.remote_manager = remote_manager
+    app.state.transfer_manager = transfer_manager
     app.state.auth = auth
 
     @app.middleware("http")
@@ -161,6 +177,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return key
 
     admin = [Depends(require_human)]
+    register_training_draft_routes(app, admin, db, auth)
+    register_training_template_routes(app, admin, db, auth)
+    register_resource_history_routes(app, admin, db)
     register_remote_routes(app, admin, remote_manager)
 
     def require_available_node(session, node_id):
@@ -179,7 +198,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     register_recipe_routes(app, admin, db, require_available_node, settings)
     register_data_processor_routes(app, admin, db, require_available_node, settings)
+    register_dataset_inspection_routes(app, admin, db, require_available_node, settings)
     register_writeback_routes(app, admin, db, require_available_node, settings)
+    register_profile_rebinding_routes(app, admin, db, require_available_node, settings)
+    register_storage_configuration_routes(app, admin, db, require_available_node, settings)
+    register_policy_deployment_routes(app, admin, db, require_available_node, settings)
+    register_checkpoint_transfer_routes(app, admin, transfer_manager)
+    register_deployment_record_routes(app, admin, db, settings)
 
     @app.get("/healthz")
     def health():
@@ -218,6 +243,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with db.read() as session:
             nodes = list(session.scalars(select(Node).where(Node.status.not_in(RETIRED_NODE_STATES))))
             allocations = {(a.node_id, a.gpu_uuid) for a in session.scalars(select(Allocation))}
+            allocations.update((item.node_id, item.gpu_uuid) for item in session.scalars(select(PolicyDeployment).where(
+                PolicyDeployment.state.in_(POLICY_RESOURCE_STATES))) if item.gpu_uuid)
             return {"nodes_online": sum(n.status == "ONLINE" for n in nodes), "nodes_total": len(nodes),
                     "gpus_total": sum(len(n.gpus) for n in nodes),
                     "gpus_available": sum(n.status == "ONLINE" and (n.id, gpu["uuid"]) not in allocations and gpu_available(gpu) for n in nodes for gpu in n.gpus),
@@ -304,6 +331,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             profile = session.get(Profile, (node.id, command.payload["profile_id"]))
             return recipe_query_dict(command, profile, node.roots)
 
+    @app.post("/api/v1/nodes/{node_id}/inference-config-suggestions", dependencies=admin, status_code=202)
+    def inference_config_suggestions_create(node_id: str, body: schemas.RecipeSuggestInput):
+        with db.write() as session:
+            node = require_available_node(session, node_id)
+            if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
+                raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法获取推理配置")
+            return create_recipe_query(session, node, body.profile_id, body.prefix, body.limit, code_only=True)
+
+    @app.get("/api/v1/nodes/{node_id}/inference-config-suggestions/{query_id}", dependencies=admin)
+    def inference_config_suggestions_get(node_id: str, query_id: str):
+        with db.write() as session:
+            node = require_available_node(session, node_id)
+            if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
+                raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法获取推理配置")
+            command = get_required(session, Command, query_id, "Inference config suggestion")
+            if command.node_id != node.id or command.type != "RECIPE_SUGGEST":
+                raise APIError(404, "NOT_FOUND", "Inference config suggestion not found")
+            expire_recipe_queries(session, node.id)
+            profile = session.get(Profile, (node.id, command.payload["profile_id"]))
+            return recipe_query_dict(command, profile, node.roots, code_only=True)
+
     @app.get("/api/v1/assets", dependencies=admin)
     def assets(node_id: str | None = None, kind: str | None = None):
         with db.read() as session:
@@ -336,6 +384,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             asset.state = "ARCHIVED"
             return asset_dict(asset)
 
+    @app.patch("/api/v1/assets/{asset_id}/dataset-profile", dependencies=admin)
+    def update_dataset_profile(asset_id: str, body: schemas.AssetDatasetProfileInput):
+        with db.write() as session:
+            asset = session.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
+            if asset is None:
+                raise APIError(404, "NOT_FOUND", "Asset not found")
+            if asset.kind != "DATASET":
+                raise APIError(409, "ASSET_KIND_MISMATCH", "只有数据集资产可以编辑数据集描述")
+            if asset.state == "ARCHIVED":
+                raise APIError(409, "ASSET_ARCHIVED", "已归档资产不能编辑数据集描述")
+            asset.metadata_json = {**asset.metadata_json,
+                                   "dataset_profile": body.dataset_profile.model_dump(mode="json", exclude_none=True)}
+            session.flush()
+            return asset_dict(asset)
+
     @app.post("/api/v1/run-previews", dependencies=admin, status_code=202)
     def preview_create(body: schemas.PreviewInput):
         data = body.model_dump()
@@ -346,12 +409,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             data["parameters"] = parameters
+            # The asset description belongs to this preflight, not a later
+            # asset edit or an Agent-supplied source snapshot. Legacy tasks
+            # retain their original command shape when no profile is present.
+            dataset_profiles = {}
+            for role, asset_id in data["inputs"].items():
+                asset = session.get(Asset, asset_id)
+                if asset.kind == "DATASET" and isinstance(asset.metadata_json.get("dataset_profile"), dict):
+                    dataset_profiles[role] = deepcopy(asset.metadata_json["dataset_profile"])
+            if dataset_profiles:
+                data["dataset_profiles"] = dataset_profiles
+            from vla_adapters.composition_spec import COMPOSABLE_PROCESSOR, validate_composition_profile_input
+            for index, binding in enumerate(data.get("dataset_bindings") or []):
+                processor = binding.get("processor") or {}
+                if processor.get("name") != COMPOSABLE_PROCESSOR:
+                    continue
+                declared = dataset_profiles.get(f"dataset_{index}")
+                if declared is None and index == 0:
+                    declared = dataset_profiles.get("dataset")
+                try:
+                    validate_composition_profile_input(declared, processor.get("parameters", {}).get("composition"))
+                except ValueError as exc:
+                    message = str(exc)
+                    code = message.split(":", 1)[0] if ":" in message else "INVALID_COMPOSITION"
+                    raise APIError(422, code, message) from exc
             preview = Preview(id=uid(), node_id=node.id, request=data, status="PENDING", checks=[],
                               created_at=now(), expires_at=offset_time(settings.preview_ttl_seconds))
             session.add(preview)
             enqueue(session, node.id, "PREFLIGHT", {"preview_id": preview.id, "profile_id": body.profile_id,
                 "template_id": body.template_id, "recipe": data["recipe"], "inputs": resolve_inputs(session, data),
                 "parameters": parameters, "gpu_count": body.gpu_count, "entrypoint": data.get("entrypoint"),
+                **({"auto_config": data["auto_config"]} if data.get("auto_config") is not None else {}),
                 **({"training_stage": data["training_stage"], "stage_config": data["stage_config"]} if data.get("training_stage") is not None else {}),
                 **({"dataset_bindings": data["dataset_bindings"]} if data.get("dataset_bindings") is not None else {}),
                 **({"recipe_definition": data["recipe_definition"], "node_id": node.id} if data.get("recipe_definition") else {})})
@@ -411,13 +499,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             preflight_error = automatic_preflight_error(session, data, preview.code_snapshot, preview.checks)
             if preflight_error:
                 raise APIError(409, preflight_error["code"], preflight_error["message"])
+            confirmation_error = config_confirmation_error(data, preview.code_snapshot, body.confirmed_config_sha256)
+            if confirmation_error:
+                raise APIError(409, confirmation_error["code"], confirmation_error["message"])
             session.scalar(select(Node).where(Node.id == node.id).with_for_update())
             require_available_node(session, node.id)
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             created = now()
-            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "training_stage", "stage_config"}}
-            run = Run(id=uid(), **run_fields, state="QUEUED", code_expectation=preview.code_snapshot,
+            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "training_stage", "stage_config", "dataset_profiles", "auto_config"}}
+            expectation = {key: deepcopy(value) for key, value in preview.code_snapshot.items() if key != "dataset_profiles"}
+            if data["template_id"] in {"openpi-sft", "recap"}:
+                expectation["confirmed_config_sha256"] = body.confirmed_config_sha256
+                expectation["config_confirmed_at"] = created
+            if "dataset_profiles" in data:
+                expectation["dataset_profiles"] = deepcopy(data["dataset_profiles"])
+            run = Run(id=uid(), **run_fields, state="QUEUED", code_expectation=expectation,
                       created_at=created, updated_at=created, queue_reason="AWAITING_SCHEDULER")
             session.add(run)
             session.flush()
@@ -496,13 +593,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for root in body.roots:
             require_path(root)
         require_path(body.output_root)
+        if body.cache_root is not None:
+            require_path(body.cache_root, body.roots)
         if len({p.id for p in body.profiles}) != len(body.profiles):
             raise APIError(422, "DUPLICATE_PROFILE", "Profile IDs must be unique on each node")
         for profile in body.profiles:
             require_path(profile.code_dir, body.roots)
             require_path(profile.python)
         registration_key = digest(key_required(idempotency_key)) if idempotency_key is not None else None
-        body_digest = digest(body.model_dump())
+        registration_data = body.model_dump()
+        if body.cache_root is None:
+            registration_data.pop("cache_root")  # Preserve older registration idempotency digests.
+        body_digest = digest(registration_data)
         with db.write() as session:
             if registration_key:
                 existing = session.scalar(select(Node).where(Node.registration_key == registration_key).with_for_update())
@@ -517,7 +619,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             node_id = uid()
             token = registration_token(node_id, registration_key) if registration_key else secrets.token_urlsafe(48)
             node = Node(id=node_id, token_hash=token_hash(token), registration_key=registration_key, registration_digest=body_digest,
-                        name=body.name, hostname=body.hostname, roots=body.roots, output_root=body.output_root,
+                        name=body.name, hostname=body.hostname, roots=body.roots, output_root=body.output_root, cache_root=body.cache_root,
                         created_at=now(), last_seen=now(), status="REGISTERED", gpus=[], metrics={})
             session.add(node)
             session.flush()
@@ -536,6 +638,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
             assert_agent_connected(node)
             node.last_seen, node.gpus, node.metrics = now(), [gpu.model_dump() for gpu in body.gpus], body.metrics
+            capture_sample(session, node)
             reported_ids = {active.attempt_id for active in body.active_attempts}
 
             def mark_unknown(attempt):
@@ -579,7 +682,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # the delivery limit. Keep delivery stable and read-only within each
             # priority, including START before its later CANCEL, so retries
             # return the same unacknowledged commands.
-            priority = case((Command.type.in_(["START", "CANCEL"]), 0),
+            priority = case((Command.type.in_(["START", "CANCEL", "POLICY_DEPLOY_START", "POLICY_DEPLOY_STOP", "POLICY_EXPORT_CANCEL"]), 0),
                             (Command.type == "PREFLIGHT", 2), else_=1)
             rows = session.scalars(select(Command).where(Command.node_id == node_id, Command.status == "PENDING")
                                    .order_by(priority, Command.created_at, Command.id).limit(100))
@@ -608,10 +711,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 apply_ack(session, command, status, result)
             elif command.type == "RECIPE_WRITE":
                 acknowledge_recipe_writeback(session, command, node, body.status, body.result)
+            elif command.type == "PROFILE_REBIND":
+                acknowledge_profile_rebind(session, command, node, body.status, body.result)
+            elif command.type == "STORAGE_CONFIGURE":
+                acknowledge_storage_configuration(session, command, node, body.status, body.result)
+            elif command.type in POLICY_DEPLOYMENT_COMMANDS:
+                acknowledge_policy_deployment(session, command, node, body.status, body.result)
+            elif command.type in EXPORT_COMMANDS:
+                acknowledge_export(session, command, node, body.status, body.result, transfer_manager)
             elif command.type == "RECIPE_DETAIL":
                 acknowledge_recipe_detail(session, command, node, body.status, body.result)
             elif command.type == "DATA_PROCESSORS":
                 acknowledge_data_processors(session, command, node, body.status, body.result)
+            elif command.type == "DATASET_INSPECT":
+                acknowledge_dataset_inspection(session, command, node, body.status, body.result)
             elif command.type == "RECIPE_SUGGEST":
                 expire_recipe_queries(session, node_id)
                 profile = session.get(Profile, (node_id, command.payload["profile_id"]))

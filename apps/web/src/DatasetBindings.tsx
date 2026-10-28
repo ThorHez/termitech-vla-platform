@@ -1,13 +1,15 @@
 import { Database, Plus, Trash2 } from 'lucide-react';
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Field } from './components';
 import { normalizedAssetPath } from './datasetBindingHelpers';
 import {
   DataProcessorCatalogStatus,
-  DataProcessorPicker,
   processorParameterErrors,
   useDataProcessorCatalog,
 } from './DataProcessorPicker';
+import { DatasetProcessing } from './DatasetProcessing';
+import type { ImageLayoutEdits } from './imageLayout';
+import { datasetProfileSummary, type DatasetProfile } from './DatasetProfileForm';
 import type {
   Asset,
   DatasetBinding,
@@ -25,6 +27,13 @@ export function DatasetBindings({
   profile,
   onValidityChange,
   managedParameters = {},
+  trainingStage = 'sft',
+  automatic = false,
+  showProcessing = true,
+  readOnly = false,
+  onEditProcessing,
+  preserveProcessingOnDatasetChange = false,
+  imageLayoutEdits,
   onChange,
 }: {
   bindings: DatasetBinding[];
@@ -34,6 +43,13 @@ export function DatasetBindings({
   profile?: Profile;
   onValidityChange?: (valid: boolean) => void;
   managedParameters?: Record<string, RecipeLiteral>;
+  trainingStage?: 'sft' | 'value' | 'offline_rl';
+  automatic?: boolean;
+  showProcessing?: boolean;
+  readOnly?: boolean;
+  onEditProcessing?: () => void;
+  preserveProcessingOnDatasetChange?: boolean;
+  imageLayoutEdits?: ImageLayoutEdits;
   onChange: (bindings: DatasetBinding[]) => void;
 }) {
   const datasets = assets.filter((asset) => asset.kind === 'DATASET');
@@ -41,22 +57,47 @@ export function DatasetBindings({
   const processingChoices = slots.length
     ? slots
     : [{ recipe_index: 0, weight: 1, processing: '配方默认处理' }];
-  const catalogState = useDataProcessorCatalog(node, profile);
+  const catalogState = useDataProcessorCatalog(
+    showProcessing ? node : undefined,
+    showProcessing ? profile : undefined,
+  );
   const entries = catalogState.catalog?.entries || [];
+  const [automaticValidity, setAutomaticValidity] = useState<
+    Record<string, { token: string; valid: boolean }>
+  >({});
+  const bindingKey = (binding: DatasetBinding, index: number) =>
+    `${node?.id}:${profile?.id}:${trainingStage}:${binding.dataset_asset_id}:${index}`;
   const validityRef = useRef(onValidityChange);
   validityRef.current = onValidityChange;
-  const valid = bindings.every(
-    (binding) =>
-      !binding.processor ||
-      processorParameterErrors(
-        binding.processor,
-        entries.find((entry) => entry.name === binding.processor!.name),
-        managedParameters,
-      ).length === 0,
+  const validationTokens = bindings.map((binding, index) =>
+    JSON.stringify([
+      binding.processor,
+      binding.recipe_index,
+      trainingStage,
+      managedParameters,
+      automatic,
+      datasets.find((asset) => asset.id === binding.dataset_asset_id)?.metadata?.dataset_profile,
+      entries.find((entry) => entry.name === binding.processor?.name),
+      slots.find((slot) => slot.recipe_index === binding.recipe_index) || slots[index] || slots[0],
+    ]),
   );
+  const valid =
+    !showProcessing ||
+    bindings.every(
+      (binding, index) =>
+        automaticValidity[bindingKey(binding, index)]?.token === validationTokens[index] &&
+        automaticValidity[bindingKey(binding, index)]?.valid === true &&
+        (!automatic || !!binding.processor) &&
+        (!binding.processor ||
+          processorParameterErrors(
+            binding.processor,
+            entries.find((entry) => entry.name === binding.processor!.name),
+            managedParameters,
+          ).length === 0),
+    );
   useEffect(() => {
     validityRef.current?.(valid);
-  }, [valid]);
+  }, [valid, onValidityChange]);
   const totalWeight = bindings.reduce(
     (sum, binding) => sum + (Number.isFinite(binding.weight) ? binding.weight : 0),
     0,
@@ -74,31 +115,35 @@ export function DatasetBindings({
           <h3>训练数据集</h3>
           <span>{bindings.length} 个</span>
         </div>
-        <button
-          type="button"
-          className="button outline small"
-          disabled={(slots.length > 0 && !slots[0]?.multiple) || bindings.length >= 64}
-          onClick={() =>
-            onChange([
-              ...bindings,
-              {
-                dataset_asset_id: '',
-                norm_asset_id: '',
-                recipe_index: processingChoices[0].recipe_index,
-                weight: 1,
-              },
-            ])
-          }
-        >
-          <Plus size={14} />
-          添加数据集
-        </button>
+        {!readOnly && (
+          <button
+            type="button"
+            className="button outline small"
+            disabled={
+              (!automatic && slots.length > 0 && !slots[0]?.multiple) || bindings.length >= 64
+            }
+            onClick={() =>
+              onChange([
+                ...bindings,
+                {
+                  dataset_asset_id: '',
+                  norm_asset_id: '',
+                  recipe_index: processingChoices[0].recipe_index,
+                  weight: 1,
+                },
+              ])
+            }
+          >
+            <Plus size={14} />
+            添加数据集
+          </button>
+        )}
       </div>
       <p className="field-hint">
         本次训练只使用这里选择的已登记资产；配方中的目录仅作源码参考。每个数据集绑定自己的归一化参数，混采权重决定相对采样比例。
       </p>
-      <DataProcessorCatalogStatus {...catalogState} />
-      {!slots.length && (
+      {showProcessing && <DataProcessorCatalogStatus {...catalogState} />}
+      {showProcessing && !automatic && !slots.length && (
         <p className="recipe-detail-warning">
           未能静态读取数据处理配置，Agent 将在预检时核对配方。
         </p>
@@ -114,113 +159,164 @@ export function DatasetBindings({
           <div className="dataset-binding" key={index}>
             <div className="dataset-binding-title">
               <strong>数据集 {index + 1}</strong>
-              <button
-                type="button"
-                className="icon-button"
-                disabled={bindings.length <= 1}
-                aria-label={`移除数据集 ${index + 1}`}
-                title="移除数据集"
-                onClick={() => onChange(bindings.filter((_, row) => row !== index))}
-              >
-                <Trash2 size={15} />
-              </button>
+              {!readOnly && (
+                <button
+                  type="button"
+                  className="icon-button"
+                  disabled={bindings.length <= 1}
+                  aria-label={`移除数据集 ${index + 1}`}
+                  title="移除数据集"
+                  onClick={() => onChange(bindings.filter((_, row) => row !== index))}
+                >
+                  <Trash2 size={15} />
+                </button>
+              )}
             </div>
-            <div className="form-grid">
-              <Field
-                label={`数据集 ${index + 1}`}
-                required
-                hint={
-                  dataset?.path ||
-                  (datasets.length
-                    ? '选择当前机器的数据集资产。'
-                    : '请先在「数据与模型」登记当前机器的数据集。')
-                }
-              >
-                <select
+            {readOnly ? (
+              <p className="field-hint">
+                数据集：{dataset?.name || '未选择'} · 归一化：{norm?.name || '未选择'} · 混采权重：
+                {binding.weight}
+              </p>
+            ) : (
+              <div className="form-grid">
+                <Field
+                  label={`数据集 ${index + 1}`}
                   required
-                  value={binding.dataset_asset_id}
-                  onChange={(event) => {
-                    const selected = datasets.find((asset) => asset.id === event.target.value);
-                    const matching = selected
-                      ? norms.filter((asset) =>
-                          normalizedAssetPath(asset.path).startsWith(
-                            `${normalizedAssetPath(selected.path)}/`,
-                          ),
-                        )
-                      : [];
-                    update(index, {
-                      dataset_asset_id: event.target.value,
-                      norm_asset_id: matching.length === 1 ? matching[0].id : '',
-                    });
-                  }}
-                >
-                  <option value="">选择数据集</option>
-                  {datasets.map((asset) => (
-                    <option value={asset.id} key={asset.id}>
-                      {asset.name} · {asset.version}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field
-                label={`归一化参数 ${index + 1}`}
-                required
-                hint={
-                  norm?.path ||
-                  (norms.length
-                    ? '选择此数据集对应的归一化参数。'
-                    : '请先在「数据与模型」登记当前机器的归一化参数。')
-                }
-              >
-                <select
-                  required
-                  value={binding.norm_asset_id}
-                  onChange={(event) => update(index, { norm_asset_id: event.target.value })}
-                >
-                  <option value="">选择归一化参数</option>
-                  {norms.map((asset) => (
-                    <option value={asset.id} key={asset.id}>
-                      {asset.name} · {asset.version}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field
-                label={`混采权重 ${index + 1}`}
-                required
-                hint={
-                  share === undefined
-                    ? '请输入大于 0 的权重。'
-                    : `当前采样比例约 ${share.toFixed(2)}%`
-                }
-              >
-                <input
-                  type="number"
-                  required
-                  min={0.000000000001}
-                  step="any"
-                  value={Number.isFinite(binding.weight) ? binding.weight : ''}
-                  onChange={(event) =>
-                    update(index, {
-                      weight: event.target.value === '' ? NaN : Number(event.target.value),
-                    })
+                  hint={
+                    dataset?.path ||
+                    (datasets.length
+                      ? '选择当前机器的数据集资产。'
+                      : '请先在「数据与模型」登记当前机器的数据集。')
                   }
-                />
-              </Field>
-            </div>
-            <DataProcessorPicker
-              binding={binding}
-              slots={slots}
-              entries={entries}
-              index={index}
-              managedParameters={managedParameters}
-              onChange={(next) =>
-                onChange(bindings.map((value, row) => (row === index ? next : value)))
-              }
-            />
+                >
+                  <select
+                    required
+                    value={binding.dataset_asset_id}
+                    onChange={(event) => {
+                      const selected = datasets.find((asset) => asset.id === event.target.value);
+                      const matching = selected
+                        ? norms.filter((asset) =>
+                            normalizedAssetPath(asset.path).startsWith(
+                              `${normalizedAssetPath(selected.path)}/`,
+                            ),
+                          )
+                        : [];
+                      const {
+                        processor: _processor,
+                        recipe_index: _recipeIndex,
+                        ...rest
+                      } = binding;
+                      const selection = {
+                        ...rest,
+                        dataset_asset_id: event.target.value,
+                        norm_asset_id: matching.length === 1 ? matching[0].id : '',
+                      };
+                      const next: DatasetBinding =
+                        preserveProcessingOnDatasetChange && binding.processor
+                          ? { ...selection, processor: binding.processor }
+                          : {
+                              ...selection,
+                              recipe_index:
+                                preserveProcessingOnDatasetChange &&
+                                binding.recipe_index !== undefined
+                                  ? binding.recipe_index
+                                  : processingChoices[0].recipe_index,
+                            };
+                      onChange(bindings.map((value, row) => (row === index ? next : value)));
+                    }}
+                  >
+                    <option value="">选择数据集</option>
+                    {datasets.map((asset) => (
+                      <option value={asset.id} key={asset.id}>
+                        {asset.name} · {asset.version}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field
+                  label={`归一化参数 ${index + 1}`}
+                  required
+                  hint={
+                    norm?.path ||
+                    (norms.length
+                      ? '选择此数据集对应的归一化参数。'
+                      : '请先在「数据与模型」登记当前机器的归一化参数。')
+                  }
+                >
+                  <select
+                    required
+                    value={binding.norm_asset_id}
+                    onChange={(event) => update(index, { norm_asset_id: event.target.value })}
+                  >
+                    <option value="">选择归一化参数</option>
+                    {norms.map((asset) => (
+                      <option value={asset.id} key={asset.id}>
+                        {asset.name} · {asset.version}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field
+                  label={`混采权重 ${index + 1}`}
+                  required
+                  hint={
+                    share === undefined
+                      ? '请输入大于 0 的权重。'
+                      : `当前采样比例约 ${share.toFixed(2)}%`
+                  }
+                >
+                  <input
+                    type="number"
+                    required
+                    min={0.000000000001}
+                    step="any"
+                    value={Number.isFinite(binding.weight) ? binding.weight : ''}
+                    onChange={(event) =>
+                      update(index, {
+                        weight: event.target.value === '' ? NaN : Number(event.target.value),
+                      })
+                    }
+                  />
+                </Field>
+              </div>
+            )}
+            {showProcessing && (
+              <DatasetProcessing
+                key={bindingKey(binding, index)}
+                binding={binding}
+                dataset={dataset}
+                node={node}
+                imageLayoutEdits={imageLayoutEdits}
+                slots={slots}
+                entries={entries}
+                index={index}
+                stage={trainingStage}
+                managedParameters={managedParameters}
+                automatic={automatic}
+                readOnly={readOnly}
+                validationToken={validationTokens[index]}
+                onValidityChange={(value) => {
+                  const key = bindingKey(binding, index);
+                  setAutomaticValidity((previous) =>
+                    previous[key]?.valid === value &&
+                    previous[key]?.token === validationTokens[index]
+                      ? previous
+                      : { ...previous, [key]: { token: validationTokens[index], valid: value } },
+                  );
+                }}
+                onChange={(next) =>
+                  onChange(bindings.map((value, row) => (row === index ? next : value)))
+                }
+              />
+            )}
           </div>
         );
       })}
+      {readOnly && onEditProcessing && (
+        <button type="button" className="button outline small" onClick={onEditProcessing}>
+          返回第 1 步修改数据处理
+        </button>
+      )}
     </section>
   );
 }
@@ -228,15 +324,18 @@ export function DatasetBindings({
 export function DatasetBindingSummary({
   bindings,
   assets,
+  profiles,
 }: {
   bindings: DatasetBinding[];
   assets: Asset[];
+  profiles?: Record<string, DatasetProfile> | null;
 }) {
   return (
     <div className="dataset-binding-summary">
       {bindings.map((binding, index) => {
         const dataset = assets.find((asset) => asset.id === binding.dataset_asset_id);
         const norm = assets.find((asset) => asset.id === binding.norm_asset_id);
+        const frozen = profiles?.[`dataset_${index}`];
         return (
           <div key={index}>
             <strong>
@@ -249,17 +348,21 @@ export function DatasetBindingSummary({
               <details open>
                 <summary>数据处理参数</summary>
                 {Object.entries(binding.processor.parameters).length ? (
-                  Object.entries(binding.processor.parameters).map(([path, value]) => (
-                    <code className="block" key={path}>
-                      {path} = {JSON.stringify(value)}
-                    </code>
-                  ))
+                  <pre className="processor-parameters-json" aria-label="数据处理参数 JSON">
+                    <code>{JSON.stringify(binding.processor.parameters, null, 2)}</code>
+                  </pre>
                 ) : (
                   <span>使用该处理器的默认参数</span>
                 )}
               </details>
             )}
             <span>{dataset?.name || binding.dataset_asset_id}</span>
+            {frozen && (
+              <>
+                <span>预检时的数据特征：{datasetProfileSummary(frozen)}</span>
+                <span>任务描述：{frozen.task_description}</span>
+              </>
+            )}
             {dataset?.path && <code>{dataset.path}</code>}
             <span>归一化参数：{norm?.name || binding.norm_asset_id}</span>
             {norm?.path && <code>{norm.path}</code>}

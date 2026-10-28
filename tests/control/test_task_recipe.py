@@ -4,7 +4,7 @@ import pytest
 
 from vla_control.models import Preview, Profile, Run
 
-from .conftest import ADMIN, snapshot
+from .conftest import ADMIN, confirmed_run_request, snapshot
 
 
 def body(node, **changes):
@@ -53,7 +53,7 @@ def test_selected_recipe_is_frozen_into_preflight_run_and_start_command(platform
     assert preview["status"] == "READY"
     assert preview["request"]["recipe"] == preview["code_snapshot"]["recipe"] == "sft_b"
     response = platform.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": "sft-b"},
-                                    json={"preflight_id": preview["id"]})
+                                    json=confirmed_run_request(preview))
     assert response.status_code == 201, response.text
     run = response.json()
     assert run["recipe"] == run["code_expectation"]["recipe"] == "sft_b"
@@ -102,7 +102,7 @@ def test_submission_uses_automatic_evidence_instead_of_legacy_allowlist(platform
     with platform.app.state.db.write() as session:
         session.get(Profile, (node["node_id"], "default")).metadata_json = {"validated_recipes": []}
     response = platform.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": "revoked"},
-                                    json={"preflight_id": preview["id"]})
+                                    json=confirmed_run_request(preview))
     assert response.status_code == 201, response.text
 
 

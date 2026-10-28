@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -47,7 +47,22 @@ import type { Asset, Gpu, Node, NodeDetail, Run } from './types';
 import { NodeOnboarding, RuntimeCheckView, runtimeCheckFor } from './NodeOnboarding';
 import { NodeManagement } from './NodeManagement';
 import { NodeRename } from './NodeRename';
+import { ResourceHistory } from './ResourceHistory';
+import { ProfileRebinding } from './ProfileRebinding';
+import { StorageConfiguration } from './StorageConfiguration';
+import { matchesNodeQuery, nodeAddressText } from './nodeAddress';
 import { PathAutocomplete } from './PathAutocomplete';
+import { DatasetInspection, useDatasetInspectionDraft } from './DatasetInspection';
+import './asset-registration.css';
+import {
+  DatasetProfileEditor,
+  DatasetProfileForm,
+  datasetProfileErrors,
+  datasetProfileSummary,
+  emptyDatasetProfile,
+  normalizedDatasetProfile,
+  readDatasetProfile,
+} from './DatasetProfileForm';
 
 export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boolean }) {
   const { nodes, templates } = useData();
@@ -399,6 +414,14 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
           {gpu.processes.map((process) => (
             <div key={process.pid}>
               PID {process.pid} ·{' '}
+              {process.kind === 'graphics'
+                ? '图形进程'
+                : process.kind === 'compute'
+                  ? '计算进程'
+                  : process.kind === 'compute_graphics'
+                    ? '计算与图形进程'
+                    : '类型未知'}{' '}
+              ·{' '}
               {process.ownership === 'platform'
                 ? '平台训练进程'
                 : process.ownership === 'external'
@@ -420,10 +443,7 @@ export function NodesPage() {
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [managing, setManaging] = useState<Node>();
   const [renaming, setRenaming] = useState<Node>();
-  const filtered =
-    nodes.data?.filter((node) =>
-      `${node.name} ${node.hostname}`.toLowerCase().includes(query.toLowerCase()),
-    ) || [];
+  const filtered = nodes.data?.filter((node) => matchesNodeQuery(node, query)) || [];
   return (
     <>
       <PageHeading
@@ -453,7 +473,7 @@ export function NodesPage() {
           <Search size={16} />
           <input
             aria-label="搜索机器"
-            placeholder="搜索机器名称或主机名"
+            placeholder="搜索机器名称、主机名或 IP"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -476,6 +496,11 @@ export function NodesPage() {
                     <p>{node.hostname}</p>
                   </div>
                   <Badge state={node.status} />
+                </div>
+                <div className="machine-address">
+                  <Network size={14} />
+                  <span>IP / 连接地址</span>
+                  <strong className="mono">{nodeAddressText(node) || '未记录连接地址'}</strong>
                 </div>
                 <div className="machine-gpu">
                   <Cpu size={16} />
@@ -514,8 +539,11 @@ export function NodesPage() {
                   <ChevronRight size={16} />
                 </div>
               </a>
-              {can('machines.manage') && (
-                <div className="machine-card-management">
+              <div className="machine-card-management">
+                <a className="text-link machine-history-link" href={`#/nodes/${node.id}`}>
+                  <Activity size={13} />占用历史
+                </a>
+                {can('machines.manage') && <>
                   <button className="text-link" onClick={() => setRenaming(node)}>
                     <Pencil size={13} />
                     重命名
@@ -524,8 +552,8 @@ export function NodesPage() {
                     <Settings2 size={13} />
                     管理连接
                   </button>
-                </div>
-              )}
+                </>}
+              </div>
             </div>
           ))}
         </div>
@@ -536,7 +564,7 @@ export function NodesPage() {
             title={query ? '没有匹配的机器' : '接入第一台裸金属'}
             description={
               query
-                ? '请尝试其他名称或主机名。'
+                ? '请尝试其他名称、主机名或 IP。'
                 : '在机器上安装 Agent，计算资源、运行环境及在线状态会自动汇报。'
             }
             action={
@@ -598,7 +626,11 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
       <PageHeading
         eyebrow="NODE DETAIL"
         title={node?.name || '机器详情'}
-        description={node?.hostname || '查看机器资源与本地资产关联'}
+        description={
+          node
+            ? `${node.hostname} · IP / 连接地址：${nodeAddressText(node) || '未记录连接地址'}`
+            : '查看机器资源与本地资产关联'
+        }
         actions={
           <>
             {can('machines.manage') && (
@@ -684,6 +716,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               <strong>{nodeRuns.filter((run) => activeStates.has(run.state)).length}</strong>
             </div>
           </div>
+          <ResourceHistory key={id} nodeId={id} status={node.status} />
           <div className="detail-columns">
             <div>
               <Panel title="GPU 资源" subtitle="利用率为整卡指标；预约与实测占用分别展示">
@@ -770,6 +803,9 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                           </div>
                         </dl>
                         <RuntimeCheckView check={runtimeCheckFor(node, profile.id)} />
+                        <ProfileRebinding node={node} profile={profile}
+                          inUse={nodeRuns.some(run => run.profile_id === profile.id && activeStates.has(run.state))}
+                          changed={() => { profiles.refresh(); nodes.refresh(); details.refresh(); }} />
                       </div>
                     ))}
                   </div>
@@ -781,7 +817,19 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                   />
                 )}
               </Panel>
-              <Panel title="本地存储">
+              <Panel
+                title="本地存储"
+                action={
+                  <StorageConfiguration
+                    node={node}
+                    inUse={nodeRuns.some((run) => activeStates.has(run.state))}
+                    changed={() => {
+                      nodes.refresh();
+                      details.refresh();
+                    }}
+                  />
+                }
+              >
                 <dl className="detail-list padded">
                   <div>
                     <dt>允许目录</dt>
@@ -796,9 +844,19 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                     </dd>
                   </div>
                   <div>
-                    <dt>产出目录</dt>
+                    <dt>训练输出目录</dt>
                     <dd>
                       <code>{node.output_root || '—'}</code>
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>训练缓存根目录</dt>
+                    <dd>
+                      {node.cache_root ? (
+                        <code>{node.cache_root}</code>
+                      ) : (
+                        '默认跟随训练项目'
+                      )}
                     </dd>
                   </div>
                   <div>
@@ -865,6 +923,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const [query, setQuery] = useState('');
   const [register, setRegister] = useState(false);
   const [archiving, setArchiving] = useState<Asset>();
+  const [editingProfile, setEditingProfile] = useState<Asset>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [showArchived, setShowArchived] = useState(false);
@@ -873,7 +932,9 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       (kind === 'ALL' || asset.kind === kind) &&
       (!nodeId || asset.node_id === nodeId) &&
       (showArchived || (asset.status || asset.state) !== 'ARCHIVED') &&
-      `${asset.name} ${asset.path}`.toLowerCase().includes(query.toLowerCase()),
+      `${asset.name} ${asset.path} ${readDatasetProfile(asset.metadata?.dataset_profile)?.robot_type || ''} ${readDatasetProfile(asset.metadata?.dataset_profile)?.task_description || ''}`
+        .toLowerCase()
+        .includes(query.toLowerCase()),
   );
   return (
     <>
@@ -932,7 +993,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             <Search size={15} />
             <input
               aria-label="搜索资产"
-              placeholder="名称或路径"
+              placeholder="名称、路径、机器人或任务"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
             />
@@ -983,6 +1044,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                         </span>
                         <strong>{asset.name}</strong>
                       </div>
+                      {asset.kind === 'DATASET' && <DatasetAssetFeatures asset={asset} />}
                     </td>
                     <td>
                       <span>{assetKinds[asset.kind] || asset.kind}</span>
@@ -1004,6 +1066,20 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                       <Badge state={asset.status || asset.state || 'REGISTERED'} />
                     </td>
                     <td>
+                      {can('assets.write') &&
+                        asset.kind === 'DATASET' &&
+                        (asset.status || asset.state) !== 'ARCHIVED' && (
+                          <button
+                            type="button"
+                            className="button ghost small"
+                            onClick={() => setEditingProfile(asset)}
+                          >
+                            <Pencil size={14} />
+                            {readDatasetProfile(asset.metadata?.dataset_profile)
+                              ? '编辑数据特征'
+                              : '补录数据特征'}
+                          </button>
+                        )}
                       {can('assets.write') && (asset.status || asset.state) !== 'ARCHIVED' && (
                         <button
                           className="icon-button"
@@ -1047,7 +1123,10 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         )}
       </div>
       {can('assets.write') && register && (
-        <RegisterAsset initialNode={nodeId} close={() => setRegister(false)} />
+        <RegisterAsset key={nodeId} initialNode={nodeId} close={() => setRegister(false)} />
+      )}
+      {can('assets.write') && editingProfile && (
+        <DatasetProfileEditor asset={editingProfile} close={() => setEditingProfile(undefined)} />
       )}
       {can('assets.write') && archiving && (
         <Modal
@@ -1095,6 +1174,21 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   );
 }
 
+function DatasetAssetFeatures({ asset }: { asset: Asset }) {
+  const profile = readDatasetProfile(asset.metadata?.dataset_profile);
+  if (!profile) return <span className="dataset-profile-summary">尚未登记数据特征</span>;
+  return (
+    <>
+      <span className="dataset-profile-summary">{datasetProfileSummary(profile)}</span>
+      <span className="dataset-profile-task" title={profile.task_description}>
+        {profile.task_description.length > 90
+          ? `${profile.task_description.slice(0, 90)}…`
+          : profile.task_description}
+      </span>
+    </>
+  );
+}
+
 function RegisterAsset(props: { close: () => void; initialNode?: string }) {
   const { can } = useAuth();
   if (!can('assets.write'))
@@ -1117,22 +1211,42 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
+  const [datasetProfile, setDatasetProfile] = useState(emptyDatasetProfile);
+  const inspectionDraft = useDatasetInspectionDraft(datasetProfile, setDatasetProfile);
+  const [deferProfile, setDeferProfile] = useState(false);
+  const pending = useRef(false);
+  const profileErrors =
+    form.kind === 'DATASET' && !deferProfile ? datasetProfileErrors(datasetProfile) : [];
   const set = (key: keyof typeof form, value: string) =>
     setForm((previous) => ({ ...previous, [key]: value }));
   const node = nodes.data?.find((item) => item.id === form.node_id);
+  const showDatasetConfig = form.kind === 'DATASET' && !deferProfile;
   return (
     <Modal
       title="登记本地资产"
+      wide
+      className={`asset-register-modal ${showDatasetConfig ? '' : 'asset-register-simple'}`}
       subtitle="建立资产元数据与裸金属本地路径的关联。"
       close={() => {
-        if (!busy) close();
+        if (!pending.current) close();
       }}
       footer={
         <>
-          <button className="button outline" onClick={close} disabled={busy}>
+          <button
+            className="button outline"
+            onClick={() => {
+              if (!pending.current) close();
+            }}
+            disabled={busy}
+          >
             取消
           </button>
-          <button className="button primary" form="register-asset" type="submit" disabled={busy}>
+          <button
+            className="button primary"
+            form="register-asset"
+            type="submit"
+            disabled={busy || profileErrors.length > 0}
+          >
             {busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}登记资产
           </button>
         </>
@@ -1140,71 +1254,157 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
     >
       <form
         id="register-asset"
+        className={`asset-registration-layout ${showDatasetConfig ? 'with-dataset-config' : ''}`}
         onSubmit={async (event) => {
           event.preventDefault();
+          if (pending.current || profileErrors.length > 0) return;
+          pending.current = true;
           setBusy(true);
           setError(undefined);
           try {
-            await post('/assets', { ...form, metadata: {} });
+            await post('/assets', {
+              ...form,
+              metadata:
+                form.kind === 'DATASET' && !deferProfile
+                  ? { dataset_profile: normalizedDatasetProfile(datasetProfile) }
+                  : {},
+            });
             refresh();
             close();
           } catch (err) {
             setError(err as Error);
           } finally {
+            pending.current = false;
             setBusy(false);
           }
         }}
       >
-        <div className="form-grid">
+        <section className="asset-registration-basics" aria-label="资产信息">
+          <h3>资产信息</h3>
           <Field label="资产名称" required>
             <input
               required
+              disabled={busy}
               maxLength={160}
               placeholder="例如 shellgame-dataset-v1"
               value={form.name}
               onChange={(event) => set('name', event.target.value)}
             />
           </Field>
-          <Field label="资产类型">
-            <select value={form.kind} onChange={(event) => set('kind', event.target.value)}>
-              {Object.entries(assetKinds).map(([value, label]) => (
-                <option value={value} key={value}>
-                  {label}
+          <div className="form-grid">
+            <Field label="资产类型">
+              <select
+                disabled={busy}
+                value={form.kind}
+                onChange={(event) => set('kind', event.target.value)}
+              >
+                {Object.entries(assetKinds).map(([value, label]) => (
+                  <option value={value} key={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="资产版本" required>
+              <input
+                required
+                disabled={busy}
+                maxLength={80}
+                placeholder="v1"
+                value={form.version}
+                onChange={(event) => set('version', event.target.value)}
+              />
+            </Field>
+          </div>
+          <Field label="所在机器" required>
+            <select
+              required
+              disabled={busy}
+              value={form.node_id}
+              onChange={(event) => set('node_id', event.target.value)}
+            >
+              <option value="">选择机器</option>
+              {nodes.data?.map((item) => (
+                <option value={item.id} key={item.id}>
+                  {item.name}
                 </option>
               ))}
             </select>
           </Field>
-        </div>
-        <Field label="所在机器" required>
-          <select
-            required
-            value={form.node_id}
-            onChange={(event) => set('node_id', event.target.value)}
-          >
-            <option value="">选择机器</option>
-            {nodes.data?.map((item) => (
-              <option value={item.id} key={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <PathAutocomplete
-          key={form.node_id}
-          node={node}
-          value={form.path}
-          onChange={(value) => set('path', value)}
-          disabled={busy}
-        />
-        <Field label="资产版本" required hint="用于区分资产内容的版本标识。">
-          <input
-            required
-            maxLength={80}
-            placeholder="v1"
-            value={form.version}
-            onChange={(event) => set('version', event.target.value)}
+          <PathAutocomplete
+            key={form.node_id}
+            node={node}
+            value={form.path}
+            onChange={(value) => set('path', value)}
+            disabled={busy}
+            hint="可输入完整路径，也可逐级选择目录。"
           />
-        </Field>
+          {showDatasetConfig && (
+            <Field label="任务描述" required>
+              <textarea
+                required
+                disabled={busy}
+                maxLength={2000}
+                rows={2}
+                value={datasetProfile.task_description}
+                placeholder="例如 抓取衣物、折叠后放入收纳盒。"
+                onChange={(event) => {
+                  inspectionDraft.touch('task_description');
+                  inspectionDraft.manualChange({
+                    ...datasetProfile,
+                    task_description: event.target.value,
+                  });
+                }}
+              />
+            </Field>
+          )}
+          {form.kind === 'DATASET' && (
+            <>
+              <label className="dataset-profile-toggle">
+                <input
+                  type="checkbox"
+                  checked={deferProfile}
+                  disabled={busy}
+                  onChange={(event) => setDeferProfile(event.target.checked)}
+                />
+                稍后补录数据集特征
+              </label>
+              {deferProfile ? (
+                <p className="field-hint">
+                  仍可登记路径。补录后，新建训练会使用这些特征匹配处理器。
+                </p>
+              ) : (
+                <>
+                  <DatasetInspection
+                    compact
+                    node={node}
+                    path={form.path}
+                    value={datasetProfile}
+                    draft={inspectionDraft}
+                    disabled={busy}
+                  />
+                </>
+              )}
+            </>
+          )}
+        </section>
+        {showDatasetConfig && (
+          <section className="asset-registration-features" aria-label="数据集配置">
+            <DatasetProfileForm
+              compact
+              showTaskDescription={false}
+              value={datasetProfile}
+              onChange={inspectionDraft.manualChange}
+              onFieldEdit={inspectionDraft.touch}
+              disabled={busy}
+            />
+            {profileErrors.length > 0 && (
+              <p className="field-hint required" role="status">
+                {profileErrors[0]}
+              </p>
+            )}
+          </section>
+        )}
         <ErrorNotice error={error} />
       </form>
     </Modal>

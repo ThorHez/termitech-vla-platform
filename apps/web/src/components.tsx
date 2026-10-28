@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   AlertCircle,
@@ -15,6 +15,14 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import { ApiError, date, navigate } from './api';
 import type { CodeSnapshot } from './types';
+import {
+  buildMetricChartModel,
+  formatMetricValue,
+  metricFraction,
+  metricInterpolate,
+  nearestMetricPoint,
+} from './metricChartData';
+import type { MetricChartInput, MetricChartPoint } from './metricChartData';
 
 const states: Record<string, [string, string]> = {
   ONLINE: ['在线', 'green'],
@@ -218,6 +226,7 @@ export function Modal({
   children,
   footer,
   wide = false,
+  className = '',
 }: {
   title: string;
   subtitle?: string;
@@ -225,6 +234,7 @@ export function Modal({
   children: ReactNode;
   footer?: ReactNode;
   wide?: boolean;
+  className?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const closeRef = useRef(close);
@@ -278,7 +288,7 @@ export function Modal({
       }}
     >
       <div
-        className={`modal ${wide ? 'wide' : ''}`}
+        className={`modal ${wide ? 'wide' : ''} ${className}`}
         ref={ref}
         role="dialog"
         aria-modal="true"
@@ -386,76 +396,196 @@ export function CodeVersion({
     </div>
   );
 }
-export function MetricChart({ values }: { values: { step: number; loss: number }[] }) {
-  if (!values.length)
+export function MetricChart({
+  values,
+  metricName = 'loss',
+}: {
+  values: readonly MetricChartInput[];
+  metricName?: string;
+}) {
+  const gradientId = useId();
+  const descriptionId = useId();
+  const [selected, setSelected] = useState<number | null>(null);
+  const model = useMemo(() => buildMetricChartModel(values), [values]);
+  if (!model.knownCount)
     return (
       <div className="chart-empty">
         <div className="chart-grid" />
-        <span>等待训练上报 loss 指标</span>
+        <span>等待训练上报 {metricName} 指标</span>
       </div>
     );
   const width = 700,
-    height = 206,
-    pad = 35;
-  const losses = values.map((item) => item.loss),
-    steps = values.map((item) => item.step);
-  const low = Math.min(...losses),
-    high = Math.max(...losses),
-    first = Math.min(...steps),
-    last = Math.max(...steps);
-  const range = high - low || Math.abs(high) * 0.1 || 1;
-  const yMin = low - range * 0.08,
-    yMax = high + range * 0.08;
-  const point = (item: { step: number; loss: number }) =>
-    `${pad + ((item.step - first) / (last - first || 1)) * (width - pad * 2)},${height - pad - ((item.loss - yMin) / (yMax - yMin)) * (height - pad * 2)}`;
-  const line = values.map(point).join(' ');
-  const area = `${pad},${height - pad} ${line} ${point(values[values.length - 1]).split(',')[0]},${height - pad}`;
+    height = 206;
+  const left = 65,
+    right = 22,
+    top = 24,
+    bottom = 34;
+  const chartWidth = width - left - right;
+  const chartHeight = height - top - bottom;
+  const x = (point: MetricChartPoint) =>
+    left + metricFraction(point.step, model.first, model.last) * chartWidth;
+  const y = (value: number) =>
+    top + (1 - metricFraction(value, model.domain.low, model.domain.high)) * chartHeight;
+  const pointCoordinates = (point: MetricChartPoint) =>
+    `${x(point).toFixed(2)},${y(point.value as number).toFixed(2)}`;
+  const selectedPoint =
+    selected === null ? undefined : model.points[Math.min(selected, model.points.length - 1)];
   return (
     <div className="metric-chart">
       <svg
         viewBox={`0 0 ${width} ${height}`}
         role="img"
-        aria-label={`训练 loss 曲线，共 ${values.length} 个采样点，最新 ${values[values.length - 1].loss}`}
+        tabIndex={0}
+        aria-label={`${metricName} 训练指标曲线，共 ${model.knownCount} 个有效采样点，最近有效观测值 ${formatMetricValue(model.latest?.value)}`}
+        aria-describedby={descriptionId}
+        onPointerMove={(event) => {
+          const bounds = event.currentTarget.getBoundingClientRect();
+          const fraction = Math.max(
+            0,
+            Math.min(
+              1,
+              (((event.clientX - bounds.left) / bounds.width) * width - left) / chartWidth,
+            ),
+          );
+          setSelected(nearestMetricPoint(model.points, fraction, model.first, model.last));
+        }}
+        onPointerLeave={() => setSelected(null)}
+        onFocus={() => setSelected(model.points.length - 1)}
+        onBlur={() => setSelected(null)}
+        onKeyDown={(event) => {
+          if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+          event.preventDefault();
+          setSelected((current) =>
+            event.key === 'Home'
+              ? 0
+              : event.key === 'End'
+                ? model.points.length - 1
+                : Math.max(
+                    0,
+                    Math.min(
+                      model.points.length - 1,
+                      (current ?? model.points.length - 1) + (event.key === 'ArrowLeft' ? -1 : 1),
+                    ),
+                  ),
+          );
+        }}
       >
+        <desc id={descriptionId}>
+          横轴为训练步数。无效或缺失指标保留断点。聚焦后使用左右方向键查看采样，Home 和 End
+          跳转首尾。
+        </desc>
         <defs>
-          <linearGradient id="lossFill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#13a595" stopOpacity=".22" />
-            <stop offset="100%" stopColor="#13a595" stopOpacity="0" />
+          <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--chart-gradient, #13a595)" stopOpacity=".22" />
+            <stop offset="100%" stopColor="var(--chart-gradient, #13a595)" stopOpacity="0" />
           </linearGradient>
         </defs>
         {[0, 1, 2, 3].map((tick) => (
           <g key={tick}>
             <line
-              x1={pad}
-              x2={width - pad}
-              y1={pad + (tick * (height - 2 * pad)) / 3}
-              y2={pad + (tick * (height - 2 * pad)) / 3}
-              stroke="#e9eef0"
+              x1={left}
+              x2={width - right}
+              y1={top + (tick * chartHeight) / 3}
+              y2={top + (tick * chartHeight) / 3}
+              stroke="var(--chart-grid, #e9eef0)"
               strokeDasharray="3 4"
             />
-            <text x={pad - 8} y={pad + (tick * (height - 2 * pad)) / 3 + 4} textAnchor="end">
-              {(yMax - ((yMax - yMin) * tick) / 3).toPrecision(3)}
+            <text x={left - 8} y={top + (tick * chartHeight) / 3 + 4} textAnchor="end">
+              {formatMetricValue(
+                metricInterpolate(model.domain.high, model.domain.low, tick / 3),
+                4,
+              )}
             </text>
           </g>
         ))}
-        <polygon points={area} fill="url(#lossFill)" />
-        <polyline
-          points={line}
-          fill="none"
-          stroke="#0b9b8e"
-          strokeWidth="2.4"
-          strokeLinejoin="round"
-        />
-        {values.length === 1 && (
-          <circle cx={pad} cy={Number(point(values[0]).split(',')[1])} r="4" fill="#0b9b8e" />
+        {model.segments.map((segment, index) => {
+          const line = segment.map(pointCoordinates).join(' ');
+          const lastPoint = segment[segment.length - 1];
+          return (
+            <g key={index}>
+              {segment.length > 1 && (
+                <>
+                  <polygon
+                    points={`${x(segment[0]).toFixed(2)},${height - bottom} ${line} ${x(lastPoint).toFixed(2)},${height - bottom}`}
+                    fill={`url(#${gradientId})`}
+                  />
+                  <polyline
+                    points={line}
+                    fill="none"
+                    stroke="var(--chart-teal, #0b9b8e)"
+                    strokeWidth="2.4"
+                    strokeLinejoin="round"
+                  />
+                </>
+              )}
+              {(segment.length === 1 || model.constant || model.first === model.last) && (
+                <circle
+                  cx={x(lastPoint)}
+                  cy={y(lastPoint.value as number)}
+                  r="4"
+                  fill="var(--chart-teal, #0b9b8e)"
+                />
+              )}
+            </g>
+          );
+        })}
+        {selectedPoint && (
+          <g>
+            <line
+              x1={x(selectedPoint)}
+              x2={x(selectedPoint)}
+              y1={top}
+              y2={height - bottom}
+              stroke="var(--text-muted, #9daeb9)"
+              strokeDasharray="3 4"
+            />
+            {selectedPoint.value !== null && (
+              <circle
+                cx={x(selectedPoint)}
+                cy={y(selectedPoint.value)}
+                r="4"
+                fill="var(--chart-teal, #0b9b8e)"
+                stroke="var(--bg-overlay, #fff)"
+                strokeWidth="2"
+              />
+            )}
+          </g>
         )}
-        <text x={pad} y={height - 9}>
-          {first}
+        <text x={left} y={height - 9}>
+          {formatMetricValue(model.first)}
         </text>
-        <text x={width - pad} y={height - 9} textAnchor="end">
-          {last} step
+        <text x={width - right} y={height - 9} textAnchor="end">
+          {formatMetricValue(model.last)} step
         </text>
       </svg>
+      <div
+        aria-live="polite"
+        style={{
+          minHeight: 27,
+          display: 'flex',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          gap: '5px 12px',
+          padding: '3px 8px',
+          color: 'var(--text-muted, #9daeb9)',
+          fontSize: 11,
+        }}
+      >
+        {selectedPoint ? (
+          <>
+            <span>step {formatMetricValue(selectedPoint.step)}</span>
+            <span>
+              {metricName} <strong>{formatMetricValue(selectedPoint.value)}</strong>
+            </span>
+            {selectedPoint.timestamp && (
+              <time dateTime={selectedPoint.timestamp}>{date(selectedPoint.timestamp)}</time>
+            )}
+            {selectedPoint.value === null && <span>此采样未上报有效数值</span>}
+          </>
+        ) : (
+          <span>移动指针或聚焦后使用方向键查看数值</span>
+        )}
+      </div>
     </div>
   );
 }

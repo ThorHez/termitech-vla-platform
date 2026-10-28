@@ -7,7 +7,7 @@ from vla_protocol import canonical_digest
 
 from vla_control.models import Asset, Preview, Profile
 
-from .conftest import ADMIN, automatic_checks, automatic_preflight, snapshot
+from .conftest import ADMIN, automatic_checks, automatic_preflight, confirmed_run_request, snapshot
 from .test_task_recipe import inputs, request_preview
 
 
@@ -31,8 +31,9 @@ def acknowledge(platform, node, identifier, command, code, checks=None):
 
 
 def submit(platform, identifier):
+    checked = platform.client.get(f"/api/v1/run-previews/{identifier}", headers=ADMIN).json()
     return platform.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": identifier},
-                                json={"preflight_id": identifier})
+                                json=confirmed_run_request(checked))
 
 
 def test_automatic_preflight_can_submit_without_claiming_manual_or_training_acceptance(platform):
@@ -44,6 +45,53 @@ def test_automatic_preflight_can_submit_without_claiming_manual_or_training_acce
     assert response.json()["code_expectation"]["automatic_preflight"] == code["automatic_preflight"]
     with platform.app.state.db.read() as session:
         assert session.get(Profile, (node["node_id"], "default")).metadata_json == {}
+
+
+def fps_warning():
+    return {"name": "dataset_fps", "ok": True, "severity": "warning", "code": "DATASET_FPS_MISMATCH",
+            "message": "Dataset registration FPS 30 differs from metadata FPS 60"}
+
+
+def test_fps_warning_ack_is_ready_and_still_requires_exact_config_confirmation(platform):
+    node, identifier, command, code = pending(platform)
+    warning = fps_warning()
+    evidence = code["automatic_preflight"]
+    dataset = evidence["plan"]["datasets"][0]
+    dataset["warnings"] = [{"code": warning["code"], "supplied": 30, "metadata": 60,
+                             "dataset_path": dataset["path"], "message": warning["message"]}]
+    evidence["plan_digest"] = canonical_digest(evidence["plan"])
+    checks = [*automatic_checks(), warning]
+    checked = acknowledge(platform, node, identifier, command, code, checks=checks)
+    assert checked["status"] == "READY"
+    assert checked["checks"] == checks
+    assert checked["code_snapshot"]["automatic_preflight"] == evidence
+    for sha, expected in ((None, "CONFIG_CONFIRMATION_REQUIRED"), ("0" * 64, "CONFIG_CONFIRMATION_MISMATCH")):
+        body = {"preflight_id": identifier}
+        if sha is not None:
+            body["confirmed_config_sha256"] = sha
+        response = platform.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": identifier}, json=body)
+        assert response.status_code == 409, response.text
+        assert response.json()["error"]["code"] == expected
+    response = submit(platform, identifier)
+    assert response.status_code == 201, response.text
+    assert response.json()["code_expectation"]["automatic_preflight"] == evidence
+
+
+@pytest.mark.parametrize("failure", [
+    {"name": "norm_contract", "ok": False, "message": "norm dimension mismatch"},
+    {"name": "data_contract", "ok": False, "severity": "warning", "message": "invalid dataset shape"},
+])
+def test_fps_warning_ack_never_overrides_false_check(platform, failure):
+    node, identifier, command, code = pending(platform)
+    checks = [*automatic_checks(), fps_warning(), failure]
+    checked = acknowledge(platform, node, identifier, command, code, checks=checks)
+    assert checked["status"] == "FAILED" and checked["error"]["code"] == "PREFLIGHT_FAILED"
+    assert checked["checks"] == checks
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "PREFLIGHT_NOT_READY"
+    with platform.app.state.db.read() as session:
+        assert all(session.get(Asset, asset_id).state == "REGISTERED"
+                   for asset_id in checked["request"]["inputs"].values())
 
 
 def test_old_agent_without_automatic_evidence_is_rejected_even_for_allowlisted_recipe(platform):

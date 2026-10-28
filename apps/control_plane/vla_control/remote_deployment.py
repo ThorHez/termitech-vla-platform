@@ -108,6 +108,9 @@ class DeploymentManager:
         self._tunnel_retries: dict[str, tuple[float, int]] = {}
         self._monitor: threading.Thread | None = None
         self._started = False
+        # An isolated control-plane copy may retain deployment history whose
+        # tunnels belong to another service. New jobs still get normal monitoring.
+        self._restore_excluded_job_ids: frozenset[str] = frozenset()
         self._wait_seconds = float(os.getenv("VLA_REMOTE_AGENT_WAIT_SECONDS", "180"))
         self._path_queries = threading.BoundedSemaphore(4)
 
@@ -131,13 +134,16 @@ class DeploymentManager:
                        target_port=int(os.getenv("VLA_TUNNEL_TARGET_PORT", "8000")),
                        expected_fingerprint=connection.fingerprint)
 
-    def start(self):
+    def start(self, *, excluded_job_ids=()):
         with self._lock:
             if self._started:
                 return
+            self._restore_excluded_job_ids = frozenset(excluded_job_ids)
             self._started = True
         with self.db.write() as session:
             for job in session.scalars(select(RemoteDeployment).where(RemoteDeployment.state.not_in(JOB_TERMINAL))):
+                if job.id in self._restore_excluded_job_ids:
+                    continue
                 self._change(job, "INTERRUPTED", "INTERRUPTED", "中台已重启，未完成的部署已中断；请检查后重试")
                 job.error = {"code": "DEPLOYMENT_INTERRUPTED", "message": "中台已重启，部署未完成；可使用重试重新检查并安装"}
                 if job.connection_mode == "ssh-tunnel":
@@ -397,8 +403,12 @@ class DeploymentManager:
         run = session.scalar(select(Run.id).where(Run.node_id == node_id, Run.state.not_in(TERMINAL)).limit(1))
         command = session.scalar(select(Command.id).where(Command.node_id == node_id, Command.status == "PENDING").limit(1))
         allocation = session.scalar(select(Allocation.node_id).where(Allocation.node_id == node_id).limit(1))
-        if run or command or allocation:
-            raise APIError(409, "NODE_BUSY", "该机器仍有训练、资源预约或待执行命令，暂不能管理 Agent")
+        from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
+        deployment = session.scalar(select(PolicyDeployment.id).where(
+            PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES)).limit(1))
+        from .checkpoint_transfers import active_transfers
+        if run or command or allocation or deployment or active_transfers(session, node_id):
+            raise APIError(409, "NODE_BUSY", "该机器仍有训练、权重同步、真机部署、资源预约或待执行命令，暂不能管理 Agent")
 
     @staticmethod
     def _assert_no_other_job(session, node_id: str | None, exclude_id: str | None = None):
@@ -865,6 +875,8 @@ class DeploymentManager:
         for job in jobs:
             if self._stop.is_set():
                 return
+            if job.id in self._restore_excluded_job_ids:
+                continue
             with self._lock:
                 tunnel = self._tunnels.get(job.id)
             if self._operation(job) != "install":

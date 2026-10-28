@@ -1,6 +1,6 @@
 """ORM models; source files and model weights never enter this database."""
 
-from sqlalchemy import Boolean, JSON, ForeignKey, ForeignKeyConstraint, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, JSON, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -21,12 +21,22 @@ class Node(Base):
     created_at: Mapped[str] = mapped_column(String(40))
     roots: Mapped[list] = mapped_column(JSON)
     output_root: Mapped[str] = mapped_column(Text)
+    cache_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     gpus: Mapped[list] = mapped_column(JSON, default=list)
     metrics: Mapped[dict] = mapped_column(JSON, default=dict)
 
     @property
     def effective_name(self) -> str:
         return self.display_name if self.display_name is not None else self.name
+
+
+class NodeResourceSample(Base):
+    """Small, server-timestamped snapshots independent of training events."""
+
+    __tablename__ = "node_resource_samples"
+    node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="RESTRICT"), primary_key=True)
+    timestamp: Mapped[str] = mapped_column(String(40), primary_key=True, index=True)
+    metrics: Mapped[dict] = mapped_column(JSON)
 
 
 class Profile(Base):
@@ -180,3 +190,30 @@ class Idempotency(Base):
     digest: Mapped[str] = mapped_column(String(64))
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"))
     created_at: Mapped[str] = mapped_column(String(40))
+
+
+class TrainingDraft(Base):
+    """One private unfinished wizard configuration per human account.
+
+    Cleared drafts retain their revision so delayed saves cannot recreate them.
+    No preview, acceptance or execution state is stored here.
+    """
+    __tablename__ = "training_drafts"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    content: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    revision: Mapped[int] = mapped_column(BigInteger, default=1)
+    updated_at: Mapped[str] = mapped_column(String(40))
+
+
+class TrainingTemplate(Base):
+    """Private reusable wizard inputs, never preflight or launch authorization."""
+    __tablename__ = "training_templates"
+    __table_args__ = (Index("uq_training_templates_user_name", "user_id", "name", unique=True),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(Text, default="")
+    content: Mapped[dict] = mapped_column(JSON)
+    revision: Mapped[int] = mapped_column(BigInteger, default=1)
+    created_at: Mapped[str] = mapped_column(String(40))
+    updated_at: Mapped[str] = mapped_column(String(40), index=True)

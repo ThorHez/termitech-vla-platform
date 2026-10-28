@@ -18,7 +18,8 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .recipe_suggestions import RECIPE_NAME, SOURCE_PATHS, _Reader, _unknown
+from .recipe_suggestions import (MAX_TOTAL_BYTES, RECIPE_NAME, RECIPE_PART_MODULES, RECIPE_PART_PATHS,
+                                 SOURCE_PATHS, _Reader, _unknown)
 from .safety import AgentError, allowed_path
 
 
@@ -142,16 +143,69 @@ def _git_pin(checkout: Path, roots: list[str]) -> dict:
 
 
 class _PrimaryReader(_Reader):
-    """Reuse registry binding semantics, without resolving imported recipes."""
-    def __init__(self, checkout: Path, module_root: Path, roots: list[str], tree: ast.Module):
+    """Resolve only the primary registry and its sanctioned recipe parts."""
+    def __init__(self, checkout: Path, module_root: Path, roots: list[str], tree: ast.Module,
+                 source: str, record: tuple):
         super().__init__(checkout, module_root, roots)
         self.tree = tree
+        self.primary_source = source
+        self.sources = {source: (*record, tree)}
+        self.total_bytes = len(record[0])
+        self.total_nodes = sum(1 for _ in ast.walk(tree))
 
     def read(self, path: Path, *, primary: bool = False) -> ast.Module:
-        return self.tree
+        if primary:
+            return self.tree
+        relative = path.relative_to(self.checkout).as_posix()
+        if relative not in RECIPE_PART_PATHS:
+            raise AgentError("RECIPE_DETAIL_UNSUPPORTED", "Imported recipe source is outside the supported recipe families")
+        content, identity, resolved = _source(path, self.checkout, self.roots)
+        if self.total_bytes + len(content) > MAX_TOTAL_BYTES:
+            raise AgentError("RECIPE_SOURCE_TOO_LARGE", "Recipe sources exceed the bounded detail size")
+        try:
+            tree = ast.parse(content)
+            nodes = sum(1 for _ in ast.walk(tree))
+            if self.total_nodes + nodes > MAX_AST_NODES:
+                raise AgentError("RECIPE_SOURCE_TOO_LARGE", "Recipe sources exceed the bounded syntax size")
+        except (SyntaxError, ValueError, UnicodeError, RecursionError) as exc:
+            raise AgentError("RECIPE_SOURCE_INVALID", "Recipe source cannot be parsed statically") from exc
+        self.total_bytes += len(content)
+        self.total_nodes += nodes
+        self.sources[relative] = (content, identity, resolved, tree)
+        return tree
 
     def imported(self, reference, depth: int):
-        return _unknown()
+        if reference.module not in RECIPE_PART_MODULES:
+            return _unknown()
+        return super().imported(reference, depth)
+
+    def verify_sources(self):
+        for relative, (content, identity, resolved, _) in self.sources.items():
+            current, current_identity, current_resolved = _source(self.checkout / relative, self.checkout, self.roots)
+            if (current, current_identity, current_resolved) != (content, identity, resolved):
+                raise AgentError("RECIPE_SOURCE_CHANGED", "Recipe source changed while the registry was being read")
+
+
+def _registry_reader(checkout: Path, roots: list[str]):
+    """Read a bounded static registry without importing its training modules."""
+    for source in SOURCE_PATHS:
+        path = checkout / source
+        if path.exists() or path.is_symlink():
+            break
+    else:
+        raise AgentError("RECIPE_SOURCE_UNAVAILABLE", "OpenPI training config.py was not found in this checkout")
+    content, identity, resolved = _source(path, checkout, roots)
+    try:
+        tree = ast.parse(content)
+        if sum(1 for _ in ast.walk(tree)) > MAX_AST_NODES:
+            raise AgentError("RECIPE_SOURCE_TOO_LARGE", "Recipe source exceeds the bounded syntax size")
+    except (SyntaxError, ValueError, UnicodeError, RecursionError) as exc:
+        raise AgentError("RECIPE_SOURCE_INVALID", "Recipe source cannot be parsed statically") from exc
+    reader = _PrimaryReader(checkout, checkout / "src" if source.startswith("src/") else checkout,
+                            roots, tree, source, (content, identity, resolved))
+    environment = reader.module("openpi.training.config", primary=True)
+    registry = reader.value(ast.Name(id="_CONFIGS"), environment or {}, set(), 0)
+    return reader, registry
 
 
 def _literal(node: ast.expr, depth: int = 0):
@@ -243,26 +297,9 @@ def recipe_details(config: dict, payload: dict) -> dict:
         raise AgentError("PROFILE_UNAVAILABLE", "Recipe details require a configured native OpenPI environment")
     try:
         checkout = allowed_path(profile["code_dir"], config["roots"])
-        for source in SOURCE_PATHS:
-            path = checkout / source
-            if path.exists() or path.is_symlink():
-                break
-        else:
-            raise AgentError("RECIPE_SOURCE_UNAVAILABLE", "OpenPI training config.py was not found in this checkout")
         pin = _git_pin(checkout, config["roots"])
-        content, identity, resolved = _source(path, checkout, config["roots"])
-        try:
-            tree = ast.parse(content)
-            if sum(1 for _ in ast.walk(tree)) > MAX_AST_NODES:
-                raise AgentError("RECIPE_SOURCE_TOO_LARGE", "Recipe source exceeds the bounded syntax size")
-            encoding, _ = tokenize.detect_encoding(io.BytesIO(content).readline)
-            text = content.decode(encoding)
-        except (SyntaxError, ValueError, UnicodeError, RecursionError) as exc:
-            raise AgentError("RECIPE_SOURCE_INVALID", "Recipe source cannot be parsed statically") from exc
-        reader = _PrimaryReader(checkout, checkout / "src" if source.startswith("src/") else checkout, config["roots"], tree)
-        environment = reader.module("openpi.training.config", primary=True)
-        registry = reader.value(ast.Name(id="_CONFIGS"), environment or {}, set(), 0)
-        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+        reader, registry = _registry_reader(checkout, config["roots"])
+        calls = [(relative, node) for relative, (*_, tree) in reader.sources.items() for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and ((isinstance(node.func, ast.Name) and node.func.id == "TrainConfig")
                       or (isinstance(node.func, ast.Attribute) and node.func.attr == "TrainConfig"))
                  and any(keyword.arg == "name" and isinstance(keyword.value, ast.Constant) and keyword.value.value == recipe
@@ -273,7 +310,10 @@ def recipe_details(config: dict, payload: dict) -> dict:
             raise AgentError("RECIPE_NOT_FOUND", "Recipe was not found in the configured checkout")
         if len(calls) != 1 or registry.names.count(recipe) != 1:
             raise AgentError("RECIPE_DETAIL_UNSUPPORTED", "Recipe declaration is ambiguous in this source")
-        selected = calls[0]
+        source, selected = calls[0]
+        content, _, _, tree = reader.sources[source]
+        encoding, _ = tokenize.detect_encoding(io.BytesIO(content).readline)
+        text = content.decode(encoding)
         if selected.args or any(keyword.arg is None for keyword in selected.keywords):
             raise AgentError("RECIPE_DETAIL_UNSUPPORTED", "Recipe details require explicit keyword fields")
         keywords = {keyword.arg: keyword.value for keyword in selected.keywords}
@@ -284,8 +324,14 @@ def recipe_details(config: dict, payload: dict) -> dict:
         if len(snippet) > MAX_SOURCE_CODE_CHARS:
             raise AgentError("RECIPE_DETAIL_UNSUPPORTED", "Recipe declaration exceeds the bounded snippet size")
         defaults = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TrainConfig"]
+        default_content = content
+        if not defaults and source != reader.primary_source:
+            default_content, _, _, default_tree = reader.sources[reader.primary_source]
+            defaults = [node for node in default_tree.body if isinstance(node, ast.ClassDef) and node.name == "TrainConfig"]
         for name, node in keywords.items():
             fields.add(name, node, "recipe")
+        default_encoding, _ = tokenize.detect_encoding(io.BytesIO(default_content).readline)
+        fields.lines = [line.encode("utf-8") for line in default_content.decode(default_encoding).splitlines(keepends=True)]
         if len(defaults) == 1:
             for statement in defaults[0].body:
                 if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.value is not None:
@@ -295,8 +341,8 @@ def recipe_details(config: dict, payload: dict) -> dict:
                             fields.warnings.add("UNRESOLVED_DEFAULTS")
         else:
             fields.warnings.add("UNRESOLVED_DEFAULTS")
-        current, current_identity, current_resolved = _source(path, checkout, config["roots"])
-        if current != content or current_identity != identity or current_resolved != resolved or _git_pin(checkout, config["roots"]) != pin:
+        reader.verify_sources()
+        if _git_pin(checkout, config["roots"]) != pin:
             raise AgentError("RECIPE_SOURCE_CHANGED", "Recipe source or tracked code changed while details were being read")
         return {"profile_id": profile_id, "recipe": recipe,
                 "source": {"path": source, "sha256": hashlib.sha256(content).hexdigest(), "line": selected.lineno,

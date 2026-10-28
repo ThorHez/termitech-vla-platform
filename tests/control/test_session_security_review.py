@@ -26,6 +26,7 @@ PASSWORD = "independent-policy-check-123"
 def secured(tmp_path):
     app = create_app(Settings(database_url="sqlite:///" + str(tmp_path / "review.db"),
                               enrollment_token="independent-agent-enrollment",
+                              session_ttl_seconds=7200, session_idle_seconds=900,
                               session_cookie_secure=False, scheduler_enabled=False))
     create_initial_admin(app.state.db, "review-admin", PASSWORD)
     with TestClient(app) as client:

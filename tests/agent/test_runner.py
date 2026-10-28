@@ -13,6 +13,8 @@ from vla_agent.state import State, TERMINAL_STATES
 from vla_agent.snapshots import capture_code
 from vla_protocol import canonical_digest
 
+from tests.agent.conftest import bind_config_confirmation
+
 
 def wait_state(state, attempt_id, predicate, timeout=15):
     deadline = time.monotonic() + timeout
@@ -173,6 +175,7 @@ def test_runner_flushes_committed_artifact_before_terminal_without_masking_proce
     baseline = payload["code_expectation"]
     payload.update(template_id="openpi-sft", recipe="fixture_recipe",
                    code_expectation={**baseline, "automatic_preflight": automatic})
+    bind_config_confirmation(payload, automatic)
     state = State(config["state_dir"])
     output = Path(config["output_root"]) / payload["attempt_id"]
     state.create_attempt(payload, str(output))

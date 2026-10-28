@@ -86,6 +86,7 @@ export function PathAutocomplete({
   const projectReady = !!profile && profile.node_id === node?.id && basePath.startsWith('/');
   const validPrefix = !projectRelative || validProjectPrefix(value);
   const prefix = projectRelative ? `${basePath}/${value}` : value;
+  const nodeRoots = JSON.stringify(node?.roots || []);
   const connection = ssh?.connection;
   const directoryOnly = ssh?.directoryOnly ?? true;
   const expiry = Date.parse(connection?.expires_at || '');
@@ -128,7 +129,10 @@ export function PathAutocomplete({
 
   useEffect(() => {
     const closeOutside = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as globalThis.Node)) setOpen(false);
+      const root = rootRef.current;
+      // Selecting an option removes its button before this click reaches
+      // document. Its original event path still identifies the click as inside.
+      if (root && !event.composedPath().includes(root)) setOpen(false);
     };
     // Close after the target receives its click. Closing on blur/pointerdown
     // can shrink the form and move that target before mouseup loses the click.
@@ -227,6 +231,7 @@ export function PathAutocomplete({
     };
   }, [
     node?.id,
+    nodeRoots,
     !!ssh,
     connection?.connection_id,
     directoryOnly,
@@ -246,9 +251,10 @@ export function PathAutocomplete({
     onChange(path);
     setResult(undefined);
     setActive(-1);
+    // Refocusing may fire onFocus, so apply the final open state afterwards.
+    inputRef.current?.focus();
     setOpen(entry.kind === 'directory');
     if (path === value && entry.kind === 'directory') setRevision((previous) => previous + 1);
-    inputRef.current?.focus();
   };
 
   return (
@@ -397,11 +403,11 @@ export function PathAutocomplete({
       <span id={`${id}-hint`} className="field-hint">
         {hint ||
           (ssh
-            ? '通过 SSH 读取当前用户可访问的目录。选择目录可继续展开，路径也可手动编辑。'
+            ? '通过 SSH 读取当前用户可访问的目录。选中目录后自动展开下一级，路径也可手动编辑。'
             : projectRelative
               ? '从当前代码项目内选择 .py 文件，填写相对路径；Agent 预检时会验证文件和训练入口。'
               : node?.roots?.length
-                ? `允许目录：${node.roots.join('、')}。选择目录后可继续展开，路径仍可手动编辑。`
+                ? `允许目录：${node.roots.join('、')}。选中目录后自动展开下一级，路径仍可手动编辑。`
                 : '填写机器上已经存在的完整路径，Agent 将在预检时验证。')}
       </span>
     </div>

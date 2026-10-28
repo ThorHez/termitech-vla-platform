@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime, timedelta
 import json
 
 from fastapi import FastAPI, Request
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import func, select
 
+from vla_control import auth as auth_module
 from vla_control.auth import AuthManager, COOKIE_NAME, PERMISSIONS, hash_password, register_auth_routes, verify_password
 from vla_control.auth_models import AuditEvent, LoginThrottle, User, UserSession
 from vla_control.common import APIError, now, offset_time
@@ -128,7 +130,7 @@ def test_secure_cookie_attributes(identity):
         response = client.post("/api/v1/auth/login", json={"username": "admin", "password": PASSWORD})
         cookie = response.headers["set-cookie"]
         assert "HttpOnly" in cookie and "Secure" in cookie and "SameSite=strict" in cookie
-        assert "Path=/api/v1" in cookie and "Max-Age=7200" in cookie
+        assert "Path=/api/v1" in cookie and "Max-Age=28800" in cookie
         assert client.get("/api/v1/auth/me").status_code == 200
 
 
@@ -390,12 +392,14 @@ def test_session_policy_defaults_and_environment(monkeypatch):
     for name in ("VLA_SESSION_TTL_SECONDS", "VLA_SESSION_IDLE_SECONDS", "VLA_SESSION_REAUTH_SECONDS"):
         monkeypatch.delenv(name, raising=False)
     settings = Settings.from_env()
-    assert (settings.session_ttl_seconds, settings.session_idle_seconds, settings.session_reauth_seconds) == (7200, 900, 300)
+    assert (settings.session_ttl_seconds, settings.session_idle_seconds, settings.session_reauth_seconds) == (28800, 3600, 300)
+    monkeypatch.setenv("VLA_SESSION_TTL_SECONDS", "14400")
     monkeypatch.setenv("VLA_SESSION_IDLE_SECONDS", "600")
     monkeypatch.setenv("VLA_SESSION_REAUTH_SECONDS", "120")
+    assert Settings.from_env().session_ttl_seconds == 14400
     assert Settings.from_env().session_idle_seconds == 600
     assert Settings.from_env().session_reauth_seconds == 120
-    for changes in ({"session_idle_seconds": 59}, {"session_idle_seconds": 7201}, {"session_reauth_seconds": 29}, {"session_reauth_seconds": 901}):
+    for changes in ({"session_idle_seconds": 59}, {"session_idle_seconds": 28801}, {"session_reauth_seconds": 29}, {"session_reauth_seconds": 901}):
         with pytest.raises(ValueError):
             replace(Settings(enrollment_token="test"), **changes).validate()
 
@@ -405,7 +409,7 @@ def test_only_explicit_human_activity_extends_idle_deadline(identity):
     _, payload = admin(identity)
     with db.write() as session:
         row = session.scalar(select(UserSession))
-        row.last_activity_at = offset_time(-800)
+        row.last_activity_at = offset_time(-1800)
         original_activity = row.last_activity_at
         original_expiry = row.expires_at
     for _ in range(3):
@@ -426,20 +430,75 @@ def test_only_explicit_human_activity_extends_idle_deadline(identity):
         assert row.expires_at == original_expiry
 
 
-@pytest.mark.parametrize("expired_field,offset", [("last_activity_at", -901), ("created_at", -7201)])
+@pytest.mark.parametrize("expired_field,offset", [("last_activity_at", -3601), ("created_at", -28801)])
 def test_idle_or_absolute_expiry_blocks_polling_and_cannot_be_revived(identity, expired_field, offset):
     db, _, _, client = identity
     _, payload = admin(identity)
     with db.write() as session:
         row = session.scalar(select(UserSession))
-        # Deliberately model an old eight-hour cookie: current two-hour policy
-        # still limits it even though its stored expires_at remains later.
-        row.expires_at = offset_time(28800)
+        # A later stored expiry cannot bypass the current idle or absolute limit.
+        row.expires_at = offset_time(86400)
         setattr(row, expired_field, offset_time(offset))
     assert client.get("/api/v1/auth/me").status_code == 401
     assert client.get("/api/v1/test/read").status_code == 401
     assert client.post("/api/v1/auth/activity", headers=headers(payload), json={}).status_code == 401
     assert client.post("/api/v1/auth/reauth", headers=headers(payload), json={"password": PASSWORD}).status_code == 401
+
+
+@pytest.mark.parametrize("elapsed,status", [(1800, 200), (3599, 200), (3600, 401)])
+def test_default_idle_timeout_is_one_hour_at_the_exact_boundary(identity, monkeypatch, elapsed, status):
+    db, _, _, client = identity
+    admin(identity)
+    with db.read() as session:
+        activity = datetime.fromisoformat(session.scalar(select(UserSession)).last_activity_at)
+    stamp = (activity + timedelta(seconds=elapsed)).isoformat(timespec="microseconds")
+    monkeypatch.setattr(auth_module, "now", lambda: stamp)
+    assert client.get("/api/v1/auth/me").status_code == status
+    assert client.get("/api/v1/test/read").status_code == status
+
+
+def test_default_absolute_eight_hour_boundary_survives_recent_activity(identity, monkeypatch):
+    db, _, _, client = identity
+    _, payload = admin(identity)
+    with db.write() as session:
+        row = session.scalar(select(UserSession))
+        created = datetime.fromisoformat(row.created_at)
+        original_expiry = row.expires_at
+        row.last_activity_at = (created + timedelta(seconds=27000)).isoformat(timespec="microseconds")
+    deadline = (created + timedelta(seconds=28800)).isoformat(timespec="microseconds")
+    stamp = (created + timedelta(seconds=28799)).isoformat(timespec="microseconds")
+    monkeypatch.setattr(auth_module, "now", lambda: stamp)
+    assert client.get("/api/v1/auth/me").status_code == 200
+    refreshed = client.post("/api/v1/auth/activity", headers=headers(payload), json={})
+    assert refreshed.status_code == 200
+    assert refreshed.json()["expires_at"] == refreshed.json()["idle_expires_at"] == deadline
+    with db.read() as session:
+        row = session.scalar(select(UserSession))
+        assert row.expires_at == original_expiry
+        assert row.last_activity_at == stamp
+    stamp = deadline
+    assert client.get("/api/v1/auth/me").status_code == 401
+    assert client.post("/api/v1/auth/activity", headers=headers(payload), json={}).status_code == 401
+    assert client.post("/api/v1/auth/reauth", headers=headers(payload), json={"password": PASSWORD}).status_code == 401
+
+
+def test_longer_default_policy_does_not_extend_existing_short_session(identity, monkeypatch):
+    db, _, _, client = identity
+    _, payload = admin(identity)
+    with db.write() as session:
+        row = session.scalar(select(UserSession))
+        created = datetime.fromisoformat(row.created_at)
+        row.expires_at = (created + timedelta(seconds=7200)).isoformat(timespec="microseconds")
+        row.last_activity_at = (created + timedelta(seconds=7190)).isoformat(timespec="microseconds")
+        stored_expiry = row.expires_at
+    stamp = (created + timedelta(seconds=7199)).isoformat(timespec="microseconds")
+    monkeypatch.setattr(auth_module, "now", lambda: stamp)
+    response = client.get("/api/v1/auth/me")
+    assert response.status_code == 200
+    assert response.json()["expires_at"] == stored_expiry
+    stamp = stored_expiry
+    assert client.get("/api/v1/auth/me").status_code == 401
+    assert client.post("/api/v1/auth/activity", headers=headers(payload), json={}).status_code == 401
 
 
 def test_sensitive_mutation_requires_separate_fresh_password_proof(identity):

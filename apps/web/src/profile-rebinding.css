@@ -1,0 +1,12 @@
+.profile-rebind-modal {
+  width: 800px;
+}
+.profile-rebind-modal .field-hint {
+  overflow-wrap: anywhere;
+}
+.profile-rebind-modal .inline-note p {
+  margin: 4px 0 0;
+}
+.profile-item > .button {
+  margin-top: 10px;
+}

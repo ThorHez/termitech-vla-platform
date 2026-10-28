@@ -10,6 +10,7 @@ from vla_adapters.entrypoints import validate_entrypoint
 from vla_adapters.recipe_definitions import recipe_parameters, resolve_definition
 from vla_adapters.recap import runtime_adapter_for, validate_training_stage
 from vla_protocol import canonical_digest
+from vla_protocol.config_preview import validate_generated_config
 
 from .common import APIError, INPUT_KINDS, TERMINAL, absolute_path, digest, now, require_path, snapshot_identity, uid, under_root, valid_snapshot
 from .models import Allocation, Asset, Attempt, Command, Event, Node, Preview, Profile, Run
@@ -24,12 +25,17 @@ def get_required(session, model, identifier, label="Record"):
 
 
 def validate_request(session, data: dict, require_online=True, *, frozen=False) -> tuple[Node, Profile, dict]:
-    node = get_required(session, Node, data["node_id"], "Node")
+    node = session.scalar(select(Node).where(Node.id == data["node_id"]).with_for_update()
+                          .execution_options(populate_existing=True))
+    if node is None:
+        raise APIError(404, "NOT_FOUND", "Node not found")
     if require_online and node.status != "ONLINE":
         raise APIError(409, "NODE_OFFLINE", "Node must be online before preflight or submission")
     profile = session.get(Profile, (node.id, data["profile_id"]))
     if profile is None or not profile.active:
         raise APIError(422, "PROFILE_NODE_MISMATCH", "Runtime profile does not belong to this node")
+    from .profile_rebindings import require_not_pending
+    require_not_pending(session, node.id, profile.id, profile.code_dir)
     template = next((t for t in get_templates() if t["id"] == data["template_id"]), None)
     if not template or template["status"] != "AVAILABLE":
         raise APIError(422, "TEMPLATE_UNAVAILABLE", "Template has not been made available")
@@ -50,7 +56,18 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
     if data.get("entrypoint") is not None and template["id"] not in {"openpi-sft", "recap"}:
         raise APIError(422, "ENTRYPOINT_UNSUPPORTED", "该训练模板不支持指定 Python 训练入口")
     try:
-        if data.get("recipe_revision_id"):
+        if data.get("auto_config") is not None:
+            from vla_adapters.automatic_config import automatic_recipe_name, normalize_auto_config
+            if template["id"] not in {"openpi-sft", "recap"}:
+                raise APIError(422, "AUTO_CONFIG_UNSUPPORTED", "该训练模板不支持自动组装配置")
+            if data.get("recipe_revision_id") or data.get("recipe_definition") is not None:
+                raise APIError(422, "AUTO_CONFIG_CONFLICT", "自动组装与高级代码配方不能同时使用")
+            data["auto_config"] = normalize_auto_config(data["auto_config"])
+            recipe = automatic_recipe_name(data["auto_config"], data.get("training_stage"))
+            if data.get("recipe") not in {None, recipe}:
+                raise APIError(422, "AUTO_CONFIG_CONFLICT", "自动组装不能同时指定其他代码配方")
+            data["recipe"] = recipe
+        elif data.get("recipe_revision_id"):
             from .recipe_library import get_recipe_definition
             definition = get_recipe_definition(session, data["recipe_revision_id"], node.id, profile.id)
             if data.get("recipe_definition") is not None and data["recipe_definition"] != definition:
@@ -70,6 +87,7 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
                     "INVALID_RECIPE": "训练配方必须是代码中已有的命名配置，仅可包含字母、数字、下划线或连字符",
                     "RECIPE_DEFINITION_INVALID": "保存的配方版本无效，请重新选择",
                     "RECIPE_DEFINITION_MISMATCH": "保存的配方不属于所选训练环境",
+                    "AUTO_CONFIG_INVALID": "自动组装的模型、微调方式或模型维度配置无效",
                     "PROFILE_TEMPLATE_MISMATCH": "所选训练环境不支持该训练模板"}
         if code not in messages:
             raise
@@ -92,6 +110,8 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
     required_inputs = set(template["required_inputs"])
     if template["id"] == "recap" and bindings is None:
         raise APIError(422, "DATASET_BINDINGS_REQUIRED", "ReCap 训练需要逐组配置数据集与归一化参数")
+    if data.get("auto_config") is not None and (not bindings or any(row.get("processor") is None for row in bindings)):
+        raise APIError(422, "AUTO_CONFIG_PROCESSOR_REQUIRED", "自动组装需要每组数据明确绑定已登记处理配置或独立数据处理器")
     if bindings is not None:
         if template["id"] not in {"openpi-sft", "recap"}:
             raise APIError(422, "DATASET_BINDINGS_UNSUPPORTED", "该训练模板不支持多数据集绑定")
@@ -209,6 +229,16 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
     """Require Agent evidence for this exact task; discovery is not execution proof."""
     if request["template_id"] not in {"openpi-sft", "recap"}:
         return None
+    from .storage_configurations import snapshot_error as storage_snapshot_error
+    storage_error = storage_snapshot_error(session, request["node_id"],
+        snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None)
+    if storage_error:
+        return storage_error
+    requested_auto = request.get("auto_config")
+    if requested_auto is not None and (not isinstance(snapshot, dict) or snapshot.get("auto_config") is None):
+        return {"code": "AGENT_AUTO_CONFIG_UNSUPPORTED", "message": "Agent 未确认自动组装配置，请更新 Agent 后重新预检"}
+    if isinstance(snapshot, dict) and canonical_digest(snapshot.get("auto_config")) != canonical_digest(requested_auto):
+        return {"code": "AUTO_CONFIG_MISMATCH", "message": "Agent 自动组装配置与本次任务不一致，请重新预检"}
     stage_error = training_stage_snapshot_error(request.get("training_stage"), request.get("stage_config"), snapshot)
     if stage_error:
         return stage_error
@@ -236,6 +266,8 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
         expected["requested_entrypoint"] = request.get("entrypoint")
     if request.get("dataset_bindings") is not None or "dataset_bindings" in plan:
         expected["dataset_bindings"] = request.get("dataset_bindings")
+    if requested_auto is not None or "auto_config" in plan:
+        expected["auto_config"] = requested_auto
     if request.get("training_stage") is not None:
         expected.update(training_stage=request["training_stage"], stage_config=request["stage_config"])
     if any(key not in plan or canonical_digest(plan[key]) != canonical_digest(value) for key, value in expected.items()):
@@ -302,7 +334,7 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
              if bindings is not None else [("dataset", "norm")])
     if len(datasets) != len(pairs):
         return {"code": "INPUT_BINDING_MISMATCH", "message": "实际训练包含未登记或未选择的数据集，请逐组绑定资产后重新预检"}
-    for dataset, (dataset_role, norm_role) in zip(datasets, pairs):
+    for index, (dataset, (dataset_role, norm_role)) in enumerate(zip(datasets, pairs)):
         norm_input = inputs.get(norm_role)
         norm_matches = (dataset.get("norm_asset_path") == norm_input if "norm_asset_path" in dataset
                         else isinstance(norm_input, str) and dataset.get("norm_path") in {norm_input, norm_input.rstrip("/") + "/norm_stats.json"})
@@ -310,11 +342,92 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
                 or dataset.get("dataset_asset_id") != resolved_inputs[dataset_role]["id"]
                 or dataset.get("norm_asset_id") != resolved_inputs[norm_role]["id"]):
             return {"code": "INPUT_BINDING_MISMATCH", "message": "实际数据集、归一化参数与所选资产身份不一致，请重新预检"}
+        declared = request.get("dataset_profiles", {}).get(dataset_role)
+        if declared is not None:
+            if dataset.get("registered_profile") is None:
+                return {"code": "AGENT_DATASET_PROFILE_UNSUPPORTED", "message": "Agent 未核验登记的数据集描述，请更新 Agent 并重新预检"}
+            if canonical_digest(dataset["registered_profile"]) != canonical_digest(declared):
+                return {"code": "DATASET_PROFILE_MISMATCH", "message": "Agent 实际核验的数据集描述与本次冻结登记不一致，请重新预检"}
+            registered_fps = declared.get("fps")
+            if type(registered_fps) in (int, float) and 0 < registered_fps <= 1000:
+                if "effective_fps" not in dataset or dataset.get("fps_source") != "registered":
+                    return {"code": "AGENT_DATASET_FPS_UNSUPPORTED", "message": "Agent 未证明训练按登记的采样频率加载数据，请更新 Agent 与训练代码后重新预检"}
+                if type(dataset["effective_fps"]) not in (int, float) or dataset["effective_fps"] != registered_fps:
+                    return {"code": "DATASET_FPS_MISMATCH", "message": "实际训练采样频率与本次冻结登记不一致，请重新预检"}
+        processor = bindings[index].get("processor") if bindings is not None else None
+        expected_spec = (processor.get("parameters", {}).get("composition")
+                         if isinstance(processor, dict) and processor.get("name") == "ComposableDataConfig" else None)
+        if expected_spec is not None:
+            from vla_adapters.composition_spec import composition_digest, validate_composition_profile_input
+            from .data_processors import _source as processor_source
+            try:
+                validate_composition_profile_input(declared, expected_spec)
+            except ValueError as exc:
+                return {"code": str(exc).split(":", 1)[0], "message": str(exc)}
+            composed = dataset.get("composition")
+            if (not isinstance(composed, dict) or type(composed.get("schema_version")) is not int
+                    or composed["schema_version"] != 1 or composed.get("digest") != composition_digest(expected_spec)
+                    or canonical_digest(composed.get("spec")) != canonical_digest(expected_spec)
+                    or composed.get("training_stage") != (request.get("training_stage") or "sft")
+                    or composed.get("model_type") not in {"Pi0Config", "Pi0GripperConfig", "Pi0ValueConfig"}
+                    or (composed.get("model_type") == "Pi0ValueConfig") != (request.get("training_stage") == "value")
+                    or type(composed.get("action_horizon")) is not int or composed["action_horizon"] <= 0
+                    or type(composed.get("action_dim")) is not int or not 1 <= composed["action_dim"] <= 4096
+                    or processor_source(composed.get("source")) is None
+                    or composed["source"]["path"] not in {"src/openpi/training/composed_processing.py", "openpi/training/composed_processing.py"}
+                    or dataset.get("factory") != "ComposableDataConfig"):
+                return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 未完成组合处理的配置、模型和源码核验，请更新 Agent 与训练代码后重新预检"}
+            raw_state = sum(field["width"] for field in expected_spec["state_fields"])
+            raw_action = sum(field["width"] for field in expected_spec["action_layout"])
+            dimensions = {"raw_state_dim": raw_state, "raw_action_dim": raw_action,
+                          "state_history": expected_spec["state_history"], "normalization": expected_spec["normalization"]}
+            shape = dataset.get("actions_shape")
+            sequence = [expected_spec["action_key"]] if shape == [raw_action] else []
+            mask = [1.] * raw_action + [0.] * (composed["action_dim"] - raw_action)
+            if (raw_action > composed["action_dim"] or type(composed.get("pi05")) is not bool
+                    or any(canonical_digest(composed.get(key)) != canonical_digest(value) for key, value in dimensions.items())
+                    or not isinstance(composed.get("action_metadata_sha256"), str)
+                    or len(composed["action_metadata_sha256"]) != 64
+                    or any(char not in "0123456789abcdef" for char in composed["action_metadata_sha256"])
+                    or composed.get("action_metadata_sha256") != dataset.get("metadata_sha256")
+                    or shape not in ([raw_action], [composed["action_horizon"], raw_action])
+                    or canonical_digest(composed.get("action_sequence_keys")) != canonical_digest(sequence)
+                    or canonical_digest(composed.get("action_loss_mask")) != canonical_digest(mask)):
+                return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 未证明组合字段宽度、动作采样和真实动作损失掩码与本次训练数据绑定一致，请更新后重新预检"}
+            image_keys, depth_keys = composed.get("image_keys"), composed.get("depth_keys")
+            slots = {"base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"}
+            if (not isinstance(image_keys, list) or not isinstance(depth_keys, list)
+                    or not all(isinstance(key, str) and key in slots for key in image_keys + depth_keys)
+                    or len(set(image_keys + depth_keys)) != len(image_keys + depth_keys)
+                    or any(camera["slot"] not in (depth_keys if camera["kind"] == "depth" else image_keys)
+                           for camera in expected_spec["cameras"])):
+                return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 未证明所选模型使用本次选择的全部视觉，或深度/RGB 视图分类不一致，请重新预检"}
+        elif dataset.get("composition") is not None or dataset.get("factory") == "ComposableDataConfig":
+            return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 返回了本次训练数据绑定未选择的组合处理配置，请重新预检"}
     if model.get("asset_id") != resolved_inputs["model"]["id"]:
         return {"code": "INPUT_BINDING_MISMATCH", "message": "实际初始化模型与所选模型资产身份不一致，请重新预检"}
     node = session.get(Node, request["node_id"])
     if node is None or not training_cache_evidence_valid(plan.get("training_cache"), datasets, node.roots):
         return {"code": "AGENT_PREFLIGHT_INVALID", "message": "Agent 自动预检未记录完整训练缓存与逐个数据集构建检查，请更新 Agent 后重新预检"}
+    generated = plan.get("generated_config")
+    if generated is None:
+        return {"code": "AGENT_CONFIG_PREVIEW_UNSUPPORTED", "message": "Agent 未生成可核对的 Python config，请更新 Agent 后重新预检"}
+    try:
+        validate_generated_config(generated)
+    except ValueError:
+        return {"code": "AGENT_CONFIG_PREVIEW_INVALID", "message": "生成的 Python config 内容或摘要无效，请重新预检"}
+    return None
+
+
+def config_confirmation_error(request: dict, snapshot: dict, confirmed_sha256: str | None) -> dict | None:
+    """Submission must acknowledge the exact code the successful preflight produced."""
+    if request["template_id"] not in {"openpi-sft", "recap"}:
+        return None
+    generated = snapshot.get("automatic_preflight", {}).get("plan", {}).get("generated_config")
+    if confirmed_sha256 is None:
+        return {"code": "CONFIG_CONFIRMATION_REQUIRED", "message": "请先检查本次生成的 Python config 并确认，再启动训练"}
+    if not isinstance(generated, dict) or confirmed_sha256 != generated.get("sha256"):
+        return {"code": "CONFIG_CONFIRMATION_MISMATCH", "message": "确认的 config 与本次预检不一致，请重新查看并确认"}
     return None
 
 
@@ -330,6 +443,8 @@ def sync_profiles(session, node: Node, entries: list[dict]) -> dict:
             return {"status": "REJECTED", "code": exc.code, "message": exc.message}
     existing = {p.id: p for p in session.scalars(select(Profile).where(Profile.node_id == node.id).with_for_update())}
     incoming = {entry["id"]: entry for entry in entries}
+    from .profile_rebindings import sync_blocked_profiles
+    rebinding = sync_blocked_profiles(session, node.id, incoming)
     changed = set()
     for profile_id in existing.keys() | incoming.keys():
         current, proposed = existing.get(profile_id), incoming.get(profile_id)
@@ -341,7 +456,7 @@ def sync_profiles(session, node: Node, entries: list[dict]) -> dict:
         elif not current.active or any(getattr(current, "metadata_json" if key == "metadata" else key) != value for key, value in proposed.items()):
             changed.add(profile_id)
     used = set(session.scalars(select(Run.profile_id).where(Run.node_id == node.id, Run.state.not_in(TERMINAL), Run.profile_id.in_(changed)))) if changed else set()
-    applied = changed - used
+    applied = changed - used - rebinding
     for profile_id in applied:
         current, proposed = existing.get(profile_id), incoming.get(profile_id)
         if proposed is None:
@@ -359,6 +474,9 @@ def sync_profiles(session, node: Node, entries: list[dict]) -> dict:
             if preview.request["profile_id"] in applied:
                 preview.status = "FAILED"
                 preview.error = {"code": "PROFILE_CHANGED_SINCE_PREFLIGHT", "message": "Runtime configuration changed; run preflight again"}
+    if rebinding & changed:
+        return {"status": "BLOCKED", "code": "PROFILE_REBIND_PENDING", "message": "Runtime profile change awaits a persisted Agent acknowledgement",
+                "blocked_profile_ids": sorted(used | rebinding & changed), "updated_profile_ids": sorted(applied)}
     if used:
         return {"status": "BLOCKED", "code": "PROFILE_IN_USE", "message": "Active runs retain their registered runtime configuration",
                 "blocked_profile_ids": sorted(used), "updated_profile_ids": sorted(applied)}

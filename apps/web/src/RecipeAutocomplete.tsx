@@ -2,6 +2,11 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { BookOpen, LoaderCircle, RefreshCw } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { Node, Profile, RecipeSuggestion, RecipeSuggestions } from './types';
+import {
+  currentRecipeEntries,
+  recipeSuggestionScope,
+  type RecipeSuggestionNamespace,
+} from './recipeSuggestions';
 
 const recipeName = /^[A-Za-z0-9_-]{1,255}$/;
 const warningMessages: Record<string, string> = {
@@ -31,14 +36,22 @@ function registeredRecipes(profile?: Profile): RecipeSuggestion[] {
   }));
 }
 
-function failureMessage(error: unknown) {
+function failureMessage(error: unknown, codeOnly: boolean) {
   if (error instanceof ApiError) {
     if (['AGENT_RECIPE_SUGGEST_UNSUPPORTED', 'COMMAND_UNSUPPORTED'].includes(error.code))
-      return '这台机器的 Agent 尚不支持配方联想，请更新 Agent。也可以手动填写。';
+      return codeOnly
+        ? '这台机器的 Agent 尚不支持配置联想，请更新 Agent 后重试。'
+        : '这台机器的 Agent 尚不支持配方联想，请更新 Agent。也可以手动填写。';
     if (['NODE_OFFLINE', 'NODE_UNAVAILABLE', 'NODE_NOT_ONLINE'].includes(error.code))
-      return '机器当前离线，暂时无法读取代码中的配方。可以继续手动填写。';
+      return codeOnly
+        ? '机器当前离线，恢复连接后才能选择代码中的推理配置。'
+        : '机器当前离线，暂时无法读取代码中的配方。可以继续手动填写。';
   }
-  return error instanceof Error ? error.message : '配方读取失败，请重试或手动填写。';
+  return error instanceof Error
+    ? error.message
+    : codeOnly
+      ? '推理配置读取失败，请重试。'
+      : '配方读取失败，请重试或手动填写。';
 }
 
 export function RecipeAutocomplete({
@@ -48,6 +61,12 @@ export function RecipeAutocomplete({
   profile,
   onResolvedName,
   disabled = false,
+  namespace = 'recipe-suggestions',
+  context = 'training',
+  codeOnly = false,
+  label,
+  hint,
+  placeholder,
 }: {
   value: string;
   onChange: (value: string) => void;
@@ -55,6 +74,12 @@ export function RecipeAutocomplete({
   profile?: Profile;
   onResolvedName?: (name: string | undefined) => void;
   disabled?: boolean;
+  namespace?: RecipeSuggestionNamespace;
+  context?: 'training' | 'inference';
+  codeOnly?: boolean;
+  label?: string;
+  hint?: string;
+  placeholder?: string;
 }) {
   const id = useId();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -80,7 +105,9 @@ export function RecipeAutocomplete({
     profile?.metadata?.validated,
     profile?.metadata?.validated_recipes,
   ]);
-  const scope = `${node?.id || ''}\0${profileKey}`;
+  const scope = recipeSuggestionScope(node, profile, namespace);
+  const inference = context === 'inference';
+  const noun = inference ? '推理配置' : '配方';
   const validPrefix = /^[A-Za-z0-9_-]{0,255}$/.test(value);
   const matchingProfile = !!profile && profile.node_id === node?.id;
   const canQuery = !!node && node.status === 'ONLINE' && matchingProfile && validPrefix;
@@ -93,7 +120,7 @@ export function RecipeAutocomplete({
       : undefined;
   const currentError = error?.scope === scope && error.prefix === value ? error.message : undefined;
   const fallback = useMemo(() => registeredRecipes(profile), [profileKey]);
-  const usingRegistered = !current && (!canQuery || !!currentError) && matchingProfile;
+  const usingRegistered = !codeOnly && !current && (!canQuery || !!currentError) && matchingProfile;
   const keyword = value.toLowerCase();
   const matchingRegistered = fallback
     .filter((entry) => entry.name.toLowerCase().includes(keyword))
@@ -106,11 +133,12 @@ export function RecipeAutocomplete({
         (a < b ? -1 : a > b ? 1 : left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
       );
     });
-  const entries = current?.entries || (usingRegistered ? matchingRegistered.slice(0, 30) : []);
+  const discovered = currentRecipeEntries(current, node, profile, value, codeOnly);
+  const entries = discovered || (usingRegistered ? matchingRegistered.slice(0, 30) : []);
   const truncated = current?.truncated || (usingRegistered && matchingRegistered.length > 30);
   const exactName =
-    current?.entries.find((entry) => entry.name === value)?.name ||
-    fallback.find((entry) => entry.name === value)?.name;
+    discovered?.find((entry) => entry.name === value)?.name ||
+    (!codeOnly ? fallback.find((entry) => entry.name === value)?.name : undefined);
   const resolvedName =
     resolved?.scope === scope && resolved.name === value ? resolved.name : undefined;
   useEffect(() => {
@@ -162,7 +190,7 @@ export function RecipeAutocomplete({
       }, 15000);
       try {
         let response = await api<RecipeSuggestions>(
-          `/nodes/${encodeURIComponent(nodeId)}/recipe-suggestions`,
+          `/nodes/${encodeURIComponent(nodeId)}/${namespace}`,
           {
             method: 'POST',
             body: JSON.stringify({ profile_id: profileId, prefix: value, limit: 30 }),
@@ -183,14 +211,14 @@ export function RecipeAutocomplete({
             }, 500);
           });
           response = await api<RecipeSuggestions>(
-            `/nodes/${encodeURIComponent(nodeId)}/recipe-suggestions/${encodeURIComponent(response.id)}`,
+            `/nodes/${encodeURIComponent(nodeId)}/${namespace}/${encodeURIComponent(response.id)}`,
             { signal: controller.signal },
           );
         }
         if (response.status === 'FAILED')
           throw new ApiError(
             response.error?.code || 'RECIPE_SUGGEST_FAILED',
-            response.error?.message || '配方读取失败，请重试。',
+            response.error?.message || `${noun}读取失败，请重试。`,
             0,
           );
         if (
@@ -198,14 +226,16 @@ export function RecipeAutocomplete({
           response.profile_id !== profileId ||
           response.prefix !== value
         )
-          throw new Error('配方响应与当前机器或运行环境不匹配，请重试。');
+          throw new Error(`${noun}响应与当前机器或运行环境不匹配，请重试。`);
         if (live) setResult({ scope, response });
       } catch (err) {
         if (live)
           setError({
             scope,
             prefix: value,
-            message: timedOut ? '配方读取超过 15 秒，请重试或手动填写。' : failureMessage(err),
+            message: timedOut
+              ? `${noun}读取超过 15 秒，请重试${codeOnly ? '。' : '或手动填写。'}`
+              : failureMessage(err, codeOnly),
           });
       } finally {
         clearTimeout(deadlineTimer);
@@ -219,11 +249,12 @@ export function RecipeAutocomplete({
       clearTimeout(deadlineTimer);
       controller.abort();
     };
-  }, [scope, canQuery, disabled, open, value, revision]);
+  }, [scope, canQuery, disabled, open, value, revision, namespace, noun, codeOnly]);
 
   const choose = (entry: RecipeSuggestion) => {
     setResolved({ scope, name: entry.name });
     onChange(entry.name);
+    resolvedCallback.current?.(entry.name);
     setOpen(false);
     setResult(undefined);
     setActive(-1);
@@ -233,7 +264,8 @@ export function RecipeAutocomplete({
   return (
     <div className="field recipe-autocomplete" ref={rootRef}>
       <label className="field-label" htmlFor={id}>
-        训练配方<span className="required"> *</span>
+        {label || (inference ? '推理配置名称' : '训练配方')}
+        <span className="required"> *</span>
       </label>
       <input
         id={id}
@@ -245,7 +277,7 @@ export function RecipeAutocomplete({
         autoComplete="off"
         spellCheck={false}
         className="mono"
-        placeholder="输入 config_name，联想所选环境中的配方"
+        placeholder={placeholder || `输入 config_name，联想所选环境中的${noun}`}
         value={value}
         role="combobox"
         aria-autocomplete="list"
@@ -289,17 +321,17 @@ export function RecipeAutocomplete({
         <div className="path-suggestion-panel recipe-suggestion-panel">
           <div role="status" className="path-suggestion-status" aria-live="polite">
             {!node ? (
-              '选择机器和运行环境后可以联想配方；也可以手动填写。'
+              `选择机器和运行环境后可以联想${noun}${codeOnly ? '。' : '；也可以手动填写。'}`
             ) : !matchingProfile ? (
               '请先选择这台机器上的运行环境。'
             ) : !validPrefix ? (
-              '配方名称仅支持字母、数字、下划线和连字符。'
+              `${noun}名称仅支持字母、数字、下划线和连字符。`
             ) : node.status !== 'ONLINE' ? (
-              '机器当前离线，暂时无法读取代码中的配方。可以继续手动填写。'
+              `机器当前离线，暂时无法读取代码中的${noun}${codeOnly ? '。' : '。可以继续手动填写。'}`
             ) : loading ? (
               <>
                 <LoaderCircle size={14} className="spin" />
-                正在读取所选环境中的训练配方…
+                正在读取所选环境中的{inference ? '推理配置' : '训练配方'}…
               </>
             ) : currentError ? (
               <>
@@ -316,11 +348,13 @@ export function RecipeAutocomplete({
               </>
             ) : entries.length ? (
               <>
-                <span>匹配 {entries.length} 个配方</span>
+                <span>
+                  匹配 {entries.length} 个{noun}
+                </span>
                 <span>↑ ↓ 选择 · Enter 填入</span>
               </>
             ) : (
-              '没有匹配的配方，可继续输入或手动填写代码中的 config_name。'
+              `没有匹配的${noun}，${codeOnly ? '请继续输入并选择当前代码中的已有配置。' : '可继续输入或手动填写代码中的 config_name。'}`
             )}
           </div>
           {current?.source && (
@@ -334,7 +368,7 @@ export function RecipeAutocomplete({
           <div
             id={`${id}-options`}
             role="listbox"
-            aria-label="训练配方建议"
+            aria-label={inference ? '推理配置建议' : '训练配方建议'}
             className="path-suggestion-list recipe-suggestion-list"
             aria-busy={loading}
           >
@@ -357,7 +391,7 @@ export function RecipeAutocomplete({
                   <small>{entry.source === 'registered' ? '已登记' : '代码中发现'}</small>
                 </span>
                 <span className={`recipe-validation ${entry.validated ? 'validated' : ''}`}>
-                  {entry.validated ? '已有验收记录' : '预检时验证'}
+                  {entry.validated ? '已有验收记录' : inference ? '部署时验证' : '预检时验证'}
                 </span>
               </button>
             ))}
@@ -365,17 +399,27 @@ export function RecipeAutocomplete({
           {truncated && (
             <p className="path-suggestion-truncated">仅显示前 30 项，继续输入可缩小范围。</p>
           )}
-          {current?.warnings.map((warning) =>
-            warningMessages[warning] ? (
-              <p className="path-suggestion-truncated" key={warning}>
-                {warningMessages[warning]}
-              </p>
-            ) : null,
-          )}
+          {!inference &&
+            current?.warnings.map((warning) =>
+              warningMessages[warning] ? (
+                <p className="path-suggestion-truncated" key={warning}>
+                  {warningMessages[warning]}
+                </p>
+              ) : null,
+            )}
         </div>
       )}
       <span id={`${id}-hint`} className="field-hint">
-        支持输入 config_name 的任意片段，不区分大小写。所选配方由 Agent 在预检时自动验证。
+        {hint ||
+          (inference
+            ? '输入 config_name 的任意片段搜索，选择目标运行环境代码中的已有配置；应与 checkpoint 的模型结构一致。'
+            : '支持输入 config_name 的任意片段，不区分大小写。所选配方由 Agent 在预检时自动验证。')}
+        {inference && resolvedName && (
+          <span>
+            {' '}
+            已确认现有配置：<code>{resolvedName}</code>。
+          </span>
+        )}
       </span>
     </div>
   );

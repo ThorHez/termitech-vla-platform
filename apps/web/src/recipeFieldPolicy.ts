@@ -1,6 +1,7 @@
 // Keep this resource boundary aligned with vla_adapters.recipe_definitions.
 const assetFields = new Set([
   'repo_id',
+  'composition',
   'repo_ids',
   'assets',
   'assets_dir',

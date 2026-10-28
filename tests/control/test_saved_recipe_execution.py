@@ -7,7 +7,7 @@ import pytest
 from vla_control.common import uid
 from vla_control.models import Profile
 
-from .conftest import ADMIN, automatic_checks, automatic_preflight, snapshot
+from .conftest import ADMIN, automatic_checks, automatic_preflight, confirmed_run_request, snapshot
 from .test_recipe_details import ready, register
 from .test_recipe_library import revise, save
 
@@ -67,7 +67,7 @@ def acknowledge_preview(platform, node, pending, *, definition="expected", recip
 
 
 def submit(platform, checked):
-    return platform.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": uid()}, json={"preflight_id": checked["id"]})
+    return platform.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": uid()}, json=confirmed_run_request(checked))
 
 
 def test_saved_recipe_reaches_agent_without_manual_approval(platform):

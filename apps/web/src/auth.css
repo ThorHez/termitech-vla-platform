@@ -4,7 +4,7 @@
   gap: 12px;
   align-items: center;
   justify-content: center;
-  color: #617887;
+  color: var(--text-secondary, #617887);
 }
 .login-page {
   min-height: 100vh;
@@ -13,14 +13,18 @@
   align-items: center;
   justify-content: center;
   padding: 40px 20px;
-  background: radial-gradient(ellipse at top, #eaf5f4, #f5f7fa 65%);
+  background: radial-gradient(
+    ellipse at top,
+    var(--bg-selected, #eaf5f4),
+    var(--bg-page, #f5f7fa) 65%
+  );
 }
 .login-card {
   width: min(100%, 460px);
-  background: white;
+  background: var(--bg-surface, white);
   border: 1px solid var(--border);
   border-radius: 14px;
-  box-shadow: 0 16px 60px #1a425411;
+  box-shadow: var(--shadow-elevated, 0 16px 60px #1a425411);
   padding: 36px;
 }
 .auth-brand {
@@ -28,7 +32,7 @@
   align-items: center;
   gap: 12px;
   font-weight: 700;
-  color: #255965;
+  color: var(--text-accent, #255965);
   letter-spacing: 0.08em;
   margin-bottom: 32px;
 }
@@ -40,20 +44,20 @@
   margin-bottom: 12px;
 }
 .login-description {
-  color: #7d909b;
+  color: var(--text-secondary, #7d909b);
   line-height: 1.8;
   margin-bottom: 26px;
 }
 .login-help {
   font-size: 12px;
-  color: #8295a2;
+  color: var(--text-muted, #8295a2);
   line-height: 1.9;
   border-top: 1px solid var(--border);
   margin-top: 26px;
   padding-top: 20px;
 }
 .login-footer {
-  color: #8b9ea9;
+  color: var(--text-muted, #8b9ea9);
   font-size: 11px;
   margin-top: 25px;
 }
@@ -96,8 +100,8 @@
   vertical-align: middle;
 }
 .auth-table th {
-  color: #8294a1;
-  background: #fafcfd;
+  color: var(--text-muted, #8294a1);
+  background: var(--bg-surface, #fafcfd);
   font-weight: 500;
 }
 .auth-table td strong {
@@ -105,7 +109,7 @@
 }
 .auth-table td small {
   display: block;
-  color: #8399a5;
+  color: var(--text-muted, #8399a5);
   margin-top: 5px;
   line-height: 1.6;
 }
@@ -127,20 +131,20 @@
   margin-bottom: 24px;
 }
 .role-card {
-  background: white;
+  background: var(--bg-surface, white);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 21px;
-  color: #639098;
+  color: var(--text-secondary, #639098);
 }
 .role-card strong {
   display: block;
-  color: #38525f;
+  color: var(--text-primary, #38525f);
   margin-top: 10px;
 }
 .role-card p {
   font-size: 12px;
-  color: #8195a2;
+  color: var(--text-muted, #8195a2);
   line-height: 1.85;
   margin-top: 8px;
 }
@@ -153,10 +157,10 @@
   text-align: center;
   padding: 80px 20px;
   gap: 16px;
-  color: #8295a1;
+  color: var(--text-muted, #8295a1);
 }
 .auth-permission h2 {
-  color: #4b6472;
+  color: var(--text-primary, #4b6472);
 }
 .account-identity {
   display: flex;
@@ -164,13 +168,13 @@
   align-items: center;
 }
 .account-identity p {
-  color: #7a909d;
+  color: var(--text-secondary, #7a909d);
   font-size: 12px;
   margin-top: 6px;
 }
 .account-identity small {
   display: block;
-  color: #91a3ad;
+  color: var(--text-muted, #91a3ad);
   font-size: 11px;
   margin-top: 6px;
 }

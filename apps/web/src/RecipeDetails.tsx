@@ -5,6 +5,7 @@ import { useAuth } from './auth';
 import { Badge, ErrorNotice, Field } from './components';
 import { recipeDatasetSlots } from './datasetBindingHelpers';
 import { assetManagedOverridePaths, isAssetManagedField } from './recipeFieldPolicy';
+import type { RecipeEditorDraft } from './trainingDraft';
 import type {
   Node,
   Profile,
@@ -242,6 +243,8 @@ export function RecipeDetails({
   onResolved,
   onDirtyChange,
   onLoadingChange,
+  restoredEditorDraft,
+  onEditorDraftChange,
 }: {
   node?: Node;
   profile?: Profile;
@@ -253,6 +256,8 @@ export function RecipeDetails({
   onResolved?: (detail: RecipeDetail, recipe: string, revisionId?: string) => void;
   onDirtyChange: (dirty: boolean) => void;
   onLoadingChange: (loading: boolean) => void;
+  restoredEditorDraft?: RecipeEditorDraft;
+  onEditorDraftChange?: (draft: RecipeEditorDraft | undefined) => void;
 }) {
   const { can } = useAuth();
   const mayEdit = can('recipes.write');
@@ -280,11 +285,17 @@ export function RecipeDetails({
   const resolvedRef = useRef(onResolved);
   const dirtyRef = useRef(onDirtyChange);
   const loadingRef = useRef(onLoadingChange);
+  const editorChangeRef = useRef(onEditorDraftChange);
+  const ignoredEditorToken = useRef<string | undefined>(undefined);
+  const hydratedEditor = useRef<{ scope: string; token: string; sourceSha256: string } | undefined>(undefined);
+  const publishedEditor = useRef<{ scope: string; token: string } | undefined>(undefined);
+  const editorPublishReady = useRef(false);
   defaultsRef.current = onDefaults;
   datasetsRef.current = onDatasets;
   resolvedRef.current = onResolved;
   dirtyRef.current = onDirtyChange;
   loadingRef.current = onLoadingChange;
+  editorChangeRef.current = onEditorDraftChange;
   const scope = JSON.stringify([
     node?.id,
     profile?.id,
@@ -323,6 +334,27 @@ export function RecipeDetails({
     !useCurrentSource && saved?.latest_revision.detail
       ? saved.latest_revision.detail
       : current?.detail;
+  const restoredEditorToken = restoredEditorDraft ? JSON.stringify(restoredEditorDraft) : undefined;
+  const cachedEditor =
+    restoredEditorDraft?.scope === scope && restoredEditorToken !== ignoredEditorToken.current
+      ? restoredEditorDraft
+      : undefined;
+  const hasCachedEditor =
+    !!cachedEditor && (Object.keys(cachedEditor.fields).length > 0 || !!cachedEditor.saveMode);
+  const cachedEditorSourceVerified =
+    !!cachedEditor &&
+    !!current?.detail &&
+    !loading &&
+    !!detail &&
+    cachedEditor.sourceSha256 === current.detail.source.sha256 &&
+    cachedEditor.sourceSha256 === detail.source.sha256;
+  const cachedEditorConflict =
+    hasCachedEditor && !!current?.detail && !loading && !cachedEditorSourceVerified;
+  const cachedEditorBlocked =
+    hasCachedEditor &&
+    (!cachedEditorSourceVerified ||
+      (hydratedEditor.current?.token !== restoredEditorToken &&
+        publishedEditor.current?.token !== restoredEditorToken));
   const savedOverrides = saved?.latest_revision.definition.overrides || {};
   const savedAssetOverrides = assetManagedOverridePaths(savedOverrides);
   const draftAssetOverrides = assetManagedOverridePaths(
@@ -361,10 +393,17 @@ export function RecipeDetails({
   const hasDraft = Object.keys(draft).length > 0 || Object.keys(reviewedAssetValues).length > 0;
 
   useEffect(() => {
+    ignoredEditorToken.current = undefined;
+    hydratedEditor.current = undefined;
+    publishedEditor.current = undefined;
+    editorPublishReady.current = false;
     setDraft({});
     setReviewedAssetOverrides(false);
     setReviewedAssetValues({});
     setShowSave(undefined);
+    setSaveName('');
+    setConfigName('');
+    setDescription('');
     setSaveError(undefined);
     setUseCurrentSource(false);
     if (writeNotice && writeNotice.configName !== recipe) setWriteNotice(undefined);
@@ -378,8 +417,14 @@ export function RecipeDetails({
       setConfigName(pending.configName);
       if (pending.job?.status === 'FAILED') setSaveError(writebackError(pending.job));
     }
-    dirtyRef.current(!!pending);
+    dirtyRef.current(!!pending || hasCachedEditor);
   }, [scope, mayWriteback]);
+
+  const forgetEditorDraft = () => {
+    ignoredEditorToken.current = restoredEditorToken;
+    publishedEditor.current = { scope, token: `empty:${scope}` };
+    editorChangeRef.current?.(undefined);
+  };
 
   const acceptWriteback = (job: RecipeWriteback, key: string, expectedScope: string) => {
     if (!mountedRef.current || scopeRef.current !== expectedScope || writeKeyRef.current !== key)
@@ -397,6 +442,7 @@ export function RecipeDetails({
     setWriteNotice({ configName: job.config_name, sha: job.commit_sha });
     setDraft({});
     setShowSave(undefined);
+    forgetEditorDraft();
     dirtyRef.current(false);
     onSavedRef.current(job.recipe);
   };
@@ -513,6 +559,98 @@ export function RecipeDetails({
   }, [scope, node?.status, revision, mayQuery]);
 
   useEffect(() => {
+    if (!current?.detail || loading || !detail || saving || pendingSave || cachedEditorConflict) {
+      editorPublishReady.current = false;
+      return;
+    }
+    if (
+      cachedEditor &&
+      restoredEditorToken &&
+      cachedEditorSourceVerified &&
+      publishedEditor.current?.token !== restoredEditorToken &&
+      (hydratedEditor.current?.scope !== scope ||
+        hydratedEditor.current.token !== restoredEditorToken ||
+        hydratedEditor.current.sourceSha256 !== current.detail.source.sha256)
+    ) {
+      editorPublishReady.current = false;
+      hydratedEditor.current = {
+        scope,
+        token: restoredEditorToken,
+        sourceSha256: current.detail.source.sha256,
+      };
+      setDraft({ ...cachedEditor.fields });
+      setShowSave(cachedEditor.saveMode);
+      setSaveName(cachedEditor.saveName || '');
+      setConfigName(cachedEditor.configName || '');
+      setDescription(cachedEditor.description || '');
+      // Source verification and asset-override review always happen anew.
+      setReviewedAssetOverrides(false);
+      setReviewedAssetValues({});
+      return;
+    }
+    editorPublishReady.current = true;
+  }, [
+    scope,
+    current?.detail,
+    detail,
+    loading,
+    saving,
+    pendingSave,
+    restoredEditorToken,
+    cachedEditorConflict,
+    cachedEditorSourceVerified,
+    draft,
+  ]);
+
+  useEffect(() => {
+    if (
+      !editorChangeRef.current ||
+      !editorPublishReady.current ||
+      !current?.detail ||
+      !detail ||
+      loading ||
+      saving ||
+      pendingSave ||
+      cachedEditorBlocked
+    )
+      return;
+    const hasText = Object.keys(draft).length > 0 || !!showSave;
+    // Reading a different recipe must not erase its still-cached editor.
+    if (
+      !hasText &&
+      restoredEditorDraft?.scope !== scope &&
+      publishedEditor.current?.scope !== scope
+    )
+      return;
+    const value: RecipeEditorDraft | undefined = hasText
+      ? {
+          scope,
+          sourceSha256: detail.source.sha256,
+          fields: { ...draft },
+          ...(showSave ? { saveMode: showSave, saveName, configName, description } : {}),
+        }
+      : undefined;
+    const token = value ? JSON.stringify(value) : `empty:${scope}`;
+    if (publishedEditor.current?.scope === scope && publishedEditor.current.token === token) return;
+    publishedEditor.current = { scope, token };
+    editorChangeRef.current(value);
+  }, [
+    scope,
+    current?.detail,
+    detail,
+    loading,
+    saving,
+    pendingSave,
+    cachedEditorBlocked,
+    restoredEditorToken,
+    draft,
+    showSave,
+    saveName,
+    configName,
+    description,
+  ]);
+
+  useEffect(() => {
     if (!detail) return;
     const values: Record<string, number> = {};
     for (const [path, parameter] of Object.entries(commonKeys)) {
@@ -543,8 +681,8 @@ export function RecipeDetails({
   }, [detail, saved?.latest_revision.id, reviewedAssetOverrides]);
 
   useEffect(() => {
-    dirtyRef.current(hasDraft || requiresAssetReview || !!pendingSave || saving);
-  }, [hasDraft, requiresAssetReview, pendingSave, saving]);
+    dirtyRef.current(hasDraft || hasCachedEditor || requiresAssetReview || !!pendingSave || saving);
+  }, [hasDraft, hasCachedEditor, requiresAssetReview, pendingSave, saving]);
   useEffect(() => {
     loadingRef.current(loading || saving);
     return () => {
@@ -610,7 +748,11 @@ export function RecipeDetails({
     sourceIdentity(saved.latest_revision.definition.source) !==
       sourceIdentity(current.detail.source);
   const canSave =
-    mayEdit && !!current?.detail && (!sourceChanged || useCurrentSource) && !requiresAssetReview;
+    mayEdit &&
+    !!current?.detail &&
+    (!sourceChanged || useCurrentSource) &&
+    !requiresAssetReview &&
+    !cachedEditorBlocked;
   const save = async () => {
     if (
       !mayEdit ||
@@ -658,6 +800,7 @@ export function RecipeDetails({
         if (mountedRef.current && scopeRef.current === scope) {
           setDraft({});
           setShowSave(undefined);
+          forgetEditorDraft();
           dirtyRef.current(false);
           onSavedRef.current(result);
         }
@@ -815,7 +958,7 @@ export function RecipeDetails({
                 });
               const inputProps = {
                 id: `${id}-${view}-${field.path}`,
-                disabled: saving || !!pendingSave,
+                disabled: saving || !!pendingSave || cachedEditorBlocked,
                 'aria-label': `修改${rule?.label || field.path}`,
                 'aria-invalid':
                   Object.hasOwn(draft, field.path) && invalid.includes(rule?.label || field.path),
@@ -910,7 +1053,7 @@ export function RecipeDetails({
         <div className="inline-note" role="status">
           <Check size={14} />
           <span>
-            已写入 config.py：<code>{writeNotice.configName}</code>；Git 提交{' '}
+            已写入配方配置文件：<code>{writeNotice.configName}</code>；Git 提交{' '}
             <code title={writeNotice.sha}>{writeNotice.sha.slice(0, 12)}</code>
             。新版本已选中，预检时验证配置。
           </span>
@@ -920,6 +1063,37 @@ export function RecipeDetails({
         <div className="recipe-detail-loading" role="status">
           <LoaderCircle size={15} className="spin" />
           正在读取代码定义与默认配置…
+        </div>
+      )}
+      {hasCachedEditor && !cachedEditorSourceVerified && (
+        <div className="inline-note amber" role={cachedEditorConflict ? 'alert' : 'status'}>
+          <div>
+            <strong>
+              {cachedEditorConflict ? '缓存的配方修改与当前源码不一致' : '配方修改尚未恢复'}
+            </strong>
+            <p>
+              {cachedEditorConflict
+                ? '源码摘要已变化，旧修改保留在训练草稿中，但不会应用或用于训练。请放弃旧修改后按当前代码重新编辑。'
+                : '需要重新读取配方并核对源码摘要后，才能恢复这些编辑文本；资产覆盖的核对状态不会恢复。'}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="button outline small"
+            disabled={saving || !!pendingSave}
+            onClick={() => {
+              forgetEditorDraft();
+              setDraft({});
+              setShowSave(undefined);
+              setSaveName('');
+              setConfigName('');
+              setDescription('');
+              setReviewedAssetOverrides(false);
+              setReviewedAssetValues({});
+            }}
+          >
+            放弃旧配方修改
+          </button>
         </div>
       )}
       <ErrorNotice error={error} retry={() => setRevision((value) => value + 1)} />
@@ -932,7 +1106,7 @@ export function RecipeDetails({
         <>
           <p className="recipe-detail-caption">
             {mayWriteback
-              ? '可修改训练超参数，以及模型、数据处理和优化器中的静态配置值。保存会在 config.py 中新增独立配方，并自动执行一次 Git 提交。'
+              ? '可修改训练超参数，以及模型、数据处理和优化器中的静态配置值。保存会在来源配置文件中新增独立配方，并自动执行一次 Git 提交。'
               : mayEdit
                 ? '可修改训练超参数，以及模型、数据处理和优化器中的静态配置值。保存将创建平台配方版本；写入训练代码需要管理员权限。'
                 : '当前为只读配方快照，可查看配置和来源。编辑配方需要操作员或管理员权限。'}
@@ -972,6 +1146,7 @@ export function RecipeDetails({
                   className="button outline small"
                   disabled={
                     saving ||
+                    cachedEditorBlocked ||
                     pendingSave?.job?.status === 'PENDING' ||
                     !!pendingSave?.job?.commit_sha
                   }
@@ -1142,7 +1317,7 @@ export function RecipeDetails({
                             return next;
                           });
                         }}
-                        disabled={saving || !!pendingSave}
+                        disabled={saving || !!pendingSave || cachedEditorBlocked}
                       />
                     </Field>
                   ))}
@@ -1170,7 +1345,7 @@ export function RecipeDetails({
               ? '下一步可配置多组数据集、各自归一化参数与混采权重。'
               : '数据、初始权重、归一化统计和输出目录由本次训练选择。'}
             {mayWriteback
-              ? '步数、批次与学习率可在下一步临时调整。这里的修改需要先保存，保存后会写入所选训练代码目录的 config.py，并提交到本地 Git 仓库。'
+              ? '步数、批次与学习率可在下一步临时调整。这里的修改需要先保存，保存后会写入所选训练代码目录的来源配置文件，并提交到本地 Git 仓库。'
               : mayEdit
                 ? '步数、批次与学习率可在下一步临时调整。这里的修改需要先保存到平台配方库，训练时使用选中的固定版本。'
                 : '配置与来源按此配方保存时的版本展示。'}
@@ -1185,7 +1360,7 @@ export function RecipeDetails({
               <button
                 type="button"
                 className="text-link"
-                disabled={saving || !!pendingSave}
+                disabled={saving || !!pendingSave || cachedEditorBlocked}
                 onClick={() => {
                   setDraft({});
                   setReviewedAssetOverrides(false);
@@ -1248,7 +1423,7 @@ export function RecipeDetails({
                     value={saveName}
                     onChange={(event) => setSaveName(event.target.value)}
                     placeholder="例如 抓取实验-低学习率"
-                    disabled={saving || !!pendingSave}
+                    disabled={saving || !!pendingSave || cachedEditorBlocked}
                   />
                 </Field>
               )}
@@ -1263,7 +1438,7 @@ export function RecipeDetails({
                     value={configName}
                     onChange={(event) => setConfigName(event.target.value)}
                     placeholder="例如 pi05_umi_custom_v2"
-                    disabled={saving || !!pendingSave}
+                    disabled={saving || !!pendingSave || cachedEditorBlocked}
                     aria-invalid={!!configName && !/^[A-Za-z0-9_-]{1,255}$/.test(configName)}
                   />
                 </Field>
@@ -1274,7 +1449,7 @@ export function RecipeDetails({
                   rows={2}
                   value={description}
                   onChange={(event) => setDescription(event.target.value)}
-                  disabled={saving || !!pendingSave}
+                  disabled={saving || !!pendingSave || cachedEditorBlocked}
                 />
               </Field>
               <div className="recipe-save-diff">
@@ -1309,8 +1484,8 @@ export function RecipeDetails({
               </div>
               <p className="field-hint">
                 {mayWriteback
-                  ? '保存会先记录平台草稿，再由机器 Agent 向 config.py 新增配方并自动执行 Git commit；提交成功后才选中可训练的新版本。存在进行中的训练或源码版本冲突时会拒绝写入。'
-                  : '保存到平台配方库并选中新版本，训练预检会验证其配置。此操作不修改训练机器上的 config.py。'}
+                  ? '保存会先记录平台草稿，再由机器 Agent 向来源配置文件新增配方并自动执行 Git commit；提交成功后才选中可训练的新版本。存在进行中的训练或源码版本冲突时会拒绝写入。'
+                  : '保存到平台配方库并选中新版本，训练预检会验证其配置。此操作不修改训练机器上的配方源码文件。'}
               </p>
               {pendingSave && (
                 <div className="inline-note amber" role="status">

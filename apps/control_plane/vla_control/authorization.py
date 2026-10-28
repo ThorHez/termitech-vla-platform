@@ -38,8 +38,10 @@ def _allow(permission, method, *paths):
 
 _allow("platform.read", "GET",
        "/templates", "/overview", "/nodes", "/nodes/{node_id}", "/profiles", "/assets",
+       "/nodes/{node_id}/resource-history",
        "/nodes/{node_id}/path-suggestions/{query_id}",
        "/nodes/{node_id}/recipe-suggestions/{query_id}",
+       "/nodes/{node_id}/inference-config-suggestions/{query_id}",
        "/nodes/{node_id}/recipe-details/{query_id}",
        "/nodes/{node_id}/data-processors/{query_id}",
        "/recipes", "/recipes/{recipe_id}", "/recipe-revisions/{revision_id}",
@@ -48,15 +50,38 @@ _allow("platform.read", "GET",
        "/runs/{run_id}/events", "/runs/{run_id}/logs", "/alerts")
 _allow("assets.write", "POST", "/assets", "/assets/{asset_id}/archive",
        "/nodes/{node_id}/path-suggestions")
+_allow("assets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
+_allow("assets.write", "POST", "/nodes/{node_id}/dataset-inspections")
+_allow("assets.write", "GET", "/nodes/{node_id}/dataset-inspections/{query_id}")
 _allow("training.write", "POST", "/run-previews", "/runs", "/runs/{run_id}/cancel")
+_allow("platform.read", "GET", "/policy-deployments", "/policy-deployments/{deployment_id}")
+_allow("platform.read", "GET", "/deployment-records", "/deployment-records/{record_id}")
+_allow("training.write", "POST", "/policy-deployments", "/policy-deployments/{deployment_id}/refresh",
+       "/policy-deployments/{deployment_id}/start",
+       "/policy-deployments/{deployment_id}/stop", "/policy-deployments/{deployment_id}/test",
+       "/nodes/{node_id}/inference-config-suggestions")
+_allow("platform.read", "GET", "/checkpoint-transfers", "/checkpoint-transfers/{transfer_id}")
+_allow("training.write", "POST", "/checkpoint-transfers", "/checkpoint-transfers/{transfer_id}/retry",
+       "/checkpoint-transfers/{transfer_id}/cancel")
+_allow("training.write", "GET", "/training-draft")
+_allow("training.write", "PUT", "/training-draft")
+_allow("training.write", "DELETE", "/training-draft")
+_allow("training.write", "GET", "/training-templates", "/training-templates/{template_id}")
+_allow("training.write", "POST", "/training-templates")
+_allow("training.write", "PUT", "/training-templates/{template_id}")
+_allow("training.write", "DELETE", "/training-templates/{template_id}")
 _allow("recipes.write", "POST", "/recipes", "/recipes/{recipe_id}/revisions",
        "/nodes/{node_id}/recipe-suggestions", "/nodes/{node_id}/recipe-details",
        "/nodes/{node_id}/data-processors")
 _allow("recipes.writeback", "POST", "/recipe-revisions/{revision_id}/writeback")
 _allow("machines.manage", "GET", "/agent-config-defaults", "/agent-package",
+       "/nodes/{node_id}/storage-configurations", "/nodes/{node_id}/storage-configurations/{operation_id}",
+       "/nodes/{node_id}/profile-rebindings", "/nodes/{node_id}/profile-rebindings/{operation_id}",
        "/nodes/{node_id}/management", "/remote-deployments", "/remote-deployments/{job_id}",
        "/remote-deployments/{job_id}/logs/download")
 _allow("machines.manage", "POST", "/agent-configs", "/ssh-connections/test", "/ssh-connections/connect",
+       "/nodes/{node_id}/storage-configurations",
+       "/nodes/{node_id}/profile-rebindings",
        "/ssh-connections/{connection_id}/path-suggestions", "/ssh-connections/{connection_id}/test",
        "/nodes/{node_id}/disconnect", "/nodes/{node_id}/uninstall",
        "/remote-deployments", "/remote-deployments/{job_id}/retry")

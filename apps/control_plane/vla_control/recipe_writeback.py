@@ -14,6 +14,7 @@ from sqlalchemy import select
 
 from .common import APIError, now, offset_time, uid
 from .models import Attempt, Command, Preview, Profile, Run
+from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from . import recipe_details
 from .recipe_models import RecipeRevision, SavedRecipe
 from .recipe_suggestions import matching_profile, profile_digest, require_profile
@@ -28,7 +29,7 @@ ERRORS = {
     "RECIPE_WRITE_FAILED": "配方回写失败，请检查机器上的操作记录",
     "INVALID_RECIPE_WRITE": "配方回写参数无效，请重新读取配方后保存",
     "RECIPE_WRITE_BUSY": "该代码目录正在执行其他操作，请等待操作完成",
-    "RECIPE_SOURCE_DIRTY": "config.py 存在未提交修改，请处理后再回写",
+    "RECIPE_SOURCE_DIRTY": "配方配置文件存在未提交修改，请处理后再回写",
     "RECIPE_NAME_CONFLICT": "代码中已存在该配方名称，请使用新的配置名称",
     "RECIPE_COMMIT_FAILED": "配方 Git 提交未完成，请检查机器上的操作记录",
     "RECIPE_GIT_BUSY": "代码仓库正在执行其他 Git 操作，请等待操作完成",
@@ -46,7 +47,7 @@ ERRORS = {
     "RECIPE_WRITE_UNSUPPORTED": "该配方的源码结构暂不支持安全回写",
     "RECIPE_OVERRIDES_INVALID": "修改项与当前配方的可编辑字段不一致",
     "RECIPE_ASSET_FIELDS_MANAGED": "数据路径、归一化、模型路径和混采权重由训练任务的资产绑定管理，请移除这些修改并保存新修订后再回写",
-    "RECIPE_CHECKOUT_BUSY": "该代码目录有训练、预检或待调度任务，暂时无法修改源码",
+    "RECIPE_CHECKOUT_BUSY": "该代码目录有训练、预检、真机部署或待调度任务，暂时无法修改源码",
     "GIT_WORKTREE_DIRTY": "代码目录存在未提交修改，请处理后再回写",
     "GIT_IDENTITY_REQUIRED": "训练代码仓库未配置 Git 提交身份",
     "GIT_COMMIT_FAILED": "配方 Git 提交失败，请检查机器上的操作记录",
@@ -83,8 +84,16 @@ def pending_for_checkout(session, node_id, code_dir):
 def require_checkout_idle(session, node_id, code_dir):
     """Reject source edits while any execution may still use the checkout."""
     wanted = _checkout(code_dir)
+    from .checkpoint_transfers import active_transfers
+    if active_transfers(session, node_id, code_dir=wanted):
+        raise APIError(409, "RECIPE_CHECKOUT_BUSY", ERRORS["RECIPE_CHECKOUT_BUSY"])
     profiles = {profile.id for profile in session.scalars(select(Profile).where(Profile.node_id == node_id))
                 if _checkout(profile.code_dir) == wanted}
+    deployment = session.scalar(select(PolicyDeployment.id).where(
+        PolicyDeployment.node_id == node_id, PolicyDeployment.profile_id.in_(profiles),
+        PolicyDeployment.state.in_(RESOURCE_STATES)).limit(1))
+    if deployment:
+        raise APIError(409, "RECIPE_CHECKOUT_BUSY", ERRORS["RECIPE_CHECKOUT_BUSY"])
     active = {"QUEUED", "STARTING", "PREPARING", "RUNNING", "CANCELLING", "STOPPING", "UNKNOWN"}
     for run in session.scalars(select(Run).where(Run.node_id == node_id, Run.state.in_(active))):
         if run.profile_id in profiles or _checkout((run.code_expectation or {}).get("code_dir")) == wanted:
@@ -103,6 +112,8 @@ def require_checkout_idle(session, node_id, code_dir):
 
 
 def require_no_pending_writeback(session, node_id, code_dir):
+    from .profile_rebindings import require_not_pending
+    require_not_pending(session, node_id, code_dir=code_dir)
     if pending_for_checkout(session, node_id, code_dir):
         raise APIError(409, "RECIPE_WRITEBACK_PENDING", "配方源码正在回写并提交，请等待结果后再预检或启动训练")
 

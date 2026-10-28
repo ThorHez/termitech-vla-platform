@@ -5,6 +5,7 @@ import { useAuth } from './auth';
 import { Badge, ErrorNotice, Field } from './components';
 import { RecipeAutocomplete } from './RecipeAutocomplete';
 import { RecipeDetails } from './RecipeDetails';
+import type { RecipeEditorDraft } from './trainingDraft';
 import type {
   Node,
   Profile,
@@ -25,6 +26,8 @@ export function RecipeLibrary({
   onResolved,
   onDirtyChange,
   onLoadingChange,
+  restoredEditorDraft,
+  onEditorDraftChange,
 }: {
   node?: Node;
   profile?: Profile;
@@ -36,6 +39,8 @@ export function RecipeLibrary({
   onResolved?: (detail: RecipeDetail, recipe: string, revisionId?: string) => void;
   onDirtyChange: (dirty: boolean) => void;
   onLoadingChange: (loading: boolean) => void;
+  restoredEditorDraft?: RecipeEditorDraft;
+  onEditorDraftChange?: (draft: RecipeEditorDraft | undefined) => void;
 }) {
   const { can } = useAuth();
   const initial =
@@ -70,6 +75,18 @@ export function RecipeLibrary({
   const choices =
     library.data?.filter((item) => item.node_id === node?.id && item.profile_id === profile?.id) ||
     [];
+  const editorScope = JSON.stringify([
+    node?.id,
+    profile?.id,
+    profile?.code_dir,
+    profile?.python,
+    profile?.adapter,
+    recipe,
+    selected?.latest_revision.id,
+  ]);
+  // A matching draft may open the detail reader, but only its fresh response
+  // can authorize restoring edits. Do not restore autocomplete confirmation.
+  const hasEditorDraft = restoredEditorDraft?.scope === editorScope;
   useEffect(() => {
     setSelected((previous) => {
       if (!previous) return previous;
@@ -213,7 +230,7 @@ export function RecipeLibrary({
           )}
         </>
       )}
-      {mode === 'saved' || (recipe && confirmedName === recipe) ? (
+      {mode === 'saved' || (recipe && (confirmedName === recipe || hasEditorDraft)) ? (
         <RecipeDetails
           node={node}
           profile={profile}
@@ -231,6 +248,8 @@ export function RecipeLibrary({
           onResolved={onResolved}
           onDirtyChange={onDirtyChange}
           onLoadingChange={onLoadingChange}
+          restoredEditorDraft={restoredEditorDraft}
+          onEditorDraftChange={onEditorDraftChange}
         />
       ) : (
         <p className="field-hint">

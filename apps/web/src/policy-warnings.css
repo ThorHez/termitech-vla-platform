@@ -1,0 +1,7 @@
+.inline-note.amber.policy-warning {
+  color: var(--text-warning, #875c12);
+}
+.policy-warning code {
+  font-size: 9px;
+  overflow-wrap: anywhere;
+}

@@ -11,6 +11,7 @@ import {
   ExternalLink,
   GitCommitHorizontal,
   LoaderCircle,
+  Rocket,
   Server,
   Square,
   Terminal,
@@ -24,16 +25,18 @@ import {
   CodeVersion,
   Empty,
   ErrorNotice,
-  MetricChart,
   Modal,
   PageHeading,
   Panel,
 } from './components';
 import { activeStates, assetKinds, inputRoles, useData } from './data';
 import { DatasetBindingSummary } from './DatasetBindings';
+import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { datasetInputLabel } from './datasetBindingHelpers';
 import { stageParameterLabels, trainingStageLabels } from './recap';
 import type { Asset, Logs, Run, RunEvent } from './types';
+import { deployableOutputs, sourceDeploymentBlocker } from './policyDeployment';
+import { TrainingMetrics } from './TrainingMetrics';
 
 function outputRemoved(output: Asset) {
   return output.state === 'UNAVAILABLE' || output.metadata?.availability === 'removed';
@@ -54,7 +57,7 @@ export default function RunDetail({ id }: { id: string }) {
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
-  const run = detail.data;
+  const run = detail.data?.id === id ? detail.data : undefined;
   const attempt = run?.attempts?.[run.attempts.length - 1];
   const outputs = useMemo(
     () =>
@@ -68,21 +71,12 @@ export default function RunDetail({ id }: { id: string }) {
     [run?.outputs],
   );
   const metricEvents = useMemo(
-    () => events.data?.filter((event) => event.type === 'METRIC') || [],
-    [events.data],
-  );
-  const metrics = attempt?.latest_metrics || metricEvents[metricEvents.length - 1]?.data;
-  const curve = useMemo(
     () =>
-      metricEvents
-        .filter(
-          (event) =>
-            typeof event.data.loss === 'number' &&
-            Number.isFinite(event.data.loss) &&
-            typeof event.data.step === 'number',
-        )
-        .map((event) => ({ step: Number(event.data.step), loss: Number(event.data.loss) })),
-    [metricEvents],
+      events.data.filter(
+        (event) =>
+          event.type === 'METRIC' && (!attempt?.id || event.attempt_id === attempt.id),
+      ),
+    [events.data, attempt?.id],
   );
   const node = nodes.data?.find((item) => item.id === run?.node_id);
   const template = templates.data?.find((item) => item.id === run?.template_id);
@@ -97,6 +91,9 @@ export default function RunDetail({ id }: { id: string }) {
     run?.code_expectation?.stage_config;
   const resource = attempt?.resources;
   const recipe = run?.recipe || attempt?.code_snapshot?.recipe || run?.code_expectation?.recipe;
+  const autoConfig =
+    run?.auto_config || attempt?.code_snapshot?.auto_config || run?.code_expectation?.auto_config;
+  const reviewedConfig = run?.code_expectation?.automatic_preflight?.plan.generated_config;
   const requestedEntrypoint =
     run?.entrypoint ||
     attempt?.code_snapshot?.requested_entrypoint ||
@@ -131,6 +128,18 @@ export default function RunDetail({ id }: { id: string }) {
           run && (
             <>
               <Badge state={run.state} />
+              {can('training.write') &&
+                run.template_id === 'openpi-sft' &&
+                deployableOutputs(run).length > 0 &&
+                !sourceDeploymentBlocker(run) && (
+                  <a
+                    className="button outline"
+                    href={`#/deployments?run=${encodeURIComponent(run.id)}`}
+                  >
+                    <Rocket size={14} />
+                    部署模型
+                  </a>
+                )}
               {can('training.write') && activeStates.has(run.state) && (
                 <button
                   className="button outline danger-text"
@@ -227,45 +236,17 @@ export default function RunDetail({ id }: { id: string }) {
             {tab === 'overview' && (
               <div className="detail-columns">
                 <div>
-                  <Panel
-                    title="训练指标"
-                    subtitle="来自训练进程的实际上报"
-                    action={
-                      <span className="chart-legend">
-                        <span />
-                        loss
-                      </span>
-                    }
-                  >
-                    <ErrorNotice error={events.error} retry={events.refresh} />
-                    <div className="training-metrics">
-                      <div>
-                        <span>当前步数</span>
-                        <strong>
-                          {displayNumber(typeof metrics?.step === 'number' ? metrics.step : null)}
-                          <small>
-                            {' '}
-                            /{' '}
-                            {displayNumber(
-                              typeof metrics?.total_steps === 'number'
-                                ? metrics.total_steps
-                                : run.parameters?.steps,
-                            )}
-                          </small>
-                        </strong>
-                      </div>
-                      <div>
-                        <span>最新 loss</span>
-                        <strong>
-                          {typeof metrics?.loss === 'number' ? metrics.loss.toFixed(5) : '—'}
-                        </strong>
-                      </div>
-                      <div>
-                        <span>指标采样数</span>
-                        <strong>{metricEvents.length}</strong>
-                      </div>
-                    </div>
-                    <MetricChart values={curve} />
+                  <Panel title="训练指标" subtitle="来自训练进程的实际上报">
+                    <TrainingMetrics
+                      key={`${id}-${attempt?.id || 'pending'}`}
+                      events={metricEvents}
+                      latestMetrics={attempt?.latest_metrics}
+                      totalSteps={run.parameters?.steps}
+                      loading={events.loading}
+                      error={events.error}
+                      retry={events.refresh}
+                      historyLimited={events.data.length >= 5000}
+                    />
                   </Panel>
                   <Panel
                     title="最近日志"
@@ -294,14 +275,14 @@ export default function RunDetail({ id }: { id: string }) {
                         </div>
                       )}
                       <div>
-                        <dt>训练配方</dt>
+                        <dt>{autoConfig ? '配置来源' : '训练配方'}</dt>
                         <dd>
                           {recipeDefinition && (
                             <span className="recipe-frozen-label">
                               {recipeDefinition.name} · v{recipeDefinition.revision}
                             </span>
                           )}
-                          {recipe ? <code>{recipe}</code> : '未记录'}
+                          {autoConfig ? '平台自动组装' : recipe ? <code>{recipe}</code> : '未记录'}
                         </dd>
                       </div>
                       <div>
@@ -487,14 +468,14 @@ export default function RunDetail({ id }: { id: string }) {
                       </div>
                     )}
                     <div>
-                      <dt>训练配方</dt>
+                      <dt>{autoConfig ? '配置来源' : '训练配方'}</dt>
                       <dd>
                         {recipeDefinition && (
                           <span className="recipe-frozen-label">
                             {recipeDefinition.name} · v{recipeDefinition.revision}
                           </span>
                         )}
-                        {recipe ? <code>{recipe}</code> : '未记录'}
+                        {autoConfig ? '平台自动组装' : recipe ? <code>{recipe}</code> : '未记录'}
                       </dd>
                     </div>
                     {recipeDefinition && (
@@ -577,6 +558,17 @@ export default function RunDetail({ id }: { id: string }) {
                       </dd>
                     </div>
                   </dl>
+                  {reviewedConfig && (
+                    <GeneratedConfigReview
+                      config={reviewedConfig}
+                      confirmedSha256={
+                        run.confirmed_config_sha256 ||
+                        run.code_expectation?.confirmed_config_sha256 ||
+                        undefined
+                      }
+                      readOnly
+                    />
+                  )}
                 </Panel>
               </div>
             )}
@@ -588,6 +580,7 @@ export default function RunDetail({ id }: { id: string }) {
                     subtitle="本次训练冻结的配对、采样权重和数据处理配置"
                   >
                     <DatasetBindingSummary
+                      profiles={run.dataset_profiles}
                       bindings={run.dataset_bindings}
                       assets={assets.data || []}
                     />

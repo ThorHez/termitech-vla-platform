@@ -1,0 +1,55 @@
+.storage-configuration-modal {
+  width: 780px;
+}
+.storage-configuration-entry {
+  display: grid;
+  justify-items: end;
+  max-width: 240px;
+  min-width: 0;
+  gap: 5px;
+}
+.storage-configuration-modal .field-hint,
+.storage-unsupported {
+  overflow-wrap: anywhere;
+}
+.storage-configuration-modal .inline-note p {
+  margin: 4px 0 0;
+}
+.storage-directory-space {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  margin-top: 18px;
+}
+.storage-directory-space > div {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px;
+}
+.storage-directory-space > div + div {
+  border-top: 1px solid var(--border);
+}
+.storage-directory-space > div > div {
+  display: grid;
+  flex: 1;
+  gap: 4px;
+  min-width: 0;
+}
+.storage-directory-space code {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.storage-directory-space > div > span {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+@media (max-width: 560px) {
+  .storage-directory-space > div {
+    flex-wrap: wrap;
+  }
+  .storage-directory-space > div > span {
+    width: 100%;
+    padding-left: 26px;
+  }
+}

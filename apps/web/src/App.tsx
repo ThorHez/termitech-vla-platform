@@ -10,6 +10,7 @@ import {
   LogOut,
   Menu,
   RefreshCw,
+  Rocket,
   Search,
   Server,
   Settings2,
@@ -28,6 +29,8 @@ import { DataProvider, useData } from './data';
 import { AssetsPage, NodePage, NodesPage, OverviewPage, RunsPage, TemplatesPage } from './pages';
 import RunDetail from './RunDetail';
 import RunWizard from './RunWizard';
+import PolicyDeployments from './PolicyDeployments';
+import { ThemeControl, ThemeProvider, ThemeSettings } from './theme';
 
 const navigation = [
   { path: '/overview', label: '训练工作台', icon: LayoutDashboard },
@@ -35,13 +38,16 @@ const navigation = [
   { path: '/assets', label: '数据与模型', icon: Database },
   { path: '/templates', label: '训练模板', icon: Layers3 },
   { path: '/runs', label: '训练任务', icon: Workflow },
+  { path: '/deployments', label: '真机部署', icon: Rocket },
 ];
 
 export default function App() {
   return (
-    <AuthProvider>
-      <SessionGate />
-    </AuthProvider>
+    <ThemeProvider>
+      <AuthProvider>
+        <SessionGate />
+      </AuthProvider>
+    </ThemeProvider>
   );
 }
 
@@ -199,6 +205,7 @@ function Shell() {
               <span />
               本地资产模式
             </span>
+            <ThemeControl />
             <button
               className="icon-button"
               title="刷新数据"
@@ -250,6 +257,12 @@ function Shell() {
               <RunsPage createRun={() => createRun()} />
             ) : path.startsWith('/runs/') ? (
               <RunDetail key={path} id={decodeURIComponent(path.slice('/runs/'.length))} />
+            ) : path === '/deployments' || path.startsWith('/deployments/') ? (
+              <PolicyDeployments
+                path={path}
+                tab={queryParams.get('tab') || 'overview'}
+                initialRun={queryParams.get('run') || undefined}
+              />
             ) : path === '/settings' ? (
               <SettingsPage />
             ) : path === '/users' ? (
@@ -385,6 +398,9 @@ export function LoginPage() {
   const [error, setError] = useState<Error>();
   return (
     <div className="login-page">
+      <div className="theme-auth-control">
+        <ThemeControl />
+      </div>
       <div className="login-card">
         <div className="auth-brand">
           <span className="mini-icon">
@@ -588,6 +604,9 @@ function LogoutButton() {
 export function RequiredPasswordChange() {
   return (
     <div className="login-page">
+      <div className="theme-auth-control">
+        <ThemeControl />
+      </div>
       <div className="login-card">
         <div className="auth-brand">
           <ShieldCheck size={26} />
@@ -611,8 +630,13 @@ function SettingsPage() {
       <PageHeading
         eyebrow="PLATFORM SETTINGS"
         title="账号与平台设置"
-        description="查看当前账号并管理登录密码。"
+        description="管理界面外观、当前账号与登录密码。"
       />
+      <div className="theme-settings-panel">
+        <Panel title="界面外观" subtitle="选择适合当前环境的显示模式。">
+          <ThemeSettings />
+        </Panel>
+      </div>
       <div className="settings-grid">
         <Panel title="当前账号">
           <div className="settings-form">

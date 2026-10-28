@@ -1,7 +1,7 @@
 .git
 .venv
 .local
-third_party/openpi-umi
+third_party/
 **/node_modules
 **/__pycache__
 **/.pytest_cache

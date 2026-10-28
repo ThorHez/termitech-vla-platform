@@ -56,11 +56,22 @@ def sanitize_remote(value: str) -> str:
 def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = None, *, recipe: str | None = None,
                  recipe_definition: dict | None = None, entrypoint: str | None = None,
                  dataset_bindings: list[dict] | None = None, training_stage: str | None = None,
-                 stage_config: dict | None = None) -> dict:
+                 stage_config: dict | None = None, auto_config: dict | None = None) -> dict:
     root = allowed_path(profile["code_dir"], roots)
     from vla_adapters.dataset_bindings import normalize_dataset_bindings
     from vla_adapters.entrypoints import validate_entrypoint
     from vla_adapters.recap import validate_training_stage
+    from vla_adapters.automatic_config import normalize_auto_config
+    try:
+        auto_config = normalize_auto_config(auto_config)
+        if auto_config is not None:
+            from vla_adapters import resolve_recipe
+            if recipe_definition is not None:
+                raise ValueError("automatic configuration cannot use a saved code recipe")
+            recipe = resolve_recipe(profile, recipe, require_validated=False,
+                                    auto_config=auto_config, training_stage=training_stage)
+    except ValueError as exc:
+        raise AgentError("AUTO_CONFIG_INVALID", str(exc)) from exc
     try:
         training_stage, stage_config = validate_training_stage("recap" if training_stage is not None else profile.get("adapter"), training_stage, stage_config)
     except ValueError as exc:
@@ -199,6 +210,8 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         runtime["requested_entrypoint"] = entrypoint
     if dataset_bindings is not None:
         runtime["dataset_bindings"] = dataset_bindings
+    if auto_config is not None:
+        runtime["auto_config"] = auto_config
     if training_stage is not None:
         runtime.update(training_stage=training_stage, stage_config=stage_config)
     if recipe_definition is not None:
@@ -232,6 +245,8 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         snapshot["recipe_definition"] = recipe_definition
     if dataset_bindings is not None:
         snapshot["dataset_bindings"] = dataset_bindings
+    if auto_config is not None:
+        snapshot["auto_config"] = auto_config
     if training_stage is not None:
         snapshot.update(training_stage=training_stage, stage_config=stage_config)
     if evidence_dir is not None:
@@ -256,7 +271,7 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
 def compare_code(expected: dict, actual: dict, *, compare_automatic: bool = True):
     if not expected.get("complete") or not actual.get("complete"):
         raise AgentError("CODE_VERSION_UNAVAILABLE", "Code snapshot is incomplete; repeat preflight after resolving missing evidence")
-    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "training_stage", "stage_config")
+    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "training_stage", "stage_config", "auto_config")
     changed = [field for field in fields if expected.get(field) != actual.get(field)]
     if changed:
         raise AgentError("CODE_CHANGED_SINCE_PREFLIGHT", "Code changed after preflight: " + ", ".join(changed))
@@ -271,6 +286,7 @@ def compare_code(expected: dict, actual: dict, *, compare_automatic: bool = True
             valid = valid and frozen.get("plan_digest") == canonical_digest(frozen["plan"])
             valid = valid and current.get("plan_digest") == canonical_digest(current["plan"])
             valid = valid and frozen["plan_digest"] == current["plan_digest"]
+            valid = valid and frozen.get("storage_configuration") == current.get("storage_configuration")
         except (KeyError, TypeError, ValueError):
             valid = False
         if not valid:

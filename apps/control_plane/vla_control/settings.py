@@ -10,8 +10,8 @@ class Settings:
     admin_token: str = ""
     enrollment_token: str = ""
     legacy_admin_enabled: bool = False
-    session_ttl_seconds: int = 7200
-    session_idle_seconds: int = 900
+    session_ttl_seconds: int = 28800
+    session_idle_seconds: int = 3600
     session_reauth_seconds: int = 300
     session_cookie_secure: bool = True
     public_url: str = ""
@@ -31,8 +31,8 @@ class Settings:
             admin_token=os.getenv("VLA_ADMIN_TOKEN", ""),
             enrollment_token=os.getenv("VLA_ENROLLMENT_TOKEN", ""),
             legacy_admin_enabled=os.getenv("VLA_LEGACY_ADMIN_ENABLED", "false").lower() in {"1", "true", "yes"},
-            session_ttl_seconds=int(os.getenv("VLA_SESSION_TTL_SECONDS", "7200")),
-            session_idle_seconds=int(os.getenv("VLA_SESSION_IDLE_SECONDS", "900")),
+            session_ttl_seconds=int(os.getenv("VLA_SESSION_TTL_SECONDS", "28800")),
+            session_idle_seconds=int(os.getenv("VLA_SESSION_IDLE_SECONDS", "3600")),
             session_reauth_seconds=int(os.getenv("VLA_SESSION_REAUTH_SECONDS", "300")),
             session_cookie_secure=os.getenv("VLA_SESSION_COOKIE_SECURE", "true").lower() in {"1", "true", "yes"},
             public_url=os.getenv("VLA_PUBLIC_URL", ""),

@@ -115,6 +115,49 @@ def test_merge_filters_keyword_and_caps_output(platform):
     assert ready["truncated"] is True
 
 
+def test_inference_config_suggestions_share_cache_and_only_return_existing_code(platform):
+    node = register(platform)
+    edit_profile(platform, node, recipe="pi0_alpha", metadata_json={"validated_recipes": ["pi0_aaa"]})
+    query = create(platform, node, limit=2).json()
+    path = f"/api/v1/nodes/{node['node_id']}/inference-config-suggestions"
+    payload = {"profile_id": "default", "prefix": "pi0", "limit": 2}
+    assert platform.client.post(path, headers=ADMIN, json=payload).json()["id"] == query["id"]
+    assert ack(platform, node, query["id"]).status_code == 200
+    ready = platform.client.get(path + "/" + query["id"], headers=ADMIN).json()
+    assert ready["status"] == "READY"
+    assert ready["entries"] == [{"name": "pi0_alpha", "validated": False, "source": "both"},
+                                {"name": "pi0_beta", "validated": False, "source": "code"}]
+    assert ready["truncated"] is False
+    cached = platform.client.post(path, headers=ADMIN, json=payload).json()
+    assert cached == ready
+    assert len(platform.commands(node)) == 0
+    assert [entry["name"] for entry in get(platform, node, query["id"]).json()["entries"]] == ["pi0_aaa", "pi0_alpha"]
+
+
+@pytest.mark.parametrize("role,expected", [("operator", 202), ("viewer", 403)])
+def test_inference_discovery_uses_deployment_permission_without_changing_recipe_permissions(platform, monkeypatch, role, expected):
+    from vla_control.auth import ROLE_PERMISSIONS
+    from vla_control.authorization import PERMISSIONS
+
+    node = register(platform)
+    # Exercise a deployer with no recipe editing permission while retaining the actual role model.
+    monkeypatch.setitem(ROLE_PERMISSIONS, "operator", frozenset({"platform.read", "training.write"}))
+    password = "test-user-password"
+    platform.app.state.auth.create_user("deployment-user", password, role)
+    platform.client.base_url = "https://testserver"
+    login = platform.client.post("/api/v1/auth/login", json={"username": "deployment-user", "password": password})
+    assert login.status_code == 200, login.text
+    headers = {"X-CSRF-Token": login.json()["csrf_token"]}
+    path = f"/api/v1/nodes/{node['node_id']}/inference-config-suggestions"
+    payload = {"profile_id": "default", "prefix": "pi0", "limit": 30}
+    response = platform.client.post(path, headers=headers, json=payload)
+    assert response.status_code == expected, response.text
+    assert platform.client.post(path.replace("inference-config", "recipe"), headers=headers, json=payload).status_code == 403
+    assert PERMISSIONS[("POST", "/api/v1/nodes/{node_id}/recipe-suggestions")] == "recipes.write"
+    if expected == 202:
+        assert platform.client.get(path + "/" + response.json()["id"]).status_code == 200
+
+
 @pytest.mark.parametrize("keyword", ["elec", "ELEC", "ElEc"])
 def test_middle_keyword_is_case_insensitive_for_code_and_registered_recipes(platform, keyword):
     node = register(platform)

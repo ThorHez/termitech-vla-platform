@@ -3,6 +3,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from vla_adapters.entrypoints import validate_entrypoint
 
+from .dataset_profiles import DatasetProfile, validate_asset_metadata
+
 
 class InputModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -53,6 +55,7 @@ class RegisterInput(InputModel):
     hostname: str = Field(min_length=1, max_length=255)
     roots: list[str] = Field(min_length=1, max_length=100)
     output_root: str
+    cache_root: str | None = Field(default=None, min_length=1, max_length=4096)
     profiles: list[ProfileInput] = Field(default_factory=list, max_length=100)
 
 
@@ -77,6 +80,7 @@ class GPUInput(InputModel):
     name: str | None = None
     memory_total_mb: float | None = Field(default=None, ge=0)
     memory_used_mb: float | None = Field(default=None, ge=0)
+    memory_free_mb: float | None = Field(default=None, ge=0)
     utilization_pct: float | None = Field(default=None, ge=0, le=100)
     processes: list[dict] | None = None
 
@@ -102,6 +106,15 @@ class AssetInput(InputModel):
     path: str = Field(min_length=1, max_length=4096)
     version: str = Field(default="1", min_length=1, max_length=200)
     metadata: dict = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def dataset_metadata(self):
+        self.metadata = validate_asset_metadata(self.kind, self.metadata)
+        return self
+
+
+class AssetDatasetProfileInput(InputModel):
+    dataset_profile: DatasetProfile
 
 
 class PathSuggestInput(InputModel):
@@ -140,6 +153,7 @@ class PreviewInput(InputModel):
     template_id: str
     training_stage: Literal["value", "offline_rl"] | None = None
     stage_config: dict | None = None
+    auto_config: dict | None = None
     recipe: str | None = Field(default=None, max_length=255, pattern=r"^[A-Za-z0-9_-]+$")
     recipe_revision_id: str | None = Field(default=None, min_length=1, max_length=36)
     entrypoint: str | None = Field(default=None, min_length=1, max_length=4096)
@@ -147,6 +161,12 @@ class PreviewInput(InputModel):
     inputs: dict[str, str] = Field(default_factory=dict)
     parameters: dict = Field(default_factory=dict)
     gpu_count: int = Field(default=1, ge=0, le=256, strict=True)
+
+    @field_validator("auto_config")
+    @classmethod
+    def validate_auto_config(cls, value):
+        from vla_adapters.automatic_config import normalize_auto_config
+        return normalize_auto_config(value)
 
     @field_validator("entrypoint")
     @classmethod
@@ -163,6 +183,7 @@ class PreviewInput(InputModel):
 
 class RunInput(InputModel):
     preflight_id: str
+    confirmed_config_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 class AckInput(InputModel):

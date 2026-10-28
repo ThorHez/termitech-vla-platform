@@ -185,15 +185,20 @@ try {
       ...selectBindingProcessor(legacy, processor),
       processor: {
         name: processor.name,
-        parameters: { horizon: 24, 'base_config.prompt_from_task': false },
+        parameters: { horizon: 24, 'base_config.prompt_from_task': false,
+          composition: { state_history: 2, state_fields: [{ key: 'observation.state', width: 7 }], gripper_range: null } },
       },
     };
     const html = renderToStaticMarkup(
       React.createElement(DatasetBindingSummary, { bindings: [binding], assets: [] }),
     );
     assert.match(html, /IndependentUmiFactory/);
-    assert.match(html, /horizon = 24/);
-    assert.match(html, /base_config.prompt_from_task = false/);
+    const serialized = html.match(/<pre[^>]*aria-label="数据处理参数 JSON"[^>]*><code>([\s\S]*?)<\/code><\/pre>/)?.[1]
+      .replaceAll('&quot;', '"').replaceAll('&#x27;', "'").replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&amp;', '&');
+    assert.ok(serialized);
+    assert.deepEqual(JSON.parse(serialized), binding.processor.parameters);
+    assert.match(serialized, /\n  "horizon": 24,/);
+    assert.match(serialized, /\n  "composition": \{\n    "state_history": 2,/);
     assert.doesNotMatch(html, /NaN|undefined|配方数据项/);
   });
 

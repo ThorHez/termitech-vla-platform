@@ -20,17 +20,21 @@ from itertools import islice
 from pathlib import Path
 
 if __package__:
+    from .automatic_config import build_automatic_base, normalize_auto_config
     from .cache_contract import configure_cache
     from .data_processors import instantiate_data_processor
     from .dataset_bindings import validate_binding_assets
+    from .dataset_fps import install_registered_fps, registered_fps_context
     from .entrypoints import read_entrypoint
     from .recipe_definitions import apply_overrides, validate_definition
     from .recap_runtime import apply_stage, stage_request
     from .training_plan import fingerprint, inspect_training_config, local_path, require_lerobot_source, training_entrypoint
 else:
+    from automatic_config import build_automatic_base, normalize_auto_config
     from cache_contract import configure_cache
     from data_processors import instantiate_data_processor
     from dataset_bindings import validate_binding_assets
+    from dataset_fps import install_registered_fps, registered_fps_context
     from entrypoints import read_entrypoint
     from recipe_definitions import apply_overrides, validate_definition
     from recap_runtime import apply_stage, stage_request
@@ -92,13 +96,14 @@ def resolve_config(base, spec, config_module, weight_loaders):
             dataset, norm_dir = paths[(dataset_role, norm_role)]
             processor = row["processor"]
             processor_cls = vars(config_module).get(processor["name"])
-            if (stage == "offline_rl" and "acp_dropout" in stage_config and dataclasses.is_dataclass(processor_cls)
+            if (processor["name"] != "ComposableDataConfig" and stage == "offline_rl" and "acp_dropout" in stage_config and dataclasses.is_dataclass(processor_cls)
                     and any(field.name == "acp_dropout" and field.init for field in dataclasses.fields(processor_cls))):
                 # Stage-owned parameters may be required constructor arguments.
                 # The frozen processor request remains separate from stage_config.
                 processor = {**processor, "parameters": {"acp_dropout": stage_config["acp_dropout"], **processor["parameters"]}}
             factory = instantiate_data_processor(processor, config_module, spec["code_dir"],
-                                                dataset_path=dataset, norm_dir=norm_dir)
+                                                dataset_path=dataset, norm_dir=norm_dir,
+                                                training_stage=stage, stage_config=stage_config)
         elif hasattr(base.data, "datasets"):
             if row["recipe_index"] >= len(base.data.datasets):
                 raise ValueError("DATASET_BINDINGS_INVALID: 所选数据处理配置超出了配方的数据源数量")
@@ -120,7 +125,14 @@ def resolve_config(base, spec, config_module, weight_loaders):
         if not isinstance(base.data, multi_type) or not isinstance(base.data.datasets, (tuple, list)) or not base.data.datasets:
             raise ValueError("RECIPE_UNSUPPORTED: unsupported or empty multi-dataset factory")
         children = [selected_factory(row, i) for i, row in enumerate(bindings)]
-        data = dataclasses.replace(base.data, datasets=children, weights=[row["weight"] for row in bindings])
+        updates = {"datasets": children, "weights": [row["weight"] for row in bindings]}
+        if spec.get("auto_config") is not None or any(type(child).__name__ == "ComposableDataConfig" for child in children):
+            if "use_merged_norm_stats" not in {field.name for field in dataclasses.fields(base.data)}:
+                raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 多数据集容器必须支持每个资产独立的归一化统计")
+            # Different robots/layouts need their own bound statistics. A shared
+            # recipe default must not merge incompatible raw feature spaces.
+            updates["use_merged_norm_stats"] = False
+        data = dataclasses.replace(base.data, **updates)
     else:
         if bindings is not None:
             if len(bindings) != 1:
@@ -181,6 +193,9 @@ def configuration_snapshot(config):
 
 
 def prepare_config(spec):
+    auto_config = normalize_auto_config(spec.get("auto_config"))
+    if auto_config is not None:
+        spec = {**spec, "auto_config": auto_config}
     definition = spec.get("recipe_definition")
     if definition is not None:
         definition = validate_definition(definition)
@@ -199,13 +214,16 @@ def prepare_config(spec):
     # Resolve the same project cache defaults before libraries freeze paths at
     # import time, in both the CPU probe and the actual training interpreter.
     configure_cache(spec)
+    install_registered_fps(spec)
     # Import through the existing environment. Agent separately verifies this origin.
     import openpi.training.config as config_module
     import openpi.training.weight_loaders as weight_loaders
     code = local_path(spec["code_dir"], spec)
     if not Path(config_module.__file__).resolve().is_relative_to(code):
         raise ValueError("MODULE_OUTSIDE_CODE_DIR: OpenPI 配置模块来自登记代码目录之外")
-    config = resolve_config(config_module.get_config(spec["recipe"]), spec, config_module, weight_loaders)
+    base = (build_automatic_base(spec, config_module, weight_loaders) if auto_config is not None
+            else config_module.get_config(spec["recipe"]))
+    config = resolve_config(base, spec, config_module, weight_loaders)
     return config, definition
 
 
@@ -233,18 +251,15 @@ def training_module(entry, code, source_sha256):
             sys.modules[name] = previous
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--spec-json", required=True)
-    parser.add_argument("--validate-only", action="store_true")
-    args = parser.parse_args()
-    spec = json.loads(args.spec_json)
+def _run_spec(spec, *, validate_only=False, fps_runtime=None):
     checks = []
-    if args.validate_only:
+    if validate_only:
         result = {"schema_version": 1, "scope": "configuration_and_local_assets", "checks": checks}
         try:
-            config, _ = prepare_config(spec)
-            result["plan"] = inspect_training_config(config, spec, checks=checks)
+            configure_cache(spec)
+            with registered_fps_context(spec) as fps_receipt:
+                config, _ = prepare_config(spec)
+                result["plan"] = inspect_training_config(config, spec, checks=checks, fps_runtime=fps_receipt)
         except Exception as exc:
             message = str(exc)
             code = message.split(":", 1)[0]
@@ -259,7 +274,7 @@ def main():
         return
 
     config, definition = prepare_config(spec)
-    plan = inspect_training_config(config, spec, checks=checks)
+    plan = inspect_training_config(config, spec, checks=checks, fps_runtime=fps_runtime)
     if spec.get("expected_plan_digest") != fingerprint(plan):
         raise ValueError("ASSETS_CHANGED_SINCE_PREFLIGHT: 训练前解析结果与 Agent 冻结的预检不一致，请重新预检")
     entry = training_entrypoint(config, spec)
@@ -268,6 +283,7 @@ def main():
     output = Path(spec["output_dir"])
     output.mkdir(parents=True, exist_ok=True)
     (output / "resolved_training.json").write_text(json.dumps(spec, indent=2, ensure_ascii=False))
+    (output / "training_config.py").write_text(plan["generated_config"]["source"], encoding="utf-8")
     effective = configuration_snapshot(config)
     effective["recipe_definition"] = definition
     effective["parameters"] = spec["parameters"]
@@ -310,6 +326,21 @@ def main():
                 "metadata": {"format": "openpi-orbax", "recipe": spec["recipe"],
                              "step": int(last.name), "evaluated": False}}
     (output / "artifacts.json").write_text(json.dumps([artifact], ensure_ascii=False, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--spec-json", required=True)
+    parser.add_argument("--validate-only", action="store_true")
+    args = parser.parse_args()
+    spec = json.loads(args.spec_json)
+    if args.validate_only:
+        return _run_spec(spec, validate_only=True)
+    # Resolve cache paths before importing LeRobot, then retain this policy
+    # through entrypoint imports, Dataset construction and spawned workers.
+    configure_cache(spec)
+    with registered_fps_context(spec) as fps_receipt:
+        return _run_spec(spec, fps_runtime=fps_receipt)
 
 
 if __name__ == "__main__":

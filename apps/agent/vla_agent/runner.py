@@ -14,6 +14,7 @@ from pathlib import Path
 
 import psutil
 from vla_adapters import build_launch
+from vla_protocol.config_preview import validate_generated_config
 
 from .artifacts import ArtifactMonitor
 from .config import load_config
@@ -121,6 +122,18 @@ def execute(config: dict, attempt_id: str) -> int:
     try:
         output = allowed_path(attempt["output_dir"], [config["output_root"]], must_exist=False)
         profile, inputs = validate_local_inputs(config, payload)
+        if profile.get("adapter") != "smoke":
+            expectation = payload.get("code_expectation", {})
+            generated = expectation.get("automatic_preflight", {}).get("plan", {}).get("generated_config")
+            try:
+                validate_generated_config(generated)
+            except ValueError as exc:
+                raise AgentError("CONFIG_CONFIRMATION_REQUIRED", "训练缺少可核对的 config，请重新预检并确认") from exc
+            confirmed = expectation.get("confirmed_config_sha256")
+            if confirmed is None:
+                raise AgentError("CONFIG_CONFIRMATION_REQUIRED", "训练缺少用户 config 确认，请重新预检并确认")
+            if confirmed != generated["sha256"] or payload.get("confirmed_config_sha256") != confirmed:
+                raise AgentError("CONFIG_CONFIRMATION_MISMATCH", "启动命令与用户确认的 config 不一致，请重新预检并确认")
         code_dir = Path(git(Path(profile["code_dir"]), "rev-parse", "--show-toplevel").decode().strip()).resolve()
         if output == code_dir or code_dir in output.parents:
             raise AgentError("INVALID_PATH", "Attempt output must be outside the training code directory")
@@ -129,7 +142,7 @@ def execute(config: dict, attempt_id: str) -> int:
             if asset_path == output or asset_path in output.parents or output in asset_path.parents:
                 raise AgentError("INVALID_PATH", "Attempt output must be separate from input assets")
         output.mkdir(parents=True, exist_ok=False)
-        start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+        start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
         compare_code(payload["code_expectation"], start_snapshot, compare_automatic=False)
         for uuid in sorted(payload.get("gpu_uuids", [])):
             # GPU UUIDs never become path components directly.
@@ -142,14 +155,14 @@ def execute(config: dict, attempt_id: str) -> int:
                 raise AgentError("GPU_BUSY", f"GPU reserved by another local Runner: {uuid}") from exc
             gpu_locks.append(gpu_lock)
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), str(output),
-                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
         allowed_path(launch["cwd"], config["roots"])
         if profile.get("adapter") != "smoke":
             if not isinstance(payload["code_expectation"].get("automatic_preflight"), dict):
                 raise AgentError("AUTOMATIC_PREFLIGHT_REQUIRED", "正式训练缺少 Agent 自动预检记录，请重新执行预检")
             launch = prepare_launch(launch, config, payload.get("inputs", {}))
             automatic = validate_training(config, launch, launch_checks, assigned=payload.get("gpu_uuids", []))
-            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
             compare_code(start_snapshot, current, compare_automatic=False)
             start_snapshot["automatic_preflight"] = automatic
             compare_code(payload["code_expectation"], start_snapshot)
@@ -163,6 +176,8 @@ def execute(config: dict, attempt_id: str) -> int:
         platform_credentials = {"VLA_ADMIN_TOKEN", "VLA_ENROLLMENT_TOKEN", "VLA_DATABASE_URL", "VLA_AGENT_TOKEN"}
         environment = {key: value for key, value in os.environ.items() if key not in platform_credentials}
         environment.update({**launch.get("env", {}), "PYTHONUNBUFFERED": "1"})
+        from .storage_configuration import cache_environment
+        environment.update(cache_environment(config))
         child = subprocess.Popen(launch["argv"], cwd=launch["cwd"], env=environment,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL, start_new_session=True)
@@ -241,7 +256,7 @@ def execute(config: dict, attempt_id: str) -> int:
                 record_line(buffer)
         code_changed = False
         try:
-            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"))
+            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
             if "automatic_preflight" in start_snapshot:
                 end_snapshot["automatic_preflight"] = start_snapshot["automatic_preflight"]
                 (output / "provenance" / "end" / "code-snapshot.json").write_text(json.dumps(end_snapshot, indent=2))
@@ -257,7 +272,7 @@ def execute(config: dict, attempt_id: str) -> int:
                 # The last save can finish between periodic scans. Publish its
                 # checkpoint and confirmed retention removals before lifecycle
                 # completion closes the attempt's transactional outbox.
-                ArtifactMonitor(state, config["output_root"]).report(state.attempt(attempt_id))
+                ArtifactMonitor(state, config["output_root"], output_roots=config.get("_output_root_history", [])).report(state.attempt(attempt_id))
             except Exception:
                 logging.getLogger("vla_agent").warning(
                     "Final checkpoint discovery failed for %s; preserving process exit result", attempt_id, exc_info=True)

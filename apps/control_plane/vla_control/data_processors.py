@@ -117,6 +117,17 @@ def _entry(value):
         if source is None:
             raise ValueError("invalid processor source")
         result["source"] = source
+    if "dataset_contract" in value:
+        from vla_adapters.dataset_contracts import normalize_dataset_contract
+        if not value["available"] or "source" not in result:
+            raise ValueError("dataset contract requires an available traceable processor")
+        result["dataset_contract"] = normalize_dataset_contract(value["dataset_contract"])
+    if "composition_schema_version" in value:
+        if (value["name"] != "ComposableDataConfig" or type(value["composition_schema_version"]) is not int
+                or value["composition_schema_version"] != 1 or not value["available"] or "source" not in result
+                or clean or excluded):
+            raise ValueError("invalid composition capability")
+        result["composition_schema_version"] = 1
     return result
 
 

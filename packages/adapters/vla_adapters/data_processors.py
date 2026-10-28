@@ -21,8 +21,12 @@ import types
 import typing
 
 if __package__:
+    from .composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
+    from .dataset_contracts import static_dataset_contract
     from .recipe_definitions import is_asset_managed_field, validate_overrides
 else:
+    from composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
+    from dataset_contracts import static_dataset_contract
     from recipe_definitions import is_asset_managed_field, validate_overrides
 
 
@@ -39,6 +43,10 @@ def normalize_processor(value):
     parameters = value["parameters"]
     if not isinstance(parameters, dict) or len(parameters) > 128:
         raise ValueError("DATA_PROCESSOR_INVALID: 数据处理参数必须是受限的字段对象")
+    if value["name"] == COMPOSABLE_PROCESSOR:
+        if set(parameters) != {"composition"}:
+            raise ValueError("COMPOSITION_INVALID: 组合处理器仅接受完整 composition，训练阶段由任务管理")
+        return {"name": COMPOSABLE_PROCESSOR, "parameters": {"composition": normalize_composition(parameters["composition"])}}
     try:
         clean = validate_overrides({"data." + key: item for key, item in parameters.items()
                                     if isinstance(key, str)})
@@ -247,6 +255,18 @@ def _parameters(cls, config_module, depth=0):
 
 
 def _descriptor(cls, config_module, name, code_dir):
+    if name == COMPOSABLE_PROCESSOR:
+        result = {"name": name, "description": (inspect.getdoc(cls) or "")[:2000], "parameters": [],
+                  "unsupported_parameters": [], "available": False}
+        try:
+            _class(config_module, name, code_dir)
+            if (type(getattr(cls, "COMPOSITION_SCHEMA_VERSION", None)) is not int
+                    or cls.COMPOSITION_SCHEMA_VERSION != 1 or not callable(getattr(cls, "processing_contract", None))):
+                raise ValueError("组合处理器不支持配置版本 1")
+            result.update(source=_source(cls, code_dir), available=True, composition_schema_version=1)
+        except (ValueError, OSError, TypeError) as exc:
+            result["reason"] = str(exc).split(":", 1)[-1].strip()
+        return result
     parameters, unsupported = _parameters(cls, config_module)
     required_unsupported = [item["path"] for item in unsupported if item["required"]]
     reason = None
@@ -264,6 +284,10 @@ def _descriptor(cls, config_module, name, code_dir):
         result["source"] = _source(cls, code_dir)
     except (ValueError, OSError, TypeError):
         pass
+    if reason is None:
+        contract = static_dataset_contract(cls, code_dir)
+        if contract is not None:
+            result["dataset_contract"] = contract
     return result
 
 
@@ -303,7 +327,8 @@ def _coerce(value, schema, path):
     return copy.deepcopy(value)
 
 
-def instantiate_data_processor(processor, config_module, code_dir, *, dataset_path=None, norm_dir=None):
+def instantiate_data_processor(processor, config_module, code_dir, *, dataset_path=None, norm_dir=None,
+                               training_stage=None, stage_config=None):
     processor = normalize_processor(processor)
     cls = _class(config_module, processor["name"], code_dir)
     descriptor = _descriptor(cls, config_module, processor["name"], code_dir)
@@ -314,7 +339,13 @@ def instantiate_data_processor(processor, config_module, code_dir, *, dataset_pa
     if missing:
         raise ValueError("DATA_PROCESSOR_PARAMETERS_REQUIRED: 缺少数据处理参数 " + ", ".join(missing))
     kwargs, base_updates = {}, {}
+    if processor["name"] == COMPOSABLE_PROCESSOR:
+        kwargs.update(composition=processor["parameters"]["composition"], training_stage=training_stage or "sft")
+        if training_stage == "offline_rl" and stage_config and "acp_dropout" in stage_config:
+            kwargs["acp_dropout"] = stage_config["acp_dropout"]
     for path, value in processor["parameters"].items():
+        if processor["name"] == COMPOSABLE_PROCESSOR and path == "composition":
+            continue
         if path not in fields:
             raise ValueError(f"DATA_PROCESSOR_PARAMETERS_INVALID: 未支持的数据处理参数 {path}")
         value = _coerce(value, fields[path], path)

@@ -1,0 +1,11 @@
+{
+  "robot_type": "ARX5",
+  "fps": 30,
+  "features": {
+    "observation.state": {"dtype": "float32", "shape": [7], "names": ["left_joint_0", "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4", "left_joint_5", "left_gripper"]},
+    "actions": {"dtype": "float32", "shape": [7], "names": ["left_joint_0", "left_joint_1", "left_joint_2", "left_joint_3", "left_joint_4", "left_joint_5", "left_gripper"]},
+    "observation.images.left_wrist": {"dtype": "video", "shape": [3, 224, 224], "info": {"private_camera_password": "must-not-return"}},
+    "task_index": {"dtype": "int64", "shape": [1]}
+  },
+  "private_token": "must-not-return"
+}

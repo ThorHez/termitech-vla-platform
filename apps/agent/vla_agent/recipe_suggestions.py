@@ -18,13 +18,16 @@ from .safety import AgentError, allowed_path
 
 MAX_SOURCE_BYTES = 1024 * 1024
 MAX_TOTAL_BYTES = 2 * 1024 * 1024
-MAX_SOURCE_FILES = 4
+MAX_SOURCE_FILES = 8
 MAX_AST_NODES = 100_000
 MAX_EVALUATION_DEPTH = 40
 MAX_COLLECTED_NAMES = 5000
 SCAN_BUDGET_SECONDS = 0.5
 RECIPE_NAME = re.compile(r"[A-Za-z0-9_-]{1,255}\Z", re.ASCII)
 SOURCE_PATHS = ("src/openpi/training/config.py", "openpi/training/config.py")
+RECIPE_PART_MODULES = frozenset(f"openpi.training.recipes.{family}" for family in ("sft", "recap", "mem", "rlt", "uot"))
+RECIPE_PART_PATHS = tuple(f"{prefix}openpi/training/recipes/{family}.py"
+                         for prefix in ("src/", "") for family in ("sft", "recap", "mem", "rlt", "uot"))
 
 
 @dataclass

@@ -1,14 +1,18 @@
+import type { DatasetProfile } from './DatasetProfileForm';
+
 export type JsonObject = Record<string, unknown>;
 export interface Gpu {
   uuid: string;
   name: string;
   memory_total_mb?: number | null;
   memory_used_mb?: number | null;
+  memory_free_mb?: number | null;
   utilization_pct?: number | null;
   processes?:
     | {
         pid: number;
         memory_mb?: number | null;
+        kind?: 'graphics' | 'compute' | 'compute_graphics' | 'unknown';
         attempt_id?: string | null;
         ownership?: string;
       }[]
@@ -19,10 +23,16 @@ export interface Node {
   id: string;
   name: string;
   hostname: string;
+  connection_address?: {
+    host: string;
+    port: number | null;
+    source: 'ssh' | 'hostname';
+  } | null;
   status: string;
   last_seen?: string | null;
   roots?: string[];
   output_root?: string;
+  cache_root?: string | null;
   gpus?: Gpu[];
   metrics?: JsonObject;
 }
@@ -124,6 +134,19 @@ export interface DataProcessorEntry {
   available: boolean;
   reason?: string;
   source?: { path: string; sha256: string };
+  dataset_contract?: DatasetProcessorContract;
+  composition_schema_version?: 1;
+}
+export interface DatasetProcessorContract {
+  arm_mode: 'single' | 'bimanual';
+  action_representation: 'eef' | 'joint';
+  camera_keys: string[];
+  required_features: string[];
+  action_mode?: 'absolute' | 'delta' | 'unknown';
+  rotation_representation?: 'axis_angle' | 'quaternion' | 'rotation_6d' | 'none' | 'unknown';
+  training_stage: 'sft' | 'value' | 'offline_rl';
+  model_family?: 'standard' | 'memory' | 'hybrid';
+  evidence: 'static_repack';
 }
 export interface DataProcessorCatalogValue {
   profile_id: string;
@@ -372,6 +395,7 @@ export interface AutomaticPreflight {
   scope: 'configuration_and_local_assets';
   plan_digest: string;
   plan: {
+    generated_config?: GeneratedTrainingConfig;
     input_authority?: 'registered_assets';
     model?: { path: string; asset_id?: string };
     entrypoint: string;
@@ -385,7 +409,24 @@ export interface AutomaticPreflight {
     [key: string]: unknown;
   };
 }
+export interface AutoTrainingConfig {
+  model_type: 'pi0' | 'pi05';
+  finetune_mode: 'full' | 'lora';
+  action_horizon: number;
+  action_dim: number;
+}
+export interface GeneratedTrainingConfig {
+  schema_version: 1;
+  language: 'python';
+  filename: string;
+  source: string;
+  sha256: string;
+}
 export interface CodeSnapshot {
+  auto_config?: AutoTrainingConfig | null;
+  confirmed_config_sha256?: string | null;
+  config_confirmed_at?: string | null;
+  dataset_profiles?: Record<string, DatasetProfile>;
   training_stage?: TrainingStage | null;
   stage_config?: Record<string, number> | null;
   dataset_bindings?: DatasetBinding[] | null;
@@ -422,6 +463,9 @@ export interface Attempt {
   code_changed_during_run?: boolean;
 }
 export interface Run {
+  auto_config?: AutoTrainingConfig | null;
+  confirmed_config_sha256?: string | null;
+  dataset_profiles?: Record<string, DatasetProfile> | null;
   training_stage?: TrainingStage | null;
   stage_config?: Record<string, number> | null;
   dataset_bindings?: DatasetBinding[] | null;
@@ -465,6 +509,7 @@ export interface Alert {
   created_at?: string;
 }
 export interface RunRequest {
+  auto_config?: AutoTrainingConfig;
   training_stage?: TrainingStage;
   stage_config?: Record<string, number>;
   dataset_bindings?: DatasetBinding[];
@@ -480,13 +525,20 @@ export interface RunRequest {
   parameters: Record<string, number>;
   gpu_count: number;
 }
+export interface PreflightCheck {
+  name: string;
+  ok: boolean;
+  message?: string;
+  severity?: 'warning' | 'error';
+  code?: string;
+}
 export interface Preview {
   id: string;
   status: string;
-  checks?: { name: string; ok: boolean; message?: string }[];
+  checks?: PreflightCheck[];
   code_snapshot?: CodeSnapshot;
   error?: { code?: string; message?: string };
-  request?: RunRequest;
+  request?: RunRequest & { dataset_profiles?: Record<string, DatasetProfile> };
 }
 export interface RunEvent {
   seq: number;

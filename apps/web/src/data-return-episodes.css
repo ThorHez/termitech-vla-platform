@@ -1,0 +1,360 @@
+.dr-episode-control {
+  min-width: 0;
+  margin: 0 0 14px;
+  border: 1px solid var(--border, #e7ecf0);
+  border-radius: 8px;
+  background: var(--bg-surface, #fff);
+  color: var(--text-primary, #345668);
+  font-family: inherit;
+  font-size: 11px;
+  overflow: hidden;
+}
+.dre-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 13px 15px;
+  background: var(--bg-subtle, #f7f9fb);
+}
+.dre-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.dre-heading-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: var(--bg-subtle, #eaf7f4);
+  color: var(--text-accent, var(--teal, #0c968a));
+}
+.dre-title > div {
+  min-width: 0;
+}
+.dre-eyebrow {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 10px;
+  color: var(--text-secondary, #82909c);
+}
+.dre-title h4 {
+  margin: 0;
+  color: var(--text-primary, #345668);
+  font-size: 13px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.dre-status,
+.dre-outcome {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border: 1px solid var(--border-default, #e1e8ed);
+  border-radius: 4px;
+  background: var(--bg-subtle, #f1f5f8);
+  color: var(--text-secondary, #78909e);
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.dre-status.recording {
+  border-color: var(--border-success, #c4e5de);
+  background: var(--bg-subtle, #eaf7f4);
+  color: var(--text-accent, var(--teal, #0c968a));
+}
+.dre-status.recording > svg {
+  fill: currentColor;
+}
+.dre-status.paused {
+  background: var(--bg-subtle, #f1f5f8);
+  color: var(--text-secondary, #627b89);
+}
+.dre-outcome.success {
+  background: var(--bg-success, #eaf7f4);
+  border-color: var(--border-success, #c4e5de);
+  color: var(--text-success, #188879);
+}
+.dre-outcome.failure {
+  background: var(--bg-danger, #fff1ef);
+  border-color: var(--border-danger, #f1d0ca);
+  color: var(--text-danger, #cf665e);
+}
+.dre-stats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 13px;
+  color: var(--text-secondary, #78909e);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.dre-stats > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.dre-stats b {
+  color: var(--text-secondary, #527281);
+  font-weight: 550;
+}
+.dre-history-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 9px;
+  margin: 0;
+  padding: 8px 15px;
+  background: var(--bg-subtle, #f7f9fb);
+  border-top: 1px solid var(--border-default, #edf1f4);
+  color: var(--text-secondary, #78909e);
+  font-size: 10px;
+  line-height: 1.7;
+}
+.dre-history-notice > p {
+  margin: 0;
+  flex: 1 1 220px;
+}
+.dre-history-notice > .dre-replay {
+  grid-column: auto;
+  grid-row: auto;
+}
+.dre-completion {
+  padding: 12px 15px;
+  border-top: 1px solid var(--border, #e7ecf0);
+}
+.dre-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.dre-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  min-height: 34px;
+  border: 1px solid var(--border-default, #dfe6eb);
+  border-radius: 7px;
+  padding: 7px 10px;
+  background: var(--bg-surface, #fff);
+  color: var(--text-secondary, #627b89);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.dre-button:hover:not(:disabled) {
+  border-color: var(--border-success, #c4e5de);
+  background: var(--bg-hover, #f5f9fa);
+}
+.dre-button.primary {
+  color: #fff;
+  background: var(--teal, #0c968a);
+  border-color: var(--teal, #0c968a);
+}
+.dre-button.primary:hover:not(:disabled) {
+  background: var(--teal-dark, #087f76);
+  border-color: var(--teal-dark, #087f76);
+}
+.dre-button.failure {
+  color: var(--text-danger, #cf665e);
+  border-color: var(--border-danger, #edc8c3);
+}
+.dre-button.failure:hover:not(:disabled) {
+  background: var(--bg-hover, #fff1ef);
+  border-color: var(--border-danger, #e7b2ab);
+}
+.dre-button:disabled {
+  opacity: 0.47;
+  cursor: not-allowed;
+}
+.dre-completion > p {
+  margin: 9px 0 0;
+  color: var(--text-secondary, #82909c);
+  font-size: 10px;
+  line-height: 1.8;
+}
+.dre-next {
+  padding: 13px 15px;
+  border-top: 1px solid var(--border, #e7ecf0);
+  background: var(--bg-surface, #fbfdfd);
+}
+.dre-next > p {
+  margin: 0 0 11px;
+  color: var(--text-secondary, #78909e);
+  font-size: 11px;
+  line-height: 1.8;
+}
+.dre-next > p strong {
+  color: var(--text-secondary, #527b78);
+  font-weight: 550;
+}
+.dre-next-action {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.dre-next-action > span {
+  color: var(--text-secondary, #82909c);
+  font-size: 10px;
+  line-height: 1.8;
+}
+.dre-next-action > .dre-blocked {
+  color: var(--text-secondary, #627b89);
+}
+.dre-session-ended {
+  margin: 0;
+  padding: 11px 15px;
+  border-top: 1px solid var(--border, #e7ecf0);
+  color: var(--text-secondary, #78909e);
+  font-size: 10px;
+  line-height: 1.8;
+}
+.dre-history {
+  border-top: 1px solid var(--border, #e7ecf0);
+}
+.dre-history > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 15px;
+  color: var(--text-secondary, #627b89);
+  font-size: 11px;
+  cursor: pointer;
+  list-style: none;
+}
+.dre-history > summary::-webkit-details-marker {
+  display: none;
+}
+.dre-history summary > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.dre-history summary b {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-secondary, #82909c);
+}
+.dre-history summary > span:last-child {
+  color: var(--text-secondary, #82909c);
+  font-size: 10px;
+}
+.dre-history summary svg {
+  transition: transform 0.15s;
+}
+.dre-history[open] summary svg {
+  transform: rotate(180deg);
+}
+.dre-history > ol {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0 15px 13px;
+  list-style: none;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.dre-history li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 6px 10px;
+  min-width: 0;
+  border: 1px solid var(--border, #e7ecf0);
+  border-radius: 6px;
+  padding: 9px 11px;
+  background: var(--bg-surface, #fff);
+}
+.dre-history li.selected {
+  border-color: var(--border-success, #c4e5de);
+  background: var(--bg-selected, #f5fbf9);
+}
+.dre-history-name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.dre-history-name > strong {
+  color: var(--text-secondary, #527281);
+  font-size: 11px;
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+.dre-history-name > small {
+  color: var(--text-secondary, #82909c);
+  font-size: 10px;
+}
+.dre-history-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+  grid-column: 1;
+  color: var(--text-secondary, #82909c);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.dre-replay,
+.dre-history-live {
+  grid-column: 2;
+  grid-row: 1 / 3;
+}
+.dre-replay {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-default, #dfe6eb);
+  border-radius: 6px;
+  background: var(--bg-surface, #fff);
+  color: var(--text-accent, var(--teal, #0c968a));
+  font-family: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.dre-replay:hover {
+  background: var(--bg-hover, #eaf7f4);
+  border-color: var(--border-success, #c4e5de);
+}
+.dre-history-live {
+  color: var(--text-secondary, #82909c);
+  font-size: 10px;
+}
+.dr-episode-control button:focus-visible,
+.dre-history > summary:focus-visible {
+  outline: 2px solid #0eaa9b;
+  outline-offset: 2px;
+}
+@media (max-width: 640px) {
+  .dre-heading {
+    align-items: flex-start;
+  }
+  .dre-stats {
+    width: 100%;
+    gap: 13px;
+  }
+  .dre-actions > .dre-button {
+    flex: 1 1 auto;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dre-history summary svg {
+    transition: none;
+  }
+}

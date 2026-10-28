@@ -1,0 +1,54 @@
+.dataset-field-annotations {
+  margin: 12px 0;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+.dataset-field-labels-table {
+  max-height: 236px;
+  overflow: auto;
+  margin-top: 8px;
+}
+.dataset-field-labels-table table {
+  width: 100%;
+  min-width: 740px;
+  table-layout: fixed;
+  font-size: 10px;
+}
+.dataset-field-labels-table th,
+.dataset-field-labels-table td {
+  padding: 4px;
+  text-align: left;
+  vertical-align: top;
+}
+.dataset-field-labels-table th:first-child {
+  width: 27%;
+}
+.dataset-field-labels-table th:last-child {
+  width: 30px;
+}
+.dataset-field-labels-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-subtle, #f5faf9);
+}
+.dataset-field-annotations .dataset-field-labels-table table :is(select, input) {
+  height: 30px;
+  padding: 4px 6px;
+  padding-right: 23px;
+  background-position: right 5px center;
+  font-size: 10px;
+}
+.dataset-field-labels-table .icon-button {
+  width: 26px;
+  height: 30px;
+}
+
+.dataset-field-labels-table .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

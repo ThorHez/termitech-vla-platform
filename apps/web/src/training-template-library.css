@@ -1,0 +1,113 @@
+.training-template-library {
+  padding: 16px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-surface, #fff);
+}
+.training-template-heading,
+.training-template-heading h3,
+.training-template-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.training-template-heading {
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+.training-template-heading h3 {
+  margin: 0 0 5px;
+  font-size: 13px;
+}
+.training-template-heading p,
+.training-template-selection > span {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.training-template-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
+}
+.training-template-catalog,
+.training-template-editor {
+  min-width: 0;
+}
+.training-template-library .field {
+  margin-bottom: 10px;
+}
+.training-template-library textarea {
+  width: 100%;
+  min-height: 65px;
+  resize: vertical;
+  padding: 8px 11px;
+  color: var(--text-primary, #2b3b47);
+  background: var(--bg-input, #fff);
+  border: 1px solid var(--border-default, #dfe6eb);
+  border-radius: 7px;
+  line-height: 1.6;
+}
+.training-template-library textarea:focus {
+  border-color: #19a89b;
+  box-shadow: 0 0 0 3px #0c968a0c;
+  outline: none;
+}
+.training-template-library textarea::placeholder {
+  color: var(--text-muted, #a0aab3);
+}
+.training-template-selection {
+  display: grid;
+  gap: 5px;
+}
+.training-template-selection > strong {
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.training-template-selection > p {
+  margin: 3px 0 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary, #55717e);
+  font-size: 12px;
+  line-height: 1.6;
+  max-height: 100px;
+  overflow-y: auto;
+}
+.training-template-actions {
+  flex-wrap: wrap;
+}
+.training-template-editor > .field-hint {
+  margin: 9px 0 0;
+  display: block;
+}
+.training-template-delete {
+  padding: 10px;
+  margin-top: 8px;
+  background: var(--bg-danger, #fff4f1);
+  border: 1px solid var(--border-danger, #f1cec6);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text-danger, #9c4635);
+}
+.training-template-delete p {
+  margin: 0 0 8px;
+  overflow-wrap: anywhere;
+}
+.training-template-notice {
+  margin: 12px 0 0;
+  color: var(--text-accent, #079c90);
+  font-size: 12px;
+}
+@media (max-width: 760px) {
+  .training-template-columns {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+  .training-template-heading {
+    align-items: flex-start;
+  }
+}

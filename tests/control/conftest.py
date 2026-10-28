@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import hashlib
 
 from fastapi.testclient import TestClient
 import pytest
@@ -12,6 +13,22 @@ from vla_protocol import canonical_digest
 
 ADMIN = {"Authorization": "Bearer test-admin"}
 ENROLL = {"Authorization": "Bearer test-enrollment"}
+
+GENERATED_CONFIG_SOURCE = "# CPU fixture: resolved configuration used for confirmation tests.\nCONFIG = {\"fixture\": True}\n"
+GENERATED_CONFIG_SHA256 = hashlib.sha256(GENERATED_CONFIG_SOURCE.encode("utf-8")).hexdigest()
+
+
+def generated_config():
+    return {"schema_version": 1, "language": "python", "filename": "training_config.py",
+            "source": GENERATED_CONFIG_SOURCE, "sha256": GENERATED_CONFIG_SHA256}
+
+
+def confirmed_run_request(preview):
+    body = {"preflight_id": preview["id"]}
+    code = (preview.get("code_snapshot") or {}).get("automatic_preflight", {}).get("plan", {}).get("generated_config")
+    if code is not None:
+        body["confirmed_config_sha256"] = code["sha256"]
+    return body
 
 
 def snapshot(**changes):
@@ -30,6 +47,7 @@ def automatic_preflight(payload):
     plan = {"recipe": payload["recipe"], "input_authority": "registered_assets", "recipe_definition_digest": definition["digest"] if definition else None,
             "requested_inputs": paths, "inputs": paths, "parameters": payload["parameters"],
             "gpu_count": payload["gpu_count"], "entrypoint": "/machine/code/scripts/train.py",
+            "generated_config": generated_config(),
             "datasets": [{"path": paths[dataset], "norm_path": paths[norm], "norm_sha256": "f" * 64,
                           "dataset_asset_id": payload["inputs"][dataset]["id"], "norm_asset_id": payload["inputs"][norm]["id"],
                           "metadata_sha256": "e" * 64, "frames": 32, "episodes": 2, "factory": "LeRobotDataConfig"}
@@ -37,10 +55,16 @@ def automatic_preflight(payload):
             "model": {"path": paths["model"] + "/params", "checkpoint_path": paths["model"], "asset_id": payload["inputs"]["model"]["id"],
                       "metadata": [], "parameter_bytes": 1024},
             "storage": {"required_bytes": 8192, "reference_checkpoint_bytes": 4096, "model_params_bytes": 1024}}
+    for dataset, (role, _) in zip(plan["datasets"], pairs):
+        fps = payload["inputs"][role].get("dataset_profile", {}).get("fps")
+        if type(fps) in (int, float) and 0 < fps <= 1000:
+            dataset.update(effective_fps=fps, fps_source="registered")
     plan["training_cache"] = {"datasets_cache": "/machine/cache/datasets",
                               "paths": {"HF_DATASETS_CACHE": "/machine/cache/datasets"},
                               "builders": [{"path": item["path"], "cache_dir": "/machine/cache/datasets/parquet/default"}
                                            for item in plan["datasets"]]}
+    if payload.get("auto_config") is not None:
+        plan["auto_config"] = payload["auto_config"]
     if bindings is not None:
         plan.update(dataset_bindings=bindings, weights=[row["weight"] for row in bindings])
         for dataset, binding in zip(plan["datasets"], bindings):
@@ -110,7 +134,7 @@ class Platform:
 
     def run(self, node, key=None, **kwargs):
         preview = self.preview(node, **kwargs)
-        response = self.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": key or preview["id"]}, json={"preflight_id": preview["id"]})
+        response = self.client.post("/api/v1/runs", headers={**ADMIN, "Idempotency-Key": key or preview["id"]}, json=confirmed_run_request(preview))
         assert response.status_code == 201, response.text
         return response.json()
 

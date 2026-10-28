@@ -1,0 +1,31 @@
+.robot-type-control {
+  position: relative;
+}
+
+.robot-type-control input {
+  padding-right: 42px;
+}
+
+.robot-type-toggle {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  bottom: 1px;
+  width: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0 5px 5px 0;
+  background: transparent;
+}
+
+.robot-type-toggle::after {
+  content: '';
+  width: 16px;
+  height: 16px;
+  background: var(--select-chevron) center / contain no-repeat;
+}
+
+.robot-type-toggle[aria-expanded='true']::after {
+  transform: rotate(180deg);
+}

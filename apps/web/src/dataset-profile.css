@@ -1,0 +1,263 @@
+.dataset-profile-form {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin: 18px 0;
+  padding: 14px;
+  min-width: 0;
+}
+
+.dataset-profile-form legend {
+  color: var(--text);
+  font-weight: 650;
+  padding: 0 6px;
+}
+
+.dataset-profile-form textarea {
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+  color: var(--text-primary, #2b3b47);
+  background: var(--bg-input, white);
+  border: 1px solid var(--border-default, #dfe6eb);
+  border-radius: 6px;
+  padding: 10px 12px;
+  line-height: 1.6;
+}
+
+.dataset-profile-cameras {
+  margin: 14px 0;
+}
+
+.dataset-profile-section-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dataset-profile-section-title > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.dataset-profile-section-title > button {
+  margin-left: auto;
+}
+
+.dataset-profile-camera {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 10px;
+  padding: 10px 12px 0;
+}
+
+.dataset-profile-camera .form-grid {
+  margin-top: 8px;
+}
+
+.dataset-profile-advanced {
+  border-top: 1px solid var(--border);
+  margin-top: 16px;
+  padding-top: 12px;
+}
+
+.dataset-profile-advanced summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.dataset-profile-summary {
+  display: block;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.7;
+  margin-top: 6px;
+  max-width: 300px;
+  overflow-wrap: anywhere;
+}
+
+.dataset-profile-task {
+  display: block;
+  max-width: 300px;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.dataset-profile-path {
+  display: block;
+  overflow-wrap: anywhere;
+  margin-bottom: 16px;
+}
+
+.dataset-profile-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0;
+  font-size: 13px;
+}
+
+.dataset-profile-form.compact {
+  margin: 0;
+  padding: 10px 12px 8px;
+}
+
+.dataset-profile-form.compact > .field-hint {
+  margin: 0 0 8px;
+}
+
+.dataset-profile-form.compact .field {
+  min-width: 0;
+  margin-bottom: 8px;
+}
+
+.dataset-profile-form.compact .field-label {
+  margin-bottom: 4px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.dataset-profile-form.compact .field-hint {
+  margin-top: 4px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.dataset-profile-form.compact .form-grid {
+  gap: 0 10px;
+}
+
+.dataset-profile-form.compact .dataset-profile-basic {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.dataset-profile-form.compact .robot-type-field > .field-hint:empty {
+  display: none;
+}
+
+.dataset-profile-form.compact .field > input,
+.dataset-profile-form.compact .field select,
+.dataset-profile-form.compact .robot-type-control input {
+  height: 34px;
+  font-size: 11px;
+}
+
+.dataset-profile-form.compact textarea {
+  min-height: 56px;
+  padding: 7px 9px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.dataset-profile-form.compact .dataset-profile-cameras {
+  margin: 4px 0 10px;
+}
+
+.dataset-profile-form.compact .dataset-profile-section-title {
+  gap: 8px;
+  font-size: 11px;
+}
+
+.dataset-profile-form.compact .dataset-profile-section-title > .button {
+  min-height: 26px;
+  height: 26px;
+  padding: 0 8px;
+  font-size: 10px;
+}
+
+.dataset-profile-form.compact .dataset-profile-camera {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) 104px minmax(0, 1.8fr) 26px;
+  gap: 8px;
+  align-items: end;
+  margin-top: 7px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.dataset-profile-form.compact .dataset-profile-camera > .dataset-profile-section-title {
+  grid-column: 4;
+  grid-row: 1;
+  align-self: end;
+  margin-bottom: 1px;
+}
+
+.dataset-profile-form.compact .dataset-profile-camera > .dataset-profile-section-title > strong {
+  display: none;
+}
+
+.dataset-profile-form.compact .dataset-profile-camera .form-grid {
+  display: contents;
+}
+
+.dataset-profile-form.compact .dataset-profile-camera .field {
+  margin-bottom: 0;
+}
+
+.dataset-profile-form.compact .dataset-profile-camera .icon-button {
+  width: 26px;
+  height: 32px;
+}
+
+.dataset-profile-form.compact .composed-mode-toggle {
+  margin: 8px 0;
+  padding-top: 8px;
+}
+
+.dataset-profile-form.compact .composed-mode-toggle > .field-hint {
+  margin-top: 2px;
+}
+
+.dataset-profile-form.compact .dataset-profile-advanced {
+  margin-top: 8px;
+  padding-top: 8px;
+}
+
+.dataset-profile-form.compact .dataset-profile-advanced > h4 {
+  margin: 0;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.dataset-profile-form.compact .dataset-profile-advanced > .field-hint {
+  margin-bottom: 8px;
+}
+
+.dataset-profile-form.compact .dataset-profile-advanced > .form-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+@media (max-width: 1100px) {
+  .dataset-profile-form.compact .dataset-profile-basic,
+  .dataset-profile-form.compact .dataset-profile-advanced > .form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 600px) {
+  .dataset-profile-form.compact {
+    padding: 10px;
+  }
+
+  .dataset-profile-form.compact .dataset-profile-basic,
+  .dataset-profile-form.compact .dataset-profile-advanced > .form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dataset-profile-form.compact .dataset-profile-camera {
+    grid-template-columns: minmax(0, 1fr) 108px 26px;
+  }
+
+  .dataset-profile-form.compact .dataset-profile-camera > .dataset-profile-section-title {
+    grid-column: 3;
+  }
+
+  .dataset-profile-form.compact .dataset-profile-camera > .field {
+    grid-column: 1 / -1;
+  }
+}

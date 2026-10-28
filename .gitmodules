@@ -1,3 +1,9 @@
 [submodule "openpi-umi"]
 	path = third_party/openpi-umi
 	url = git@github.com:ThorHez/openpi-umi.git
+[submodule "arx5-sdk"]
+	path = third_party/arx5-sdk
+	url = https://github.com/real-stanford/arx5-sdk.git
+[submodule "umi-arx-deploy"]
+	path = third_party/umi-arx-deploy
+	url = https://github.com/ThorHez/umi-arx.git

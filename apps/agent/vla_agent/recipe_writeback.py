@@ -1,4 +1,4 @@
-"""Write one statically declared recipe and commit only its config.py change."""
+"""Write one statically declared recipe and commit only its source file."""
 from __future__ import annotations
 
 import ast
@@ -20,7 +20,8 @@ from pathlib import Path
 from vla_adapters.recipe_definitions import (override_path_tokens, validate_definition,
                                             validate_overrides_against_fields)
 
-from .recipe_details import MAX_AST_NODES, MAX_SOURCE_BYTES, _git, _git_pin, recipe_details
+from .recipe_details import (MAX_AST_NODES, MAX_SOURCE_BYTES, _git, _git_pin, _registry_reader,
+                             _source, recipe_details)
 from .safety import AgentError, allowed_path, identity_matches, process_identity, safe_identifier
 
 
@@ -113,6 +114,9 @@ def _git_write(checkout: Path, *arguments: str, input: bytes | None = None,
 def _idle(config: dict, state, checkout: Path):
     profiles = {item.get("id"): item for item in config.get("profiles", [])}
     repository = _repository_root(config, checkout, strict=True)
+    from .policy_deployment import active_policy_checkouts
+    if any(_repository_root(config, directory) == repository for directory in active_policy_checkouts(config)):
+        raise AgentError("RECIPE_CHECKOUT_BUSY", "该代码目录仍有本地推理服务，请先停止部署后再修改运行环境或配方")
     for attempt in state.active_attempts():
         payload = attempt.get("payload") or {}
         profile = payload.get("profile") or profiles.get(payload.get("profile_id")) or {}
@@ -184,7 +188,7 @@ def _default_constructor(node: ast.expr, tree: ast.Module) -> ast.expr:
     raise AgentError("RECIPE_WRITE_UNSUPPORTED", "默认工厂无法静态展开，请在基础配方中显式声明该构造器")
 
 
-def _render(content: bytes, base_recipe: str, config_name: str, overrides: dict) -> bytes:
+def _render(content: bytes, base_recipe: str, config_name: str, overrides: dict, *, defaults_source: bytes | None = None) -> bytes:
     try:
         encoding, _ = tokenize.detect_encoding(io.BytesIO(content).readline)
         text = content.decode(encoding)
@@ -198,7 +202,7 @@ def _render(content: bytes, base_recipe: str, config_name: str, overrides: dict)
             elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.target.id == "_CONFIGS":
                 registries.append(statement.value)
         if len(registries) != 1 or not isinstance(registries[0], (ast.List, ast.Tuple)):
-            raise AgentError("RECIPE_WRITE_UNSUPPORTED", "回写要求 config.py 中存在唯一静态 _CONFIGS 列表或元组")
+            raise AgentError("RECIPE_WRITE_UNSUPPORTED", "回写要求配方源文件中存在唯一静态 _CONFIGS 列表或元组")
         registry = registries[0]
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and ((isinstance(node.func, ast.Name) and node.func.id == "TrainConfig")
@@ -214,6 +218,14 @@ def _render(content: bytes, base_recipe: str, config_name: str, overrides: dict)
         # Scalar defaults may be added as explicit keyword fields. Nested edits
         # need a declared constructor, never an evaluated default factory.
         defaults = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "TrainConfig"]
+        default_tree = tree
+        if not defaults and defaults_source is not None:
+            if len(defaults_source) > MAX_SOURCE_BYTES:
+                raise ValueError("Oversized defaults source")
+            default_tree = ast.parse(defaults_source)
+            if sum(1 for _ in ast.walk(default_tree)) > MAX_AST_NODES:
+                raise ValueError("Oversized defaults syntax")
+            defaults = [node for node in default_tree.body if isinstance(node, ast.ClassDef) and node.name == "TrainConfig"]
         declared = {keyword.arg for keyword in clone.keywords}
         default_values = {}
         if len(defaults) == 1:
@@ -223,7 +235,7 @@ def _render(content: bytes, base_recipe: str, config_name: str, overrides: dict)
         for path, value in overrides.items():
             tokens = override_path_tokens(path)
             if len(tokens) > 1 and tokens[0] not in declared and tokens[0] in default_values:
-                clone.keywords.append(ast.keyword(arg=tokens[0], value=_default_constructor(default_values[tokens[0]], tree)))
+                clone.keywords.append(ast.keyword(arg=tokens[0], value=_default_constructor(default_values[tokens[0]], default_tree)))
                 declared.add(tokens[0])
             _set(clone, tokens, value)
         snippet = ast.unparse(ast.fix_missing_locations(clone))
@@ -274,7 +286,7 @@ def _clean_source(checkout: Path, relative: str):
     status = _git(checkout, "status", "--porcelain=v1", "--untracked-files=all", "--", relative)
     tracked = _git(checkout, "ls-files", "--stage", "--", relative).decode().splitlines()
     if status or len(tracked) != 1 or not tracked[0].startswith(("100644 ", "100755 ")):
-        raise AgentError("RECIPE_SOURCE_DIRTY", "config.py 有未提交或暂存的改动，请先单独处理这些改动后再回写")
+        raise AgentError("RECIPE_SOURCE_DIRTY", f"配方源码 {relative} 有未提交或暂存的改动，请先单独处理这些改动后再回写")
     # status may hide edits behind assume-unchanged/skip-worktree flags. Compare
     # the actual file and index blob with HEAD rather than trusting that hint.
     entry = tracked[0].split("\t", 1)[0].split()
@@ -284,12 +296,21 @@ def _clean_source(checkout: Path, relative: str):
     expected_mode = "100755" if source.stat().st_mode & 0o111 else "100644"
     if (len(entry) != 3 or entry[2] != "0" or entry[1] != head_blob or entry[0] != expected_mode
             or source.read_bytes() != original):
-        raise AgentError("RECIPE_SOURCE_DIRTY", "config.py 与 HEAD 或索引不一致，请先单独提交已有改动")
+        raise AgentError("RECIPE_SOURCE_DIRTY", f"配方源码 {relative} 与 HEAD 或索引不一致，请先单独提交已有改动")
 
 
 def _same_source(path: Path, expected: bytes):
     if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_SOURCE_BYTES or path.read_bytes() != expected:
-        raise AgentError("RECIPE_SOURCE_CHANGED", "config.py 在保存期间发生变化，请重新读取配方")
+        raise AgentError("RECIPE_SOURCE_CHANGED", f"配方源码 {path.name} 在保存期间发生变化，请重新读取配方")
+
+
+def _same_dependencies(config: dict, checkout: Path, receipt: dict, relative: str):
+    for dependency, expected in receipt.get("registry_sources", {}).items():
+        if dependency == relative:
+            continue
+        content, _, _ = _source(checkout / dependency, checkout, config["roots"])
+        if hashlib.sha256(content).hexdigest() != expected:
+            raise AgentError("RECIPE_SOURCE_CHANGED", "配方注册依赖在保存期间变化，请重新读取配方")
 
 
 def _index_lock(checkout: Path, receipt: dict, receipt_path: Path):
@@ -358,7 +379,7 @@ def write_recipe(config: dict, payload: dict, state) -> dict:
         relative = definition["source"]["path"]
         source = checkout / relative
         if source.is_symlink() or allowed_path(str(source), config["roots"]) != source:
-            raise AgentError("RECIPE_SOURCE_CHANGED", "config.py 必须是训练代码目录中的普通文件")
+            raise AgentError("RECIPE_SOURCE_CHANGED", f"配方源码 {relative} 必须是训练代码目录中的普通文件")
         _idle(config, state, checkout)
         if receipt is None:
             detail = recipe_details(config, {"profile_id": payload["profile_id"], "recipe": definition["base_recipe"],
@@ -366,9 +387,16 @@ def write_recipe(config: dict, payload: dict, state) -> dict:
             if detail["source"] != definition["source"]:
                 raise AgentError("RECIPE_SOURCE_CHANGED", "基础配方或 Git 版本已变化，请重新读取并保存版本")
             clean = validate_overrides_against_fields(definition["overrides"], detail["fields"])
+            registry_reader, registry = _registry_reader(checkout, config["roots"])
+            if registry.truncated or registry_reader.limit_reached:
+                raise AgentError("RECIPE_WRITE_UNSUPPORTED", "配方注册表超过静态读取上限，无法确认跨文件名称唯一性")
+            if name in registry.names:
+                raise AgentError("RECIPE_NAME_CONFLICT", "该 config 名称已存在于训练配方注册表，请使用新的名称")
+            registry_reader.verify_sources()
             _clean_source(checkout, relative)
             original = source.read_bytes()
-            proposed = _render(original, definition["base_recipe"], name, clean)
+            defaults_source = registry_reader.sources[registry_reader.primary_source][0]
+            proposed = _render(original, definition["base_recipe"], name, clean, defaults_source=defaults_source)
             mode = stat.S_IMODE(source.stat().st_mode)
             # Prepare the isolated commit tree without touching the real index,
             # worktree, branch, or unrelated staged/unstaged files.
@@ -394,6 +422,8 @@ def write_recipe(config: dict, payload: dict, state) -> dict:
             receipt = {"request_digest": identity, "operation_id": operation_id, "definition_digest": definition["digest"],
                        "profile_id": payload["profile_id"], "base_recipe": definition["base_recipe"], "config_name": name,
                        "previous_commit_sha": previous, "commit_sha": commit, "changed_paths": [relative],
+                       "registry_sources": {key: hashlib.sha256(record[0]).hexdigest()
+                                            for key, record in registry_reader.sources.items()},
                        "repository_relative": repository_relative, "blob": blob, "mode": mode, "file_mode": file_mode}
             _record(receipt_path, receipt)
         original = (directory / (receipt_path.stem + ".original")).read_bytes()
@@ -434,9 +464,10 @@ def write_recipe(config: dict, payload: dict, state) -> dict:
                            receipt["repository_relative"], index=new_index)
                 _idle(config, state, checkout)
                 if not published:
+                    _same_dependencies(config, checkout, receipt, relative)
                     current = source.read_bytes()
                     if current not in (original, proposed):
-                        raise AgentError("RECIPE_SOURCE_CHANGED", "config.py 在保存期间发生变化，请重新读取配方")
+                        raise AgentError("RECIPE_SOURCE_CHANGED", f"配方源码 {relative} 在保存期间发生变化，请重新读取配方")
                     if current == original:
                         _same_source(source, original)
                         _atomic(source, proposed, receipt["mode"])

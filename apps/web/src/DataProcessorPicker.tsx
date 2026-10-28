@@ -3,6 +3,7 @@ import { LoaderCircle } from 'lucide-react';
 import { api, ApiError } from './api';
 import { Field } from './components';
 import { assetManagedOverridePaths } from './recipeFieldPolicy';
+import { composedProcessingErrors } from './composedProcessing';
 import type {
   DataProcessorCatalog,
   DataProcessorCatalogValue,
@@ -70,8 +71,9 @@ export function filterDataProcessors(
 ) {
   return entries.filter(
     (entry) =>
-      entry.name === selected ||
-      `${entry.name} ${entry.description}`.toLowerCase().includes(search.trim().toLowerCase()),
+      (entry.name !== 'ComposableDataConfig' || entry.name === selected) &&
+      (entry.name === selected ||
+        `${entry.name} ${entry.description}`.toLowerCase().includes(search.trim().toLowerCase())),
   );
 }
 
@@ -109,6 +111,16 @@ export function processorParameterErrors(
 ): string[] {
   if (!entry) return ['处理器未出现在当前环境目录中，请重新读取并选择。'];
   if (!entry.available) return [entry.reason || '此处理器有无法从页面提供的必填配置。'];
+  if (choice.name === 'ComposableDataConfig') {
+    if (entry.name !== choice.name || entry.composition_schema_version !== 1)
+      return ['当前训练环境不支持版本 1 的组件组合处理，请更新 Agent 和训练代码。'];
+    if (
+      Object.keys(choice.parameters).length !== 1 ||
+      !Object.hasOwn(choice.parameters, 'composition')
+    )
+      return ['组件组合只接受本次训练保存的 composition，训练阶段由任务注入。'];
+    return composedProcessingErrors(choice.parameters.composition);
+  }
   const errors: string[] = [];
   const managed = assetManagedOverridePaths(
     Object.fromEntries(
@@ -293,6 +305,7 @@ export function DataProcessorPicker({
   entries,
   index,
   managedParameters = {},
+  allowRecipeDefault = true,
   onChange,
 }: {
   binding: DatasetBinding;
@@ -300,6 +313,7 @@ export function DataProcessorPicker({
   entries: DataProcessorEntry[];
   index: number;
   managedParameters?: Record<string, RecipeLiteral>;
+  allowRecipeDefault?: boolean;
   onChange: (binding: DatasetBinding) => void;
 }) {
   const id = useId();
@@ -307,9 +321,11 @@ export function DataProcessorPicker({
   const choice = binding.processor;
   const selected = choice ? entries.find((entry) => entry.name === choice.name) : undefined;
   const errors = choice ? processorParameterErrors(choice, selected, managedParameters) : [];
-  const legacy = slots.length
-    ? slots
-    : [{ recipe_index: 0, processing: '未静态展开的当前配方数据处理', weight: 1 }];
+  const legacy = allowRecipeDefault
+    ? slots.length
+      ? slots
+      : [{ recipe_index: 0, processing: '未静态展开的当前配方数据处理', weight: 1 }]
+    : [];
   const filtered = filterDataProcessors(entries, search, choice?.name);
   const changeParameter = (parameter: DataProcessorParameter, text: string, json = false) => {
     if (!choice) return;
@@ -352,10 +368,21 @@ export function DataProcessorPicker({
       <Field
         label={`数据处理配置 ${index + 1}`}
         required
-        hint="可选择项目中的处理器，或明确沿用当前配方数据项；选择后仍需训练预检。"
+        hint={
+          allowRecipeDefault
+            ? '可选择项目中的处理器，或明确沿用当前配方数据项；选择后仍需训练预检。'
+            : '自动组装需要明确的数据处理配置；可使用资产组合配置或选择已注册处理器。'
+        }
       >
         <select
-          value={choice ? `class:${choice.name}` : `legacy:${binding.recipe_index}`}
+          required
+          value={
+            choice
+              ? `class:${choice.name}`
+              : allowRecipeDefault
+                ? `legacy:${binding.recipe_index}`
+                : ''
+          }
           onChange={(event) => {
             if (event.target.value.startsWith('legacy:'))
               onChange(selectBindingProcessor(binding, Number(event.target.value.slice(7))));
@@ -366,13 +393,16 @@ export function DataProcessorPicker({
             }
           }}
         >
-          <optgroup label="当前配方数据项（兼容旧任务）">
-            {legacy.map((slot) => (
-              <option key={slot.recipe_index} value={`legacy:${slot.recipe_index}`}>
-                沿用当前配方数据项 {slot.recipe_index + 1} · {slot.processing}
-              </option>
-            ))}
-          </optgroup>
+          {!allowRecipeDefault && <option value="">选择数据处理器</option>}
+          {allowRecipeDefault && (
+            <optgroup label="当前配方数据项（兼容旧任务）">
+              {legacy.map((slot) => (
+                <option key={slot.recipe_index} value={`legacy:${slot.recipe_index}`}>
+                  沿用当前配方数据项 {slot.recipe_index + 1} · {slot.processing}
+                </option>
+              ))}
+            </optgroup>
+          )}
           <optgroup label="当前项目已注册的处理器">
             {choice && !selected && (
               <option value={`class:${choice.name}`}>{choice.name}（等待目录核对）</option>
@@ -535,9 +565,14 @@ export function DataProcessorPicker({
         </div>
       )}
       {errors.length > 0 && (
-        <p className="recipe-detail-warning" role="alert">
-          {errors.join(' ')}
-        </p>
+        <div className="inline-note red training-validation-error" role="alert">
+          <div>
+            <strong>处理器配置错误</strong>
+            <ul className="training-validation-errors">
+              {errors.map((error) => <li key={error}>{error}</li>)}
+            </ul>
+          </div>
+        </div>
       )}
     </div>
   );

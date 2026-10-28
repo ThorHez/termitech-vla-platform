@@ -1,0 +1,83 @@
+.training-dataset-processing {
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  margin-top: 14px;
+  min-width: 0;
+  container: training-processing / inline-size;
+}
+
+.training-processing-panels,
+.training-processing-controls {
+  min-width: 0;
+}
+
+.training-processing-panels {
+  display: grid;
+  gap: 14px;
+  align-items: start;
+}
+
+.training-source-tags {
+  margin: 0;
+  font-size: 11px;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.training-source-tags summary {
+  cursor: pointer;
+}
+
+.training-source-tags table {
+  margin-top: 8px;
+  font-size: 11px;
+  min-width: 520px;
+}
+
+.training-source-tags .table-scroll {
+  max-height: 260px;
+  overflow: auto;
+}
+
+.training-source-tags th,
+.training-source-tags td {
+  padding: 9px 8px;
+}
+
+.training-source-tags thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-surface, #fff);
+}
+
+.training-source-tags th:first-child {
+  width: 45%;
+}
+
+.training-source-tags td {
+  overflow-wrap: anywhere;
+}
+
+.training-source-tags .field-hint {
+  margin-bottom: 0;
+}
+
+.training-processing-controls > :first-child {
+  margin-top: 0;
+}
+
+@container training-processing (min-width: 800px) {
+  .training-processing-panels.has-source-tags {
+    grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr);
+  }
+}
+
+.composed-training-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}

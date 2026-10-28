@@ -22,6 +22,29 @@ import { inputRoles, requiredInputs, useData } from './data';
 import { RecipeLibrary } from './RecipeLibrary';
 import { DatasetBindings, DatasetBindingSummary } from './DatasetBindings';
 import { newDatasetBindings } from './datasetBindingHelpers';
+import { GeneratedConfigReview } from './GeneratedConfigReview';
+import { PreflightChecks } from './PreflightChecks';
+import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft';
+import type { ImageLayoutEdits } from './imageLayout';
+import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
+import {
+  applyTrainingTemplate,
+  TRAINING_TEMPLATE_PROCESSING_MARKER,
+  type TrainingTemplateRecord,
+} from './trainingTemplate';
+import type { RecipeEditorDraft, TrainingDraftSnapshot } from './trainingDraft';
+import {
+  automaticConfigErrors,
+  configurationConfirmed,
+  DEFAULT_AUTO_CONFIG,
+  inferDatasetActionHorizon,
+} from './trainingConfiguration';
+import {
+  actionHorizonDraftParameters,
+  defaultActionHorizon,
+  restoreActionHorizonMode,
+} from './actionHorizonDefaults';
+import './training-wizard.css';
 import { PathAutocomplete, validTrainingEntrypoint } from './PathAutocomplete';
 import { recapRecipeConfiguration, stageParameterLabels, trainingStageLabels } from './recap';
 import type {
@@ -35,22 +58,6 @@ import type {
   Template,
   TrainingStage,
 } from './types';
-
-const preflightCheckLabels: Record<string, string> = {
-  runtime: '训练运行环境',
-  local_paths: '本机资产路径',
-  code_version: '实际执行代码版本',
-  adapter: '训练模板与适配器',
-  recipe_configuration: '配方配置解析',
-  data_contract: '数据集与数据协议',
-  norm_contract: '归一化参数',
-  model_checkpoint: '模型检查点',
-  training_entrypoint: '训练入口',
-  training_cache: '训练缓存与数据加载权限',
-  output_storage: '输出目录与磁盘空间',
-  gpu_capacity: 'GPU 数量与配置',
-  validation: '预检验证',
-};
 
 function preflightHint(error?: Error) {
   if (error instanceof ApiError) {
@@ -75,59 +82,190 @@ function specs(template?: Pick<Template, 'parameters'>): Record<string, Paramete
     ]),
   );
 }
-export default function RunWizard(props: Parameters<typeof RunWizardContent>[0]) {
-  const { can } = useAuth();
+interface RunWizardProps {
+  close: () => void;
+  initialNode?: string;
+  initialTemplate?: string;
+}
+
+export default function RunWizard(props: RunWizardProps) {
+  const { can, user } = useAuth();
   if (!can('training.write'))
     return (
       <Modal title="权限不足" close={props.close}>
         创建训练需要操作员或管理员权限。
       </Modal>
     );
-  return <RunWizardContent {...props} />;
+  if (!user?.id)
+    return (
+      <Modal title="新建训练" close={props.close}>
+        正在读取当前用户身份…
+      </Modal>
+    );
+  return <TrainingDraftWizard key={user.id} {...props} userId={user.id} />;
+}
+
+function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
+  const data = useData();
+  const draft = useTrainingDraft(props.userId);
+  const [templateNotice, setTemplateNotice] = useState<{ name: string; issues: string[] }>();
+  const savedRevisionId = draft.initialSnapshot?.request.recipe_revision_id;
+  const resources = [data.nodes, data.profiles, data.assets, data.templates];
+  const resourceError = resources.find((resource) => resource.error)?.error;
+  const ready = resources.every((resource) => resource.data !== undefined);
+  if (!draft.loaded || !ready)
+    return (
+      <Modal title="新建训练" close={props.close}>
+        {resourceError ? (
+          <ErrorNotice error={resourceError} retry={data.refresh} />
+        ) : (
+          <p className="training-draft-loading">
+            <LoaderCircle size={16} className="spin" />
+            正在恢复训练草稿与资源…
+          </p>
+        )}
+      </Modal>
+    );
+  return (
+    <RestoredRunWizard
+      key={`${draft.generation}:${savedRevisionId || ''}`}
+      {...props}
+      draftSession={draft}
+      initialDraft={draft.initialSnapshot}
+      userId={props.userId}
+      templateNotice={templateNotice}
+      onApplyTemplate={async (record) => {
+        const applied = applyTrainingTemplate(record, {
+          nodes: data.nodes.data || [],
+          profiles: data.profiles.data || [],
+          assets: data.assets.data || [],
+        });
+        applied.snapshot.request.name = `${record.name} 训练`;
+        await draft.replace(applied.snapshot);
+        setTemplateNotice({ name: record.name, issues: applied.issues });
+      }}
+    />
+  );
+}
+
+// Each restored configuration owns its recipe request. A previous revision's
+// result or error must not initialise a newly applied template's recipe editor.
+function RestoredRunWizard(props: Parameters<typeof RunWizardContent>[0]) {
+  const revisionId = props.initialDraft?.request.recipe_revision_id;
+  const revision = useApi<RecipeRevision>(
+    revisionId ? `/recipe-revisions/${encodeURIComponent(revisionId)}` : null,
+    0,
+  );
+  if (revisionId && !revision.data && !revision.error)
+    return (
+      <Modal title="新建训练" close={props.close}>
+        <p className="training-draft-loading">
+          <LoaderCircle size={16} className="spin" />
+          正在恢复配方版本…
+        </p>
+      </Modal>
+    );
+  return (
+    <RunWizardContent
+      {...props}
+      initialSavedRevision={revision.data?.id === revisionId ? revision.data : undefined}
+    />
+  );
 }
 
 function RunWizardContent({
   close,
   initialNode,
   initialTemplate,
-}: {
-  close: () => void;
-  initialNode?: string;
-  initialTemplate?: string;
+  initialDraft,
+  initialSavedRevision,
+  draftSession,
+  userId,
+  templateNotice,
+  onApplyTemplate,
+}: RunWizardProps & {
+  initialDraft?: TrainingDraftSnapshot;
+  initialSavedRevision?: RecipeRevision;
+  draftSession: TrainingDraftSession;
+  userId: string;
+  templateNotice?: { name: string; issues: string[] };
+  onApplyTemplate: (record: TrainingTemplateRecord) => Promise<void>;
 }) {
   const { nodes, assets, profiles, templates, refresh } = useData();
-  const [step, setStep] = useState(0);
-  const [request, setRequest] = useState<RunRequest>({
-    name: '',
-    node_id: initialNode || '',
-    profile_id: '',
-    template_id:
-      initialTemplate ||
-      templates.data?.find((item) => item.id === 'openpi-sft')?.id ||
-      templates.data?.find((item) => item.status === 'AVAILABLE')?.id ||
-      '',
-    inputs: {},
-    parameters: {},
-    gpu_count: 1,
-  });
+  const [step, setStep] = useState(initialDraft?.step || 0);
+  const [advancedRecipe, setAdvancedRecipe] = useState(initialDraft?.advancedRecipe || false);
+  const [confirmedConfigSha256, setConfirmedConfigSha256] = useState<string>();
+  const [request, setRequest] = useState<RunRequest>(
+    () =>
+      initialDraft?.request || {
+        name: '',
+        node_id: initialNode || '',
+        profile_id: '',
+        template_id: initialTemplate || 'openpi-sft',
+        inputs: {},
+        parameters: {},
+        gpu_count: 1,
+        auto_config: initialTemplate === 'smoke' ? undefined : { ...DEFAULT_AUTO_CONFIG },
+      },
+  );
   const [previewId, setPreviewId] = useState('');
   const [createdPreview, setCreatedPreview] = useState<Preview>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const idempotencyKey = useRef(crypto.randomUUID());
   const recipeSelection = useRef<string | undefined>(undefined);
-  const editedParameters = useRef(new Set<string>());
-  const editedStageParameters = useRef(new Set<string>());
-  const entrypointEdited = useRef(false);
-  const [selectedRecipeRevision, setSelectedRecipeRevision] = useState<RecipeRevision>();
-  const [recipeDirty, setRecipeDirty] = useState(false);
+  const editedParameters = useRef(new Set<string>(initialDraft?.editedParameters));
+  const [imageLayoutEditVersion, setImageLayoutEditVersion] = useState(0);
+  const imageLayoutEdits: ImageLayoutEdits = {
+    has: (marker) => editedParameters.current.has(marker),
+    set: (marker, manual) => {
+      if (editedParameters.current.has(marker) === manual) return;
+      if (manual) editedParameters.current.add(marker);
+      else editedParameters.current.delete(marker);
+      setImageLayoutEditVersion((value) => value + 1);
+      draftSession.markEdited();
+    },
+  };
+  const [actionHorizonMode, setActionHorizonMode] = useState(() =>
+    restoreActionHorizonMode(initialDraft),
+  );
+  const editedStageParameters = useRef(new Set<string>(initialDraft?.editedStageParameters));
+  const entrypointEdited = useRef(initialDraft?.entrypointEdited || false);
+  const [selectedRecipeRevision, setSelectedRecipeRevision] = useState<RecipeRevision | undefined>(
+    initialSavedRevision,
+  );
+  const [recipeDirty, setRecipeDirty] = useState(
+    !!Object.keys(initialDraft?.recipeEditorDraft?.fields || {}).length,
+  );
   const [recipeReading, setRecipeReading] = useState(false);
-  const [recipeDefaults, setRecipeDefaults] = useState<Record<string, number>>({});
-  const [recipeDatasets, setRecipeDatasets] = useState<RecipeDatasetSlot[]>([]);
-  const [processorsValid, setProcessorsValid] = useState(true);
-  const [stageRecipeDefaults, setStageRecipeDefaults] = useState<Record<string, number>>({});
-  const [stageRecipeInfo, setStageRecipeInfo] =
-    useState<ReturnType<typeof recapRecipeConfiguration>>();
+  const [recipeDefaults, setRecipeDefaults] = useState<Record<string, number>>(
+    initialDraft?.recipeDefaults || {},
+  );
+  const [recipeDatasets, setRecipeDatasets] = useState<RecipeDatasetSlot[]>(
+    initialDraft?.recipeDatasets || [],
+  );
+  const [processorValidation, setProcessorValidation] = useState<{
+    scope: string;
+    valid: boolean;
+  }>();
+  const [stageRecipeDefaults, setStageRecipeDefaults] = useState<Record<string, number>>(
+    initialDraft?.stageRecipeDefaults || {},
+  );
+  const [stageRecipeInfo, setStageRecipeInfo] = useState<
+    ReturnType<typeof recapRecipeConfiguration> | undefined
+  >(initialDraft?.stageRecipeInfo);
+  const [recipeEditorDraft, setRecipeEditorDraft] = useState<RecipeEditorDraft | undefined>(
+    initialDraft?.recipeEditorDraft,
+  );
+  const [draftActionError, setDraftActionError] = useState<Error>();
+  const [confirmClearDraft, setConfirmClearDraft] = useState(false);
+  const [draftActionBusy, setDraftActionBusy] = useState(false);
+  const [unsavedClose, setUnsavedClose] = useState(false);
+  const initialDefaultsScope = useRef(
+    initialDraft ? `${initialDraft.request.template_id}:${initialDraft.advancedRecipe}` : undefined,
+  );
+  const initialSelectionInstalled = useRef(false);
+  const initialProfile = useRef(initialDraft?.request.profile_id);
   const datasetDefaultsScope = useRef('');
   const requestRef = useRef(request);
   requestRef.current = request;
@@ -145,6 +283,13 @@ function RunWizardContent({
   const template = templates.data?.find((item) => item.id === request.template_id);
   const isRecap = template?.id === 'recap';
   const hasLocalTraining = template?.id === 'openpi-sft' || isRecap;
+  const automaticMode = hasLocalTraining && !advancedRecipe;
+  const generatedConfig = automaticPreflight?.plan.generated_config;
+  const configConfirmed =
+    !hasLocalTraining || configurationConfirmed(generatedConfig, confirmedConfigSha256);
+  useEffect(() => {
+    setConfirmedConfigSha256(undefined);
+  }, [request, previewId, generatedConfig?.sha256]);
   const trainingStage = isRecap
     ? template?.stages?.find((stage) => stage.id === request.training_stage)
     : undefined;
@@ -163,6 +308,87 @@ function RunWizardContent({
   const stageParameterSpecs = specs(trainingStage);
   const inputRequirements = requiredInputs(trainingStage || template);
   const selectedProfile = compatibleProfiles.find((profile) => profile.id === request.profile_id);
+  if (initialDraft && !initialSelectionInstalled.current) {
+    recipeSelection.current = `${request.node_id}\0${hasLocalTraining ? 'local' : request.template_id}\0${request.profile_id}\0${selectedProfile?.code_dir}`;
+    initialSelectionInstalled.current = true;
+  }
+  const snapshot: TrainingDraftSnapshot = {
+    request,
+    step: step === 0 ? 0 : 1,
+    advancedRecipe,
+    editedParameters: actionHorizonDraftParameters(editedParameters.current, actionHorizonMode),
+    editedStageParameters: [...editedStageParameters.current],
+    entrypointEdited: entrypointEdited.current,
+    recipeDatasets,
+    recipeDefaults,
+    stageRecipeDefaults,
+    stageRecipeInfo,
+    recipeEditorDraft,
+  };
+  draftSession.snapshotRef.current = snapshot;
+  useEffect(() => {
+    draftSession.changed();
+  }, [
+    request,
+    actionHorizonMode,
+    imageLayoutEditVersion,
+    step,
+    advancedRecipe,
+    recipeDatasets,
+    recipeDefaults,
+    stageRecipeDefaults,
+    stageRecipeInfo,
+    recipeEditorDraft,
+    draftSession.changed,
+  ]);
+  const processorValidationScope = JSON.stringify([
+    step,
+    request.node_id,
+    request.profile_id,
+    selectedProfile?.code_dir,
+    selectedProfile?.python,
+    request.training_stage || 'sft',
+    request.dataset_bindings,
+    request.stage_config,
+    request.auto_config,
+  ]);
+  const processorsValid =
+    processorValidation?.scope === processorValidationScope && processorValidation.valid;
+  const missingProcessors = automaticMode
+    ? (request.dataset_bindings || []).flatMap((binding, index) =>
+        binding.processor ? [] : [`数据集 ${index + 1}`],
+      )
+    : [];
+  const dataProcessingBlocker =
+    step === 1 && hasLocalTraining && !processorsValid
+      ? missingProcessors.length
+        ? `${missingProcessors.slice(0, 3).join('、')}${missingProcessors.length > 3 ? `等 ${missingProcessors.length} 组数据` : ''}尚未选择数据处理器。自动组装需要为每个数据集明确配置处理方式。`
+        : '数据处理配置错误，修正后才能生成 config 并预检。请检查各数据集列出的错误。'
+      : undefined;
+  const mixedDropoutUnresolved =
+    !!stageRecipeInfo?.mixedDropout &&
+    (typeof request.stage_config?.acp_dropout !== 'number' ||
+      !Number.isFinite(request.stage_config.acp_dropout) ||
+      request.stage_config.acp_dropout < 0 ||
+      request.stage_config.acp_dropout > 1);
+  const editDataProcessing = () => {
+    draftSession.markEdited();
+    setStep(0);
+    setPreviewId('');
+    setCreatedPreview(undefined);
+    setError(undefined);
+    setConfirmedConfigSha256(undefined);
+  };
+  const setProcessorsValid = useCallback(
+    (valid: boolean) => {
+      setProcessorValidation((previous) =>
+        previous?.scope === processorValidationScope && previous.valid === valid
+          ? previous
+          : { scope: processorValidationScope, valid },
+      );
+    },
+    [processorValidationScope],
+  );
   const localAssets = useMemo(
     () =>
       assets.data?.filter(
@@ -174,6 +400,39 @@ function RunWizardContent({
       ) || [],
     [assets.data, request.node_id],
   );
+  const actionHorizonInference = useMemo(
+    () => inferDatasetActionHorizon(request.dataset_bindings || [], localAssets),
+    [request.dataset_bindings, localAssets],
+  );
+  const actionHorizonErrors = automaticMode
+    ? [
+        ...actionHorizonInference.errors,
+        ...(actionHorizonInference.recommendedHorizon !== undefined &&
+        request.auto_config?.action_horizon !== actionHorizonInference.recommendedHorizon
+          ? [
+              `数据集已存储 ${actionHorizonInference.recommendedHorizon} 步动作，动作预测长度必须与其一致。当前处理器不会自动裁剪或补齐已有动作块。`,
+            ]
+          : []),
+      ]
+    : [];
+  const actionHorizonBlocker = step === 1 ? actionHorizonErrors.join(' ') : '';
+  const processingBlocker = actionHorizonBlocker || dataProcessingBlocker;
+  useEffect(() => {
+    if (!automaticMode || actionHorizonMode !== 'automatic') return;
+    setRequest((value) => {
+      if (!value.auto_config) return value;
+      const inferred = inferDatasetActionHorizon(value.dataset_bindings || [], localAssets);
+      const horizon = defaultActionHorizon(
+        value.auto_config.action_horizon,
+        actionHorizonMode,
+        inferred.recommendedHorizon,
+        inferred.errors,
+      );
+      return Object.is(horizon, value.auto_config.action_horizon)
+        ? value
+        : { ...value, auto_config: { ...value.auto_config, action_horizon: horizon } };
+    });
+  }, [automaticMode, actionHorizonMode, request.dataset_bindings, localAssets]);
   const validatedRecipes = Array.isArray(selectedProfile?.metadata?.validated_recipes)
     ? [
         ...new Set(
@@ -185,34 +444,46 @@ function RunWizardContent({
     : [];
   const minGpus = template?.min_gpus ?? (template?.id === 'smoke' ? 0 : 1);
   useEffect(() => {
-    const rules = specs(template);
+    const modeScope = `${request.template_id}:${advancedRecipe}`;
+    if (initialDefaultsScope.current === modeScope) return;
+    initialDefaultsScope.current = modeScope;
+    setActionHorizonMode('automatic');
+    const local = ['openpi-sft', 'recap'].includes(request.template_id);
     setRequest((value) => ({
       ...value,
       parameters:
-        template?.id === 'openpi-sft' || template?.id === 'recap'
+        advancedRecipe && local
           ? {}
           : Object.fromEntries(
-              Object.entries(rules).map(([key, rule]) => [key, rule.default ?? 1]),
+              Object.entries(specs(template)).map(([key, rule]) => [key, rule.default ?? 1]),
             ),
-      gpu_count: template?.min_gpus ?? (template?.id === 'smoke' ? 0 : 1),
-      inputs: {},
-      dataset_bindings: undefined,
-      training_stage: undefined,
-      stage_config: undefined,
+      gpu_count: template?.id === 'smoke' ? 0 : Math.max(template?.min_gpus ?? 1, value.gpu_count),
+      auto_config:
+        local && !advancedRecipe ? value.auto_config || { ...DEFAULT_AUTO_CONFIG } : undefined,
+      inputs: local ? value.inputs : {},
+      dataset_bindings: local ? value.dataset_bindings || newDatasetBindings([]) : undefined,
+      training_stage: request.template_id === 'recap' ? value.training_stage : undefined,
+      stage_config: request.template_id === 'recap' ? value.stage_config : undefined,
+      recipe: template?.id === 'smoke' ? 'smoke' : advancedRecipe ? value.recipe : undefined,
+      recipe_revision_id: advancedRecipe ? value.recipe_revision_id : undefined,
+      entrypoint: undefined,
     }));
-    // A change to template metadata does not reset an in-progress form.
+    // Reapply defaults only when the method or assembly mode changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [request.template_id]);
+  }, [request.template_id, advancedRecipe, template?.id]);
   useEffect(() => {
     setRequest((value) =>
-      compatibleProfiles.some((profile) => profile.id === value.profile_id)
+      initialProfile.current && value.profile_id === initialProfile.current
         ? value
-        : { ...value, profile_id: compatibleProfiles[0]?.id || '' },
+        : compatibleProfiles.some((profile) => profile.id === value.profile_id)
+          ? value
+          : { ...value, profile_id: compatibleProfiles[0]?.id || '' },
     );
   }, [compatibleProfiles]);
   useEffect(() => {
-    const selection = `${request.node_id}\0${request.template_id}\0${request.training_stage}\0${request.profile_id}\0${selectedProfile?.code_dir}`;
+    const selection = `${request.node_id}\0${hasLocalTraining ? 'local' : request.template_id}\0${request.profile_id}\0${selectedProfile?.code_dir}`;
     if (!selectedProfile) {
+      if (initialProfile.current) return;
       recipeSelection.current = undefined;
       setRequest((value) =>
         value.recipe === undefined && value.entrypoint === undefined
@@ -236,26 +507,21 @@ function RunWizardContent({
       recipe:
         request.template_id === 'smoke'
           ? 'smoke'
-          : request.template_id === 'recap'
-            ? ''
-            : selectedProfile.recipe?.trim() ||
-              (validatedRecipes.length === 1 ? validatedRecipes[0] : ''),
+          : advancedRecipe
+            ? selectedProfile.recipe?.trim() ||
+              (validatedRecipes.length === 1 ? validatedRecipes[0] : '')
+            : undefined,
       recipe_revision_id: undefined,
       entrypoint: undefined,
-      dataset_bindings: undefined,
-      parameters: ['openpi-sft', 'recap'].includes(request.template_id) ? {} : value.parameters,
+      inputs: {},
+      dataset_bindings: hasLocalTraining ? newDatasetBindings([]) : undefined,
+      parameters: advancedRecipe && hasLocalTraining ? {} : value.parameters,
     }));
     setSelectedRecipeRevision(undefined);
     setRecipeDirty(false);
     // Only selection changes choose a default; background refreshes preserve user input.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    request.node_id,
-    request.template_id,
-    request.training_stage,
-    request.profile_id,
-    selectedProfile,
-  ]);
+  }, [request.node_id, request.template_id, request.profile_id, selectedProfile]);
   useEffect(() => {
     if (!trainingStage) return;
     setRequest((value) =>
@@ -270,15 +536,56 @@ function RunWizardContent({
     );
   }, [trainingStage]);
   useEffect(() => {
-    if (!isRecap || !trainingStage || entrypointEdited.current) return;
-    const multiple = recipeDatasets.some((slot) => slot.multiple);
-    const entrypoint = multiple
-      ? trainingStage.default_multi_entrypoint
-      : trainingStage.default_entrypoint;
-    if (entrypoint) setRequest((value) => ({ ...value, entrypoint }));
-  }, [isRecap, trainingStage, recipeDatasets]);
-  const update = <K extends keyof RunRequest>(key: K, value: RunRequest[K]) =>
+    if (!hasLocalTraining || automaticMode || entrypointEdited.current) return;
+    const multiple =
+      (request.dataset_bindings?.length || 0) > 1 || recipeDatasets.some((slot) => slot.multiple);
+    const entrypoint = isRecap
+      ? multiple
+        ? trainingStage?.default_multi_entrypoint
+        : trainingStage?.default_entrypoint
+      : multiple
+        ? 'scripts/train_multi_dataset.py'
+        : 'scripts/train.py';
+    if (entrypoint)
+      setRequest((value) => (value.entrypoint === entrypoint ? value : { ...value, entrypoint }));
+  }, [
+    hasLocalTraining,
+    automaticMode,
+    isRecap,
+    trainingStage,
+    recipeDatasets,
+    request.dataset_bindings?.length,
+  ]);
+  const update = <K extends keyof RunRequest>(key: K, value: RunRequest[K]) => {
+    draftSession.markEdited();
+    if (key === 'node_id' || key === 'profile_id' || key === 'template_id')
+      initialProfile.current = undefined;
+    setConfirmedConfigSha256(undefined);
     setRequest((previous) => ({ ...previous, [key]: value }));
+  };
+  const toggleRecipeMode = (enabled: boolean) => {
+    draftSession.markEdited();
+    setAdvancedRecipe(enabled);
+    setActionHorizonMode('automatic');
+    entrypointEdited.current = false;
+    datasetDefaultsScope.current = '';
+    setRecipeDirty(false);
+    setRecipeReading(false);
+    setSelectedRecipeRevision(undefined);
+    setRecipeDatasets([]);
+    setRecipeDefaults({});
+    setStageRecipeDefaults({});
+    setStageRecipeInfo(undefined);
+    editedParameters.current.clear();
+    editedStageParameters.current.clear();
+    setRequest((value) => ({
+      ...value,
+      recipe: enabled ? selectedProfile?.recipe?.trim() || '' : undefined,
+      recipe_revision_id: undefined,
+      entrypoint: undefined,
+      auto_config: enabled ? undefined : { ...DEFAULT_AUTO_CONFIG },
+    }));
+  };
   const applyRecipeDefaults = useCallback(
     (defaults: Record<string, number>, recipe: string, revisionId?: string) => {
       const current = requestRef.current;
@@ -346,13 +653,16 @@ function RunWizardContent({
         return {
           ...value,
           inputs: value.inputs.model ? { model: value.inputs.model } : {},
-          dataset_bindings: newDatasetBindings(slots),
+          dataset_bindings: value.dataset_bindings?.some((binding) => binding.dataset_asset_id)
+            ? value.dataset_bindings
+            : newDatasetBindings(slots),
         };
       });
     },
     [],
   );
   const selectRecipe = (recipe: string, revision?: RecipeRevision) => {
+    draftSession.markEdited();
     setRecipeDirty(false);
     setSelectedRecipeRevision(revision);
     if (recipe !== request.recipe || revision?.id !== request.recipe_revision_id) {
@@ -368,7 +678,7 @@ function RunWizardContent({
         recipe,
         recipe_revision_id: revision?.id,
         parameters: {},
-        dataset_bindings: undefined,
+        dataset_bindings: value.dataset_bindings,
         stage_config:
           request.template_id === 'recap'
             ? Object.fromEntries(
@@ -379,6 +689,7 @@ function RunWizardContent({
     }
   };
   const selectStage = (stage: TrainingStage | undefined) => {
+    draftSession.markEdited();
     editedParameters.current.clear();
     editedStageParameters.current.clear();
     entrypointEdited.current = false;
@@ -397,12 +708,16 @@ function RunWizardContent({
       ...value,
       training_stage: stage,
       stage_config: undefined,
-      recipe: '',
+      recipe: advancedRecipe ? '' : undefined,
       recipe_revision_id: undefined,
       entrypoint: undefined,
-      inputs: {},
-      dataset_bindings: undefined,
-      parameters: {},
+      auto_config: value.auto_config
+        ? {
+            ...value.auto_config,
+            finetune_mode: stage === 'value' ? 'full' : value.auto_config.finetune_mode,
+          }
+        : undefined,
+      parameters: advancedRecipe ? {} : value.parameters,
     }));
   };
   const beginPreview = async () => {
@@ -410,6 +725,7 @@ function RunWizardContent({
     setError(undefined);
     setPreviewId('');
     setCreatedPreview(undefined);
+    setConfirmedConfigSha256(undefined);
     idempotencyKey.current = crypto.randomUUID();
     try {
       const result = await post<Preview>('/run-previews', {
@@ -423,9 +739,10 @@ function RunWizardContent({
         stage_config: isRecap ? request.stage_config : undefined,
         parameters: request.parameters,
         gpu_count: request.gpu_count,
-        recipe_revision_id: request.recipe_revision_id,
-        recipe: request.recipe?.trim(),
-        entrypoint: hasLocalTraining ? request.entrypoint?.trim() : undefined,
+        auto_config: automaticMode ? request.auto_config : undefined,
+        recipe_revision_id: advancedRecipe ? request.recipe_revision_id : undefined,
+        recipe: automaticMode ? undefined : request.recipe?.trim(),
+        entrypoint: hasLocalTraining && advancedRecipe ? request.entrypoint?.trim() : undefined,
       });
       setCreatedPreview(result);
       setPreviewId(result.id);
@@ -436,15 +753,19 @@ function RunWizardContent({
     }
   };
   const start = async () => {
-    if (preview?.status !== 'READY') return;
+    if (draftActionBusy || preview?.status !== 'READY' || !configConfirmed) return;
     setBusy(true);
     setError(undefined);
     try {
       const run = await post<Run>(
         '/runs',
-        { preflight_id: preview.id },
+        {
+          preflight_id: preview.id,
+          confirmed_config_sha256: hasLocalTraining ? confirmedConfigSha256 : undefined,
+        },
         { 'Idempotency-Key': idempotencyKey.current },
       );
+      await draftSession.finished().catch(() => {});
       refresh();
       close();
       navigate(`/runs/${run.id}`);
@@ -454,16 +775,77 @@ function RunWizardContent({
       setBusy(false);
     }
   };
+  const draftAction = async (operation: () => Promise<void>) => {
+    setDraftActionBusy(true);
+    setDraftActionError(undefined);
+    try {
+      await operation();
+      setConfirmClearDraft(false);
+    } catch (cause) {
+      setDraftActionError(cause instanceof Error ? cause : new Error(String(cause)));
+    } finally {
+      setDraftActionBusy(false);
+    }
+  };
+  const draftStatusText = {
+    loading: '正在读取草稿…',
+    idle: '填写后自动保存到当前账号',
+    pending: '有修改，正在等待自动保存…',
+    saving: '正在保存草稿…',
+    saved: `草稿已保存${draftSession.updatedAt ? ` · ${new Date(draftSession.updatedAt).toLocaleTimeString()}` : ''}`,
+    error: '尚未同步到服务端，当前修改会尽可能暂存在此浏览器',
+    conflict: '草稿版本冲突，当前填写尚未覆盖服务端',
+  }[draftSession.status];
   return (
     <Modal
       title="新建训练"
-      subtitle="选择本机资源，预检通过后启动。"
+      className="training-run-modal"
+      subtitle="选择数据和初始模型，确认训练方式与参数，预检后核对 config 再启动。"
       close={() => {
-        if (!busy) close();
+        if (busy || draftActionBusy) return;
+        void draftSession
+          .flush()
+          .then(close)
+          .catch((cause) => {
+            if (draftSession.hasCheckpoint()) close();
+            else {
+              setDraftActionError(
+                new Error(`草稿未能保存，请重试。${cause instanceof Error ? cause.message : ''}`),
+              );
+              setUnsavedClose(true);
+            }
+          });
       }}
       wide
       footer={
         <>
+          {processingBlocker && (
+            <div
+              className="wizard-processing-blocker"
+              id="training-processing-blocker"
+              role="alert"
+            >
+              <XCircle size={16} aria-hidden="true" />
+              <span>{processingBlocker}</span>
+              <button
+                type="button"
+                className="button outline small"
+                disabled={busy}
+                onClick={() => {
+                  if (
+                    actionHorizonBlocker &&
+                    actionHorizonInference.recommendedHorizon !== undefined
+                  )
+                    document.getElementById('training-action-horizon')?.focus();
+                  else editDataProcessing();
+                }}
+              >
+                {actionHorizonBlocker && actionHorizonInference.recommendedHorizon !== undefined
+                  ? '检查预测长度'
+                  : '返回数据配置'}
+              </button>
+            </div>
+          )}
           <div className="wizard-footer-note">
             <ShieldCheck size={14} />
             <span>
@@ -473,12 +855,14 @@ function RunWizardContent({
           {step > 0 && (
             <button
               className="button outline"
-              disabled={busy}
+              disabled={busy || draftActionBusy}
               onClick={() => {
+                draftSession.markEdited();
                 setStep(step - 1);
                 setPreviewId('');
                 setCreatedPreview(undefined);
                 setError(undefined);
+                setConfirmedConfigSha256(undefined);
               }}
             >
               <ArrowLeft size={15} />
@@ -490,19 +874,23 @@ function RunWizardContent({
               className="button primary"
               type="submit"
               form="run-wizard-form"
+              formNoValidate={step === 0}
+              aria-describedby={processingBlocker ? 'training-processing-blocker' : undefined}
               disabled={
                 busy ||
-                (step === 0 && recipeReading) ||
+                draftActionBusy ||
+                (step === 1 && recipeReading) ||
+                !!actionHorizonBlocker ||
                 (step === 1 && hasLocalTraining && !processorsValid)
               }
             >
-              {step === 1 ? '开始预检' : recipeReading ? '读取配方配置…' : '下一步'}
+              {step === 1 ? (recipeReading ? '读取配方配置…' : '生成 config 并预检') : '下一步'}
               <ArrowRight size={15} />
             </button>
           ) : (
             <button
               className="button primary"
-              disabled={busy || preview?.status !== 'READY'}
+              disabled={busy || draftActionBusy || preview?.status !== 'READY' || !configConfirmed}
               onClick={() => void start()}
             >
               {busy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} />}确认启动训练
@@ -513,9 +901,9 @@ function RunWizardContent({
     >
       <div className="wizard-steps">
         {[
-          { title: '机器与模板', icon: Server },
-          { title: '资产与参数', icon: Database },
-          { title: '预检与确认', icon: GitCommitHorizontal },
+          { title: '数据和初始模型', icon: Database },
+          { title: '训练方式与参数', icon: Cpu },
+          { title: '预检与 config 确认', icon: GitCommitHorizontal },
         ].map((item, index) => (
           <div
             key={item.title}
@@ -526,6 +914,115 @@ function RunWizardContent({
           </div>
         ))}
       </div>
+      <section className="training-draft-status" aria-label="训练配置草稿">
+        <div className="training-draft-summary" role="status">
+          <strong>{draftStatusText}</strong>
+          <span>
+            {initialDraft
+              ? '已恢复未完成配置；请重新核对资源并预检。'
+              : '草稿按账号隔离，可跨浏览器、跨设备恢复。'}
+          </span>
+        </div>
+        <div className="training-draft-actions">
+          <button
+            type="button"
+            className="button outline small"
+            disabled={busy || draftActionBusy || draftSession.status === 'saving'}
+            onClick={() =>
+              void draftAction(async () => {
+                draftSession.markEdited();
+                await draftSession.retry();
+              })
+            }
+          >
+            {draftSession.status === 'error' ? '重试保存草稿' : '立即保存草稿'}
+          </button>
+          <button
+            type="button"
+            className="button outline small"
+            disabled={busy || draftActionBusy || draftSession.status === 'saving'}
+            onClick={() => setConfirmClearDraft(true)}
+          >
+            清空草稿
+          </button>
+        </div>
+        {draftSession.error && (
+          <p className="training-draft-error" role="alert">
+            {draftSession.error}
+          </p>
+        )}
+        {draftSession.status === 'conflict' && (
+          <div className="training-draft-actions training-draft-choice">
+            <button
+              type="button"
+              className="button outline small"
+              disabled={draftActionBusy}
+              onClick={() => void draftAction(draftSession.reload)}
+            >
+              加载服务端草稿（替换当前填写）
+            </button>
+            <button
+              type="button"
+              className="button outline small"
+              disabled={draftActionBusy}
+              onClick={() => void draftAction(draftSession.saveCurrent)}
+            >
+              保留当前填写并覆盖服务端草稿
+            </button>
+          </div>
+        )}
+        {confirmClearDraft && (
+          <div className="training-draft-choice" role="alert">
+            <span>清空草稿会移除已保存内容，并重新开始当前配置。</span>
+            <button
+              type="button"
+              className="button outline small"
+              disabled={draftActionBusy}
+              onClick={() => void draftAction(draftSession.clear)}
+            >
+              确认清空并重新配置
+            </button>
+            <button
+              type="button"
+              className="button outline small"
+              disabled={draftActionBusy}
+              onClick={() => setConfirmClearDraft(false)}
+            >
+              保留草稿
+            </button>
+          </div>
+        )}
+        <ErrorNotice error={draftActionError} title="草稿操作未完成" />
+        {unsavedClose && (
+          <button type="button" className="button outline small" onClick={close}>
+            放弃未保存修改并关闭
+          </button>
+        )}
+      </section>
+      <TrainingTemplateLibrary
+        userId={userId}
+        snapshot={snapshot}
+        busy={busy || draftActionBusy}
+        onApply={async (record) => {
+          setDraftActionBusy(true);
+          try {
+            await onApplyTemplate(record);
+          } finally {
+            setDraftActionBusy(false);
+          }
+        }}
+      />
+      {templateNotice && editedParameters.current.has(TRAINING_TEMPLATE_PROCESSING_MARKER) && (
+        <div className="inline-note" role="status">
+          <strong>已套用模板：{templateNotice.name}</strong>
+          <span>
+            选择本次数据集和归一化参数后，可继续预检；已有字段组合、模型和训练参数已保留。
+          </span>
+          {templateNotice.issues.map((issue, index) => (
+            <span key={index}>{issue}</span>
+          ))}
+        </div>
+      )}
       <ErrorNotice
         error={displayedError}
         title={
@@ -549,12 +1046,22 @@ function RunWizardContent({
       {step < 2 && (
         <form
           id="run-wizard-form"
+          inert={draftActionBusy}
+          onChangeCapture={draftSession.markEdited}
           onSubmit={(event) => {
             event.preventDefault();
+            if (!request.name.trim() || request.name.trim().length > 160) {
+              setError(new Error('请填写 1 到 160 个字符的训练名称。'));
+              return;
+            }
+            if (!selectedProfile || node?.status !== 'ONLINE' || template?.status !== 'AVAILABLE') {
+              setError(new Error('请选择在线机器和匹配的本机运行环境。'));
+              return;
+            }
             if (
-              step === 1 &&
               hasLocalTraining &&
-              (!request.dataset_bindings?.length ||
+              (!request.inputs.model ||
+                !request.dataset_bindings?.length ||
                 request.dataset_bindings.some(
                   (binding) =>
                     !binding.dataset_asset_id ||
@@ -563,81 +1070,89 @@ function RunWizardContent({
                     binding.weight <= 0,
                 ))
             ) {
-              setError(new Error('请为每个数据集选择归一化参数，并填写大于 0 的混采权重。'));
-              return;
-            }
-            if (step === 1 && hasLocalTraining && !processorsValid) {
               setError(
-                new Error(
-                  '请等待数据处理器目录读取完成，并填写所选处理器的必填参数；无法读取目录时可明确选择沿用当前配方数据项。',
-                ),
+                new Error('请选择初始模型，为每个数据集选择归一化参数，并填写大于 0 的混采权重。'),
               );
               return;
             }
-            if (
-              step === 0 &&
-              (!selectedProfile || node?.status !== 'ONLINE' || template?.status !== 'AVAILABLE')
-            ) {
-              setError(new Error('请选择在线机器、可用模板和匹配的本机运行环境。'));
-              return;
-            }
-            if (step === 0 && !request.recipe?.trim()) {
-              setError(new Error('请填写本次训练使用的配方名称。'));
-              return;
-            }
-            if (isRecap && !trainingStage) {
-              setError(new Error('请选择本次 ReCap 训练阶段。'));
-              return;
-            }
-            if (step === 0 && recipeDirty) {
-              setError(new Error('配方详情中有未保存的修改，请先保存为配方版本，或还原修改。'));
-              return;
-            }
-            if (step === 0 && recipeReading) {
-              setError(new Error('正在读取配方配置，完成后再继续。'));
-              return;
-            }
-            if (
-              step === 1 &&
-              hasLocalTraining &&
-              !validTrainingEntrypoint(request.entrypoint?.trim() || '')
-            ) {
-              setError(
-                new Error('请选择代码项目内的 .py 训练入口文件，使用相对路径，不能包含 ..。'),
-              );
-              return;
+            if (step === 1) {
+              if (actionHorizonErrors.length) {
+                setError(new Error(actionHorizonErrors.join(' ')));
+                return;
+              }
+              if (isRecap && !trainingStage) {
+                setError(new Error('请选择本次 ReCap 训练阶段。'));
+                return;
+              }
+              if (hasLocalTraining && !processorsValid) {
+                setError(
+                  new Error(
+                    automaticMode
+                      ? '请完成独立数据处理配置；自动组装不使用旧版配方数据项。'
+                      : '请完成数据处理配置，或明确选择沿用代码配方数据项。',
+                  ),
+                );
+                return;
+              }
+              if (
+                automaticMode &&
+                (!request.auto_config || automaticConfigErrors(request.auto_config).length)
+              ) {
+                setError(
+                  new Error(
+                    request.auto_config
+                      ? automaticConfigErrors(request.auto_config).join(' ')
+                      : '缺少自动组装配置。',
+                  ),
+                );
+                return;
+              }
+              if (advancedRecipe && (!request.recipe?.trim() || recipeDirty || recipeReading)) {
+                setError(
+                  new Error(
+                    recipeDirty
+                      ? '请先保存配方修改或还原修改。'
+                      : recipeReading
+                        ? '正在读取配方配置，完成后再继续。'
+                        : '请在高级设置中选择代码配方。',
+                  ),
+                );
+                return;
+              }
+              if (
+                advancedRecipe &&
+                hasLocalTraining &&
+                !validTrainingEntrypoint(request.entrypoint?.trim() || '')
+              ) {
+                setError(new Error('请选择代码项目内的相对 .py 训练入口文件。'));
+                return;
+              }
             }
             setError(undefined);
-            if (step === 0 && hasLocalTraining && !request.dataset_bindings) {
-              update('dataset_bindings', [
-                { dataset_asset_id: '', norm_asset_id: '', recipe_index: 0, weight: 1 },
-              ]);
-            }
+            draftSession.markEdited();
             setStep(step + 1);
             if (step === 1) void beginPreview();
           }}
         >
           {step === 0 ? (
-            <>
-              <Field label="训练名称" required hint="使用清晰的名称，便于查找训练结果。">
-                <input
-                  required
-                  autoFocus
-                  maxLength={160}
-                  placeholder="例如 shellgame-sft-1015"
-                  value={request.name}
-                  onChange={(event) => update('name', event.target.value)}
-                />
-              </Field>
-              <div className="form-grid">
+            <div className={`training-data-layout${hasLocalTraining ? ' with-datasets' : ''}`}>
+              <section className="training-data-resources" aria-label="训练与运行资源">
+                <h3>训练与运行资源</h3>
+                <Field label="训练名称" required hint="使用清晰的名称，便于查找训练结果。">
+                  <input
+                    required
+                    autoFocus
+                    maxLength={160}
+                    placeholder="例如 umi-pi05-sft"
+                    value={request.name}
+                    onChange={(event) => update('name', event.target.value)}
+                  />
+                </Field>
                 <Field label="计算机器" required>
                   <select
                     required
                     value={request.node_id}
-                    onChange={(event) => {
-                      update('node_id', event.target.value);
-                      update('inputs', {});
-                    }}
+                    onChange={(event) => update('node_id', event.target.value)}
                   >
                     <option value="">选择在线机器</option>
                     {nodes.data?.map((item) => (
@@ -648,28 +1163,204 @@ function RunWizardContent({
                     ))}
                   </select>
                 </Field>
-                <Field label="训练模板" required>
+                <Field
+                  label="本机运行环境"
+                  required
+                  hint="环境由管理员配置，平台根据模板过滤兼容的环境。"
+                >
                   <select
                     required
-                    value={request.template_id}
-                    onChange={(event) => update('template_id', event.target.value)}
+                    value={request.profile_id}
+                    onChange={(event) => update('profile_id', event.target.value)}
                   >
-                    <option value="">选择模板</option>
-                    {templates.data?.map((item) => (
-                      <option key={item.id} value={item.id} disabled={item.status !== 'AVAILABLE'}>
-                        {item.name}
-                        {item.status !== 'AVAILABLE' ? ' · 待接入' : ''}
+                    <option value="">
+                      {request.node_id
+                        ? compatibleProfiles.length
+                          ? '选择环境'
+                          : '此机器没有匹配的运行环境'
+                        : '请先选择机器'}
+                    </option>
+                    {compatibleProfiles.map((profile) => (
+                      <option value={profile.id} key={profile.id}>
+                        {profile.name}
                       </option>
                     ))}
                   </select>
                 </Field>
-              </div>
-              {template && (
-                <div className={`template-note ${template.id === 'smoke' ? 'amber' : ''}`}>
-                  <ShieldCheck size={17} />
-                  <p>{template.description}</p>
-                </div>
+                {selectedProfile && (
+                  <details className="training-runtime-details">
+                    <summary>查看运行环境路径与执行方式</summary>
+                    <dl className="detail-list inset">
+                      <div>
+                        <dt>代码目录</dt>
+                        <dd>
+                          <code>{selectedProfile.code_dir}</code>
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Python</dt>
+                        <dd>
+                          <code>{selectedProfile.python}</code>
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>执行方式</dt>
+                        <dd>{selectedProfile.execution_mode || 'native'}</dd>
+                      </div>
+                    </dl>
+                  </details>
+                )}
+                {inputRequirements.length ? (
+                  inputRequirements
+                    .filter((role) => !hasLocalTraining || role === 'model')
+                    .map((role) => {
+                      const kind =
+                        role === 'dataset' ? 'DATASET' : role === 'model' ? 'MODEL' : 'NORM';
+                      const choices =
+                        assets.data?.filter(
+                          (asset) =>
+                            asset.node_id === request.node_id &&
+                            asset.kind === kind &&
+                            !['ARCHIVED', 'MISSING', 'INVALID', 'UNAVAILABLE'].includes(
+                              asset.status || asset.state || '',
+                            ),
+                        ) || [];
+                      return (
+                        <Field
+                          key={role}
+                          label={
+                            isRecap && role === 'model'
+                              ? request.training_stage === 'value'
+                                ? '初始骨干 / 价值模型权重'
+                                : '初始策略权重'
+                              : inputRoles[role] || role
+                          }
+                          required
+                          hint={
+                            choices.length
+                              ? '只显示当前机器的资产，实际可用性将在预检时验证。'
+                              : '当前机器没有可选资产，请先在「数据与模型」中登记。'
+                          }
+                        >
+                          <select
+                            required
+                            value={request.inputs[role] || ''}
+                            onChange={(event) =>
+                              update('inputs', { ...request.inputs, [role]: event.target.value })
+                            }
+                          >
+                            <option value="">选择{inputRoles[role] || role}</option>
+                            {choices.map((asset) => (
+                              <option key={asset.id} value={asset.id}>
+                                {asset.name} · {asset.version}
+                              </option>
+                            ))}
+                          </select>
+                        </Field>
+                      );
+                    })
+                ) : (
+                  <div className="inline-note">
+                    当前模板使用合成数据进行链路测试，无需选择本地数据资产。
+                  </div>
+                )}
+                <details className="training-advanced-settings">
+                  <summary>其他任务</summary>
+                  <label className="training-mode-choice">
+                    <input
+                      type="checkbox"
+                      checked={request.template_id === 'smoke'}
+                      onChange={(event) =>
+                        update('template_id', event.target.checked ? 'smoke' : 'openpi-sft')
+                      }
+                    />
+                    <span>仅进行平台链路测试（使用合成数据，不产生 VLA 模型）</span>
+                  </label>
+                </details>
+              </section>
+              {hasLocalTraining && (
+                <section className="training-data-datasets" aria-label="训练数据与处理方式">
+                  <DatasetBindings
+                    imageLayoutEdits={imageLayoutEdits}
+                    showProcessing
+                    preserveProcessingOnDatasetChange={editedParameters.current.has(
+                      TRAINING_TEMPLATE_PROCESSING_MARKER,
+                    )}
+                    bindings={request.dataset_bindings || []}
+                    slots={advancedRecipe ? recipeDatasets : []}
+                    automatic={automaticMode}
+                    assets={localAssets}
+                    node={node}
+                    profile={selectedProfile}
+                    trainingStage={request.training_stage || 'sft'}
+                    onValidityChange={setProcessorsValid}
+                    managedParameters={
+                      isRecap &&
+                      request.training_stage === 'offline_rl' &&
+                      Object.hasOwn(request.stage_config || {}, 'acp_dropout')
+                        ? { acp_dropout: request.stage_config!.acp_dropout }
+                        : {}
+                    }
+                    onChange={(bindings) => {
+                      setPreviewId('');
+                      setCreatedPreview(undefined);
+                      setError(undefined);
+                      update('dataset_bindings', bindings);
+                    }}
+                  />
+                </section>
               )}
+            </div>
+          ) : (
+            <>
+              <div className="selection-summary">
+                <Server size={16} />
+                <strong>{node?.name}</strong>
+                <span>→</span>
+                <span>{selectedProfile?.name}</span>
+              </div>
+              <Field label="训练方式" required>
+                <select
+                  required
+                  value={request.template_id}
+                  onChange={(event) => {
+                    setRecipeDatasets([]);
+                    setRecipeDefaults({});
+                    setStageRecipeInfo(undefined);
+                    setStageRecipeDefaults({});
+                    setSelectedRecipeRevision(undefined);
+                    setRecipeDirty(false);
+                    setRecipeReading(false);
+                    entrypointEdited.current = false;
+                    editedParameters.current.clear();
+                    editedStageParameters.current.clear();
+                    setRequest((value) => ({
+                      ...value,
+                      template_id: event.target.value,
+                      training_stage: undefined,
+                      stage_config: undefined,
+                      recipe_revision_id: undefined,
+                      recipe:
+                        event.target.value === 'smoke' ? 'smoke' : advancedRecipe ? '' : undefined,
+                    }));
+                  }}
+                >
+                  <option value="">选择模板</option>
+                  {templates.data?.map((item) => (
+                    <option
+                      key={item.id}
+                      value={item.id}
+                      disabled={
+                        item.status !== 'AVAILABLE' ||
+                        (request.template_id !== 'smoke' && item.id === 'smoke')
+                      }
+                    >
+                      {item.name}
+                      {item.status !== 'AVAILABLE' ? ' · 待接入' : ''}
+                    </option>
+                  ))}
+                </select>
+              </Field>
               {isRecap && (
                 <section className="recap-stage-selection" aria-label="ReCap 训练阶段">
                   <Field
@@ -690,6 +1381,11 @@ function RunWizardContent({
                           {stage.name}
                         </option>
                       ))}
+                      {request.profile_id && !selectedProfile && (
+                        <option value={request.profile_id}>
+                          草稿中的运行环境暂不可用，请重新选择
+                        </option>
+                      )}
                     </select>
                   </Field>
                   <div className="recap-flow" aria-label="ReCap 阶段流程">
@@ -712,60 +1408,188 @@ function RunWizardContent({
                   )}
                 </section>
               )}
-              {(!isRecap || trainingStage) && (
-                <>
-                  <Field
-                    label="本机运行环境"
-                    required
-                    hint="环境由管理员配置，平台根据模板过滤兼容的环境。"
-                  >
-                    <select
+              {automaticMode && request.auto_config && (
+                <section aria-label="自动组装模型配置">
+                  <p className="field-hint">
+                    自动组装适用标准
+                    Pi0/Pi05。多数据混采需要可核验的状态布局，建议使用资产组件组合配置；MEM、Hybrid
+                    等特殊模型请使用高级代码配方。
+                  </p>
+                  <div className="form-section-title">
+                    <Cpu size={16} />
+                    <h3>模型与微调方式</h3>
+                    <span>平台自动组装 config</span>
+                  </div>
+                  <div className="form-grid">
+                    <Field label="模型结构" required hint="需要与所选初始权重匹配。">
+                      <select
+                        value={request.auto_config.model_type}
+                        onChange={(event) =>
+                          update('auto_config', {
+                            ...request.auto_config!,
+                            model_type: event.target.value as 'pi0' | 'pi05',
+                          })
+                        }
+                      >
+                        <option value="pi05">π0.5</option>
+                        <option value="pi0">π0</option>
+                      </select>
+                    </Field>
+                    <Field
+                      label="微调方式"
                       required
-                      value={request.profile_id}
-                      onChange={(event) => update('profile_id', event.target.value)}
+                      hint={
+                        request.training_stage === 'value'
+                          ? '自动组装价值训练使用全量更新；仅训练价值头可使用高级代码配方。不支持 LoRA。'
+                          : '全量微调或 LoRA；冻结规则写入生成的 config。'
+                      }
                     >
-                      <option value="">
-                        {request.node_id
-                          ? compatibleProfiles.length
-                            ? '选择环境'
-                            : '此机器没有匹配的运行环境'
-                          : '请先选择机器'}
-                      </option>
-                      {compatibleProfiles.map((profile) => (
-                        <option value={profile.id} key={profile.id}>
-                          {profile.name}
+                      <select
+                        value={request.auto_config.finetune_mode}
+                        onChange={(event) =>
+                          update('auto_config', {
+                            ...request.auto_config!,
+                            finetune_mode: event.target.value as 'full' | 'lora',
+                          })
+                        }
+                      >
+                        <option value="full">
+                          {request.training_stage === 'value' ? '价值模型全量训练' : '全量微调'}
                         </option>
-                      ))}
-                    </select>
-                  </Field>
-                  {selectedProfile && (
-                    <dl className="detail-list inset">
-                      <div>
-                        <dt>代码目录</dt>
-                        <dd>
-                          <code>{selectedProfile.code_dir}</code>
-                        </dd>
+                        <option value="lora" disabled={request.training_stage === 'value'}>
+                          LoRA 微调
+                        </option>
+                      </select>
+                    </Field>
+                    <Field
+                      label="动作预测长度"
+                      required
+                      hint={
+                        actionHorizonInference.errors.length
+                          ? '请先解决已登记动作字段或序列长度的错误，再确定预测长度。'
+                          : actionHorizonInference.recommendedHorizon !== undefined
+                            ? `已登记动作形状包含 ${actionHorizonInference.recommendedHorizon} 步序列，可自动填入；手动修改仍需与已有动作块一致。`
+                            : actionHorizonInference.sources.some(
+                                  (source) => source.kind === 'single-step',
+                                )
+                              ? '已登记为单步动作，由加载器按此长度组装；训练长度默认 50，可手动修改。'
+                              : '尚未识别到已打包的动作序列；预测长度默认 50，可手动填写，远端预检会核验。'
+                      }
+                    >
+                      <input
+                        id="training-action-horizon"
+                        required
+                        type="number"
+                        min={1}
+                        max={1000}
+                        step={1}
+                        value={
+                          Number.isFinite(request.auto_config.action_horizon)
+                            ? request.auto_config.action_horizon
+                            : ''
+                        }
+                        aria-invalid={actionHorizonErrors.length > 0 || undefined}
+                        aria-describedby="training-action-horizon-source"
+                        onChange={(event) => {
+                          setActionHorizonMode('manual');
+                          update('auto_config', {
+                            ...request.auto_config!,
+                            action_horizon:
+                              event.target.value === '' ? NaN : Number(event.target.value),
+                          });
+                        }}
+                      />
+                      <div id="training-action-horizon-source" className="field-hint">
+                        {actionHorizonMode === 'automatic'
+                          ? actionHorizonInference.errors.length
+                            ? '自动填入暂不可用'
+                            : '自动默认值'
+                          : '手动设置 · 自动识别不会覆盖'}
+                        {actionHorizonInference.sources
+                          .filter((source) => source.shape)
+                          .map((source, index) => (
+                            <div key={index}>
+                              {source.assetName} · {source.actionKey} [{source.shape!.join(', ')}]
+                            </div>
+                          ))}
                       </div>
-                      <div>
-                        <dt>Python</dt>
-                        <dd>
-                          <code>{selectedProfile.python}</code>
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>执行方式</dt>
-                        <dd>{selectedProfile.execution_mode || 'native'}</dd>
-                      </div>
-                    </dl>
-                  )}
-                  {selectedProfile && template?.id !== 'smoke' && (
-                    <>
-                      {isRecap && trainingStage?.recipe_prefixes?.length && (
-                        <p className="field-hint">
-                          本阶段配方名称参考：{trainingStage.recipe_prefixes.join('、')}。Agent
-                          将核对配方实际模型与数据配置。
-                        </p>
+                      {actionHorizonMode === 'manual' && !actionHorizonInference.errors.length && (
+                        <button
+                          type="button"
+                          className="button outline small"
+                          onClick={() => {
+                            setActionHorizonMode('automatic');
+                            update('auto_config', {
+                              ...request.auto_config!,
+                              action_horizon:
+                                actionHorizonInference.recommendedHorizon ??
+                                DEFAULT_AUTO_CONFIG.action_horizon,
+                            });
+                          }}
+                        >
+                          {actionHorizonInference.recommendedHorizon !== undefined
+                            ? `使用数据集长度 ${actionHorizonInference.recommendedHorizon}`
+                            : '恢复训练默认值 50'}
+                        </button>
                       )}
+                      {actionHorizonErrors.map((message, index) => (
+                        <div className="inline-note red" role="alert" key={index}>
+                          {message}
+                        </div>
+                      ))}
+                      {actionHorizonInference.warnings.map((message, index) => (
+                        <div className="field-hint" key={index}>
+                          {message}
+                        </div>
+                      ))}
+                    </Field>
+                    <Field
+                      label="模型动作维度"
+                      required
+                      hint="应与初始化模型匹配；数据原始维度来自登记配置，平台检查填充兼容性。"
+                    >
+                      <input
+                        required
+                        type="number"
+                        min={1}
+                        max={4096}
+                        step={1}
+                        value={
+                          Number.isFinite(request.auto_config.action_dim)
+                            ? request.auto_config.action_dim
+                            : ''
+                        }
+                        onChange={(event) =>
+                          update('auto_config', {
+                            ...request.auto_config!,
+                            action_dim:
+                              event.target.value === '' ? NaN : Number(event.target.value),
+                          })
+                        }
+                      />
+                    </Field>
+                  </div>
+                </section>
+              )}
+              {hasLocalTraining && (
+                <details className="training-advanced-settings" open={advancedRecipe || undefined}>
+                  <summary>高级设置：代码配方与训练入口</summary>
+                  <label className="training-mode-choice">
+                    <input
+                      type="checkbox"
+                      checked={advancedRecipe}
+                      onChange={(event) => toggleRecipeMode(event.target.checked)}
+                    />
+                    <span>使用已有代码配方或自定义配方</span>
+                  </label>
+                  {!advancedRecipe && (
+                    <p className="field-hint">
+                      常规训练由平台根据数据、模型、训练方式和参数组装
+                      config。启用后可复用项目内的特殊训练配置。
+                    </p>
+                  )}
+                  {advancedRecipe && (
+                    <>
                       <RecipeLibrary
                         key={`${request.node_id}\0${request.profile_id}\0${request.training_stage}`}
                         recipe={request.recipe || ''}
@@ -776,100 +1600,53 @@ function RunWizardContent({
                         onResolved={applyStageRecipeDefaults}
                         onDirtyChange={setRecipeDirty}
                         onLoadingChange={setRecipeReading}
+                        restoredEditorDraft={recipeEditorDraft}
+                        onEditorDraftChange={(next) => {
+                          setRecipeEditorDraft(next);
+                          draftSession.markEdited();
+                        }}
                         node={node}
                         profile={selectedProfile}
                       />
+                      <PathAutocomplete
+                        key={`${request.node_id}\0${request.profile_id}\0${selectedProfile?.code_dir}`}
+                        label="训练脚本入口文件"
+                        placeholder="选择项目内脚本，例如 scripts/train_multi_dataset.py"
+                        value={request.entrypoint || ''}
+                        onChange={(value) => {
+                          entrypointEdited.current = true;
+                          update('entrypoint', value);
+                        }}
+                        node={node}
+                        profile={selectedProfile}
+                        projectRelative
+                      />
                     </>
                   )}
-                </>
-              )}
-              {selectedProfile && template?.id === 'smoke' && (
-                <div className="inline-note">平台链路测试自动使用 smoke 配方，无需填写。</div>
-              )}
-            </>
-          ) : (
-            <>
-              <div className="selection-summary">
-                <Server size={16} />
-                <strong>{node?.name}</strong>
-                <span>→</span>
-                <span>{template?.name}</span>
-                {trainingStage && (
-                  <>
-                    <span>→</span>
-                    <strong>{trainingStage.name}</strong>
-                  </>
-                )}
-              </div>
-              {isRecap && (
-                <div className="inline-note amber">
-                  {request.training_stage === 'value'
-                    ? '价值函数训练：数据需包含 value_target 等价值监督字段，选择初始骨干或价值模型权重。'
-                    : '离线强化学习：使用已完成优势标注的数据集（如 is_positive），并选择初始策略权重。价值模型 checkpoint 用于前序标注，不替代策略权重。'}
-                </div>
-              )}
-              {inputRequirements.length ? (
-                inputRequirements
-                  .filter((role) => !hasLocalTraining || role === 'model')
-                  .map((role) => {
-                    const kind =
-                      role === 'dataset' ? 'DATASET' : role === 'model' ? 'MODEL' : 'NORM';
-                    const choices =
-                      assets.data?.filter(
-                        (asset) =>
-                          asset.node_id === request.node_id &&
-                          asset.kind === kind &&
-                          !['ARCHIVED', 'MISSING', 'INVALID', 'UNAVAILABLE'].includes(
-                            asset.status || asset.state || '',
-                          ),
-                      ) || [];
-                    return (
-                      <Field
-                        key={role}
-                        label={
-                          isRecap && role === 'model'
-                            ? request.training_stage === 'value'
-                              ? '初始骨干 / 价值模型权重'
-                              : '初始策略权重'
-                            : inputRoles[role] || role
-                        }
-                        required
-                        hint={
-                          choices.length
-                            ? '只显示当前机器的资产，实际可用性将在预检时验证。'
-                            : '当前机器没有可选资产，请先在「数据与模型」中登记。'
-                        }
-                      >
-                        <select
-                          required
-                          value={request.inputs[role] || ''}
-                          onChange={(event) =>
-                            update('inputs', { ...request.inputs, [role]: event.target.value })
-                          }
-                        >
-                          <option value="">选择{inputRoles[role] || role}</option>
-                          {choices.map((asset) => (
-                            <option key={asset.id} value={asset.id}>
-                              {asset.name} · {asset.version}
-                            </option>
-                          ))}
-                        </select>
-                      </Field>
-                    );
-                  })
-              ) : (
-                <div className="inline-note">
-                  当前模板使用合成数据进行链路测试，无需选择本地数据资产。
-                </div>
+                </details>
               )}
               {hasLocalTraining && (
-                <>
+                <details
+                  className="training-advanced-settings"
+                  open={isRecap || advancedRecipe || !processorsValid || undefined}
+                >
+                  <summary>
+                    核对数据与处理配置（{request.dataset_bindings?.length || 0} 个数据集）
+                  </summary>
                   <DatasetBindings
+                    imageLayoutEdits={imageLayoutEdits}
+                    preserveProcessingOnDatasetChange={editedParameters.current.has(
+                      TRAINING_TEMPLATE_PROCESSING_MARKER,
+                    )}
+                    readOnly
+                    onEditProcessing={editDataProcessing}
                     bindings={request.dataset_bindings || []}
-                    slots={recipeDatasets}
+                    slots={advancedRecipe ? recipeDatasets : []}
+                    automatic={automaticMode}
                     assets={localAssets}
                     node={node}
                     profile={selectedProfile}
+                    trainingStage={request.training_stage || 'sft'}
                     onValidityChange={setProcessorsValid}
                     managedParameters={
                       isRecap &&
@@ -885,28 +1662,7 @@ function RunWizardContent({
                       update('dataset_bindings', bindings);
                     }}
                   />
-                  <Field label="代码项目基地址" hint="训练脚本入口固定在所选运行环境的代码项目内。">
-                    <input
-                      className="mono"
-                      readOnly
-                      value={selectedProfile?.code_dir || ''}
-                      aria-label="代码项目基地址"
-                    />
-                  </Field>
-                  <PathAutocomplete
-                    key={`${request.node_id}\0${request.profile_id}\0${selectedProfile?.code_dir}`}
-                    label="训练脚本入口文件"
-                    placeholder="选择项目内脚本，例如 scripts/train_multi_dataset.py"
-                    value={request.entrypoint || ''}
-                    onChange={(value) => {
-                      entrypointEdited.current = true;
-                      update('entrypoint', value);
-                    }}
-                    node={node}
-                    profile={selectedProfile}
-                    projectRelative
-                  />
-                </>
+                </details>
               )}
               {isRecap && trainingStage && (
                 <>
@@ -916,7 +1672,10 @@ function RunWizardContent({
                     <span>仅用于当前阶段</span>
                   </div>
                   {stageRecipeInfo?.mixedDropout && (
-                    <div className="inline-note amber">
+                    <div
+                      className={`inline-note ${mixedDropoutUnresolved ? 'red training-validation-error' : 'amber'}`}
+                      role={mixedDropoutUnresolved ? 'alert' : 'status'}
+                    >
                       配方中各数据项的 ACP 条件丢弃概率不一致，请明确填写本次统一覆盖值。
                     </div>
                   )}
@@ -954,7 +1713,7 @@ function RunWizardContent({
                       </Field>
                     ))}
                   </div>
-                  {request.training_stage === 'value' && (
+                  {advancedRecipe && request.training_stage === 'value' && (
                     <dl className="detail-list inset">
                       <div>
                         <dt>训练参数范围</dt>
@@ -985,9 +1744,7 @@ function RunWizardContent({
                 <Cpu size={16} />
                 <h3>训练参数</h3>
                 <span>
-                  {hasLocalTraining
-                    ? '已解析的配方值自动填入；未解析项请填写本次值'
-                    : '模板已填入推荐默认值'}
+                  {advancedRecipe ? '从所选配方带入，可为本次训练覆盖' : '模板已填入推荐默认值'}
                 </span>
               </div>
               <div className="form-grid parameters">
@@ -997,7 +1754,7 @@ function RunWizardContent({
                     label={spec.label || key}
                     required
                     hint={
-                      hasLocalTraining
+                      advancedRecipe
                         ? Object.hasOwn(recipeDefaults, key)
                           ? `配方值：${recipeDefaults[key]}${editedParameters.current.has(key) ? '；当前为本次覆盖' : ''}`
                           : '无法静态读取，请明确填写本次训练值。'
@@ -1059,7 +1816,9 @@ function RunWizardContent({
             <div>
               <h3>
                 {preview?.status === 'READY'
-                  ? 'Agent 自动预检通过，可以提交训练'
+                  ? hasLocalTraining
+                    ? '预检通过，请检查 config 并确认'
+                    : '平台链路测试预检通过'
                   : requestFailed
                     ? '预检请求未完成'
                     : previewExpired
@@ -1074,7 +1833,7 @@ function RunWizardContent({
               </h3>
               <p>
                 {preview?.status === 'READY'
-                  ? '已检查配方配置与本机资产，尚未执行训练。启动前会再次核对代码与资源。'
+                  ? '已检查配置与本机资产，尚未执行训练。请核对下方生成的 config，勾选确认后启动。'
                   : requestFailed
                     ? '尚未取得预检记录，请根据错误提示修正后重新预检。'
                     : previewExpired
@@ -1088,15 +1847,7 @@ function RunWizardContent({
             </div>
           </div>
           {preview?.checks?.length ? (
-            <div className="preflight-checks">
-              {preview.checks.map((check, index) => (
-                <div className={check.ok ? 'ok' : 'bad'} key={`${check.name}-${index}`}>
-                  {check.ok ? <CheckCircle2 size={17} /> : <XCircle size={17} />}
-                  <strong>{preflightCheckLabels[check.name] || check.name}</strong>
-                  <span>{check.message}</span>
-                </div>
-              ))}
-            </div>
+            <PreflightChecks checks={preview.checks} />
           ) : (
             preview?.status === 'PENDING' &&
             !progressUnavailable && (
@@ -1194,7 +1945,7 @@ function RunWizardContent({
               </>
             )}
             <div>
-              <dt>训练配方</dt>
+              <dt>{preview?.request?.auto_config ? '配置来源' : '训练配方'}</dt>
               <dd>
                 {frozenRecipe && (
                   <span className="recipe-frozen-label">
@@ -1202,10 +1953,12 @@ function RunWizardContent({
                   </span>
                 )}
                 <code>
-                  {preview?.request?.recipe ||
-                    preview?.code_snapshot?.recipe ||
-                    request.recipe?.trim() ||
-                    '未选择'}
+                  {preview?.request?.auto_config
+                    ? '平台自动组装'
+                    : preview?.request?.recipe ||
+                      preview?.code_snapshot?.recipe ||
+                      request.recipe?.trim() ||
+                      '未选择'}
                 </code>
               </dd>
             </div>
@@ -1235,7 +1988,8 @@ function RunWizardContent({
                     <code>
                       {preview?.request?.entrypoint ||
                         preview?.code_snapshot?.requested_entrypoint ||
-                        request.entrypoint}
+                        request.entrypoint ||
+                        '由训练方式和数据集数量自动选择'}
                     </code>
                   </dd>
                 </div>
@@ -1248,10 +2002,18 @@ function RunWizardContent({
               <DatasetBindingSummary
                 bindings={preview?.request?.dataset_bindings || request.dataset_bindings}
                 assets={assets.data || []}
+                profiles={preview?.request?.dataset_profiles}
               />
             </div>
           )}
-          {(!preview || ['FAILED', 'EXPIRED'].includes(preview.status)) && !busy && (
+          {hasLocalTraining && preview?.status === 'READY' && (
+            <GeneratedConfigReview
+              config={generatedConfig}
+              confirmedSha256={confirmedConfigSha256}
+              onConfirm={setConfirmedConfigSha256}
+            />
+          )}
+          {(!preview || ['FAILED', 'EXPIRED', 'READY'].includes(preview.status)) && !busy && (
             <button className="button outline" onClick={() => void beginPreview()}>
               <RotateCcw size={15} />
               重新预检

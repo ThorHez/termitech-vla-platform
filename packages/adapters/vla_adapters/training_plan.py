@@ -15,15 +15,25 @@ import time
 from pathlib import Path
 
 if __package__:
+    from .automatic_config import normalize_auto_config
+    from .generated_config import generated_training_config
+    from .composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from .cache_contract import inspect_training_cache
     from .data_processors import processor_identity, validate_processor_instance
     from .dataset_bindings import validate_binding_assets
+    from .dataset_contracts import verify_registered_dataset_profile
+    from .dataset_fps import resolve_registered_fps
     from .entrypoints import read_entrypoint, validate_entrypoint
     from .recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
 else:
+    from automatic_config import normalize_auto_config
+    from generated_config import generated_training_config
+    from composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from cache_contract import inspect_training_cache
     from data_processors import processor_identity, validate_processor_instance
     from dataset_bindings import validate_binding_assets
+    from dataset_contracts import verify_registered_dataset_profile
+    from dataset_fps import resolve_registered_fps
     from entrypoints import read_entrypoint, validate_entrypoint
     from recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
 
@@ -134,18 +144,155 @@ def training_entrypoint(config, spec):
     return entry
 
 
-def dataset_contract(factory, spec):
+def registered_task_features(path, info, spec, registered_profile, *, selected_composition=None):
+    """Prove LeRobot v2's task_index -> task mapping from its real task file."""
+    declared = registered_profile.get("feature_keys", []) if isinstance(registered_profile, dict) else []
+    automatic_task = False
+    if selected_composition is not None:
+        composition = normalize_composition(selected_composition)
+        declared = [*declared, composition["prompt_key"]]
+        claimed = {row["key"] for row in composition["state_fields"] + composition["cameras"]}
+        claimed.update([composition["action_key"], *composition["aux_keys"]])
+        automatic_task = not composition["prompt_key"] and not any(
+            key == "task" or key.startswith("task/") for key in claimed)
+    elif isinstance(registered_profile, dict) and isinstance(registered_profile.get("processing"), dict):
+        composition = normalize_composition(registered_profile["processing"])
+        declared = [*declared, composition["prompt_key"]]
+        claimed = {row["key"] for row in composition["state_fields"] + composition["cameras"]}
+        claimed.update([composition["action_key"], *composition["aux_keys"]])
+        automatic_task = not composition["prompt_key"] and not any(
+            key == "task" or key.startswith("task/") for key in claimed)
+    task_declared = "task" in declared
+    features = info.get("features", {})
+    if not (task_declared or automatic_task) or "task" in features:
+        return {}
+    if not isinstance(features.get("task_index"), dict):
+        return {}
+    try:
+        source = local_path(path / "meta/tasks.jsonl", spec)
+        descriptor = os.open(source, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            stat_info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(stat_info.st_mode) or stat_info.st_size > 1024 * 1024:
+                raise ValueError("tasks.jsonl must be a bounded regular file")
+            content = stream.read(1024 * 1024 + 1)
+        if len(content) > 1024 * 1024:
+            raise ValueError("tasks.jsonl exceeds size limit")
+        lines = content.decode("utf-8").splitlines()
+        if not 1 <= len(lines) <= 10000:
+            raise ValueError("tasks.jsonl row count is invalid")
+        indices = set()
+        for line in lines:
+            if len(line) > 8192:
+                raise ValueError("task row exceeds size limit")
+            row = json.loads(line)
+            task, index = row.get("task"), row.get("task_index")
+            if (not isinstance(row, dict) or type(index) is not int or index < 0 or index in indices
+                    or not isinstance(task, str) or not 1 <= len(task) <= 2000 or not task.strip()
+                    or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in task)):
+                raise ValueError("task mapping row is invalid")
+            indices.add(index)
+        return {"derived_features": ["task"], "task_metadata_sha256": hashlib.sha256(content).hexdigest()}
+    except FileNotFoundError as exc:
+        if automatic_task and not task_declared:
+            return {}
+        raise ValueError("DATASET_PROFILE_UNVERIFIABLE: 登记了派生 task 字段，但无法从真实 meta/tasks.jsonl 核实 task_index 到任务文本的映射；首版暂不支持 tasks.parquet") from exc
+    except (OSError, ValueError, TypeError, AttributeError, UnicodeError, RecursionError) as exc:
+        raise ValueError("DATASET_PROFILE_UNVERIFIABLE: 登记了派生 task 字段，但无法从真实 meta/tasks.jsonl 核实 task_index 到任务文本的映射；首版暂不支持 tasks.parquet") from exc
+
+
+def dataset_contract(factory, spec, registered_profile=None, *, model_config=None, binding=None, checks=None):
     path = local_path(factory.repo_id, spec)
     info, metadata_sha = read_json(path / "meta" / "info.json", spec)
     for key in ("total_frames", "total_episodes"):
         if type(info.get(key)) is not int or info[key] <= 0:
             raise ValueError(f"DATASET_FORMAT: {path} 的 {key} 必须大于零")
     features = info.get("features")
-    if not isinstance(features, dict) or not isinstance(features.get("actions"), dict):
+    composition = normalize_composition(factory.composition) if type(factory).__name__ == COMPOSABLE_PROCESSOR else None
+    action_key = composition["action_key"] if composition else "actions"
+    if not isinstance(features, dict) or not isinstance(features.get(action_key), dict):
         raise ValueError(f"DATASET_FORMAT: {path} 缺少 actions 特征元数据")
-    actions = features["actions"].get("shape")
+    actions = features[action_key].get("shape")
     if not isinstance(actions, list) or not actions or any(type(v) is not int or v <= 0 for v in actions):
         raise ValueError(f"DATASET_FORMAT: {path} 的动作形状无效")
+    derived = (registered_task_features(path, info, spec, registered_profile, selected_composition=composition)
+               if registered_profile is not None or composition is not None else {})
+    warnings = []
+    declared = ({"registered_profile": verify_registered_dataset_profile(registered_profile, info,
+                  derived_features=derived.get("derived_features", ()), selected_composition=composition,
+                  warnings=warnings)} if registered_profile is not None else {})
+    warnings = [{**warning, "dataset_path": str(path),
+                 "message": f"数据集 {path}：{warning['message']}"} for warning in warnings]
+    if checks is not None:
+        # Preserve completed advisory checks even if a later contract for this
+        # same dataset raises; the following hard failure remains authoritative.
+        checks.extend({"name": "dataset_fps", "ok": True, "severity": "warning",
+                       "code": warning["code"], "message": warning["message"]} for warning in warnings)
+    composed = {}
+    if composition is not None:
+        processor = binding.get("processor") if isinstance(binding, dict) else None
+        expected = (processor.get("parameters", {}).get("composition")
+                    if isinstance(processor, dict) and processor.get("name") == COMPOSABLE_PROCESSOR else None)
+        if binding is None and isinstance(registered_profile, dict):
+            # Compatibility for callers holding only a historical frozen asset.
+            # Normal run planning always supplies the explicit dataset binding.
+            expected = registered_profile.get("processing")
+        if expected is None or composition_digest(expected) != composition_digest(composition):
+            raise ValueError("COMPOSITION_BINDING_MISMATCH: 实际组合处理配置与本次冻结的训练数据绑定不一致")
+        validate_composition_profile_input(registered_profile, composition)
+        model_type = type(model_config).__name__
+        if model_type not in {"Pi0Config", "Pi0GripperConfig", "Pi0ValueConfig"}:
+            raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 组合处理首版支持标准 Pi0/Pi05、Value 和 Gripper 模型，MEM/Hybrid 使用原处理器")
+        horizon, action_dim = getattr(model_config, "action_horizon", None), getattr(model_config, "action_dim", None)
+        if type(horizon) is not int or horizon <= 0 or type(action_dim) is not int or action_dim <= 0:
+            raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 模型动作维度和预测长度无效")
+        verify_composition_metadata(composition, info, derived_features=derived.get("derived_features", ()), action_horizon=horizon)
+        if sum(field["width"] for field in composition["action_layout"]) > action_dim:
+            raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 数据动作宽度超过模型 action_dim")
+        if (getattr(model_config, "pi05", False) is not True and
+                composition["state_history"] * sum(field["width"] for field in composition["state_fields"]) > action_dim):
+            raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: Pi0 展平状态宽度超过模型 action_dim，禁止截断")
+        stage, _ = stage_request(spec)
+        stage = stage or "sft"
+        if getattr(factory, "training_stage", None) != stage or (model_type == "Pi0ValueConfig") != (stage == "value"):
+            raise ValueError("COMPOSITION_STAGE_UNSUPPORTED: 组合处理的模型/阶段与任务不一致")
+        required_aux = {"value": "value_target", "offline_rl": "is_positive"}.get(stage)
+        if required_aux and required_aux not in composition["aux_keys"]:
+            raise ValueError("COMPOSITION_STAGE_UNSUPPORTED: 组合处理缺少阶段监督字段 " + required_aux)
+        describe = getattr(factory, "processing_contract", None)
+        if not callable(describe):
+            raise ValueError("COMPOSITION_SOURCE_UNAVAILABLE: 训练处理器缺少轻量预检接口，请更新训练代码")
+        runtime = describe(model_config)
+        depth_keys = list(getattr(model_config, "depth_keys", None) or ())
+        image_keys = getattr(model_config, "image_keys", None)
+        image_keys = list(image_keys) if image_keys is not None else [key for key in SLOTS if key not in depth_keys]
+        expected_runtime = {"training_stage": stage, "model_type": model_type,
+            "pi05": getattr(model_config, "pi05", False) is True, "action_dim": action_dim, "action_horizon": horizon,
+            "raw_state_dim": sum(field["width"] for field in composition["state_fields"]),
+            "raw_action_dim": sum(field["width"] for field in composition["action_layout"]),
+            "state_history": composition["state_history"], "normalization": composition["normalization"],
+            "action_loss_mask": [1.] * sum(field["width"] for field in composition["action_layout"]) +
+                                [0.] * (action_dim - sum(field["width"] for field in composition["action_layout"])),
+            "acp_dropout": float(getattr(factory, "acp_dropout", .1)),
+            "image_keys": image_keys, "depth_keys": depth_keys,
+            "action_sequence_keys": [action_key] if len(actions) == 1 else [], "action_metadata_sha256": metadata_sha}
+        if not isinstance(runtime, dict) or fingerprint(runtime) != fingerprint(expected_runtime):
+            raise ValueError("COMPOSITION_RUNTIME_MISMATCH: 组合处理预检的模型/动作采样或元信息与登记证据不一致，请重新预检")
+        source = next((Path(spec["code_dir"]) / relative for relative in
+                       ("src/openpi/training/composed_processing.py", "openpi/training/composed_processing.py")
+                       if (Path(spec["code_dir"]) / relative).is_file()), None)
+        if source is None:
+            raise ValueError("COMPOSITION_SOURCE_UNAVAILABLE: 训练代码缺少组合处理实现，请更新训练代码")
+        source = local_path(source, spec)
+        root = Path(spec["code_dir"]).resolve(strict=True)
+        if not source.is_relative_to(root) or source.stat().st_size > 1024 * 1024:
+            raise ValueError("COMPOSITION_SOURCE_UNAVAILABLE: 组合处理实现超出登记代码范围或大小限制")
+        contents = source.read_bytes()
+        if len(contents) > 1024 * 1024:
+            raise ValueError("COMPOSITION_SOURCE_UNAVAILABLE: 组合处理实现超过读取上限")
+        composed = {"composition": {"schema_version": 1, "spec": composition,
+                    "digest": composition_digest(composition), **runtime,
+                    "source": {"path": source.relative_to(root).as_posix(), "sha256": hashlib.sha256(contents).hexdigest()}}}
     rows, data_bytes, manifest = file_manifest(path / "data", spec)
     if not any(row[0].endswith(".parquet") and row[1] > 0 for row in rows):
         raise ValueError(f"DATASET_FORMAT: {path} 缺少非空 parquet 数据文件")
@@ -170,7 +317,26 @@ def dataset_contract(factory, spec):
         video_evidence = {"video_bytes": video_bytes, "video_manifest_digest": video_manifest}
     return {"path": str(path), "metadata_sha256": metadata_sha, "frames": info["total_frames"],
             "episodes": info["total_episodes"], "factory": type(factory).__name__,
-            "actions_shape": actions, "data_bytes": data_bytes, "data_manifest_digest": manifest, **video_evidence}
+            "effective_fps": registered_profile["fps"] if isinstance(registered_profile, dict) and "fps" in registered_profile else info.get("fps"),
+            "fps_source": "registered" if isinstance(registered_profile, dict) and "fps" in registered_profile else "metadata",
+            "actions_shape": actions, "data_bytes": data_bytes, "data_manifest_digest": manifest,
+            **({"warnings": warnings} if warnings else {}),
+            **video_evidence, **derived, **declared, **composed}
+
+
+def check_composed_mixture(data_factory, datasets):
+    compositions = [data["composition"] for data in datasets if "composition" in data]
+    if not compositions or not hasattr(data_factory, "datasets"):
+        return
+    if getattr(data_factory, "use_merged_norm_stats", None) is not False:
+        raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 组合数据集必须分别使用所绑定的归一化统计，不能跨布局合并")
+    target = getattr(data_factory, "state_pad_dim", None)
+    for composition in compositions:
+        actual = (composition["state_history"] * composition["raw_state_dim"]
+                  if composition["pi05"] else composition["action_dim"])
+        if (type(target) is not int or target < actual or
+                not composition["pi05"] and target != composition["action_dim"]):
+            raise ValueError(f"COMPOSITION_STATE_PADDING_INVALID: 配方 data.state_pad_dim={target} 与组合输出状态宽度 {actual} 不兼容；Pi05 至少需要 {actual}，Pi0 必须等于模型 action_dim")
 
 
 def norm_contract(factory, spec):
@@ -182,6 +348,7 @@ def norm_contract(factory, spec):
     norm_path = local_path(Path(asset_dir) / asset_id / "norm_stats.json", spec)
     document, sha = read_json(norm_path, spec)
     stats = document.get("norm_stats")
+    composition = normalize_composition(factory.composition) if type(factory).__name__ == COMPOSABLE_PROCESSOR else None
     if not isinstance(stats, dict) or not all(key in stats for key in ("state", "actions")):
         raise ValueError(f"NORM_FORMAT: {norm_path} 必须包含 state 和 actions 统计")
     for key in ("state", "actions"):
@@ -201,8 +368,12 @@ def norm_contract(factory, spec):
             lengths.append(len(array))
         if len(set(lengths)) != 1:
             raise ValueError(f"NORM_FORMAT: {norm_path} 的 {key} 统计维度不一致")
+        if composition is not None:
+            expected = sum(field["width"] for field in composition["state_fields" if key == "state" else "action_layout"])
+            if lengths[0] != expected:
+                raise ValueError(f"COMPOSITION_NORM_MISMATCH: {key} 归一化统计宽度与组合拼接顺序的总宽度不一致")
         base = getattr(factory, "base_config", None)
-        if getattr(base, "use_quantile_norm", False) and not all(values.get(k) is not None for k in ("q01", "q99")):
+        if (getattr(base, "use_quantile_norm", False) or composition is not None and composition["normalization"] == "quantile") and not all(values.get(k) is not None for k in ("q01", "q99")):
             raise ValueError(f"NORM_FORMAT: {norm_path} 缺少分位数归一化统计")
     return {"norm_path": str(norm_path), "norm_sha256": sha}
 
@@ -254,7 +425,7 @@ def storage_estimate(config, model, reference_bytes):
             "checkpoint_copies": simultaneous, "headroom_bytes": 1024 ** 3}
 
 
-def inspect_training_config(config, spec, *, checks):
+def inspect_training_config(config, spec, *, checks, fps_runtime=None):
     """Return deterministic evidence shared by preflight and actual launch."""
     def passed(name, message):
         checks.append({"name": name, "ok": True, "message": message})
@@ -283,7 +454,13 @@ def inspect_training_config(config, spec, *, checks):
         if local_path(factory.repo_id, spec) != local_path(spec["inputs"][dataset_role]["path"], spec):
             raise ValueError("DATASET_BINDINGS_INVALID: 实际训练的数据目录与所选资产不一致")
     passed("recipe_configuration", f"已解析配方 {spec['recipe']}，{len(factories)} 个数据集；batch {config.batch_size} / {spec['gpu_count']} GPU")
-    datasets = [dataset_contract(factory, spec) for factory in factories]
+    datasets = []
+    for index, (factory, (dataset_role, _)) in enumerate(zip(factories, roles)):
+        data = dataset_contract(factory, spec, spec["inputs"][dataset_role].get("dataset_profile"),
+                                model_config=getattr(config, "model", None),
+                                binding=bindings[index] if bindings is not None else None, checks=checks)
+        datasets.append(data)
+    check_composed_mixture(config.data, datasets)
     passed("data_contract", "已核对所有数据集的 LeRobot 元数据与 parquet 文件：" + "、".join(d["path"] for d in datasets))
     for data, factory in zip(datasets, factories):
         data.update(norm_contract(factory, spec))
@@ -320,6 +497,10 @@ def inspect_training_config(config, spec, *, checks):
     cache = inspect_training_cache(datasets, spec)
     passed("training_cache", f"数据集缓存可写，已核对 {len(cache['builders'])} 组 parquet builder 文件锁：{cache['datasets_cache']}")
     return {"recipe": spec["recipe"], "input_authority": "registered_assets", "recipe_definition_digest": (spec.get("recipe_definition") or {}).get("digest"),
+            "dataset_fps_policy": resolve_registered_fps(spec),
+            "dataset_fps_runtime": fps_runtime if fps_runtime and fps_runtime.get("installed") is True else None,
+            "generated_config": generated_training_config(config, spec),
+            **({"auto_config": normalize_auto_config(spec["auto_config"])} if spec.get("auto_config") is not None else {}),
             **({"training_stage": stage, "stage_config": stage_config, "recap_stage_contract": stage_contract}
                if stage is not None else {}),
             **({"dataset_bindings": bindings} if bindings is not None else {}),
@@ -329,7 +510,7 @@ def inspect_training_config(config, spec, *, checks):
             "parameters": spec["parameters"], "gpu_count": spec["gpu_count"], "entrypoint": str(entry),
             "entrypoint_sha256": hashlib.sha256(read_entrypoint(entry)).hexdigest(),
             "adapter_sha256": fingerprint({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                                            for name in ("openpi_entry.py", "training_plan.py", "recipe_definitions.py", "entrypoints.py", "dataset_bindings.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py")}),
+                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py")}),
             "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),

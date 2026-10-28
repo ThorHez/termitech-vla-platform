@@ -330,6 +330,35 @@ def test_tunnel_reconnect_reuses_assigned_port_and_pinned_host(remote, monkeypat
     assert manager.get(job["id"])["tunnel_state"] == "HEALTHY"
 
 
+def test_isolated_copy_preserves_inherited_jobs_but_monitors_new_connections(remote, monkeypatch):
+    platform, manager = remote
+    monkeypatch.setenv("VLA_AGENT_CONTROL_PLANE_URL", "http://127.0.0.1:18000")
+    tested = connection(platform).json()
+    inherited = create(platform, payload(tested["connection_id"])).json()
+    FakeRemote.installer = lambda config: agent_online(platform, config)
+    manager._execute(inherited["id"])
+    manager.close()
+    previous_calls = len(FakeTunnel.calls)
+    restored = DeploymentManager(platform.app.state.db, platform.settings,
+                                 remote_factory=FakeRemote, tunnel_factory=FakeTunnel)
+    try:
+        restored.start(excluded_job_ids=[inherited["id"]])
+        restored._maintain_tunnels()
+        assert len(FakeTunnel.calls) == previous_calls
+        assert restored.get(inherited["id"])["state"] == "SUCCEEDED"
+        # A fresh explicit deployment is eligible for reconnection supervision.
+        newer = create(platform, payload(tested["connection_id"]), key="fresh-explicit-test").json()
+        with platform.app.state.db.write() as session:
+            row = session.get(RemoteDeployment, newer["id"])
+            row.state, row.tunnel_state, row.tunnel_remote_port = "SUCCEEDED", "FAILED", 22022
+        restored._maintain_tunnels()
+        assert len(FakeTunnel.calls) == previous_calls + 1
+        assert FakeTunnel.calls[-1].options["remote_port"] == 22022
+        assert restored.get(newer["id"])["tunnel_state"] == "HEALTHY"
+    finally:
+        restored.close()
+
+
 def test_successful_update_preserves_old_tunnel_until_new_success(remote, monkeypatch):
     platform, manager = remote
     monkeypatch.setenv("VLA_AGENT_CONTROL_PLANE_URL", "http://127.0.0.1:18000")

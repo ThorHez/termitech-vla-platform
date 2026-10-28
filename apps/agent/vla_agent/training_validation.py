@@ -17,6 +17,7 @@ from pathlib import Path
 
 from vla_adapters.dataset_bindings import validate_binding_assets
 from vla_protocol import canonical_digest
+from vla_protocol.config_preview import validate_generated_config
 
 from .metrics import gpu_inventory
 from .runtime_checks import PLATFORM_CREDENTIALS
@@ -132,7 +133,8 @@ def prepare_launch(launch: dict, config: dict, requested_inputs: dict, *, expect
     if expected_plan_digest is not None:
         spec["expected_plan_digest"] = expected_plan_digest
     argv[index + 1] = json.dumps(spec, ensure_ascii=False, allow_nan=False)
-    return {**launch, "argv": argv}
+    from .storage_configuration import cache_environment
+    return {**launch, "argv": argv, "env": {**launch.get("env", {}), **cache_environment(config)}}
 
 
 def _probe_spec(launch: dict, config: dict) -> tuple[list[str], dict]:
@@ -155,6 +157,9 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
     argv, spec = _probe_spec(launch, config)
     environment = {key: value for key, value in os.environ.items() if key not in PLATFORM_CREDENTIALS}
     environment.update({key: value for key, value in launch.get("env", {}).items() if key not in PLATFORM_CREDENTIALS})
+    from .storage_configuration import cache_environment
+    configured_cache = cache_environment(config)
+    environment.update(configured_cache)
     environment.update({"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu", "PYTHONDONTWRITEBYTECODE": "1",
                         "WANDB_MODE": "disabled", "WANDB_DISABLED": "true", "HF_HUB_OFFLINE": "1",
                         "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "PYTHONUNBUFFERED": "1"})
@@ -189,7 +194,13 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
         plan = response.get("plan")
         if not isinstance(plan, dict):
             raise ValueError("missing resolved execution plan")
+        validate_generated_config(plan.get("generated_config"))
+        if canonical_digest(plan.get("auto_config")) != canonical_digest(spec.get("auto_config")):
+            raise ValueError("resolved execution plan does not match automatic configuration")
         _validate_training_cache(plan, config["roots"])
+        if configured_cache and any(plan["training_cache"]["paths"].get(key) != value
+                                    for key, value in configured_cache.items()):
+            raise ValueError("training cache evidence differs from the configured cache root")
         for field in ("recipe", "parameters", "gpu_count"):
             if plan.get(field) != spec.get(field):
                 raise ValueError("resolved execution plan does not match " + field)
@@ -302,4 +313,5 @@ def validate_training(config: dict, launch: dict, checks: list[dict], *, assigne
         except AgentError as exc:
             checks.append({"name": name, "ok": False, "message": str(exc)})
             raise
-    return {"schema_version": 1, "scope": VALIDATION_SCOPE, "plan": plan, "plan_digest": canonical_digest(plan)}
+    return {"schema_version": 1, "scope": VALIDATION_SCOPE, "plan": plan, "plan_digest": canonical_digest(plan),
+            "storage_configuration": {"output_root": config["output_root"], "cache_root": config.get("cache_root")}}

@@ -59,6 +59,35 @@ def platform(tmp_path_factory):
         "python": sys.executable, "adapter": "openpi-sft", "execution_mode": "native",
         "metadata": {"validated_recipes": ["pi0_alpha"]},
     })
+    split_code = base / "split-recipe-code"
+    split_root = split_code / "src/openpi/training/config.py"
+    split_root.parent.mkdir(parents=True)
+    split_root.write_text(
+        "raise RuntimeError('Split recipe discovery must never execute the facade')\n"
+        "class TrainConfig:\n    name: str\n    num_workers: int = 2\n"
+        "from openpi.training.recipes.sft import _CONFIGS as _SFT_CONFIGS\n"
+        "from openpi.training.recipes.uot import _CONFIGS as _UOT_CONFIGS\n"
+        "_CONFIGS = [*_SFT_CONFIGS, *_UOT_CONFIGS]\n"
+    )
+    for method in ("sft", "uot"):
+        part = split_root.parent / "recipes" / f"{method}.py"
+        part.parent.mkdir(exist_ok=True)
+        part.write_text(
+            "raise RuntimeError('Split recipe source must never execute')\n"
+            "from openpi.training.config import TrainConfig\n"
+            f"_CONFIGS = [TrainConfig(name='pi0_split_{method}', batch_size=72, "
+            "lr_schedule=CosineDecaySchedule(peak_lr=0.00003), "
+            "data=MultiDataConfigFactory(state_pad_dim=128, weights=[1, 1], "
+            "datasets=[UmiData(repo_id='/fixture/first', image_horizon=1), "
+            "UmiData(repo_id='/fixture/second', image_horizon=1)]))]\n"
+        )
+    for arguments in (["init"], ["add", "."], ["-c", "user.name=Split recipe fixture", "-c", "user.email=fixture@localhost",
+                      "-c", "commit.gpgsign=false", "commit", "-m", "Record split recipe fixture"]):
+        subprocess.run(["git", "-C", str(split_code), *arguments], check=True, capture_output=True)
+    fixture["config"]["profiles"].append({
+        "id": "split-recipes", "name": "Split SFT/UOT recipe fixture", "code_dir": str(split_code),
+        "python": sys.executable, "adapter": "openpi-sft", "execution_mode": "native", "metadata": {},
+    })
     processor_code = base / "processor-code"
     processor_source = processor_code / "src/openpi/training/config.py"
     processor_source.parent.mkdir(parents=True)
@@ -188,6 +217,52 @@ def reauthenticate(client, fixture):
     assert response.status_code == 200, response.text
 
 
+def test_storage_configuration_reaches_real_agent_and_future_runner(platform):
+    """The HTTP setting must persist remotely and change actual Runner outputs."""
+    client, fixture, node, _ = platform
+    reauthenticate(client, fixture)
+    current = next(row for row in client.get('/api/v1/nodes').json() if row['id'] == node['id'])
+    original_output, original_cache = current['output_root'], current.get('cache_root')
+    old_preview = preview(platform)
+    destination = fixture['base'] / 'later-storage'
+    output, cache = str(destination / 'outputs'), str(destination / 'cache')
+    endpoint = f"/api/v1/nodes/{node['id']}/storage-configurations"
+
+    def configure(expected_output, expected_cache, new_output, new_cache):
+        response = client.post(endpoint, json={
+            'expected_output_root': expected_output, 'expected_cache_root': expected_cache,
+            'output_root': new_output, 'cache_root': new_cache})
+        assert response.status_code == 202, response.text
+        result = eventually(lambda: client.get(endpoint + '/' + response.json()['id']).json(),
+                            lambda row: row['status'] != 'PENDING')
+        assert result['status'] == 'READY', result
+        return result
+
+    changed = configure(original_output, original_cache, output, cache)
+    try:
+        assert changed['storage']['output_root'] == output
+        assert changed['storage']['cache_root'] == cache
+        assert changed['storage']['directories']['output']['free_bytes'] >= 0
+        persisted = json.loads(fixture['config_file'].read_text())
+        assert persisted['output_root'] == output and persisted['cache_root'] == cache
+        listed = next(row for row in client.get('/api/v1/nodes').json() if row['id'] == node['id'])
+        assert listed['output_root'] == output and listed['cache_root'] == cache
+        assert client.get('/api/v1/run-previews/' + old_preview['id']).json()['status'] != 'READY'
+        refused = client.post('/api/v1/runs', json={'preflight_id': old_preview['id']},
+                              headers={'Idempotency-Key': 'storage-old-preview'})
+        assert refused.status_code == 409, refused.text
+        run = submit(client, preview(platform), 'storage-new-output')
+        finished = eventually(lambda: client.get('/api/v1/runs/' + run['id']).json(),
+                              lambda row: row['state'] in {'SUCCEEDED', 'FAILED'})
+        assert finished['state'] == 'SUCCEEDED', finished
+        assert Path(finished['attempts'][0]['output_dir']).is_relative_to(Path(output))
+        assert finished['outputs'] and all(Path(row['path']).is_relative_to(Path(output)) for row in finished['outputs'])
+    finally:
+        configure(output, cache, original_output, original_cache)
+    assert Path(output).is_dir() and Path(cache).is_dir()
+    assert all(Path(row['path']).exists() for row in finished['outputs'])
+
+
 def test_real_process_training_lifecycle_and_lineage(platform):
     client, fixture, node, inputs = platform
     preflight = preview(platform)
@@ -208,6 +283,45 @@ def test_real_process_training_lifecycle_and_lineage(platform):
     assert logs["items"]
 
 
+def test_real_agent_reads_metadata_before_asset_registration_without_training_import(platform):
+    import hashlib
+
+    client, fixture, node, _ = platform
+    dataset = fixture['base'] / 'new-unregistered-dataset'
+    (dataset / 'meta').mkdir(parents=True)
+    labels = [f'left_joint_{index}' for index in range(6)] + ['left_gripper']
+    info = {'robot_type': 'ARX5', 'fps': 30, 'total_frames': 10, 'total_episodes': 1,
+            'features': {'actions': {'dtype': 'float32', 'shape': [7], 'names': labels},
+                         'observation.state': {'dtype': 'float32', 'shape': [7], 'names': labels},
+                         'observation.images.left_wrist': {'dtype': 'image', 'shape': [3, 8, 8]},
+                         'task_index': {'dtype': 'int64', 'shape': [1]}},
+            'private_secret': 'must-not-leak'}
+    source = dataset / 'meta/info.json'
+    source.write_text(json.dumps(info))
+    (dataset / 'meta/tasks.jsonl').write_text(json.dumps({'task_index': 0, 'task': 'Pick up the cup'}) + '\n')
+    original = source.read_bytes()
+    before_assets = client.get('/api/v1/assets').json()
+    created = client.post(f"/api/v1/nodes/{node['id']}/dataset-inspections", json={'path': str(dataset)})
+    assert created.status_code == 202, created.text
+    query_id = created.json()['id']
+    ready = eventually(lambda: client.get(f"/api/v1/nodes/{node['id']}/dataset-inspections/{query_id}").json(),
+                       lambda item: item['status'] != 'PENDING')
+    assert ready['status'] == 'READY', ready
+    inspected = ready['inspection']
+    assert inspected['suggestions']['fps'] == 30 and inspected['suggestions']['action_dim'] == 7
+    assert inspected['suggestions']['state_dim'] == 7 and inspected['suggestions']['robot_type'] == 'ARX5'
+    assert inspected['source']['info_sha256'] == hashlib.sha256(original).hexdigest()
+    assert 'must-not-leak' not in json.dumps(ready)
+    assert source.read_bytes() == original
+    assert client.get('/api/v1/assets').json() == before_assets
+    cache = client.post(f"/api/v1/nodes/{node['id']}/dataset-inspections", json={'path': str(dataset)})
+    assert cache.json()['id'] == query_id
+    unavailable = client.post(f"/api/v1/nodes/{node['id']}/dataset-inspections", json={'path': str(dataset.parent / 'absent')})
+    failed = eventually(lambda: client.get(f"/api/v1/nodes/{node['id']}/dataset-inspections/{unavailable.json()['id']}").json(),
+                        lambda item: item['status'] != 'PENDING')
+    assert failed['status'] == 'FAILED' and failed['inspection'] is None
+
+
 def test_real_training_finishes_after_human_session_idle_expiry(platform):
     from sqlalchemy import func, select
     from vla_control.auth_models import UserSession
@@ -220,12 +334,13 @@ def test_real_training_finishes_after_human_session_idle_expiry(platform):
     running = eventually(lambda: client.get("/api/v1/runs/" + run["id"]).json(),
                          lambda value: value["state"] == "RUNNING")
     attempt_id = running["attempts"][0]["id"]
+    idle_seconds = client.get("/api/v1/auth/me").json()["session_idle_seconds"]
     db = Database(fixture["env"]["VLA_DATABASE_URL"])
     try:
         with db.write() as transaction:
             previous_seq = transaction.scalar(select(func.max(Event.seq)).where(Event.attempt_id == attempt_id)) or 0
             for row in transaction.scalars(select(UserSession)):
-                row.last_activity_at = offset_time(-901)
+                row.last_activity_at = offset_time(-idle_seconds - 1)
         assert client.get("/api/v1/runs/" + run["id"]).status_code == 401
 
         def persisted_state():
@@ -460,6 +575,65 @@ def test_real_agent_recipe_detail_clone_and_revisions_do_not_execute_source(plat
     historical = client.get("/api/v1/recipe-revisions/" + first["latest_revision"]["id"]).json()
     assert historical["definition"] == first["latest_revision"]["definition"]
     assert (fixture["base"] / "recipe-code/src/openpi/training/config.py").read_bytes() == code_before
+
+
+def test_real_http_split_recipe_discovery_details_and_uot_writeback(platform):
+    import hashlib
+
+    client, fixture, node, _ = platform
+    checkout = fixture["base"] / "split-recipe-code"
+    root_source = checkout / "src/openpi/training/config.py"
+    sft_source = root_source.parent / "recipes/sft.py"
+    uot_source = root_source.parent / "recipes/uot.py"
+    protected = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (root_source, sft_source)}
+    response = client.post(f"/api/v1/nodes/{node['id']}/recipe-suggestions", json={
+        "profile_id": "split-recipes", "prefix": "pi0_split", "limit": 30})
+    assert response.status_code == 202, response.text
+    suggestions = eventually(lambda: client.get(
+        f"/api/v1/nodes/{node['id']}/recipe-suggestions/{response.json()['id']}").json(),
+        lambda value: value["status"] != "PENDING")
+    assert suggestions["status"] == "READY", suggestions
+    assert {entry["name"] for entry in suggestions["entries"]} == {"pi0_split_sft", "pi0_split_uot"}
+    response = client.post(f"/api/v1/nodes/{node['id']}/recipe-details", json={
+        "profile_id": "split-recipes", "recipe": "pi0_split_uot"})
+    assert response.status_code == 202, response.text
+    detail = eventually(lambda: client.get(
+        f"/api/v1/nodes/{node['id']}/recipe-details/{response.json()['id']}").json(),
+        lambda value: value["status"] != "PENDING")
+    assert detail["status"] == "READY", detail
+    assert detail["detail"]["source"]["path"] == "src/openpi/training/recipes/uot.py"
+    fields = {field["path"]: field for field in detail["detail"]["fields"]}
+    assert fields["num_workers"]["value"] == 2 and fields["num_workers"]["origin"] == "default"
+    saved = client.post("/api/v1/recipes", json={
+        "node_id": node["id"], "profile_id": "split-recipes", "name": "独立 UOT 配方",
+        "detail_query_id": detail["id"], "overrides": {"batch_size": 40, "data.state_pad_dim": 64}})
+    assert saved.status_code == 201, saved.text
+    revision = saved.json()["latest_revision"]
+    reauthenticate(client, fixture)
+    endpoint = f"/api/v1/recipe-revisions/{revision['id']}/writeback"
+    response = client.post(endpoint, json={"config_name": "pi0_split_uot_saved"})
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["id"]
+    receipt = eventually(lambda: client.get(f"/api/v1/recipe-writebacks/{operation_id}").json(),
+                         lambda value: value["status"] != "PENDING")
+    assert receipt["status"] == "SUCCEEDED", receipt
+    assert receipt["recipe"]["latest_revision"]["definition"]["source"]["path"] == "src/openpi/training/recipes/uot.py"
+    changed = subprocess.check_output(["git", "-C", str(checkout), "diff-tree", "--no-commit-id", "--name-only",
+                                       "-r", receipt["commit_sha"]], text=True).splitlines()
+    assert changed == ["src/openpi/training/recipes/uot.py"]
+    assert "pi0_split_uot_saved" in uot_source.read_text()
+    assert protected == {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (root_source, sft_source)}
+    retry = client.post(endpoint, json={"config_name": "pi0_split_uot_saved"})
+    assert retry.status_code == 202 and retry.json()["id"] == operation_id
+    assert subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip() == receipt["commit_sha"]
+    # This fixture is shared with tests that exercise the recent-password gate.
+    # Leave a normal login session rather than leaking this test's reauth proof.
+    authentication = client.post("/api/v1/auth/login", json={
+        "username": fixture["credentials"]["admin_username"],
+        "password": fixture["credentials"]["admin_password"]})
+    assert authentication.status_code == 200, authentication.text
+    assert authentication.json()["reauth_expires_at"] is None
+    client.headers["X-CSRF-Token"] = authentication.json()["csrf_token"]
 
 
 def test_real_agent_writes_nested_recipe_and_commits_once_without_executing_source(platform):
