@@ -19,9 +19,10 @@ from vla_protocol.config_preview import validate_generated_config
 from .artifacts import ArtifactMonitor
 from .config import load_config
 from .metrics import check_gpus, process_metrics
+from .output_isolation import validate_output_isolation
 from .preflight import validate_local_inputs
 from .safety import AgentError, allowed_path, identity_matches, process_identity, safe_identifier, signal_owned_group
-from .snapshots import capture_code, compare_code, git
+from .snapshots import capture_code, compare_code
 from .state import State, TERMINAL_STATES
 from .training_validation import prepare_launch, validate_training
 
@@ -134,13 +135,7 @@ def execute(config: dict, attempt_id: str) -> int:
                 raise AgentError("CONFIG_CONFIRMATION_REQUIRED", "训练缺少用户 config 确认，请重新预检并确认")
             if confirmed != generated["sha256"] or payload.get("confirmed_config_sha256") != confirmed:
                 raise AgentError("CONFIG_CONFIRMATION_MISMATCH", "启动命令与用户确认的 config 不一致，请重新预检并确认")
-        code_dir = Path(git(Path(profile["code_dir"]), "rev-parse", "--show-toplevel").decode().strip()).resolve()
-        if output == code_dir or code_dir in output.parents:
-            raise AgentError("INVALID_PATH", "Attempt output must be outside the training code directory")
-        for asset in inputs.values():
-            asset_path = Path(asset["path"])
-            if asset_path == output or asset_path in output.parents or output in asset_path.parents:
-                raise AgentError("INVALID_PATH", "Attempt output must be separate from input assets")
+        validate_output_isolation(config, profile["code_dir"], inputs, str(output))
         output.mkdir(parents=True, exist_ok=False)
         start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
         compare_code(payload["code_expectation"], start_snapshot, compare_automatic=False)

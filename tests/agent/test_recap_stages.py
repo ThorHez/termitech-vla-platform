@@ -63,7 +63,9 @@ def staged_probe(fixture):
 
 
 def write_response(fixture, plan, *, with_check=True):
-    checks = ["recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache"]
+    # Synthetic wrapper attestations only; this fixture does not decode data.
+    checks = ["recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples",
+              "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache"]
     if with_check:
         checks.append("recap_stage")
     response = {"schema_version": 1, "scope": "configuration_and_local_assets", "plan": plan,

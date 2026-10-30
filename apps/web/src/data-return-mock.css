@@ -1177,10 +1177,12 @@
   backdrop-filter: blur(3px);
 }
 .dr-modal {
-  width: 100%;
-  max-width: 590px;
+  width: 590px;
+  max-width: 100%;
   max-height: calc(100dvh - 48px);
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   border-radius: 12px;
   background: var(--bg-surface, #fff);
   box-shadow: 0 20px 80px #102a4233;
@@ -1188,6 +1190,7 @@
 }
 .dr-modal > header {
   display: flex;
+  flex-shrink: 0;
   align-items: flex-start;
   gap: 20px;
   justify-content: space-between;
@@ -1218,16 +1221,31 @@
   cursor: pointer;
 }
 .dr-modal-body {
+  min-height: 0;
+  overflow: auto;
   padding: 23px 25px;
 }
 .dr-modal > footer {
   display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 9px;
   padding: 17px 25px;
   border-top: 1px solid var(--border-default, #e7edf0);
   background: var(--bg-surface, #fcfdfd);
+}
+
+@container dialog (max-width: 480px) {
+  .dr-modal > header,
+  .dr-modal-body {
+    padding: 16px;
+  }
+
+  .dr-modal > footer {
+    padding: 12px 16px;
+  }
 }
 .dr-form-field {
   display: flex;

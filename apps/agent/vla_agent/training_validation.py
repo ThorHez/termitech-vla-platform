@@ -16,10 +16,12 @@ import time
 from pathlib import Path
 
 from vla_adapters.dataset_bindings import validate_binding_assets
+from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_protocol import canonical_digest
 from vla_protocol.config_preview import validate_generated_config
 
 from .metrics import gpu_inventory
+from .output_isolation import validate_output_isolation
 from .runtime_checks import PLATFORM_CREDENTIALS
 from .safety import AgentError, allowed_path
 
@@ -186,7 +188,7 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
             raise AgentError(error["code"], error["message"])
         if returncode or any(not check["ok"] for check in detailed):
             raise AgentError("RECIPE_VALIDATION_FAILED", "训练配方自动预检未通过，请查看具体检查项")
-        required = {"recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache"}
+        required = {"recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache"}
         if spec.get("training_stage") is not None:
             required.add("recap_stage")
         if not required.issubset({check["name"] for check in detailed if check["ok"]}):
@@ -194,6 +196,7 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
         plan = response.get("plan")
         if not isinstance(plan, dict):
             raise ValueError("missing resolved execution plan")
+        validate_sample_evidence(plan)
         validate_generated_config(plan.get("generated_config"))
         if canonical_digest(plan.get("auto_config")) != canonical_digest(spec.get("auto_config")):
             raise ValueError("resolved execution plan does not match automatic configuration")
@@ -305,6 +308,18 @@ def _check_output_storage(config: dict, plan: dict, checks: list[dict]):
 
 def validate_training(config: dict, launch: dict, checks: list[dict], *, assigned: list[str] | None = None) -> dict:
     """Return a deterministic evidence identity after all automatic checks pass."""
+    try:
+        _, spec = _probe_spec(launch, config)
+        isolation = validate_output_isolation(config, spec["code_dir"], spec["inputs"], spec["output_dir"])
+    except AgentError as exc:
+        checks.append({"name": "output_isolation", "ok": False, "message": str(exc)})
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        message = "训练适配器缺少代码、输入资产或输出目录，无法检查目录隔离"
+        checks.append({"name": "output_isolation", "ok": False, "message": message})
+        raise AgentError("PREFLIGHT_INVALID_RESPONSE", message) from exc
+    checks.append({"name": "output_isolation", "ok": True,
+                   "message": f"已核对本次输出路径与代码和输入资产隔离；输出根目录：{isolation['output_root']}"})
     plan = _wrapper_validation(config, launch, checks)
     for name, callback in (("gpu_capacity", lambda: _check_gpu_capacity(plan["gpu_count"], checks, assigned=assigned)),
                            ("output_storage", lambda: _check_output_storage(config, plan, checks))):

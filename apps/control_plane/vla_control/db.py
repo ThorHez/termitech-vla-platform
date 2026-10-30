@@ -66,6 +66,9 @@ class Database:
                 connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN display_name VARCHAR(200)")
             if "cache_root" not in node_columns:
                 connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN cache_root TEXT")
+            run_columns = {column["name"] for column in inspect(connection).get_columns("runs")}
+            if "requested_gpu_uuids" not in run_columns:
+                connection.exec_driver_sql("ALTER TABLE runs ADD COLUMN requested_gpu_uuids JSON")
             policy_columns = {column["name"] for column in inspect(connection).get_columns("policy_deployments")}
             if "inference_backend" not in policy_columns:
                 connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN inference_backend VARCHAR(16) NOT NULL DEFAULT 'auto'")

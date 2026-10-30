@@ -58,6 +58,13 @@ class Config:
 
 @pytest.fixture
 def training(tmp_path, monkeypatch):
+    # These fixture files exercise plan assembly, not Parquet decoding. Actual
+    # timestamp reads and failure cases have real-file tests in their own suite.
+    monkeypatch.setattr(training_plan, "inspect_dataset_timestamps", lambda data, spec: {
+        "schema_version": 1, "status": "verified", "checked_rows": data["frames"],
+        "effective_fps": data.get("effective_fps"), "data_manifest_digest": data["data_manifest_digest"]})
+    monkeypatch.setattr(training_plan, "inspect_composed_samples_isolated", lambda factory, config, spec, data: {
+        "schema_version": 1, "status": "verified" if "composition" in data else "not_applicable"})
     cache = str(tmp_path / "training-cache")
     monkeypatch.setattr(training_plan, "inspect_training_cache", lambda datasets, spec: {
         "datasets_cache": cache, "paths": {"HF_DATASETS_CACHE": cache},
@@ -119,7 +126,35 @@ def test_multi_binds_all_selected_assets_and_routes_actual_entry(training):
     plan = inspect_training_config(config, spec, checks=checks)
     assert plan["entrypoint"].endswith("train_multi_dataset.py")
     assert [d["path"] for d in plan["datasets"]] == [d.repo_id for d in original.data.datasets]
-    assert len(checks) == 6 and all(c["ok"] for c in checks)
+    assert len(checks) == 8 and all(c["ok"] for c in checks)
+    assert any(c["name"] == "dataset_timestamps" for c in checks)
+    assert all(data["timestamp_contract"]["status"] == "verified" for data in plan["datasets"])
+
+
+def test_real_timestamp_failure_is_reported_before_model_or_cache_validation(training, monkeypatch):
+    config = resolve(training)
+    checks = []
+
+    def mismatch(data, spec):
+        raise ValueError("DATASET_TIMESTAMPS_INVALID: 生效 20 Hz，实测帧间隔 0.016667 秒")
+
+    monkeypatch.setattr(training_plan, "inspect_dataset_timestamps", mismatch)
+    monkeypatch.setattr(training_plan, "model_contract", lambda *_: pytest.fail("Do not continue after invalid timestamps"))
+    with pytest.raises(ValueError, match="DATASET_TIMESTAMPS_INVALID"):
+        inspect_training_config(config, training[1], checks=checks)
+    assert checks[-1]["name"] == "dataset_timestamps" and checks[-1]["ok"] is False
+
+
+def test_decoded_sample_failure_blocks_before_model_or_cache_validation(training, monkeypatch):
+    config = resolve(training)
+    checks = []
+    def mismatch(*args):
+        raise ValueError("DATASET_SAMPLE_INVALID: sample=0 camera=front actual=[3,224,224] declared=hwc")
+    monkeypatch.setattr(training_plan, "inspect_composed_samples_isolated", mismatch)
+    monkeypatch.setattr(training_plan, "model_contract", lambda *_: pytest.fail("Do not continue after a sample failure"))
+    with pytest.raises(ValueError, match="DATASET_SAMPLE_INVALID"):
+        inspect_training_config(config, training[1], checks=checks)
+    assert checks[-1]["name"] == "dataset_samples" and checks[-1]["ok"] is False
 
 
 def test_single_dataset_binding_uses_selected_dataset_and_single_entry(training):

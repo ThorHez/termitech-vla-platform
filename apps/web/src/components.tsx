@@ -23,6 +23,7 @@ import {
   nearestMetricPoint,
 } from './metricChartData';
 import type { MetricChartInput, MetricChartPoint } from './metricChartData';
+import { useDialogResize } from './ResizableDialog';
 
 const states: Record<string, [string, string]> = {
   ONLINE: ['在线', 'green'],
@@ -237,6 +238,7 @@ export function Modal({
   className?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const resize = useDialogResize(ref);
   const closeRef = useRef(close);
   closeRef.current = close;
   useEffect(() => {
@@ -288,7 +290,8 @@ export function Modal({
       }}
     >
       <div
-        className={`modal ${wide ? 'wide' : ''} ${className}`}
+        className={`modal dialog-resizable ${wide ? 'wide' : ''} ${className}`}
+        style={resize.style}
         ref={ref}
         role="dialog"
         aria-modal="true"
@@ -306,6 +309,7 @@ export function Modal({
         </header>
         <div className="modal-body">{children}</div>
         {footer && <footer className="modal-footer">{footer}</footer>}
+        {resize.handles}
       </div>
     </div>
   );

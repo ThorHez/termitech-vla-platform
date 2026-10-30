@@ -105,6 +105,7 @@ class Run(Base):
     inputs: Mapped[dict] = mapped_column(JSON)
     parameters: Mapped[dict] = mapped_column(JSON)
     gpu_count: Mapped[int] = mapped_column(Integer)
+    requested_gpu_uuids: Mapped[list | None] = mapped_column(JSON, nullable=True)
     code_expectation: Mapped[dict] = mapped_column(JSON)
     queue_reason: Mapped[str | None] = mapped_column(Text)
     error: Mapped[dict | None] = mapped_column(JSON, nullable=True)

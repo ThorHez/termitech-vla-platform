@@ -15,6 +15,7 @@ class Settings:
     session_reauth_seconds: int = 300
     session_cookie_secure: bool = True
     public_url: str = ""
+    public_url_aliases: str = ""
     require_https: bool = False
     forwarded_allow_ips: str = "127.0.0.1,::1"
     tls_cert_file: str = ""
@@ -36,6 +37,7 @@ class Settings:
             session_reauth_seconds=int(os.getenv("VLA_SESSION_REAUTH_SECONDS", "300")),
             session_cookie_secure=os.getenv("VLA_SESSION_COOKIE_SECURE", "true").lower() in {"1", "true", "yes"},
             public_url=os.getenv("VLA_PUBLIC_URL", ""),
+            public_url_aliases=os.getenv("VLA_PUBLIC_URL_ALIASES", ""),
             require_https=os.getenv("VLA_REQUIRE_HTTPS", "false").lower() in {"1", "true", "yes"},
             forwarded_allow_ips=os.getenv("VLA_FORWARDED_ALLOW_IPS", cls.forwarded_allow_ips),
             tls_cert_file=os.getenv("VLA_TLS_CERT_FILE", ""),

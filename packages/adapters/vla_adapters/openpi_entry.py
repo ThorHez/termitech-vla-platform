@@ -28,6 +28,8 @@ if __package__:
     from .entrypoints import read_entrypoint
     from .recipe_definitions import apply_overrides, validate_definition
     from .recap_runtime import apply_stage, stage_request
+    from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, runtime_parameter_overrides,
+                                  validate_runtime_parameter_relations)
     from .training_plan import fingerprint, inspect_training_config, local_path, require_lerobot_source, training_entrypoint
 else:
     from automatic_config import build_automatic_base, normalize_auto_config
@@ -38,6 +40,8 @@ else:
     from entrypoints import read_entrypoint
     from recipe_definitions import apply_overrides, validate_definition
     from recap_runtime import apply_stage, stage_request
+    from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, runtime_parameter_overrides,
+                                 validate_runtime_parameter_relations)
     from training_plan import fingerprint, inspect_training_config, local_path, require_lerobot_source, training_entrypoint
 
 
@@ -140,7 +144,29 @@ def resolve_config(base, spec, config_module, weight_loaders):
             data = selected_factory(bindings[0], 0)
         else:
             data = bound_factory(base.data, "dataset", "norm")
-    schedule = dataclasses.replace(base.lr_schedule, peak_lr=spec["parameters"]["learning_rate"])
+    parameters = spec["parameters"]
+    runtime_overrides = runtime_parameter_overrides(parameters)
+    validate_runtime_parameter_relations(parameters, gpu_count=spec["gpu_count"])
+    schedule_updates = {name: value for name, value in runtime_overrides.items() if name in SCHEDULE_PARAMETERS}
+    if ({"decay_steps", "decay_lr"} & schedule_updates.keys()
+            and type(base.lr_schedule).__name__ != "CosineDecaySchedule"):
+        raise ValueError("TRAINING_PARAMETER_UNSUPPORTED: 所选学习率计划不是 CosineDecaySchedule，不能应用余弦衰减参数")
+    schedule_updates["peak_lr"] = parameters["learning_rate"]
+    if (not dataclasses.is_dataclass(base.lr_schedule)
+            or set(schedule_updates) - {field.name for field in dataclasses.fields(base.lr_schedule)}):
+        raise ValueError("TRAINING_PARAMETER_UNSUPPORTED: 所选学习率计划缺少明确填写的参数")
+    schedule = dataclasses.replace(base.lr_schedule, **schedule_updates)
+    if SCHEDULE_PARAMETERS & parameters.keys():
+        effective_schedule = {name: getattr(schedule, name) for name in SCHEDULE_PARAMETERS if hasattr(schedule, name)}
+        validate_runtime_parameter_relations({**effective_schedule, "learning_rate": schedule.peak_lr})
+    component_changes = {}
+    if "clip_gradient_norm" in runtime_overrides:
+        optimizer = getattr(base, "optimizer", None)
+        if (not dataclasses.is_dataclass(optimizer)
+                or "clip_gradient_norm" not in {field.name for field in dataclasses.fields(optimizer)}):
+            raise ValueError("TRAINING_PARAMETER_UNSUPPORTED: 所选优化器不支持 clip_gradient_norm，不能覆盖梯度裁剪参数")
+        component_changes["optimizer"] = dataclasses.replace(optimizer,
+            clip_gradient_norm=runtime_overrides["clip_gradient_norm"])
     # Keep recipe-specific initialization for newly added value / gripper heads.
     # A plain policy loader rejects those intentionally missing parameters.
     loader = base.weight_loader
@@ -153,12 +179,17 @@ def resolve_config(base, spec, config_module, weight_loaders):
         loader = weight_loaders.CheckpointWeightLoader(str(params_dir))
     if stage == "value" and type(loader).__name__ != "CheckpointWeightLoaderWithValueHead":
         raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方需要 CheckpointWeightLoaderWithValueHead 初始化价值头")
+    root_overrides = {name: value for name, value in runtime_overrides.items()
+                      if name not in SCHEDULE_PARAMETERS | OPTIMIZER_PARAMETERS}
+    root_overrides.setdefault("fsdp_devices", spec["gpu_count"])
+    if set(root_overrides) - {field.name for field in dataclasses.fields(base)}:
+        raise ValueError("TRAINING_PARAMETER_UNSUPPORTED: 当前训练环境缺少所选检查点或数据加载参数")
     config = dataclasses.replace(base, data=data,
         weight_loader=loader,
         lr_schedule=schedule, num_train_steps=spec["parameters"]["steps"],
-        batch_size=spec["parameters"]["batch_size"], fsdp_devices=spec["gpu_count"],
+        batch_size=spec["parameters"]["batch_size"],
         checkpoint_base_dir=str(Path(spec["output_dir"]) / "checkpoints"),
-        exp_name="platform", resume=False, overwrite=False, wandb_enabled=False)
+        exp_name="platform", resume=False, overwrite=False, wandb_enabled=False, **root_overrides, **component_changes)
     return apply_stage(config, spec)
 
 

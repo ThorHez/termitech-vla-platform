@@ -18,9 +18,17 @@ OVERRIDE_RULES = {
     "save_interval": {"type": "integer", "min": 1, "max": 1_000_000},
     "keep_period": {"type": "integer", "min": 1, "max": 10_000_000},
     "seed": {"type": "integer", "min": 0, "max": 4_294_967_295},
+    "fsdp_devices": {"type": "integer", "min": 1, "max": 4096},
+    "lr_schedule.warmup_steps": {"type": "integer", "min": 0, "max": 10_000_000},
+    "lr_schedule.decay_steps": {"type": "integer", "min": 1, "max": 100_000_000},
+    "lr_schedule.decay_lr": {"type": "number", "min": 0, "max": 0.1},
     "optimizer.clip_gradient_norm": {"type": "number", "min": 1e-8, "max": 1000},
 }
-PARAMETER_PATHS = {"steps": "num_train_steps", "batch_size": "batch_size", "learning_rate": "lr_schedule.peak_lr"}
+PARAMETER_PATHS = {"steps": "num_train_steps", "batch_size": "batch_size", "learning_rate": "lr_schedule.peak_lr",
+                   "save_interval": "save_interval", "keep_period": "keep_period", "num_workers": "num_workers",
+                   "warmup_steps": "lr_schedule.warmup_steps", "decay_steps": "lr_schedule.decay_steps",
+                   "decay_lr": "lr_schedule.decay_lr", "clip_gradient_norm": "optimizer.clip_gradient_norm",
+                   "ema_decay": "ema_decay", "fsdp_devices": "fsdp_devices", "log_interval": "log_interval"}
 SOURCE_PATHS = {"src/openpi/training/config.py", "openpi/training/config.py"}
 # Discovery still starts at the compatibility facade. Only these explicit
 # recipe parts may provide a saved definition or receive a source writeback.

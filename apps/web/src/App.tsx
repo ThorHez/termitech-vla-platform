@@ -31,6 +31,7 @@ import RunDetail from './RunDetail';
 import RunWizard from './RunWizard';
 import PolicyDeployments from './PolicyDeployments';
 import { ThemeControl, ThemeProvider, ThemeSettings } from './theme';
+import type { Run } from './types';
 
 const navigation = [
   { path: '/overview', label: '训练工作台', icon: LayoutDashboard },
@@ -75,7 +76,7 @@ function Shell() {
   const path = route.split('?')[0];
   const queryParams = new URLSearchParams(route.split('?')[1] || '');
   const [mobileNav, setMobileNav] = useState(false);
-  const [wizard, setWizard] = useState<{ nodeId?: string; templateId?: string }>();
+  const [wizard, setWizard] = useState<{ nodeId?: string; templateId?: string; sourceRun?: Run }>();
   const { overview, alerts, runs, refresh } = useData();
   const section =
     navigation.find((item) => path.startsWith(item.path)) ||
@@ -256,7 +257,13 @@ function Shell() {
             ) : path === '/runs' ? (
               <RunsPage createRun={() => createRun()} />
             ) : path.startsWith('/runs/') ? (
-              <RunDetail key={path} id={decodeURIComponent(path.slice('/runs/'.length))} />
+              <RunDetail
+                key={path}
+                id={decodeURIComponent(path.slice('/runs/'.length))}
+                onRetry={(sourceRun) => {
+                  if (can('training.write')) setWizard({ sourceRun });
+                }}
+              />
             ) : path === '/deployments' || path.startsWith('/deployments/') ? (
               <PolicyDeployments
                 path={path}
@@ -286,8 +293,10 @@ function Shell() {
       </div>
       {wizard && can('training.write') && (
         <RunWizard
+          key={wizard.sourceRun?.id || 'new-training'}
           initialNode={wizard.nodeId}
           initialTemplate={wizard.templateId}
+          sourceRun={wizard.sourceRun}
           close={() => setWizard(undefined)}
         />
       )}

@@ -161,6 +161,13 @@ class PreviewInput(InputModel):
     inputs: dict[str, str] = Field(default_factory=dict)
     parameters: dict = Field(default_factory=dict)
     gpu_count: int = Field(default=1, ge=0, le=256, strict=True)
+    requested_gpu_uuids: list[str] | None = Field(default=None, min_length=1, max_length=256)
+
+    @model_validator(mode="after")
+    def validate_requested_gpus(self):
+        from .gpu_selection import requested_gpu_uuids
+        self.requested_gpu_uuids = requested_gpu_uuids(self.requested_gpu_uuids, self.gpu_count)
+        return self
 
     @field_validator("auto_config")
     @classmethod

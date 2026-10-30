@@ -12,6 +12,7 @@ import {
   GitCommitHorizontal,
   LoaderCircle,
   Rocket,
+  RotateCcw,
   Server,
   Square,
   Terminal,
@@ -37,6 +38,15 @@ import { stageParameterLabels, trainingStageLabels } from './recap';
 import type { Asset, Logs, Run, RunEvent } from './types';
 import { deployableOutputs, sourceDeploymentBlocker } from './policyDeployment';
 import { TrainingMetrics } from './TrainingMetrics';
+import { retryableRun } from './runRetry';
+import { requestedGpuSummary } from './trainingGpuSelection';
+
+const queueReasonLabels: Record<string, string> = {
+  GPU_UNAVAILABLE: '可用 GPU 数量不足，等待资源释放',
+  REQUESTED_GPU_UNAVAILABLE: '指定 GPU 正在使用、已预约或状态尚未确认，等待所选设备可用',
+  REQUESTED_GPU_MISSING: '部分指定 GPU 尚未上报，等待设备恢复；不会自动替换其他卡',
+  REQUESTED_GPU_INVALID: '指定 GPU 配置无效，请重新配置并预检',
+};
 
 function outputRemoved(output: Asset) {
   return output.state === 'UNAVAILABLE' || output.metadata?.availability === 'removed';
@@ -47,17 +57,18 @@ function outputStep(output: Asset) {
   return typeof step === 'number' && Number.isFinite(step) ? step : -1;
 }
 
-export default function RunDetail({ id }: { id: string }) {
+export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run: Run) => void }) {
   const { can } = useAuth();
   const { nodes, templates, assets, profiles, refresh } = useData();
   const detail = useApi<Run>(`/runs/${id}`, 3000);
-  const events = useRunFeed<RunEvent>(`/runs/${id}/events`, 'events');
-  const logs = useRunFeed<Logs['items'][number]>(`/runs/${id}/logs`, 'logs');
+  const run = detail.data?.id === id ? detail.data : undefined;
+  const live = !run || !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(run.state);
+  const events = useRunFeed<RunEvent>(`/runs/${id}/events`, 'events', live);
+  const logs = useRunFeed<Logs['items'][number]>(`/runs/${id}/logs`, 'logs', live);
   const [tab, setTab] = useState('overview');
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
-  const run = detail.data?.id === id ? detail.data : undefined;
   const attempt = run?.attempts?.[run.attempts.length - 1];
   const outputs = useMemo(
     () =>
@@ -73,8 +84,7 @@ export default function RunDetail({ id }: { id: string }) {
   const metricEvents = useMemo(
     () =>
       events.data.filter(
-        (event) =>
-          event.type === 'METRIC' && (!attempt?.id || event.attempt_id === attempt.id),
+        (event) => event.type === 'METRIC' && (!attempt?.id || event.attempt_id === attempt.id),
       ),
     [events.data, attempt?.id],
   );
@@ -128,6 +138,12 @@ export default function RunDetail({ id }: { id: string }) {
           run && (
             <>
               <Badge state={run.state} />
+              {can('training.write') && onRetry && retryableRun(run) && (
+                <button type="button" className="button primary" onClick={() => onRetry(run)}>
+                  <RotateCcw size={14} />
+                  {run.state === 'FAILED' ? '重新配置并启动' : '重新训练'}
+                </button>
+              )}
               {can('training.write') &&
                 run.template_id === 'openpi-sft' &&
                 deployableOutputs(run).length > 0 &&
@@ -163,7 +179,7 @@ export default function RunDetail({ id }: { id: string }) {
             {run.queue_reason && (
               <div className="info-strip">
                 <Clock3 size={17} />
-                <span>排队原因：{run.queue_reason}</span>
+                <span>排队原因：{queueReasonLabels[run.queue_reason] || run.queue_reason}</span>
               </div>
             )}
             {run.state === 'UNKNOWN' && (
@@ -205,6 +221,16 @@ export default function RunDetail({ id }: { id: string }) {
                   GPU 配额
                 </span>
                 <strong>{run.gpu_count ?? '—'} 张</strong>
+                <small title={run.requested_gpu_uuids?.join('\n')}>
+                  {run.requested_gpu_uuids?.length
+                    ? `指定：${requestedGpuSummary(run.requested_gpu_uuids, node)}`
+                    : '自动分配'}
+                </small>
+                {!!attempt?.gpu_uuids?.length && (
+                  <small title={attempt.gpu_uuids.join('\n')}>
+                    实际：{requestedGpuSummary(attempt.gpu_uuids, node)}
+                  </small>
+                )}
               </div>
               <div>
                 <span>
@@ -250,6 +276,13 @@ export default function RunDetail({ id }: { id: string }) {
                   </Panel>
                   <Panel
                     title="最近日志"
+                    subtitle={
+                      live
+                        ? undefined
+                        : logs.complete
+                          ? '训练已结束，日志已同步'
+                          : '训练已结束，正在补齐历史日志…'
+                    }
                     action={
                       <button className="text-link" onClick={() => setTab('logs')}>
                         全部日志
@@ -404,7 +437,13 @@ export default function RunDetail({ id }: { id: string }) {
             {tab === 'logs' && (
               <Panel
                 title="运行日志"
-                subtitle="按上报顺序展示 · 自动刷新 · 保留最近 5,000 条"
+                subtitle={
+                  live
+                    ? '按上报顺序展示 · 自动刷新 · 保留最近 5,000 条'
+                    : logs.complete
+                      ? '训练已结束，日志已同步 · 保留最近 5,000 条'
+                      : '训练已结束，正在补齐历史日志…'
+                }
                 action={
                   <button
                     className="button outline small"
@@ -518,6 +557,16 @@ export default function RunDetail({ id }: { id: string }) {
                             {
                               steps: '训练步数',
                               batch_size: '批次大小',
+                              save_interval: '检查点保存间隔',
+                              keep_period: '检查点永久保留周期',
+                              num_workers: '数据加载进程数',
+                              warmup_steps: '学习率预热步数',
+                              decay_steps: '学习率衰减总步数',
+                              decay_lr: '最终学习率',
+                              clip_gradient_norm: '梯度裁剪阈值',
+                              ema_decay: 'EMA 衰减系数',
+                              fsdp_devices: 'FSDP 分片设备数',
+                              log_interval: '日志记录间隔',
                               learning_rate: '学习率',
                             } as Record<string, string>
                           )[key] || key}
@@ -558,19 +607,19 @@ export default function RunDetail({ id }: { id: string }) {
                       </dd>
                     </div>
                   </dl>
-                  {reviewedConfig && (
-                    <GeneratedConfigReview
-                      config={reviewedConfig}
-                      confirmedSha256={
-                        run.confirmed_config_sha256 ||
-                        run.code_expectation?.confirmed_config_sha256 ||
-                        undefined
-                      }
-                      readOnly
-                    />
-                  )}
                 </Panel>
               </div>
+            )}
+            {tab === 'code' && reviewedConfig && (
+              <GeneratedConfigReview
+                config={reviewedConfig}
+                confirmedSha256={
+                  run.confirmed_config_sha256 ||
+                  run.code_expectation?.confirmed_config_sha256 ||
+                  undefined
+                }
+                readOnly
+              />
             )}
             {tab === 'assets' && (
               <>

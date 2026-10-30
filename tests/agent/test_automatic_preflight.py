@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from vla_protocol import canonical_digest
-from vla_agent import preflight, runner, training_validation
+from vla_agent import output_isolation, preflight, runner, training_validation
 from vla_agent.safety import AgentError
 from vla_agent.snapshots import capture_code, compare_code
 from vla_agent.state import State
@@ -30,7 +30,7 @@ def probe_fixture(agent_fixture, monkeypatch):
         inputs[role] = {"path": str(path)}
     params = {"steps": 2, "batch_size": 8, "learning_rate": 0.00005}
     spec = {"code_dir": str(agent_fixture["repo"]), "recipe": "test_recipe", "inputs": inputs,
-            "parameters": params, "gpu_count": 1, "output_dir": str(root / "unused-output")}
+            "parameters": params, "gpu_count": 1, "output_dir": str(Path(config["output_root"]) / "unused-output")}
     plan = {"recipe": spec["recipe"], "recipe_definition_digest": None, "parameters": params, "gpu_count": 1,
             "requested_inputs": {role: asset["path"] for role, asset in inputs.items()},
             "inputs": {role: asset["path"] for role, asset in inputs.items()},
@@ -46,7 +46,7 @@ def probe_fixture(agent_fixture, monkeypatch):
                               "builders": [{"path": inputs["dataset"]["path"], "cache_dir": cache + "/parquet/default"}]}
     result = {"schema_version": 1, "scope": "configuration_and_local_assets", "plan": plan,
               "checks": [{"name": name, "ok": True, "message": "verified"} for name in
-                         ("recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]}
+                         ("recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]}
     marker = root / "probe-environment.json"
     script = root / "fake-wrapper.py"
     script.write_text(
@@ -73,8 +73,8 @@ def test_cpu_probe_strips_credentials_and_returns_bound_plan_without_outputs(pro
     evidence = training_validation.validate_training(fixture["config"], fixture["launch"], checks)
     assert evidence["plan_digest"] == canonical_digest(fixture["plan"])
     assert {item["name"] for item in checks} == {
-        "recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache",
-        "gpu_capacity", "output_storage"}
+        "recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache",
+        "output_isolation", "gpu_capacity", "output_storage"}
     environment = json.loads(fixture["marker"].read_text())
     assert not {"VLA_ADMIN_TOKEN", "VLA_AGENT_TOKEN", "VLA_DATABASE_URL"} & environment.keys()
     assert environment["CUDA_VISIBLE_DEVICES"] == "" and environment["JAX_PLATFORMS"] == "cpu"
@@ -95,7 +95,7 @@ def test_explicit_cache_root_reaches_cpu_probe_and_is_bound_to_its_evidence(prob
                                                      'cache_dir': cache + '/parquet/default'}]}
     response = {'schema_version': 1, 'scope': 'configuration_and_local_assets', 'plan': fixture['plan'],
                 'checks': [{'name': name, 'ok': True, 'message': 'verified'} for name in
-                           ('recipe_configuration', 'data_contract', 'norm_contract', 'model_checkpoint',
+                           ('recipe_configuration', 'data_contract', 'dataset_timestamps', 'dataset_samples', 'norm_contract', 'model_checkpoint',
                             'training_entrypoint', 'training_cache')]}
     fixture['script'].write_text('import os,json\nfrom pathlib import Path\n'
                                 f'Path({str(fixture["marker"])!r}).write_text(json.dumps(dict(os.environ)))\n'
@@ -162,7 +162,8 @@ def test_wrapper_detailed_failure_is_preserved(probe_fixture):
     with pytest.raises(AgentError) as error:
         training_validation.validate_training(fixture["config"], fixture["launch"], checks)
     assert error.value.code == "NORM_CONTRACT"
-    assert checks == response["checks"]
+    assert checks[0]["name"] == "output_isolation" and checks[0]["ok"] is True
+    assert checks[1:] == response["checks"]
 
 
 def fps_warning():
@@ -176,6 +177,93 @@ def write_probe_response(fixture, checks, plan=None):
     fixture["script"].write_text("import json\nprint('VLA_PREFLIGHT:'+json.dumps(" + repr(response) + "))\n")
 
 
+@pytest.mark.parametrize("required_check", ["dataset_timestamps", "dataset_samples"])
+def test_wrapper_cannot_claim_success_without_real_dataset_check(probe_fixture, required_check):
+    fixture = probe_fixture
+    checks = [{"name": name, "ok": True, "message": "verified"} for name in (
+        "recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract",
+        "model_checkpoint", "training_entrypoint", "training_cache") if name != required_check]
+    write_probe_response(fixture, checks)
+    observed = []
+    with pytest.raises(AgentError) as failure:
+        training_validation.validate_training(fixture["config"], fixture["launch"], observed)
+    assert failure.value.code == "PREFLIGHT_INVALID_RESPONSE"
+    assert observed[0]["name"] == "output_isolation" and observed[0]["ok"] is True
+    assert observed[1:] == checks
+    assert not Path(fixture["spec"]["output_dir"]).exists()
+
+
+@pytest.fixture
+def composed_probe_fixture(probe_fixture):
+    fixture = probe_fixture
+    data = fixture["plan"]["datasets"][0]
+    data.update(factory="ComposableDataConfig", frames=32,
+                composition={"action_horizon": 16, "action_sequence_keys": []})
+    data["sample_probe"] = {"schema_version": 1, "status": "verified", "path": data["path"],
+                            "checked_samples": 3, "sample_indices": [0, 16, 31],
+                            "samples": [{"index": index} for index in (0, 16, 31)],
+                            "action_horizon": 16, "action_sequence_keys": []}
+    return fixture
+
+
+def test_wrapper_accepts_task_bound_positive_composed_sample_evidence(composed_probe_fixture):
+    fixture = composed_probe_fixture
+    checks = [{"name": name, "ok": True, "message": "verified"} for name in (
+        "recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract",
+        "model_checkpoint", "training_entrypoint", "training_cache")]
+    write_probe_response(fixture, checks)
+    result = training_validation.validate_training(fixture["config"], fixture["launch"], [])
+    assert result["plan"] == fixture["plan"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("missing", None), ("schema_version", True), ("schema_version", 2), ("status", "not_applicable"),
+    ("path", "/different/dataset"), ("checked_samples", 0), ("checked_samples", True), ("checked_samples", 4),
+    ("sample_indices", []), ("sample_indices", [-1, 16, 31]), ("sample_indices", [0, 16, 32]),
+    ("sample_indices", [False, 16, 31]), ("sample_indices", [0, 0, 31]),
+    ("samples", []), ("samples", [{"index": 0}, {"index": 15}, {"index": 31}]),
+    ("action_horizon", 50), ("action_horizon", True), ("action_sequence_keys", ["actions"]),
+])
+def test_wrapper_rejects_forged_composed_sample_evidence_despite_passing_check(composed_probe_fixture, field, value):
+    fixture = composed_probe_fixture
+    data = fixture["plan"]["datasets"][0]
+    if field == "missing":
+        data.pop("sample_probe")
+    else:
+        data["sample_probe"][field] = value
+    checks = [{"name": name, "ok": True, "message": "verified"} for name in (
+        "recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract",
+        "model_checkpoint", "training_entrypoint", "training_cache")]
+    write_probe_response(fixture, checks)
+    with pytest.raises(AgentError) as error:
+        training_validation.validate_training(fixture["config"], fixture["launch"], [])
+    assert error.value.code == "PREFLIGHT_INVALID_RESPONSE"
+    assert not Path(fixture["spec"]["output_dir"]).exists()
+
+
+@pytest.mark.parametrize("explicit_error", [False, True])
+def test_wrapper_real_sample_failure_is_blocking_and_preserves_diagnostics(probe_fixture, explicit_error):
+    fixture = probe_fixture
+    message = "RGB 图像形状必须与明确 CHW/HWC 布局一致，历史图像须选择时间索引"
+    failure = {"name": "dataset_samples", "ok": False, "severity": "error",
+               "code": "COMPOSITION_DATA_INVALID", "message": message}
+    checks = [fps_warning(), failure]
+    response = {"schema_version": 1, "scope": "configuration_and_local_assets",
+                "plan": fixture["plan"], "checks": checks}
+    if explicit_error:
+        response["error"] = {"code": "COMPOSITION_DATA_INVALID", "message": message}
+    # Even a zero-exit wrapper cannot authorize a sample that failed its transform.
+    fixture["script"].write_text("import json\nprint('VLA_PREFLIGHT:'+json.dumps(" + repr(response) + "))\n")
+    observed = []
+    with pytest.raises(AgentError) as error:
+        training_validation.validate_training(fixture["config"], fixture["launch"], observed)
+    assert error.value.code == ("COMPOSITION_DATA_INVALID" if explicit_error else "RECIPE_VALIDATION_FAILED")
+    assert observed[0]["name"] == "output_isolation" and observed[0]["ok"] is True
+    assert observed[1:] == checks
+    assert observed[-1]["ok"] is False and observed[-1]["severity"] == "error"
+    assert not Path(fixture["spec"]["output_dir"]).exists()
+
+
 def test_fps_warning_survives_wrapper_validation_and_plan_digest(probe_fixture):
     fixture = probe_fixture
     plan = copy.deepcopy(fixture["plan"])
@@ -183,11 +271,12 @@ def test_fps_warning_survives_wrapper_validation_and_plan_digest(probe_fixture):
     plan["datasets"][0]["warnings"] = [{"code": warning["code"], "supplied": 30, "metadata": 60,
         "dataset_path": fixture["inputs"]["dataset"]["path"], "message": warning["message"]}]
     wrapper_checks = [{"name": name, "ok": True, "message": "verified"} for name in
-                      ("recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]
+                      ("recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]
     write_probe_response(fixture, [*wrapper_checks, warning], plan)
     checks = []
     evidence = training_validation.validate_training(fixture["config"], fixture["launch"], checks)
-    assert checks[:len(wrapper_checks) + 1] == [*wrapper_checks, warning]
+    assert checks[0]["name"] == "output_isolation" and checks[0]["ok"] is True
+    assert checks[1:len(wrapper_checks) + 2] == [*wrapper_checks, warning]
     assert evidence["plan"] == plan
     assert evidence["plan_digest"] == canonical_digest(plan)
     assert evidence["plan_digest"] != canonical_digest(fixture["plan"])
@@ -204,7 +293,8 @@ def test_wrapper_fps_warning_never_overrides_false_check(probe_fixture, failure)
     with pytest.raises(AgentError) as error:
         training_validation.validate_training(probe_fixture["config"], probe_fixture["launch"], observed)
     assert error.value.code == "RECIPE_VALIDATION_FAILED"
-    assert observed == checks
+    assert observed[0]["name"] == "output_isolation" and observed[0]["ok"] is True
+    assert observed[1:] == checks
 
 
 @pytest.mark.parametrize("inner,expected_count", [
@@ -241,7 +331,7 @@ def test_wrapper_requires_complete_cache_evidence_for_every_dataset(probe_fixtur
     fixture = probe_fixture
     plan = copy.deepcopy(fixture["plan"])
     checks = [{"name": name, "ok": True, "message": "verified"} for name in
-              ("recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]
+              ("recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]
     cache = plan["training_cache"]
     if mutation == "missing_check":
         checks.pop()
@@ -282,7 +372,8 @@ def test_wrapper_preserves_specific_training_cache_permission_failure(probe_fixt
     with pytest.raises(AgentError) as failure:
         training_validation.validate_training(fixture["config"], fixture["launch"], checks)
     assert failure.value.code == "TRAINING_CACHE_NOT_WRITABLE"
-    assert checks == response["checks"]
+    assert checks[0]["name"] == "output_isolation" and checks[0]["ok"] is True
+    assert checks[1:] == response["checks"]
 
 
 def test_probe_rejects_execution_plan_for_different_requested_entrypoint(probe_fixture):
@@ -399,7 +490,7 @@ def test_runner_rechecks_plan_and_never_spawns_changed_assets(agent_fixture, mon
     output = Path(config["output_root"]) / payload["attempt_id"]
     state.create_attempt(payload, str(output))
     monkeypatch.setattr(runner, "validate_local_inputs", lambda *args: (profile, {}))
-    monkeypatch.setattr(runner, "git", lambda *args: str(agent_fixture["repo"]).encode())
+    monkeypatch.setattr(output_isolation, "git", lambda *args: str(agent_fixture["repo"]).encode())
     monkeypatch.setattr(runner, "capture_code", lambda *args, **kwargs: dict(baseline))
     monkeypatch.setattr(runner, "build_launch", lambda *args, **kwargs: {"cwd": str(agent_fixture["repo"]), "argv": []})
     monkeypatch.setattr(runner, "prepare_launch", lambda launch, *args: launch)
@@ -423,7 +514,7 @@ def test_runner_records_automatic_evidence_on_started_and_saved_provenance(agent
     output = Path(config["output_root"]) / payload["attempt_id"]
     state.create_attempt(payload, str(output))
     monkeypatch.setattr(runner, "validate_local_inputs", lambda *args: (profile, {}))
-    monkeypatch.setattr(runner, "git", lambda *args: str(agent_fixture["repo"]).encode())
+    monkeypatch.setattr(output_isolation, "git", lambda *args: str(agent_fixture["repo"]).encode())
 
     def capture(*args, **kwargs):
         if len(args) > 2:
@@ -469,7 +560,7 @@ def test_wrapper_requires_valid_generated_code_and_exact_automatic_settings(prob
         plan["auto_config"] = {"model_type": "pi05", "finetune_mode": "full", "action_horizon": 50, "action_dim": 32}
     response = {"schema_version": 1, "scope": "configuration_and_local_assets", "plan": plan,
                 "checks": [{"name": name, "ok": True, "message": "verified"} for name in
-                           ("recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]}
+                           ("recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]}
     fixture["script"].write_text("import json\nprint('VLA_PREFLIGHT:'+json.dumps(" + repr(response) + "))\n")
     with pytest.raises(AgentError) as failure:
         training_validation.validate_training(fixture["config"], fixture["launch"], [])

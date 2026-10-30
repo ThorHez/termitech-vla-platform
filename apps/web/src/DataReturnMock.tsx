@@ -58,6 +58,7 @@ import DataReturnAnnotationEditor, {
   DataReturnAnnotationSummary,
 } from './DataReturnAnnotationEditor';
 import DataReturnEpisodeControl from './DataReturnEpisodeControl';
+import { useDialogResize } from './ResizableDialog';
 import './data-return-mock.css';
 
 type View = 'sessions' | 'review' | 'versions';
@@ -1935,6 +1936,7 @@ function MockDialog({
   footer: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const resize = useDialogResize(ref);
   const closeRef = useRef(close);
   closeRef.current = close;
   const id = useId();
@@ -1981,7 +1983,8 @@ function MockDialog({
       }}
     >
       <div
-        className="dr-modal"
+        className="dr-modal dialog-resizable"
+        style={resize.style}
         role="dialog"
         aria-modal="true"
         aria-labelledby={id}
@@ -1999,6 +2002,7 @@ function MockDialog({
         </header>
         <div className="dr-modal-body">{children}</div>
         <footer>{footer}</footer>
+        {resize.handles}
       </div>
     </div>
   );

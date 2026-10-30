@@ -261,3 +261,33 @@
     grid-column: 1 / -1;
   }
 }
+
+@container dialog (max-width: 1100px) {
+  .dataset-profile-form.compact .dataset-profile-basic,
+  .dataset-profile-form.compact .dataset-profile-advanced > .form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container dialog (max-width: 600px) {
+  .dataset-profile-form.compact {
+    padding: 10px;
+  }
+
+  .dataset-profile-form.compact .dataset-profile-basic,
+  .dataset-profile-form.compact .dataset-profile-advanced > .form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .dataset-profile-form.compact .dataset-profile-camera {
+    grid-template-columns: minmax(0, 1fr) 108px 26px;
+  }
+
+  .dataset-profile-form.compact .dataset-profile-camera > .dataset-profile-section-title {
+    grid-column: 3;
+  }
+
+  .dataset-profile-form.compact .dataset-profile-camera > .field {
+    grid-column: 1 / -1;
+  }
+}

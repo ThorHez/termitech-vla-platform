@@ -52,6 +52,103 @@ def fps_warning():
             "message": "Dataset registration FPS 30 differs from metadata FPS 60"}
 
 
+@pytest.mark.parametrize("required_check", ["dataset_timestamps", "dataset_samples"])
+def test_legacy_preflight_without_real_dataset_check_cannot_authorize_training(platform, required_check):
+    node, identifier, command, code = pending(platform)
+    checks = [item for item in automatic_checks() if item["name"] != required_check]
+    checked = acknowledge(platform, node, identifier, command, code, checks=checks)
+    assert checked["status"] == "FAILED" and checked["error"]["code"] == "AGENT_PREFLIGHT_INCOMPLETE"
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "PREFLIGHT_NOT_READY"
+
+
+@pytest.mark.parametrize("required_check,message", [
+    ("dataset_timestamps", "DATASET_TIMESTAMPS_INVALID: 20 Hz 与真实 60 Hz 时间戳不符"),
+    ("dataset_samples", "COMPOSITION_DATA_INVALID: 解码 RGB 图像与配置的 HWC 布局不符"),
+])
+def test_real_dataset_failure_stays_blocking_alongside_metadata_fps_warning(platform, required_check, message):
+    node, identifier, command, code = pending(platform)
+    checks = [{**item, "ok": False, "message": message}
+              if item["name"] == required_check else item for item in automatic_checks()]
+    checked = acknowledge(platform, node, identifier, command, code, checks=[*checks, fps_warning()])
+    assert checked["status"] == "FAILED" and checked["error"]["code"] == "PREFLIGHT_FAILED"
+    assert any(check["name"] == required_check and check["ok"] is False
+               and check["message"] == message for check in checked["checks"])
+    assert any(check["name"] == "dataset_fps" and check["severity"] == "warning" for check in checked["checks"])
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "PREFLIGHT_NOT_READY"
+
+
+@pytest.mark.parametrize("required_check", ["dataset_timestamps", "dataset_samples"])
+def test_submission_rechecks_real_dataset_evidence_in_a_previously_ready_preview(platform, required_check):
+    node, identifier, command, code = pending(platform)
+    assert acknowledge(platform, node, identifier, command, code)["status"] == "READY"
+    with platform.app.state.db.write() as session:
+        preview = session.get(Preview, identifier)
+        preview.checks = [check for check in preview.checks if check["name"] != required_check]
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "AGENT_PREFLIGHT_INCOMPLETE"
+
+
+def test_preflight_without_output_isolation_check_cannot_become_ready(platform):
+    node, identifier, command, code = pending(platform)
+    checks = [check for check in automatic_checks() if check["name"] != "output_isolation"]
+    checked = acknowledge(platform, node, identifier, command, code, checks=checks)
+    assert checked["status"] == "FAILED"
+    assert checked["error"]["code"] == "AGENT_PREFLIGHT_INCOMPLETE"
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "PREFLIGHT_NOT_READY"
+
+
+def test_submission_rechecks_output_isolation_in_a_previously_ready_preview(platform):
+    node, identifier, command, code = pending(platform)
+    assert acknowledge(platform, node, identifier, command, code)["status"] == "READY"
+    with platform.app.state.db.write() as session:
+        preview = session.get(Preview, identifier)
+        preview.checks = [check for check in preview.checks if check["name"] != "output_isolation"]
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "AGENT_PREFLIGHT_INCOMPLETE"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("missing", None), ("schema_version", True), ("schema_version", 2), ("status", "not_applicable"),
+    ("path", "/different/dataset"), ("checked_samples", 0), ("checked_samples", True), ("checked_samples", 4),
+    ("sample_indices", []), ("sample_indices", [-1, 16, 31]), ("sample_indices", [0, 16, 32]),
+    ("sample_indices", [False, 16, 31]), ("sample_indices", [0, 0, 31]),
+    ("samples", []), ("samples", [{"index": 0}, {"index": 15}, {"index": 31}]),
+    ("action_horizon", 50), ("action_horizon", True), ("action_sequence_keys", ["actions"]),
+])
+def test_composed_samples_require_positive_bound_evidence_despite_passing_check(platform, field, value):
+    from .test_composed_asset_processing import pending as composed_pending
+    node, identifier, command, code, _ = composed_pending(platform)
+    evidence = code["automatic_preflight"]
+    data = evidence["plan"]["datasets"][0]
+    if field == "missing":
+        data.pop("sample_probe")
+    else:
+        data["sample_probe"][field] = value
+    evidence["plan_digest"] = canonical_digest(evidence["plan"])
+    checked = acknowledge(platform, node, identifier, command, code)
+    assert checked["status"] == "FAILED" and checked["error"]["code"] == "AGENT_PREFLIGHT_INVALID"
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "PREFLIGHT_NOT_READY"
+
+
+def test_submission_rechecks_composed_samples_in_a_previously_ready_preview(platform):
+    from .test_composed_asset_processing import pending as composed_pending
+    node, identifier, command, code, _ = composed_pending(platform)
+    assert acknowledge(platform, node, identifier, command, code)["status"] == "READY"
+    with platform.app.state.db.write() as session:
+        preview = session.get(Preview, identifier)
+        changed = copy.deepcopy(preview.code_snapshot)
+        plan = changed["automatic_preflight"]["plan"]
+        plan["datasets"][0].pop("sample_probe")
+        changed["automatic_preflight"]["plan_digest"] = canonical_digest(plan)
+        preview.code_snapshot = changed
+    response = submit(platform, identifier)
+    assert response.status_code == 409 and response.json()["error"]["code"] == "AGENT_PREFLIGHT_INVALID"
+
+
 def test_fps_warning_ack_is_ready_and_still_requires_exact_config_confirmation(platform):
     node, identifier, command, code = pending(platform)
     warning = fps_warning()

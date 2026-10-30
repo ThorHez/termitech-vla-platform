@@ -172,3 +172,30 @@
     padding: 10px 12px;
   }
 }
+
+@container dialog (max-width: 1100px) {
+  .asset-registration-layout.with-dataset-config {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 14px;
+  }
+
+  .with-dataset-config > .asset-registration-basics {
+    padding-right: 0;
+    border-right: 0;
+  }
+}
+
+@container dialog (max-width: 600px) {
+  .asset-register-modal .modal-heading,
+  .asset-register-modal .modal-body {
+    padding: 12px;
+  }
+
+  .asset-register-modal .modal-footer {
+    padding: 10px 12px;
+  }
+
+  .asset-registration-basics .form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

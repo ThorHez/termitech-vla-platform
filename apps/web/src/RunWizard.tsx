@@ -27,6 +27,9 @@ import { PreflightChecks } from './PreflightChecks';
 import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft';
 import type { ImageLayoutEdits } from './imageLayout';
 import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
+import { retryTrainingSnapshot, sameTrainingConfiguration } from './runRetry';
+import { TrainingGpuSelector } from './TrainingGpuSelector';
+import { requestedGpuError, requestedGpuSummary } from './trainingGpuSelection';
 import {
   applyTrainingTemplate,
   TRAINING_TEMPLATE_PROCESSING_MARKER,
@@ -44,6 +47,31 @@ import {
   defaultActionHorizon,
   restoreActionHorizonMode,
 } from './actionHorizonDefaults';
+import {
+  editTrainingParameter,
+  optionalTrainingParameter,
+  trainingParameterDefaults,
+  trainingParameterErrors,
+  trainingParameterGroups,
+  trainingParameterHint,
+} from './trainingParameters';
+import {
+  initializeVisibleTrainingParameters,
+  recipeNumericParameterDefaults,
+  recipeParameterCompatibility,
+  unsupportedTrainingParameters,
+  type TrainingParameterCompatibility,
+} from './trainingParameterInitialization';
+import {
+  TRAINING_RESOURCE_FIELDS,
+  applyResourceRecommendations,
+  automaticResourceRecommendation,
+  isTrainingResourceField,
+  recommendTrainingResources,
+  resourceRecommendationTracking,
+  setResourceRecommendationMode,
+  trainingResourceRecommendationHint,
+} from './trainingResourceRecommendations';
 import './training-wizard.css';
 import { PathAutocomplete, validTrainingEntrypoint } from './PathAutocomplete';
 import { recapRecipeConfiguration, stageParameterLabels, trainingStageLabels } from './recap';
@@ -86,6 +114,7 @@ interface RunWizardProps {
   close: () => void;
   initialNode?: string;
   initialTemplate?: string;
+  sourceRun?: Run;
 }
 
 export default function RunWizard(props: RunWizardProps) {
@@ -109,10 +138,57 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
   const data = useData();
   const draft = useTrainingDraft(props.userId);
   const [templateNotice, setTemplateNotice] = useState<{ name: string; issues: string[] }>();
+  const consumedSourceRun = useRef<string | undefined>(undefined);
+  const sourceImportInFlight = useRef(false);
+  const [sourceImport, setSourceImport] = useState<{
+    state: 'confirm' | 'loading' | 'error';
+    snapshot?: TrainingDraftSnapshot;
+    previous?: TrainingDraftSnapshot;
+    error?: Error;
+  }>();
+  const [sourceNotice, setSourceNotice] = useState<string>();
   const savedRevisionId = draft.initialSnapshot?.request.recipe_revision_id;
   const resources = [data.nodes, data.profiles, data.assets, data.templates];
   const resourceError = resources.find((resource) => resource.error)?.error;
   const ready = resources.every((resource) => resource.data !== undefined);
+  const loadSource = useCallback(
+    async (snapshot: TrainingDraftSnapshot) => {
+      if (sourceImportInFlight.current) return;
+      sourceImportInFlight.current = true;
+      setSourceImport({ state: 'loading', snapshot });
+      try {
+        await draft.replace(snapshot);
+        setSourceNotice(props.sourceRun?.name || '原训练');
+        setSourceImport(undefined);
+      } catch (cause) {
+        setSourceImport({
+          state: 'error',
+          snapshot,
+          error: cause instanceof Error ? cause : new Error(String(cause)),
+        });
+      } finally {
+        sourceImportInFlight.current = false;
+      }
+    },
+    [draft.replace, props.sourceRun?.name],
+  );
+  useEffect(() => {
+    const source = props.sourceRun;
+    if (!source || !draft.loaded || !ready || consumedSourceRun.current === source.id) return;
+    consumedSourceRun.current = source.id;
+    try {
+      const snapshot = retryTrainingSnapshot(source);
+      const previous = draft.snapshotRef.current || draft.initialSnapshot;
+      if (previous && !sameTrainingConfiguration(previous, snapshot))
+        setSourceImport({ state: 'confirm', snapshot, previous });
+      else void loadSource(snapshot);
+    } catch (cause) {
+      setSourceImport({
+        state: 'error',
+        error: cause instanceof Error ? cause : new Error(String(cause)),
+      });
+    }
+  }, [props.sourceRun?.id, draft.loaded, ready, draft.initialSnapshot, loadSource]);
   if (!draft.loaded || !ready)
     return (
       <Modal title="新建训练" close={props.close}>
@@ -126,6 +202,97 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
         )}
       </Modal>
     );
+  if (props.sourceRun && (consumedSourceRun.current !== props.sourceRun.id || sourceImport)) {
+    const importing = sourceImport?.state === 'loading' || !sourceImport;
+    return (
+      <Modal
+        title={sourceImport?.state === 'confirm' ? '确认载入原训练配置' : '载入原训练配置'}
+        subtitle={`来源：${props.sourceRun.name}`}
+        close={() => {
+          if (!importing) props.close();
+        }}
+        footer={
+          sourceImport?.state === 'confirm' ? (
+            <>
+              <button type="button" className="button outline" onClick={props.close}>
+                取消
+              </button>
+              <button
+                type="button"
+                className="button primary"
+                id="load-source-run-draft"
+                onClick={() => {
+                  if (sourceImport.snapshot) void loadSource(sourceImport.snapshot);
+                }}
+              >
+                载入并替换草稿
+              </button>
+            </>
+          ) : sourceImport?.state === 'error' ? (
+            <button type="button" className="button outline" onClick={props.close}>
+              关闭，保留原草稿
+            </button>
+          ) : undefined
+        }
+      >
+        {importing ? (
+          <p className="training-draft-loading">
+            <LoaderCircle size={16} className="spin" />
+            正在载入配置并保存到当前账号草稿…
+          </p>
+        ) : sourceImport?.state === 'error' ? (
+          <ErrorNotice
+            title="原配置未载入"
+            error={sourceImport.error}
+            hint="本页仍保留原草稿，未自动重试覆盖。请核对服务端草稿或先处理版本冲突。"
+          />
+        ) : (
+          <>
+            <p>当前账号已有未完成的训练草稿。载入下面的配置会替换它，请确认后继续。</p>
+            <dl className="detail-list">
+              <div>
+                <dt>将被替换的草稿</dt>
+                <dd>{sourceImport.previous?.request.name || '未命名训练'}</dd>
+              </div>
+              <div>
+                <dt>即将载入</dt>
+                <dd>{sourceImport.snapshot?.request.name}</dd>
+              </div>
+              <div>
+                <dt>计算机器</dt>
+                <dd>
+                  {data.nodes.data?.find(
+                    (node) => node.id === sourceImport.snapshot?.request.node_id,
+                  )?.name || sourceImport.snapshot?.request.node_id}
+                </dd>
+              </div>
+              <div>
+                <dt>初始模型</dt>
+                <dd>
+                  {data.assets.data?.find(
+                    (asset) => asset.id === sourceImport.snapshot?.request.inputs.model,
+                  )?.name ||
+                    sourceImport.snapshot?.request.inputs.model ||
+                    '无'}
+                </dd>
+              </div>
+              <div>
+                <dt>数据集与资源</dt>
+                <dd>
+                  {sourceImport.snapshot?.request.dataset_bindings?.length ||
+                    (sourceImport.snapshot?.request.inputs.dataset ? 1 : 0)}{' '}
+                  个数据集 · {sourceImport.snapshot?.request.gpu_count} 张 GPU
+                </dd>
+              </div>
+            </dl>
+            <p className="field-hint">
+              载入后从原初始模型重新训练，需重新预检、核对 config 并确认启动。原训练记录保持不变。
+            </p>
+          </>
+        )}
+      </Modal>
+    );
+  }
   return (
     <RestoredRunWizard
       key={`${draft.generation}:${savedRevisionId || ''}`}
@@ -134,6 +301,7 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
       initialDraft={draft.initialSnapshot}
       userId={props.userId}
       templateNotice={templateNotice}
+      sourceRunNotice={sourceNotice}
       onApplyTemplate={async (record) => {
         const applied = applyTrainingTemplate(record, {
           nodes: data.nodes.data || [],
@@ -183,6 +351,7 @@ function RunWizardContent({
   userId,
   templateNotice,
   onApplyTemplate,
+  sourceRunNotice,
 }: RunWizardProps & {
   initialDraft?: TrainingDraftSnapshot;
   initialSavedRevision?: RecipeRevision;
@@ -190,6 +359,7 @@ function RunWizardContent({
   userId: string;
   templateNotice?: { name: string; issues: string[] };
   onApplyTemplate: (record: TrainingTemplateRecord) => Promise<void>;
+  sourceRunNotice?: string;
 }) {
   const { nodes, assets, profiles, templates, refresh } = useData();
   const [step, setStep] = useState(initialDraft?.step || 0);
@@ -215,6 +385,17 @@ function RunWizardContent({
   const idempotencyKey = useRef(crypto.randomUUID());
   const recipeSelection = useRef<string | undefined>(undefined);
   const editedParameters = useRef(new Set<string>(initialDraft?.editedParameters));
+  const defaultedParameterKeys = useRef(new Set<string>());
+  const defaultFillNeedsSave = useRef(false);
+  const initializedParameterScope = useRef<string | undefined>(undefined);
+  const currentStep = useRef(step);
+  currentStep.current = step;
+  const [resolvedParameterSource, setResolvedParameterSource] = useState<{
+    scope: string;
+    defaults: Record<string, number>;
+    compatibility: TrainingParameterCompatibility;
+  }>();
+  const resolvedParameterSourceRef = useRef(resolvedParameterSource);
   const [imageLayoutEditVersion, setImageLayoutEditVersion] = useState(0);
   const imageLayoutEdits: ImageLayoutEdits = {
     has: (marker) => editedParameters.current.has(marker),
@@ -294,6 +475,27 @@ function RunWizardContent({
     ? template?.stages?.find((stage) => stage.id === request.training_stage)
     : undefined;
   const node = nodes.data?.find((item) => item.id === request.node_id);
+  const resourceRecommendations = recommendTrainingResources(request.gpu_count, node?.metrics);
+  const parameterScope = JSON.stringify([
+    request.node_id,
+    request.profile_id,
+    request.template_id,
+    advancedRecipe,
+    request.recipe,
+    request.recipe_revision_id,
+    request.training_stage,
+    request.auto_config?.finetune_mode,
+  ]);
+  const parameterCompatibility =
+    advancedRecipe && resolvedParameterSource?.scope === parameterScope
+      ? resolvedParameterSource.compatibility
+      : {};
+  const unusedParameters = unsupportedTrainingParameters(parameterCompatibility);
+  const emaDefaultDisabled = automaticMode
+    ? request.auto_config?.finetune_mode === 'lora'
+    : parameterCompatibility.emaDisabled === true;
+  const parameterContextRef = useRef({ parameterScope, metrics: node?.metrics });
+  parameterContextRef.current = { parameterScope, metrics: node?.metrics };
   const compatibleProfiles = useMemo(
     () =>
       profiles.data?.filter(
@@ -305,6 +507,30 @@ function RunWizardContent({
     [profiles.data, request.node_id, request.template_id, template?.runtime_adapter],
   );
   const parameterSpecs = specs(template);
+  const parameterSpecsRef = useRef(parameterSpecs);
+  parameterSpecsRef.current = parameterSpecs;
+  const parameterGroups = trainingParameterGroups(parameterSpecs);
+  const parameterIssues = [
+    ...trainingParameterErrors(
+      request.parameters,
+      parameterSpecs,
+      request.gpu_count,
+      advancedRecipe ? recipeDefaults : {},
+    ),
+    ...unusedParameters
+      .filter((key) => Object.hasOwn(request.parameters, key))
+      .map((key) => ({
+        key,
+        message: `此配方不使用${parameterSpecs[key]?.label || key}，请清除此项后重新预检。`,
+      })),
+  ];
+  const parameterBlocker =
+    step === 1 ? parameterIssues.map((issue) => issue.message).join(' ') : '';
+  const gpuSelectionError = requestedGpuError(
+    request,
+    node,
+    template?.min_gpus ?? (template?.id === 'smoke' ? 0 : 1),
+  );
   const stageParameterSpecs = specs(trainingStage);
   const inputRequirements = requiredInputs(trainingStage || template);
   const selectedProfile = compatibleProfiles.find((profile) => profile.id === request.profile_id);
@@ -326,6 +552,11 @@ function RunWizardContent({
     recipeEditorDraft,
   };
   draftSession.snapshotRef.current = snapshot;
+  useEffect(() => {
+    if (!defaultFillNeedsSave.current) return;
+    defaultFillNeedsSave.current = false;
+    draftSession.markEdited();
+  }, [request, draftSession.markEdited]);
   useEffect(() => {
     draftSession.changed();
   }, [
@@ -449,15 +680,19 @@ function RunWizardContent({
     initialDefaultsScope.current = modeScope;
     setActionHorizonMode('automatic');
     const local = ['openpi-sft', 'recap'].includes(request.template_id);
+    if (local && !advancedRecipe)
+      TRAINING_RESOURCE_FIELDS.forEach((key) =>
+        setResourceRecommendationMode(editedParameters.current, key, true),
+      );
     setRequest((value) => ({
       ...value,
-      parameters:
-        advancedRecipe && local
-          ? {}
-          : Object.fromEntries(
-              Object.entries(specs(template)).map(([key, rule]) => [key, rule.default ?? 1]),
-            ),
-      gpu_count: template?.id === 'smoke' ? 0 : Math.max(template?.min_gpus ?? 1, value.gpu_count),
+      parameters: local ? value.parameters : trainingParameterDefaults(specs(template)),
+      gpu_count:
+        value.requested_gpu_uuids !== undefined
+          ? value.requested_gpu_uuids.length
+          : template?.id === 'smoke'
+            ? 0
+            : Math.max(template?.min_gpus ?? 1, value.gpu_count),
       auto_config:
         local && !advancedRecipe ? value.auto_config || { ...DEFAULT_AUTO_CONFIG } : undefined,
       inputs: local ? value.inputs : {},
@@ -471,6 +706,72 @@ function RunWizardContent({
     // Reapply defaults only when the method or assembly mode changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [request.template_id, advancedRecipe, template?.id]);
+  useEffect(() => {
+    if (!hasLocalTraining || step >= 2 || initializedParameterScope.current === parameterScope)
+      return;
+    initializedParameterScope.current = parameterScope;
+    setRequest((value) => {
+      const resolvedSource = resolvedParameterSourceRef.current;
+      const source =
+        advancedRecipe && resolvedSource?.scope === parameterScope ? resolvedSource : undefined;
+      const initialized = initializeVisibleTrainingParameters(
+        value.parameters,
+        parameterSpecsRef.current,
+        {
+          recipeDefaults: source?.defaults,
+          compatibility: source?.compatibility,
+          resources: recommendTrainingResources(value.gpu_count, node?.metrics),
+          lora: !advancedRecipe && value.auto_config?.finetune_mode === 'lora',
+          defaultedKeys: defaultedParameterKeys.current,
+          edited: editedParameters.current,
+          phase: 'initial',
+        },
+      );
+      defaultedParameterKeys.current = initialized.defaultedKeys;
+      editedParameters.current = initialized.edited;
+      if (initialized.parameters !== value.parameters) defaultFillNeedsSave.current = true;
+      return initialized.parameters === value.parameters
+        ? value
+        : { ...value, parameters: initialized.parameters };
+    });
+    // Initialization boundaries deliberately exclude live CPU refresh and edits.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasLocalTraining, parameterScope, step]);
+  useEffect(() => {
+    // A generated preview is frozen. Resume resource following only after the
+    // user returns to configuration, without changing its approval underneath.
+    if (!hasLocalTraining || step >= 2 || busy || draftActionBusy) return;
+    const next = applyResourceRecommendations(
+      request.parameters,
+      editedParameters.current,
+      resourceRecommendations,
+    );
+    if (next === request.parameters) return;
+    draftSession.markEdited();
+    setRequest((value) => {
+      const parameters = applyResourceRecommendations(
+        value.parameters,
+        editedParameters.current,
+        recommendTrainingResources(value.gpu_count, node?.metrics),
+      );
+      return parameters === value.parameters ? value : { ...value, parameters };
+    });
+    // Include current values so a late schema/default read cannot overwrite an
+    // automatic value without being corrected on the next render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    hasLocalTraining,
+    advancedRecipe,
+    step,
+    busy,
+    draftActionBusy,
+    request.gpu_count,
+    request.parameters.fsdp_devices,
+    request.parameters.num_workers,
+    node?.id,
+    node?.metrics?.cpu_count,
+    node?.metrics?.available_cpu_count,
+  ]);
   useEffect(() => {
     setRequest((value) =>
       initialProfile.current && value.profile_id === initialProfile.current
@@ -494,7 +795,7 @@ function RunWizardContent({
     }
     if (recipeSelection.current === selection) return;
     recipeSelection.current = selection;
-    editedParameters.current.clear();
+    editedParameters.current = resourceRecommendationTracking(editedParameters.current);
     editedStageParameters.current.clear();
     entrypointEdited.current = false;
     datasetDefaultsScope.current = '';
@@ -515,7 +816,7 @@ function RunWizardContent({
       entrypoint: undefined,
       inputs: {},
       dataset_bindings: hasLocalTraining ? newDatasetBindings([]) : undefined,
-      parameters: advancedRecipe && hasLocalTraining ? {} : value.parameters,
+      parameters: value.parameters,
     }));
     setSelectedRecipeRevision(undefined);
     setRecipeDirty(false);
@@ -529,9 +830,7 @@ function RunWizardContent({
         ? value
         : {
             ...value,
-            stage_config: Object.fromEntries(
-              Object.entries(specs(trainingStage)).map(([key, rule]) => [key, rule.default ?? 1]),
-            ),
+            stage_config: trainingParameterDefaults(specs(trainingStage)),
           },
     );
   }, [trainingStage]);
@@ -561,7 +860,22 @@ function RunWizardContent({
     if (key === 'node_id' || key === 'profile_id' || key === 'template_id')
       initialProfile.current = undefined;
     setConfirmedConfigSha256(undefined);
-    setRequest((previous) => ({ ...previous, [key]: value }));
+    setPreviewId('');
+    setCreatedPreview(undefined);
+    setRequest((previous) => ({
+      ...previous,
+      [key]: value,
+      ...(key === 'node_id' && value !== previous.node_id
+        ? { requested_gpu_uuids: undefined, gpu_count: Math.max(minGpus, previous.gpu_count) }
+        : {}),
+    }));
+  };
+  const updateGpuSelection = (selection: Pick<RunRequest, 'gpu_count' | 'requested_gpu_uuids'>) => {
+    draftSession.markEdited();
+    setConfirmedConfigSha256(undefined);
+    setPreviewId('');
+    setCreatedPreview(undefined);
+    setRequest((previous) => ({ ...previous, ...selection }));
   };
   const toggleRecipeMode = (enabled: boolean) => {
     draftSession.markEdited();
@@ -591,21 +905,40 @@ function RunWizardContent({
       const current = requestRef.current;
       if (current.recipe !== recipe || current.recipe_revision_id !== revisionId) return;
       setRecipeDefaults(defaults);
-      setRequest((value) => ({
-        ...value,
-        parameters: {
-          ...value.parameters,
-          ...Object.fromEntries(
-            Object.entries(defaults).filter(([key]) => !editedParameters.current.has(key)),
-          ),
-        },
-      }));
     },
     [],
   );
   const applyStageRecipeDefaults = useCallback(
     (detail: RecipeDetail, recipe: string, revisionId?: string) => {
       const current = requestRef.current;
+      if (current.recipe !== recipe || current.recipe_revision_id !== revisionId) return;
+      const compatibility = recipeParameterCompatibility(detail);
+      const defaults = recipeNumericParameterDefaults(detail);
+      const context = parameterContextRef.current;
+      const source = { scope: context.parameterScope, defaults, compatibility };
+      resolvedParameterSourceRef.current = source;
+      setResolvedParameterSource(source);
+      if (currentStep.current < 2)
+        setRequest((value) => {
+          const initialized = initializeVisibleTrainingParameters(
+            value.parameters,
+            parameterSpecsRef.current,
+            {
+              recipeDefaults: defaults,
+              compatibility,
+              resources: recommendTrainingResources(value.gpu_count, context.metrics),
+              defaultedKeys: defaultedParameterKeys.current,
+              edited: editedParameters.current,
+              phase: 'resolved',
+            },
+          );
+          defaultedParameterKeys.current = initialized.defaultedKeys;
+          editedParameters.current = initialized.edited;
+          if (initialized.parameters !== value.parameters) defaultFillNeedsSave.current = true;
+          return initialized.parameters === value.parameters
+            ? value
+            : { ...value, parameters: initialized.parameters };
+        });
       if (
         current.template_id !== 'recap' ||
         current.training_stage !== request.training_stage ||
@@ -677,20 +1010,18 @@ function RunWizardContent({
         ...value,
         recipe,
         recipe_revision_id: revision?.id,
-        parameters: {},
+        parameters: value.parameters,
         dataset_bindings: value.dataset_bindings,
         stage_config:
           request.template_id === 'recap'
-            ? Object.fromEntries(
-                Object.entries(stageParameterSpecs).map(([key, rule]) => [key, rule.default ?? 1]),
-              )
+            ? trainingParameterDefaults(stageParameterSpecs)
             : undefined,
       }));
     }
   };
   const selectStage = (stage: TrainingStage | undefined) => {
     draftSession.markEdited();
-    editedParameters.current.clear();
+    editedParameters.current = resourceRecommendationTracking(editedParameters.current);
     editedStageParameters.current.clear();
     entrypointEdited.current = false;
     datasetDefaultsScope.current = '';
@@ -717,7 +1048,7 @@ function RunWizardContent({
             finetune_mode: stage === 'value' ? 'full' : value.auto_config.finetune_mode,
           }
         : undefined,
-      parameters: advancedRecipe ? {} : value.parameters,
+      parameters: value.parameters,
     }));
   };
   const beginPreview = async () => {
@@ -739,6 +1070,7 @@ function RunWizardContent({
         stage_config: isRecap ? request.stage_config : undefined,
         parameters: request.parameters,
         gpu_count: request.gpu_count,
+        requested_gpu_uuids: request.requested_gpu_uuids,
         auto_config: automaticMode ? request.auto_config : undefined,
         recipe_revision_id: advancedRecipe ? request.recipe_revision_id : undefined,
         recipe: automaticMode ? undefined : request.recipe?.trim(),
@@ -819,6 +1151,27 @@ function RunWizardContent({
       wide
       footer={
         <>
+          {parameterBlocker && (
+            <div className="wizard-processing-blocker" id="training-parameter-blocker" role="alert">
+              <XCircle size={16} aria-hidden="true" />
+              <span>{parameterBlocker}</span>
+              <button
+                type="button"
+                className="button outline small"
+                onClick={() =>
+                  document.getElementById(`training-parameter-${parameterIssues[0]?.key}`)?.focus()
+                }
+              >
+                检查训练参数
+              </button>
+            </div>
+          )}
+          {step === 1 && gpuSelectionError && (
+            <div className="wizard-processing-blocker" id="training-gpu-blocker" role="alert">
+              <XCircle size={16} aria-hidden="true" />
+              <span>{gpuSelectionError}</span>
+            </div>
+          )}
           {processingBlocker && (
             <div
               className="wizard-processing-blocker"
@@ -875,12 +1228,22 @@ function RunWizardContent({
               type="submit"
               form="run-wizard-form"
               formNoValidate={step === 0}
-              aria-describedby={processingBlocker ? 'training-processing-blocker' : undefined}
+              aria-describedby={
+                [
+                  processingBlocker && 'training-processing-blocker',
+                  parameterBlocker && 'training-parameter-blocker',
+                  gpuSelectionError && 'training-gpu-blocker',
+                ]
+                  .filter(Boolean)
+                  .join(' ') || undefined
+              }
               disabled={
                 busy ||
                 draftActionBusy ||
                 (step === 1 && recipeReading) ||
                 !!actionHorizonBlocker ||
+                !!parameterBlocker ||
+                (step === 1 && !!gpuSelectionError) ||
                 (step === 1 && hasLocalTraining && !processorsValid)
               }
             >
@@ -914,6 +1277,12 @@ function RunWizardContent({
           </div>
         ))}
       </div>
+      {sourceRunNotice && (
+        <div className="inline-note" role="status">
+          已载入“{sourceRunNotice}
+          ”的训练设置。默认使用原初始模型创建新训练，请核对资源、重新预检并确认 config。
+        </div>
+      )}
       <section className="training-draft-status" aria-label="训练配置草稿">
         <div className="training-draft-summary" role="status">
           <strong>{draftStatusText}</strong>
@@ -1076,6 +1445,14 @@ function RunWizardContent({
               return;
             }
             if (step === 1) {
+              if (gpuSelectionError) {
+                setError(new Error(gpuSelectionError));
+                return;
+              }
+              if (parameterIssues.length) {
+                setError(new Error(parameterIssues.map((issue) => issue.message).join(' ')));
+                return;
+              }
               if (actionHorizonErrors.length) {
                 setError(new Error(actionHorizonErrors.join(' ')));
                 return;
@@ -1743,57 +2120,209 @@ function RunWizardContent({
               <div className="form-section-title">
                 <Cpu size={16} />
                 <h3>训练参数</h3>
-                <span>
-                  {advancedRecipe ? '从所选配方带入，可为本次训练覆盖' : '模板已填入推荐默认值'}
-                </span>
+                <span>参数已填入初始值，可直接修改后生成 config</span>
               </div>
-              <div className="form-grid parameters">
-                {Object.entries(parameterSpecs).map(([key, spec]) => (
-                  <Field
-                    key={key}
-                    label={spec.label || key}
-                    required
-                    hint={
-                      advancedRecipe
-                        ? Object.hasOwn(recipeDefaults, key)
-                          ? `配方值：${recipeDefaults[key]}${editedParameters.current.has(key) ? '；当前为本次覆盖' : ''}`
-                          : '无法静态读取，请明确填写本次训练值。'
-                        : undefined
-                    }
+              <div className="training-parameter-sections">
+                {parameterGroups.map((group) => (
+                  <section
+                    className="training-parameter-section"
+                    key={group.id}
+                    aria-label={group.title}
                   >
-                    <input
-                      type="number"
-                      required
-                      min={spec.min ?? spec.minimum}
-                      max={spec.max ?? spec.maximum}
-                      step={spec.type === 'integer' ? 1 : 'any'}
-                      value={
-                        Number.isFinite(request.parameters[key]) ? request.parameters[key] : ''
-                      }
-                      onChange={(event) => {
-                        editedParameters.current.add(key);
-                        update('parameters', {
-                          ...request.parameters,
-                          [key]: event.target.value === '' ? NaN : Number(event.target.value),
-                        });
-                      }}
-                    />
-                  </Field>
+                    <h4>{group.title}</h4>
+                    <div className="form-grid parameters">
+                      {group.entries.map(([key, spec]) => (
+                        <Field
+                          key={key}
+                          label={spec.label || key}
+                          required={
+                            !unusedParameters.includes(key) && !optionalTrainingParameter(spec)
+                          }
+                          hint={
+                            isTrainingResourceField(key)
+                              ? trainingResourceRecommendationHint(key, resourceRecommendations)
+                              : trainingParameterHint(
+                                  key,
+                                  spec,
+                                  advancedRecipe,
+                                  recipeDefaults,
+                                  editedParameters.current.has(key) &&
+                                    Object.hasOwn(request.parameters, key),
+                                )
+                          }
+                        >
+                          {unusedParameters.includes(key) ? (
+                            <div
+                              className="training-parameter-unused"
+                              id={`training-parameter-unused-${key}`}
+                            >
+                              <span>此配方不使用</span>
+                              {Object.hasOwn(request.parameters, key) && (
+                                <>
+                                  <code>已保存值：{String(request.parameters[key])}</code>
+                                  <button
+                                    type="button"
+                                    className="button outline small"
+                                    id={`training-clear-unsupported-${key}`}
+                                    onClick={() => {
+                                      defaultedParameterKeys.current.delete(key);
+                                      editedParameters.current.add(key);
+                                      const parameters = { ...request.parameters };
+                                      delete parameters[key];
+                                      update('parameters', parameters);
+                                    }}
+                                  >
+                                    清除此项
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          ) : (
+                            <>
+                              {key === 'ema_decay' && emaDefaultDisabled && (
+                                <div className="training-ema-choice">
+                                  <input
+                                    type="checkbox"
+                                    id="training-ema-enabled"
+                                    aria-label="开启 EMA"
+                                    checked={Object.hasOwn(request.parameters, 'ema_decay')}
+                                    onChange={(event) => {
+                                      defaultedParameterKeys.current.delete('ema_decay');
+                                      editedParameters.current.add('ema_decay');
+                                      const parameters = { ...request.parameters };
+                                      if (event.target.checked) parameters.ema_decay = 0.99;
+                                      else delete parameters.ema_decay;
+                                      update('parameters', parameters);
+                                    }}
+                                  />
+                                  <span>
+                                    {Object.hasOwn(request.parameters, 'ema_decay')
+                                      ? '已手动开启 EMA'
+                                      : 'EMA 默认关闭，可手动开启'}
+                                  </span>
+                                </div>
+                              )}
+                              {!(
+                                key === 'ema_decay' &&
+                                emaDefaultDisabled &&
+                                !Object.hasOwn(request.parameters, 'ema_decay')
+                              ) && (
+                                <input
+                                  id={`training-parameter-${key}`}
+                                  type="number"
+                                  required={!optionalTrainingParameter(spec)}
+                                  min={spec.min ?? spec.minimum}
+                                  max={spec.max ?? spec.maximum}
+                                  step={spec.type === 'integer' ? 1 : 'any'}
+                                  value={
+                                    Number.isFinite(request.parameters[key])
+                                      ? request.parameters[key]
+                                      : ''
+                                  }
+                                  aria-invalid={
+                                    parameterIssues.some((issue) => issue.key === key) || undefined
+                                  }
+                                  aria-describedby={
+                                    parameterIssues.some((issue) => issue.key === key)
+                                      ? `training-parameter-error-${key}`
+                                      : undefined
+                                  }
+                                  onChange={(event) => {
+                                    defaultedParameterKeys.current.delete(key);
+                                    editedParameters.current.add(key);
+                                    if (isTrainingResourceField(key))
+                                      setResourceRecommendationMode(
+                                        editedParameters.current,
+                                        key,
+                                        false,
+                                      );
+                                    update(
+                                      'parameters',
+                                      editTrainingParameter(
+                                        request.parameters,
+                                        key,
+                                        event.target.value,
+                                        spec,
+                                      ),
+                                    );
+                                  }}
+                                />
+                              )}
+                            </>
+                          )}
+                          {isTrainingResourceField(key) && (
+                            <div
+                              className="training-resource-recommendation"
+                              id={`training-resource-recommendation-${key}`}
+                            >
+                              <span>
+                                {resourceRecommendations[key] === undefined
+                                  ? '填写有效 GPU 数量后显示推荐'
+                                  : `推荐值：${resourceRecommendations[key]}`}
+                                {' · '}
+                                {automaticResourceRecommendation(editedParameters.current, key)
+                                  ? '自动跟随'
+                                  : Object.hasOwn(request.parameters, key)
+                                    ? '手动保留'
+                                    : '空值沿用配置'}
+                              </span>
+                              <button
+                                type="button"
+                                className="button outline small"
+                                id={`training-use-recommendation-${key}`}
+                                aria-label={`使用${spec.label || key}推荐值`}
+                                disabled={
+                                  busy ||
+                                  draftActionBusy ||
+                                  resourceRecommendations[key] === undefined ||
+                                  automaticResourceRecommendation(editedParameters.current, key)
+                                }
+                                onClick={() => {
+                                  setResourceRecommendationMode(
+                                    editedParameters.current,
+                                    key,
+                                    true,
+                                  );
+                                  update(
+                                    'parameters',
+                                    applyResourceRecommendations(
+                                      request.parameters,
+                                      editedParameters.current,
+                                      resourceRecommendations,
+                                    ),
+                                  );
+                                }}
+                              >
+                                {automaticResourceRecommendation(editedParameters.current, key)
+                                  ? '已使用推荐'
+                                  : '使用推荐值'}
+                              </button>
+                            </div>
+                          )}
+                          {parameterIssues.some((issue) => issue.key === key) && (
+                            <span
+                              className="training-parameter-error"
+                              id={`training-parameter-error-${key}`}
+                            >
+                              {parameterIssues
+                                .filter((issue) => issue.key === key)
+                                .map((issue) => issue.message)
+                                .join(' ')}
+                            </span>
+                          )}
+                        </Field>
+                      ))}
+                      {group.id === 'resources' && (
+                        <TrainingGpuSelector
+                          request={request}
+                          node={node}
+                          minimum={minGpus}
+                          onChange={updateGpuSelection}
+                        />
+                      )}
+                    </div>
+                  </section>
                 ))}
-                <Field
-                  label="申请 GPU 数量"
-                  hint={minGpus === 0 ? '测试模板支持 0 GPU。' : '资源不足时将排队等待。'}
-                >
-                  <input
-                    type="number"
-                    required
-                    min={minGpus}
-                    max={Math.max(minGpus, node?.gpus?.length || 0)}
-                    step={1}
-                    value={request.gpu_count}
-                    onChange={(event) => update('gpu_count', Number(event.target.value))}
-                  />
-                </Field>
               </div>
             </>
           )}
@@ -1972,7 +2501,9 @@ function RunWizardContent({
             )}
             <div>
               <dt>申请 GPU</dt>
-              <dd>{request.gpu_count} 张</dd>
+              <dd>
+                {request.gpu_count} 张 · {requestedGpuSummary(request.requested_gpu_uuids, node)}
+              </dd>
             </div>
             {hasLocalTraining && (
               <>

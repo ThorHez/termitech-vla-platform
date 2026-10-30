@@ -19,6 +19,7 @@ from .dataset_inspections import expire_pending as expire_dataset_inspections
 from .recipe_writeback import pending_for_checkout
 from .remote_models import RemoteDeployment
 from .settings import Settings
+from .gpu_selection import requested_gpu_uuids
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +103,27 @@ def tick(db: Database, settings: Settings) -> int:
                     run.error = {"code": "INPUT_UNAVAILABLE", "message": "An input asset is no longer available"}
                     run.queue_reason = None
                     continue
-                if run.gpu_count > len(free):
-                    run.queue_reason = "GPU_UNAVAILABLE"
+                try:
+                    requested = requested_gpu_uuids(run.requested_gpu_uuids, run.gpu_count)
+                except ValueError:
+                    run.queue_reason = "REQUESTED_GPU_INVALID"
                     continue
-                chosen = free[:run.gpu_count]
+                if run.code_expectation.get("requested_gpu_uuids") != requested:
+                    run.queue_reason = "REQUESTED_GPU_INVALID"
+                    continue
+                if requested is not None:
+                    if not set(requested) <= {gpu["uuid"] for gpu in node.gpus}:
+                        run.queue_reason = "REQUESTED_GPU_MISSING"
+                        continue
+                    if not set(requested) <= set(free):
+                        run.queue_reason = "REQUESTED_GPU_UNAVAILABLE"
+                        continue
+                    chosen = requested
+                else:
+                    if run.gpu_count > len(free):
+                        run.queue_reason = "GPU_UNAVAILABLE"
+                        continue
+                    chosen = free[:run.gpu_count]
                 attempt = Attempt(id=uid(), run_id=run.id, node_id=node_id, number=1,
                                   execution_token=secrets.token_hex(32), state="STARTING",
                                   created_at=now(), gpu_uuids=chosen, last_event_seq=0)
@@ -129,7 +147,7 @@ def tick(db: Database, settings: Settings) -> int:
                     **({"recipe_definition": run.code_expectation["recipe_definition"], "node_id": node_id} if run.code_expectation.get("recipe_definition") else {}),
                 })
                 run.state, run.queue_reason, run.updated_at = "STARTING", None, now()
-                free = free[run.gpu_count:]
+                free = [uuid for uuid in free if uuid not in set(chosen)]
                 dispatched += 1
     with db.write() as session:
         expire_path_queries(session)

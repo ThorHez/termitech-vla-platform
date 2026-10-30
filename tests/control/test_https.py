@@ -22,6 +22,7 @@ from vla_control.transport_security import TransportSecurityMiddleware, public_o
 
 PASSWORD = "https-isolated-test-password"
 ORIGIN = "https://controller.example:8443"
+LAN_ORIGIN = "https://192.168.20.15:9443"
 
 
 @pytest.fixture
@@ -79,6 +80,21 @@ def test_unsafe_public_origins_are_rejected(url):
         Settings(enrollment_token="separate", public_url=url).validate()
 
 
+@pytest.mark.parametrize("aliases", [
+    " ", ",", "https://192.168.20.15:8443,", ",https://192.168.20.15:8443",
+    "http://192.168.20.15:8443", "https://*.example.com", "https://example.com/app",
+    "https://admin:secret@example.com", "https://example.com:0", "https://example.com?x=y",
+])
+def test_unsafe_public_url_aliases_are_rejected(aliases):
+    with pytest.raises(ValueError, match="VLA_PUBLIC_URL_ALIASES"):
+        Settings(enrollment_token="separate", public_url=ORIGIN, public_url_aliases=aliases).validate()
+
+
+def test_public_url_aliases_require_primary_origin():
+    with pytest.raises(ValueError, match="VLA_PUBLIC_URL_ALIASES requires VLA_PUBLIC_URL"):
+        Settings(enrollment_token="separate", public_url_aliases=LAN_ORIGIN).validate()
+
+
 @pytest.mark.parametrize("value", ["*", "0.0.0.0/0", "::/0", "127.0.0.1,*", "127.0.0.1,", "example.com"])
 def test_proxy_trust_requires_explicit_ip_or_bounded_network(value):
     with pytest.raises(ValueError, match="VLA_FORWARDED_ALLOW_IPS"):
@@ -86,13 +102,14 @@ def test_proxy_trust_requires_explicit_ip_or_bounded_network(value):
 
 
 def test_transport_environment_is_explicit(monkeypatch):
-    values = {"VLA_PUBLIC_URL": ORIGIN, "VLA_REQUIRE_HTTPS": "true",
+    values = {"VLA_PUBLIC_URL": ORIGIN, "VLA_PUBLIC_URL_ALIASES": LAN_ORIGIN, "VLA_REQUIRE_HTTPS": "true",
               "VLA_FORWARDED_ALLOW_IPS": "127.0.0.1,::1,10.30.0.0/24",
               "VLA_TLS_CERT_FILE": "/private/certificate.pem", "VLA_TLS_KEY_FILE": "/private/key.pem"}
     for key, value in values.items():
         monkeypatch.setenv(key, value)
     settings = Settings.from_env()
     assert settings.public_url == ORIGIN and settings.require_https
+    assert settings.public_url_aliases == LAN_ORIGIN
     assert settings.forwarded_allow_ips == values["VLA_FORWARDED_ALLOW_IPS"]
     assert settings.tls_cert_file == values["VLA_TLS_CERT_FILE"]
     assert settings.tls_key_file == values["VLA_TLS_KEY_FILE"]
@@ -217,6 +234,58 @@ def test_duplicate_hosts_and_forwarded_host_are_not_trusted(secure_app):
                          ("Host", "evil.example")]).status_code == 400
         assert client.get("/api/v1/auth/me", headers={"Host": "evil.example",
                          "X-Forwarded-Host": "controller.example:8443"}).status_code == 400
+
+
+@pytest.fixture
+def alias_app(tmp_path):
+    settings = Settings(database_url="sqlite:///" + str(tmp_path / "aliases.sqlite"),
+                        enrollment_token="separate-agent-credential", scheduler_enabled=False,
+                        public_url=ORIGIN, public_url_aliases=f" {LAN_ORIGIN}, https://127.0.0.1:8443 ",
+                        require_https=True)
+    app = create_app(settings)
+    app.state.auth.create_user("admin", PASSWORD, "admin")
+    yield app
+    app.state.remote_manager.close()
+    app.state.db.close()
+
+
+def test_explicit_aliases_accept_only_their_own_hostname_and_https_port(alias_app):
+    with TestClient(alias_app, base_url=ORIGIN) as client:
+        for host in ("controller.example:8443", "192.168.20.15:9443", "127.0.0.1:8443"):
+            response = client.get("/api/v1/auth/me", headers={"Host": host})
+            assert response.status_code == 401 and response.json()["error"]["code"] == "UNAUTHORIZED"
+        for host in ("192.168.20.15:8443", "controller.example:9443", "127.0.0.1:9443",
+                     "192.168.20.16:9443", "192.168.20.15.evil:9443"):
+            response = client.get("/api/v1/auth/me", headers={"Host": host})
+            assert response.status_code == 400 and response.json()["error"]["code"] == "HOST_REJECTED"
+        response = client.get("/api/v1/auth/me", headers=[("Host", "192.168.20.15:9443"),
+                                                          ("Host", "controller.example:8443")])
+        assert response.status_code == 400
+
+
+def test_alias_login_keeps_secure_cookie_csrf_and_same_origin_boundaries(alias_app):
+    with TestClient(alias_app, base_url=LAN_ORIGIN) as client:
+        response = login(client, headers={"Origin": LAN_ORIGIN})
+        assert response.status_code == 200, response.text
+        cookie = response.headers["set-cookie"]
+        assert "Secure" in cookie and "HttpOnly" in cookie and "SameSite=strict" in cookie
+        assert "domain=" not in cookie.lower()
+        assert client.get("/api/v1/auth/me").status_code == 200
+        assert client.post("/api/v1/auth/logout", headers={"Origin": LAN_ORIGIN}).status_code == 403
+        token = response.json()["csrf_token"]
+        for other_origin in (ORIGIN, "https://127.0.0.1:8443", "https://evil.example"):
+            rejected = client.post("/api/v1/auth/logout", headers={"Origin": other_origin, "X-CSRF-Token": token})
+            assert rejected.status_code == 403 and rejected.json()["error"]["code"] == "ORIGIN_REJECTED"
+        assert client.post("/api/v1/auth/logout", headers={"Origin": LAN_ORIGIN,
+                                                          "X-CSRF-Token": token}).status_code == 204
+
+
+def test_alias_http_navigation_still_redirects_to_primary_and_login_is_rejected(alias_app):
+    with TestClient(alias_app, base_url="http://192.168.20.15") as client:
+        response = client.get("/assets?from=lan", follow_redirects=False)
+        assert response.status_code == 308 and response.headers["location"] == ORIGIN + "/assets?from=lan"
+        rejected = login(client)
+        assert rejected.status_code == 426 and rejected.json()["error"]["code"] == "HTTPS_REQUIRED"
 
 
 def test_browser_redirect_uses_only_canonical_origin(secure_app):

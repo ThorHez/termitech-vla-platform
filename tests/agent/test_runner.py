@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from vla_agent import runner
+from vla_agent import output_isolation, runner
 from vla_agent.main import Agent
 from vla_agent.safety import identity_matches
 from vla_agent.state import State, TERMINAL_STATES
@@ -180,7 +180,7 @@ def test_runner_flushes_committed_artifact_before_terminal_without_masking_proce
     output = Path(config["output_root"]) / payload["attempt_id"]
     state.create_attempt(payload, str(output))
     monkeypatch.setattr(runner, "validate_local_inputs", lambda *_: (profile, {}))
-    monkeypatch.setattr(runner, "git", lambda *_: str(agent_fixture["repo"]).encode())
+    monkeypatch.setattr(output_isolation, "git", lambda *_: str(agent_fixture["repo"]).encode())
 
     def capture(*args, **kwargs):
         if len(args) > 2:

@@ -1,7 +1,8 @@
 import { useState } from 'react';
-import { Copy, Download } from 'lucide-react';
+import { Copy, Download, FileCode2 } from 'lucide-react';
 import { configurationConfirmed, generatedConfigAvailable } from './trainingConfiguration';
 import type { GeneratedTrainingConfig } from './types';
+import './generated-config-review.css';
 
 export function GeneratedConfigReview({
   config,
@@ -33,12 +34,17 @@ export function GeneratedConfigReview({
     URL.revokeObjectURL(url);
   };
   return (
-    <section className="generated-config-review" aria-label="检查本次训练 config">
+    <section
+      className={`generated-config-review${readOnly ? ' generated-config-readonly' : ''}`}
+      aria-label={readOnly ? '本次训练 config' : '检查本次训练 config'}
+    >
       <div className="generated-config-heading">
         <div>
           <h3>{readOnly ? '本次训练 config' : '检查本次训练 config'}</h3>
           <p>
-            以下代码由 Agent 根据本次实际解析结果生成。请核对模型、数据处理、资产路径和训练参数。
+            {readOnly
+              ? '由 Agent 根据本次实际解析结果生成，保留模型、数据处理、资产路径和训练参数。'
+              : '请核对 Agent 生成的模型、数据处理、资产路径和训练参数。'}
           </p>
         </div>
         <div className="generated-config-actions">
@@ -61,25 +67,39 @@ export function GeneratedConfigReview({
           </button>
         </div>
       </div>
-      <pre className="generated-config-source" tabIndex={0}>
-        <code>{config.source}</code>
-      </pre>
-      <p className="generated-config-digest">
-        SHA-256：<code>{config.sha256}</code>
-      </p>
-      {!readOnly && (
-        <label className="generated-config-confirmation">
-          <input
-            type="checkbox"
-            checked={configurationConfirmed(config, confirmedSha256)}
-            onChange={(event) => onConfirm?.(event.target.checked ? config.sha256 : undefined)}
-          />
-          <span>已核对本次 config，确认启动训练</span>
-        </label>
-      )}
-      {!readOnly && (
-        <p className="field-hint">修改配置或重新预检后需要重新确认；启动前会再次核对代码与资产。</p>
-      )}
+      <div className="generated-config-body">
+        <div className="generated-config-code">
+          <div className="generated-config-file">
+            <span>
+              <FileCode2 size={14} aria-hidden="true" />
+              training_config.py
+            </span>
+            <span>Python</span>
+          </div>
+          <pre className="generated-config-source" tabIndex={0} aria-label="Python 配置代码">
+            <code>{config.source}</code>
+          </pre>
+        </div>
+        <p className="generated-config-digest">
+          <span>SHA-256</span>
+          <code>{config.sha256}</code>
+        </p>
+        {!readOnly && (
+          <label className="generated-config-confirmation">
+            <input
+              type="checkbox"
+              checked={configurationConfirmed(config, confirmedSha256)}
+              onChange={(event) => onConfirm?.(event.target.checked ? config.sha256 : undefined)}
+            />
+            <span>已核对本次 config，确认启动训练</span>
+          </label>
+        )}
+        {!readOnly && (
+          <p className="field-hint">
+            修改配置或重新预检后需要重新确认；启动前会再次核对代码与资产。
+          </p>
+        )}
+      </div>
     </section>
   );
 }

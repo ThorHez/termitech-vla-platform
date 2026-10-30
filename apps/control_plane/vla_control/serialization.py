@@ -74,7 +74,7 @@ def attempt_dict(attempt):
 
 def run_dict(session, run):
     result = {key: getattr(run, key) for key in ("id", "name", "node_id", "profile_id", "template_id",
-              "state", "created_at", "updated_at", "finished_at", "inputs", "parameters", "gpu_count",
+              "state", "created_at", "updated_at", "finished_at", "inputs", "parameters", "gpu_count", "requested_gpu_uuids",
               "code_expectation", "queue_reason", "error")}
     attempts = list(session.scalars(select(Attempt).where(Attempt.run_id == run.id).order_by(Attempt.number)))
     result["recipe"] = run.code_expectation.get("recipe")

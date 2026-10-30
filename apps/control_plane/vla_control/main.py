@@ -514,6 +514,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expectation["config_confirmed_at"] = created
             if "dataset_profiles" in data:
                 expectation["dataset_profiles"] = deepcopy(data["dataset_profiles"])
+            if data.get("requested_gpu_uuids") is not None:
+                expectation["requested_gpu_uuids"] = deepcopy(data["requested_gpu_uuids"])
             run = Run(id=uid(), **run_fields, state="QUEUED", code_expectation=expectation,
                       created_at=created, updated_at=created, queue_reason="AWAITING_SCHEDULER")
             session.add(run)

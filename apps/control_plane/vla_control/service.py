@@ -9,6 +9,7 @@ from vla_adapters.dataset_bindings import binding_inputs, normalize_dataset_bind
 from vla_adapters.entrypoints import validate_entrypoint
 from vla_adapters.recipe_definitions import recipe_parameters, resolve_definition
 from vla_adapters.recap import runtime_adapter_for, validate_training_stage
+from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_protocol import canonical_digest
 from vla_protocol.config_preview import validate_generated_config
 
@@ -96,8 +97,21 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
         raise APIError(422, "GPU_REQUIRED", "The selected template requires a GPU")
     if data["gpu_count"] > len(node.gpus):
         raise APIError(422, "GPU_CAPACITY_EXCEEDED", "Requested GPU count exceeds this node's reported devices")
+    from .gpu_selection import requested_gpu_uuids
+    try:
+        selected = requested_gpu_uuids(data.get("requested_gpu_uuids"), data["gpu_count"],
+                                       [gpu["uuid"] for gpu in node.gpus])
+    except ValueError as exc:
+        message = str(exc)
+        raise APIError(422, message.split(":", 1)[0], message.split(":", 1)[1].strip()) from exc
+    if selected is None:
+        data.pop("requested_gpu_uuids", None)
+    else:
+        data["requested_gpu_uuids"] = selected
     try:
         parameters = validate_parameters(template["id"], {**recipe_parameters(data.get("recipe_definition")), **data["parameters"]})
+        from vla_adapters.runtime_options import validate_runtime_parameter_relations
+        validate_runtime_parameter_relations(parameters, gpu_count=data["gpu_count"])
     except ValueError as exc:
         raise APIError(422, "INVALID_PARAMETERS", str(exc)) from exc
     if data["gpu_count"] and parameters["batch_size"] % data["gpu_count"]:
@@ -143,8 +157,8 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
     return node, profile, parameters
 
 
-AUTOMATIC_PREFLIGHT_CHECKS = {"recipe_configuration", "data_contract", "norm_contract", "model_checkpoint",
-                              "training_entrypoint", "training_cache", "output_storage", "gpu_capacity", "runtime", "local_paths",
+AUTOMATIC_PREFLIGHT_CHECKS = {"recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint",
+                              "training_entrypoint", "training_cache", "output_isolation", "output_storage", "gpu_capacity", "runtime", "local_paths",
                               "code_version", "adapter"}
 CACHE_PATH_KEYS = {"HF_DATASETS_CACHE", "HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_CACHE",
                    "TRANSFORMERS_CACHE", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME",
@@ -409,6 +423,10 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
     node = session.get(Node, request["node_id"])
     if node is None or not training_cache_evidence_valid(plan.get("training_cache"), datasets, node.roots):
         return {"code": "AGENT_PREFLIGHT_INVALID", "message": "Agent 自动预检未记录完整训练缓存与逐个数据集构建检查，请更新 Agent 后重新预检"}
+    try:
+        validate_sample_evidence(plan)
+    except ValueError:
+        return {"code": "AGENT_PREFLIGHT_INVALID", "message": "Agent 真实样本预检证据不完整或与本次组合配置不一致，请更新 Agent 后重新预检"}
     generated = plan.get("generated_config")
     if generated is None:
         return {"code": "AGENT_CONFIG_PREVIEW_UNSUPPORTED", "message": "Agent 未生成可核对的 Python config，请更新 Agent 后重新预检"}

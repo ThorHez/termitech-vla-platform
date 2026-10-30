@@ -4,6 +4,7 @@ import {
   type TrainingDraftSnapshot,
 } from './trainingDraft';
 import type { Asset, JsonObject, Node, Profile } from './types';
+import { requestedGpuError } from './trainingGpuSelection';
 
 export const TRAINING_TEMPLATE_PROCESSING_MARKER = 'training_template.reuse_processing';
 
@@ -124,6 +125,12 @@ export function applyTrainingTemplate(
       `模板中的机器 ${selectedNode.name} 当前未在线；已保留原选择，上线或重新选择后才能预检。`,
     );
   }
+  const gpuIssue = requestedGpuError(
+    request,
+    selectedNode,
+    request.template_id === 'smoke' ? 0 : 1,
+  );
+  if (gpuIssue) issues.push(`模板中的指定 GPU 需要核对：${gpuIssue}`);
 
   const selectedProfile = resources.profiles.find(
     (profile) => profile.id === request.profile_id && profile.node_id === request.node_id,

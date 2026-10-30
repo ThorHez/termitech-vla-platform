@@ -188,44 +188,76 @@ export function navigate(path: string) {
 
 // Retain a bounded local tail while advancing the server cursor. Re-fetching the
 // first page would freeze live logs as soon as an execution emits 1,000 events.
-export function useRunFeed<T extends { seq: number }>(path: string, kind: 'events' | 'logs') {
+export function useRunFeed<T extends { seq: number }>(
+  path: string,
+  kind: 'events' | 'logs',
+  live = true,
+) {
   const [data, setData] = useState<T[]>([]);
   const [error, setError] = useState<Error>();
   const [loading, setLoading] = useState(true);
+  const [complete, setComplete] = useState(false);
   const [revision, setRevision] = useState(0);
+  const liveRef = useRef(live);
+  const previousLive = useRef(live);
+  const wake = useRef<(() => void) | undefined>(undefined);
+  liveRef.current = live;
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
   useEffect(() => {
     let active = true;
     let cursor = 0;
     let rows: T[] = [];
+    let inFlight = false;
+    let requested = false;
     let timer: ReturnType<typeof setTimeout>;
     const controller = new AbortController();
     setData([]);
     setLoading(true);
+    setComplete(false);
     const poll = async () => {
-      let nextDelay = 3000;
+      if (!active || inFlight) return;
+      inFlight = true;
+      requested = false;
+      let fullPage = false;
+      let failed = false;
       try {
         const result = await api<T[] | { items: T[]; next_seq: number }>(
           `${path}?after_seq=${cursor}&limit=1000`,
           { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]) },
         );
+        if (!active) return;
         const batch = kind === 'logs' ? (result as { items: T[] }).items : (result as T[]);
+        fullPage = batch.length === 1000;
         if (batch.length) {
           cursor = Math.max(cursor, ...batch.map((item) => item.seq));
           rows = [...rows, ...batch].slice(-5000);
+          setData(rows);
         }
         if (active) {
-          setData(rows);
           setError(undefined);
+          setComplete(!liveRef.current && !fullPage && !requested);
         }
-        if (batch.length === 1000) nextDelay = 50;
       } catch (err) {
-        if (active) setError(err instanceof Error ? err : new Error(String(err)));
+        failed = true;
+        if (active) {
+          setError(err instanceof Error ? err : new Error(String(err)));
+          setComplete(false);
+        }
       } finally {
+        inFlight = false;
         if (active) {
           setLoading(false);
-          timer = setTimeout(poll, nextDelay);
+          if (requested || fullPage || failed || liveRef.current)
+            timer = setTimeout(poll, requested ? 0 : fullPage ? 50 : 3000);
         }
+      }
+    };
+    wake.current = () => {
+      requested = true;
+      setComplete(false);
+      if (!inFlight) {
+        clearTimeout(timer);
+        void poll();
       }
     };
     void poll();
@@ -233,9 +265,17 @@ export function useRunFeed<T extends { seq: number }>(path: string, kind: 'event
       active = false;
       controller.abort();
       clearTimeout(timer);
+      wake.current = undefined;
     };
   }, [path, kind, revision]);
-  return { data, error, loading, refresh };
+  useEffect(() => {
+    if (previousLive.current === live) return;
+    previousLive.current = live;
+    // A final read after the terminal transition also covers an older request
+    // that started before the server committed the last logs and terminal event.
+    wake.current?.();
+  }, [live]);
+  return { data, error, loading, complete, refresh };
 }
 export function useRoute() {
   const [route, setRoute] = useState(window.location.hash.slice(1) || '/overview');

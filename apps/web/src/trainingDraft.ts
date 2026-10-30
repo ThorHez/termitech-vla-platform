@@ -1,4 +1,5 @@
 import type { JsonObject, RecipeDatasetSlot, RunRequest } from './types';
+import { validRequestedGpuList } from './trainingGpuSelection';
 
 export const MAX_TRAINING_DRAFT_BYTES = 512 * 1024;
 export const MAX_TRAINING_DRAFT_DEPTH = 48;
@@ -52,6 +53,7 @@ const requestKeys = new Set([
   'inputs',
   'parameters',
   'gpu_count',
+  'requested_gpu_uuids',
   'auto_config',
   'training_stage',
   'stage_config',
@@ -206,6 +208,8 @@ function validRequest(value: unknown): value is RunRequest {
     !numbers(value.parameters) ||
     typeof value.gpu_count !== 'number'
   )
+    return false;
+  if (value.requested_gpu_uuids !== undefined && !validRequestedGpuList(value.requested_gpu_uuids))
     return false;
   for (const key of ['entrypoint', 'recipe', 'recipe_revision_id'])
     if (value[key] !== undefined && !text(value[key])) return false;

@@ -9,6 +9,7 @@ from .entrypoints import validate_entrypoint
 from .dataset_bindings import validate_binding_assets
 from .recap import recap_stages, runtime_adapter_for, validate_training_stage
 from .automatic_config import automatic_recipe_name, normalize_auto_config
+from .runtime_options import RUNTIME_PARAMETER_RULES, validate_runtime_parameter_relations
 
 
 def get_templates() -> list[dict]:
@@ -17,6 +18,7 @@ def get_templates() -> list[dict]:
         "batch_size": {"type": "integer", "default": 8, "min": 1, "max": 4096, "label": "批次大小"},
         "learning_rate": {"type": "number", "default": 0.00005, "min": 0.00000001, "max": 0.1, "label": "峰值学习率"},
     }
+    openpi_parameters = {**parameters, **{name: dict(rule) for name, rule in RUNTIME_PARAMETER_RULES.items()}}
     return [
         {"id": "smoke", "name": "平台链路测试", "algorithm": "SMOKE", "status": "AVAILABLE",
          "description": "CPU 合成数据测试，验证调度、日志、指标与代码追溯；不产生 VLA 模型。",
@@ -24,13 +26,13 @@ def get_templates() -> list[dict]:
          "required_inputs": [], "min_gpus": 0},
         {"id": "openpi-sft", "name": "OpenPI / UMI 监督微调", "algorithm": "SFT", "status": "AVAILABLE",
          "description": "绑定本机配方、数据、初始权重与归一化统计，由 Agent 自动检查配置和资产，通过后可提交训练。",
-         "parameters": parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
+         "parameters": openpi_parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
         {"id": "mem", "name": "MEM 记忆训练", "algorithm": "MEM", "status": "PLANNED",
          "description": "待接入 mem_exp 两阶段训练与记忆产物选择。", "parameters": {}, "required_inputs": []},
         {"id": "recap", "name": "ReCap 策略提升", "algorithm": "RECAP", "status": "AVAILABLE",
          "description": "先选择价值函数训练或离线强化学习阶段，再配置对应的配方、数据、权重与参数。两阶段之间需完成离线优势标注。",
          "runtime_adapter": "openpi-sft", "stages": recap_stages(),
-         "parameters": parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
+         "parameters": openpi_parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
         {"id": "rlt", "name": "RLT 离线训练", "algorithm": "RLT", "status": "PLANNED",
          "description": "待确认代码入口与 replay 数据协议。", "parameters": {}, "required_inputs": []},
     ]
@@ -45,14 +47,17 @@ def validate_parameters(template_id: str, parameters: dict) -> dict:
         raise ValueError("Unknown training parameters")
     result = {}
     for name, rule in rules.items():
+        if rule.get("optional") and name not in parameters:
+            continue
         value = parameters.get(name, rule["default"])
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or isinstance(value, float) and not math.isfinite(value):
             raise ValueError(f"Invalid parameter: {name}")
         if rule["type"] == "integer" and not isinstance(value, int):
             raise ValueError(f"{name} must be an integer")
         if not rule["min"] <= value <= rule["max"]:
             raise ValueError(f"{name} outside permitted range")
         result[name] = value
+    validate_runtime_parameter_relations(result)
     return result
 
 
@@ -142,6 +147,7 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
                 raise ValueError(f"Missing required {role} asset")
         if parameters["batch_size"] % len(gpu_uuids):
             raise ValueError("batch_size must be divisible by GPU count")
+        validate_runtime_parameter_relations(parameters, gpu_count=len(gpu_uuids))
         # The wrapper is standard-library-only until it enters the registered interpreter.
         wrapper = Path(__file__).with_name("openpi_entry.py").resolve()
         spec = {"code_dir": str(code_dir), "recipe": recipe, "inputs": inputs,

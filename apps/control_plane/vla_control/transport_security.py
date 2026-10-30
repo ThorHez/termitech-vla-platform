@@ -57,8 +57,26 @@ def public_origin(value: str) -> PublicOrigin | None:
         raise ValueError("VLA_PUBLIC_URL must be an HTTPS origin without credentials, path, query or fragment") from None
 
 
+def public_origins(settings) -> tuple[PublicOrigin, ...]:
+    primary = public_origin(settings.public_url)
+    if not settings.public_url_aliases:
+        return (primary,) if primary else ()
+    if primary is None:
+        raise ValueError("VLA_PUBLIC_URL_ALIASES requires VLA_PUBLIC_URL")
+    aliases = []
+    for value in settings.public_url_aliases.split(","):
+        try:
+            alias = public_origin(value.strip())
+        except ValueError:
+            raise ValueError("VLA_PUBLIC_URL_ALIASES must contain explicit HTTPS origins") from None
+        if alias is None:
+            raise ValueError("VLA_PUBLIC_URL_ALIASES cannot contain empty entries")
+        aliases.append(alias)
+    return tuple(dict.fromkeys((primary, *aliases)))
+
+
 def validate_transport_settings(settings) -> None:
-    public_origin(settings.public_url)
+    public_origins(settings)
     if settings.forwarded_allow_ips:
         for entry in settings.forwarded_allow_ips.split(","):
             try:
@@ -102,7 +120,8 @@ class TransportSecurityMiddleware:
     def __init__(self, app, settings):
         self.app = app
         self.settings = settings
-        self.origin = public_origin(settings.public_url)
+        self.origins = public_origins(settings)
+        self.origin = self.origins[0] if self.origins else None
 
     def allowed_host(self, scope) -> bool:
         headers = [value for key, value in scope.get("headers", []) if key.lower() == b"host"]
@@ -120,8 +139,9 @@ class TransportSecurityMiddleware:
             # HTTPS requests must match the canonical TLS endpoint exactly.
             default = 443 if scope.get("scheme") == "https" else 80
             port = host.port if host.port is not None else default
-            ports = {self.origin.port} if default == 443 else {80, self.origin.port}
-            return hostname == self.origin.hostname and port in ports
+            return any(hostname == origin.hostname and
+                       port in ({origin.port} if default == 443 else {80, origin.port})
+                       for origin in self.origins)
         except (ValueError, UnicodeError):
             return False
 

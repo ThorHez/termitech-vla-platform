@@ -360,12 +360,17 @@ export interface NodeManagementInfo {
 export interface ParameterSpec {
   name?: string;
   type?: string;
-  default?: number;
+  default?: number | null;
   minimum?: number;
   maximum?: number;
   min?: number;
   max?: number;
   label?: string;
+  optional?: boolean;
+  required?: boolean;
+  hint?: string;
+  exclusive_max?: boolean;
+  exclusive_min?: boolean;
 }
 export interface Template {
   id: string;
@@ -483,6 +488,7 @@ export interface Run {
   inputs?: Record<string, string | { id?: string; path?: string; name?: string }>;
   parameters?: Record<string, number>;
   gpu_count?: number;
+  requested_gpu_uuids?: string[] | null;
   code_expectation?: CodeSnapshot;
   attempts?: Attempt[];
   outputs?: Asset[];
@@ -524,6 +530,7 @@ export interface RunRequest {
   inputs: Record<string, string>;
   parameters: Record<string, number>;
   gpu_count: number;
+  requested_gpu_uuids?: string[];
 }
 export interface PreflightCheck {
   name: string;

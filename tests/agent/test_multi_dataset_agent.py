@@ -107,9 +107,11 @@ def explicit_probe(fixture):
 
 
 def write_probe_response(fixture, plan):
+    # Synthetic wrapper attestations only; this fixture does not decode data.
     result = {"schema_version": 1, "scope": "configuration_and_local_assets", "plan": plan,
               "checks": [{"name": name, "ok": True, "message": "verified"} for name in
-                         ("recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]}
+                         ("recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples",
+                          "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache")]}
     fixture["script"].write_text("import json\nprint('VLA_PREFLIGHT:'+json.dumps(" + repr(result) + "))\n")
 
 

@@ -54,6 +54,16 @@ try {
     assert.match(html, /&lt;script&gt;unsafe&lt;\/script&gt;/);
     assert.doesNotMatch(html, /class="warning"|<script>/);
   });
+
+  await test('real timestamp mismatches are red blockers while metadata FPS differences remain warnings', () => {
+    const html = render([fps, { name: 'dataset_timestamps', ok: false,
+      message: '生效 20 Hz，期望间隔 0.05 秒，实际间隔 0.016667 秒；请核对采样率或先重采样。' }]);
+    assert.match(html, /class="bad" role="group" aria-label="未通过：真实数据时间戳与采样率"/);
+    assert.match(html, /期望间隔 0.05 秒/);
+    assert.match(html, /实际间隔 0.016667 秒/);
+    assert.equal((html.match(/class="warning"/g) || []).length, 1);
+    assert.equal((html.match(/class="bad"/g) || []).length, 1);
+  });
 } finally {
   await server.close();
 }

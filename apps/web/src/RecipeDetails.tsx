@@ -20,22 +20,46 @@ import type {
   SavedRecipe,
 } from './types';
 
-const editable: Record<string, { label: string; integer?: boolean; min?: number; max?: number }> = {
+const editable: Record<
+  string,
+  {
+    label: string;
+    integer?: boolean;
+    min?: number;
+    max?: number;
+    exclusiveMax?: boolean;
+    exclusiveMin?: boolean;
+  }
+> = {
   num_train_steps: { label: '训练步数', integer: true, min: 1, max: 1000000 },
   batch_size: { label: '批次大小', integer: true, min: 1, max: 4096 },
   'lr_schedule.peak_lr': { label: '峰值学习率', min: 0.00000001, max: 0.1 },
-  ema_decay: { label: 'EMA 衰减', min: 0, max: 0.999999999 },
+  'lr_schedule.warmup_steps': { label: '学习率预热步数', integer: true, min: 0, max: 10000000 },
+  'lr_schedule.decay_steps': { label: '学习率衰减步数', integer: true, min: 1, max: 100000000 },
+  'lr_schedule.decay_lr': { label: '衰减结束学习率', min: 0, max: 0.1 },
+  ema_decay: { label: 'EMA 衰减', min: 0, max: 1, exclusiveMax: true },
+  fsdp_devices: { label: 'FSDP 分片数', integer: true, min: 1, max: 4096 },
   num_workers: { label: '数据加载进程数', integer: true, min: 0, max: 128 },
   log_interval: { label: '日志间隔', integer: true, min: 1, max: 1000000 },
   save_interval: { label: '检查点保存间隔', integer: true, min: 1, max: 1000000 },
   keep_period: { label: '检查点保留周期', integer: true, min: 1, max: 10000000 },
   seed: { label: '随机种子', integer: true, min: 0, max: 4294967295 },
-  'optimizer.clip_gradient_norm': { label: '梯度裁剪阈值', min: 0.00000001, max: 1000 },
+  'optimizer.clip_gradient_norm': { label: '梯度裁剪阈值', min: 0, max: 1000, exclusiveMin: true },
 };
 const commonKeys: Record<string, string> = {
   num_train_steps: 'steps',
   batch_size: 'batch_size',
   'lr_schedule.peak_lr': 'learning_rate',
+  num_workers: 'num_workers',
+  save_interval: 'save_interval',
+  keep_period: 'keep_period',
+  log_interval: 'log_interval',
+  'lr_schedule.warmup_steps': 'warmup_steps',
+  'lr_schedule.decay_steps': 'decay_steps',
+  'lr_schedule.decay_lr': 'decay_lr',
+  'optimizer.clip_gradient_norm': 'clip_gradient_norm',
+  ema_decay: 'ema_decay',
+  fsdp_devices: 'fsdp_devices',
 };
 const warningMessages: Record<string, string> = {
   DYNAMIC_REGISTRY_UNSUPPORTED: '部分配置由 Python 动态生成，无法静态解析。',
@@ -709,8 +733,9 @@ export function RecipeDetails({
         if (
           !Number.isFinite(number) ||
           (rule.integer && !Number.isInteger(number)) ||
-          (rule.min !== undefined && number < rule.min) ||
-          (rule.max !== undefined && number > rule.max)
+          (rule.min !== undefined &&
+            (rule.exclusiveMin ? number <= rule.min : number < rule.min)) ||
+          (rule.max !== undefined && (rule.exclusiveMax ? number >= rule.max : number > rule.max))
         )
           throw new Error();
         value = number;
@@ -1226,6 +1251,7 @@ export function RecipeDetails({
                     'batch_size',
                     'ema_decay',
                     'num_workers',
+                    'fsdp_devices',
                     'log_interval',
                     'save_interval',
                     'keep_period',

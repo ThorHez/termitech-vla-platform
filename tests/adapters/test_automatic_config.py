@@ -234,7 +234,7 @@ def test_generated_python_is_faithful_stable_across_attempt_paths_and_changes_wi
     ast.parse(generated["source"])
     assert generated["sha256"] == hashlib.sha256(generated["source"].encode()).hexdigest()
     assert spec["output_dir"] not in generated["source"]
-    assert "<runtime_output_dir>/checkpoints" in generated["source"]
+    assert "str(Path(output_dir) / 'checkpoints')" in generated["source"]
     assert "registered" in generated["source"] and "bounded review projection" in generated["source"]
     assert "def native_configuration" in generated["source"] and "return Config(" in generated["source"]
     assert spec["inputs"]["dataset_2"]["path"] in generated["source"]

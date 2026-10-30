@@ -64,6 +64,38 @@ def gpu_inventory() -> tuple[list[dict], dict]:
             pass
 
 
+def _cpu_capacity(errors: dict) -> dict:
+    """Report logical/affinity CPU counts, not idle cores or a job allocation.
+
+    Platforms without process affinity fall back to the host logical count.
+    Affinity does not measure cgroup CPU quotas or reserve any CPU resources.
+    """
+    def count(name, callback):
+        try:
+            value = callback()
+        except (psutil.Error, OSError, AttributeError, NotImplementedError) as exc:
+            errors[name] = type(exc).__name__
+            return None
+        if type(value) is not int or value <= 0:
+            errors[name] = "Unavailable"
+            return None
+        return value
+
+    logical = count("cpu_count", lambda: psutil.cpu_count(logical=True))
+    available = None
+    try:
+        affinity = getattr(psutil.Process(), "cpu_affinity", None)
+        if callable(affinity):
+            available = count("cpu_affinity", lambda: len(affinity()))
+    except (psutil.Error, OSError, AttributeError, NotImplementedError) as exc:
+        errors["cpu_affinity"] = type(exc).__name__
+    if available is None:
+        available = logical
+    if available is None:
+        errors["available_cpu_count"] = "Unavailable"
+    return {"cpu_count": logical, "available_cpu_count": available}
+
+
 def system_metrics(output_root: str) -> dict:
     errors = {}
     def sample(name, callback):
@@ -75,6 +107,7 @@ def system_metrics(output_root: str) -> dict:
     memory = sample("memory", psutil.virtual_memory)
     disk = sample("disk", lambda: psutil.disk_usage(output_root))
     return {"cpu_percent": sample("cpu", lambda: psutil.cpu_percent(interval=None)),
+            **_cpu_capacity(errors),
             "memory_total_bytes": memory.total if memory else None,
             "memory_used_bytes": memory.used if memory else None, "memory_percent": memory.percent if memory else None,
             "disk_total_bytes": disk.total if disk else None, "disk_free_bytes": disk.free if disk else None,

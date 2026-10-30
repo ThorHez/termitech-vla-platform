@@ -1198,7 +1198,7 @@ tbody tr:hover {
   transition: width 0.4s;
 }
 .progress.blue > span {
-  background: var(--bg-subtle, #83b6d7);
+  background: var(--chart-memory, #83b6d7);
 }
 .alert-list {
   padding: 4px 20px 12px;
@@ -1651,6 +1651,14 @@ tbody tr:hover {
   gap: 6px;
   color: var(--text-accent, #0c968a);
   font-size: 12px;
+}
+.run-summary > div > small {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-secondary, #607d8d);
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 .detail-columns {
   display: grid;

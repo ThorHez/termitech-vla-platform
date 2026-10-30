@@ -38,6 +38,14 @@ def snapshot(**changes):
             "captured_at": now(), "complete": True, "recipe": "smoke", **changes}
 
 
+def sample_probe(path, *, frames=32, horizon=16, sequence=()):
+    indices = sorted({0, frames // 2, frames - 1})
+    return {"schema_version": 1, "status": "verified", "path": path,
+            "checked_samples": len(indices), "sample_indices": indices,
+            "samples": [{"index": index} for index in indices],
+            "action_horizon": horizon, "action_sequence_keys": list(sequence)}
+
+
 def automatic_preflight(payload):
     """Simulate the evidence a current Agent returns after its local checks."""
     paths = {role: value["path"] for role, value in payload["inputs"].items()}
@@ -72,14 +80,17 @@ def automatic_preflight(payload):
                 dataset.update(processor=binding["processor"], factory=binding["processor"]["name"],
                                processor_identity={"name": binding["processor"]["name"], "module": "openpi.training.config",
                                                    "source": {"path": "src/openpi/training/config.py", "sha256": "d" * 64}})
+                if binding["processor"]["name"] == "ComposableDataConfig":
+                    dataset["sample_probe"] = sample_probe(dataset["path"], frames=dataset["frames"],
+                        horizon=(payload.get("auto_config") or {}).get("action_horizon", 16))
     return {"schema_version": 1, "scope": "configuration_and_local_assets", "plan": plan,
             "plan_digest": canonical_digest(plan)}
 
 
 def automatic_checks():
     return [{"name": name, "ok": True, "message": "checked"} for name in (
-        "recipe_configuration", "data_contract", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache",
-        "output_storage", "gpu_capacity", "runtime", "local_paths", "code_version", "adapter")]
+        "recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache",
+        "output_isolation", "output_storage", "gpu_capacity", "runtime", "local_paths", "code_version", "adapter")]
 
 
 def gpu(uuid="GPU-1", **changes):
