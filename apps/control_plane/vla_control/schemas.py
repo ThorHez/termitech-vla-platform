@@ -106,15 +106,34 @@ class AssetInput(InputModel):
     path: str = Field(min_length=1, max_length=4096)
     version: str = Field(default="1", min_length=1, max_length=200)
     metadata: dict = Field(default_factory=dict)
+    norm_asset_id: str | None = Field(default=None, min_length=1, max_length=36)
+    norm_path: str | None = Field(default=None, min_length=1, max_length=4096, strict=True)
 
     @model_validator(mode="after")
     def dataset_metadata(self):
+        if "norm_path" in self.model_fields_set:
+            if "norm_asset_id" in self.model_fields_set or self.norm_path is None:
+                raise ValueError("norm_path 与 norm_asset_id 只能填写一个；路径不能为空")
         self.metadata = validate_asset_metadata(self.kind, self.metadata)
         return self
 
 
 class AssetDatasetProfileInput(InputModel):
     dataset_profile: DatasetProfile
+
+
+class AssetNormBindingInput(InputModel):
+    norm_asset_id: str | None = Field(default=None, min_length=1, max_length=36)
+    norm_path: str | None = Field(default=None, min_length=1, max_length=4096, strict=True)
+
+    @model_validator(mode="after")
+    def one_binding_source(self):
+        fields = self.model_fields_set
+        if len(fields & {"norm_asset_id", "norm_path"}) != 1:
+            raise ValueError("请选择已有 norm_stats，或填写路径，二者只能选择一个")
+        if "norm_path" in fields and self.norm_path is None:
+            raise ValueError("norm_stats 路径不能为空")
+        return self
 
 
 class PathSuggestInput(InputModel):

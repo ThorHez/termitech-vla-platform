@@ -16,6 +16,7 @@ export function requestedGpuError(
   request: Pick<RunRequest, 'requested_gpu_uuids' | 'gpu_count'>,
   node?: Pick<Node, 'gpus'>,
   minimum = 1,
+  userId?: string,
 ): string | undefined {
   const selected = request.requested_gpu_uuids;
   if (selected === undefined) return undefined;
@@ -26,10 +27,28 @@ export function requestedGpuError(
   const available = new Set(node?.gpus?.map((gpu) => gpu.uuid));
   if (selected.some((uuid) => !available.has(uuid)))
     return '部分指定 GPU 已不属于当前机器或尚未上报，请重新选择；不会自动替换。';
+  if (userId) {
+    for (const gpu of node?.gpus || []) {
+      if (!selected.includes(gpu.uuid)) continue;
+      const reservationError = gpuReservationError(gpu, userId);
+      if (reservationError) return reservationError;
+    }
+  }
   return undefined;
 }
 
-export function gpuSelectionState(gpu: Gpu): 'available' | 'busy' | 'unknown' {
+export function gpuReservationError(gpu: Gpu, userId?: string): string | undefined {
+  const reservation = gpu.user_reservation;
+  if (reservation && reservation.user_id !== userId)
+    return `GPU 已由 ${reservation.display_name || reservation.username} 预留，请选择其他 GPU。`;
+  return undefined;
+}
+
+export function gpuSelectionState(
+  gpu: Gpu,
+  userId?: string,
+): 'available' | 'busy' | 'unknown' | 'reserved' {
+  if (gpuReservationError(gpu, userId)) return 'reserved';
   if (gpu.reserved_by || (Array.isArray(gpu.processes) && gpu.processes.length > 0)) return 'busy';
   if (
     !Array.isArray(gpu.processes) ||

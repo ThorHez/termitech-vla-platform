@@ -1,4 +1,5 @@
 import { Field } from './components';
+import { useAuth } from './auth';
 import { gpuSelectionState, requestedGpuError } from './trainingGpuSelection';
 import type { Node, RunRequest } from './types';
 
@@ -6,6 +7,7 @@ const stateLabels = {
   available: '可用',
   busy: '占用中，将等待释放',
   unknown: '状态未知，将等待确认',
+  reserved: '其他用户已预留',
 };
 
 export function TrainingGpuSelector({
@@ -19,9 +21,10 @@ export function TrainingGpuSelector({
   minimum: number;
   onChange: (selection: Pick<RunRequest, 'gpu_count' | 'requested_gpu_uuids'>) => void;
 }) {
+  const { user } = useAuth();
   const manual = request.requested_gpu_uuids !== undefined;
   const selected = request.requested_gpu_uuids || [];
-  const error = requestedGpuError(request, node, minimum);
+  const error = requestedGpuError(request, node, minimum, user?.id);
   return (
     <div className="training-gpu-selection">
       <Field label="GPU 分配方式">
@@ -52,7 +55,7 @@ export function TrainingGpuSelector({
             ? '数量跟随所选 GPU；占用中或状态未知时排队，不会换卡。'
             : minimum === 0
               ? '测试模板支持 0 GPU。'
-              : '资源不足时将排队等待。'
+              : '优先使用你的预留卡，再使用共享卡；资源不足时排队。'
         }
       >
         <input
@@ -73,7 +76,7 @@ export function TrainingGpuSelector({
         <div className="training-gpu-options" aria-label="选择具体 GPU">
           {!node?.gpus?.length && <p className="field-hint">当前机器尚未上报 GPU，请等待刷新。</p>}
           {node?.gpus?.map((gpu, index) => {
-            const state = gpuSelectionState(gpu);
+            const state = gpuSelectionState(gpu, user?.id);
             return (
               <label
                 key={gpu.uuid}
@@ -83,6 +86,7 @@ export function TrainingGpuSelector({
                   type="checkbox"
                   aria-label={`选择 GPU ${index}`}
                   checked={selected.includes(gpu.uuid)}
+                  disabled={state === 'reserved' && !selected.includes(gpu.uuid)}
                   onChange={(event) => {
                     const next = event.target.checked
                       ? [...selected, gpu.uuid]
@@ -100,6 +104,13 @@ export function TrainingGpuSelector({
                       : '显存未知'}{' '}
                     · <span className={`training-gpu-state ${state}`}>{stateLabels[state]}</span>
                   </span>
+                  {gpu.user_reservation && (
+                    <span>
+                      {gpu.user_reservation.user_id === user?.id
+                        ? '为你预留'
+                        : `${gpu.user_reservation.display_name || gpu.user_reservation.username} 已预留`}
+                    </span>
+                  )}
                   <code title={gpu.uuid}>
                     {gpu.uuid.length > 24
                       ? `${gpu.uuid.slice(0, 15)}…${gpu.uuid.slice(-6)}`

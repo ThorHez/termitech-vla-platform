@@ -12,6 +12,7 @@ import re
 from types import SimpleNamespace
 from typing import Literal
 
+from fastapi import Request
 from pydantic import Field, field_validator, model_validator
 from sqlalchemy import select
 from vla_protocol.config_preview import validate_generated_config
@@ -20,6 +21,7 @@ from vla_protocol.gpu_policy import gpu_deployment_error, normalize_gpu_policy
 from .common import APIError, TERMINAL, now, offset_time, require_path, uid
 from .models import Allocation, Asset, Attempt, Command, Node, Profile, Run
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
+from .gpu_reservations import request_owner, reservation_owners
 from .profile_rebindings import require_not_pending
 from .recipe_writeback import require_no_pending_writeback
 from .schemas import InputModel
@@ -113,7 +115,7 @@ def deployment_dict(session, row, settings):
     connected = node is not None and node.status == "ONLINE" and node.last_seen >= offset_time(-settings.heartbeat_timeout_seconds)
     pending = _pending(session, row.id)
     result = {key: deepcopy(getattr(row, key)) for key in (
-        "id", "name", "node_id", "profile_id", "checkpoint_path", "config_name", "inference_backend", "resolved_backend", "port", "gpu_uuid", "gpu_mode", "gpu_memory_mb",
+        "id", "name", "node_id", "profile_id", "owner_user_id", "checkpoint_path", "config_name", "inference_backend", "resolved_backend", "port", "gpu_uuid", "gpu_mode", "gpu_memory_mb",
         "default_prompt", "source_run_id", "state", "endpoint", "pid", "logs", "checks", "error",
         "test_result", "created_at", "updated_at")}
     ownership = session.get(DeploymentRecordRuntime, row.id)
@@ -449,9 +451,12 @@ def _source_warnings(source):
 def _source_training(session, body):
     if body.source_run_id is None:
         return None
-    run = session.get(Run, body.source_run_id)
+    run = session.scalar(select(Run).where(Run.id == body.source_run_id).with_for_update()
+                         .execution_options(populate_existing=True))
     if run is None or run.node_id != body.node_id or run.profile_id != body.profile_id:
         raise APIError(422, "POLICY_DEPLOY_SOURCE_MISMATCH", "来源训练任务必须属于所选机器和运行环境")
+    if run.deleted_at is not None:
+        raise APIError(409, "RUN_DELETED", "来源训练任务记录已删除，请选择其他训练任务或本地权重")
     if run.state not in TERMINAL:
         raise APIError(409, "POLICY_DEPLOY_SOURCE_ACTIVE", "来源训练尚未结束，请等待完成后部署权重")
     attempts = list(session.scalars(select(Attempt).where(Attempt.run_id == run.id, Attempt.node_id == run.node_id)))
@@ -505,7 +510,7 @@ def _stopped_execution_confirmed(session, row, latest):
     return False
 
 
-def _admit_resources(session, node, body):
+def _admit_resources(session, node, body, owner_user_id=None):
     from .scheduler import gpu_available
 
     active = list(session.scalars(select(PolicyDeployment).where(
@@ -514,6 +519,8 @@ def _admit_resources(session, node, body):
         raise APIError(409, "POLICY_DEPLOY_PORT_BUSY", "该端口已有部署或尚未确认停止，请选择其他端口")
     reserved = {row.gpu_uuid for row in session.scalars(select(Allocation).where(Allocation.node_id == node.id))}
     reserved.update(row.gpu_uuid for row in active if row.gpu_uuid)
+    user_reservations = reservation_owners(session, node.id)
+    reserved.update(uuid for uuid, owner in user_reservations.items() if owner != owner_user_id)
     capabilities = (node.metrics or {}).get("capabilities")
     if getattr(body, "inference_backend", "auto") != "auto" and (not isinstance(capabilities, list)
             or "POLICY_DEPLOY_BACKEND_V1" not in capabilities):
@@ -526,7 +533,10 @@ def _admit_resources(session, node, body):
             return None if gpu_available(gpu) else _error("GPU_UNAVAILABLE", "GPU 未满足独占空闲要求")
         return gpu_deployment_error(gpu, body.gpu_mode, body.gpu_memory_mb)
     available = [gpu for gpu in node.gpus if gpu.get("uuid") not in reserved and admission_error(gpu) is None]
+    available.sort(key=lambda gpu: gpu.get("uuid") not in user_reservations)
     gpu_uuid = body.gpu_uuid
+    if gpu_uuid in user_reservations and user_reservations[gpu_uuid] != owner_user_id:
+        raise APIError(409, "GPU_RESERVED_BY_OTHER_USER", "所选 GPU 已由其他用户预留，请选择其他 GPU")
     if gpu_uuid is not None and not any(gpu.get("uuid") == gpu_uuid for gpu in available):
         selected = next((gpu for gpu in node.gpus if gpu.get("uuid") == gpu_uuid), None)
         if body.gpu_mode == "shared" and selected is not None and gpu_uuid not in reserved:
@@ -547,6 +557,9 @@ def _admit_resources(session, node, body):
 
 
 def register_routes(app, admin, db, require_available_node, settings):
+    from .deployment_record_models import DeploymentRecord, DeploymentRecordRuntime
+    from .deployment_records import require_runtime_record
+
     def online(session, node_id):
         node = require_available_node(session, node_id)
         if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
@@ -559,7 +572,9 @@ def register_routes(app, admin, db, require_available_node, settings):
             raise APIError(404, "NOT_FOUND", "部署记录不存在")
         # Every writer takes node then deployment, matching Agent ACK and the
         # scheduler lock order on PostgreSQL as well as SQLite.
+        require_runtime_record(session, deployment_id)
         online(session, row.node_id)
+        require_runtime_record(session, deployment_id, lock=True)
         return session.scalar(select(PolicyDeployment).where(PolicyDeployment.id == deployment_id)
                               .with_for_update().execution_options(populate_existing=True))
 
@@ -567,6 +582,9 @@ def register_routes(app, admin, db, require_available_node, settings):
     def list_deployments():
         with db.read() as session:
             return [deployment_dict(session, row, settings) for row in session.scalars(select(PolicyDeployment)
+                    .outerjoin(DeploymentRecordRuntime, DeploymentRecordRuntime.deployment_id == PolicyDeployment.id)
+                    .outerjoin(DeploymentRecord, DeploymentRecord.id == DeploymentRecordRuntime.record_id)
+                    .where(DeploymentRecord.deleted_at.is_(None))
                     .order_by(PolicyDeployment.created_at.desc(), PolicyDeployment.id.desc()))]
 
     @app.get("/api/v1/policy-deployments/{deployment_id}", dependencies=admin)
@@ -575,10 +593,11 @@ def register_routes(app, admin, db, require_available_node, settings):
             row = session.get(PolicyDeployment, deployment_id)
             if row is None:
                 raise APIError(404, "NOT_FOUND", "部署记录不存在")
+            require_runtime_record(session, deployment_id)
             return deployment_dict(session, row, settings)
 
     @app.post("/api/v1/policy-deployments", dependencies=admin, status_code=202)
-    def create_deployment(body: CreateInput):
+    def create_deployment(body: CreateInput, request: Request):
         with db.write() as session:
             node = online(session, body.node_id)
             profile = _start_profile(session, node, body.profile_id)
@@ -616,9 +635,10 @@ def register_routes(app, admin, db, require_available_node, settings):
                     record = require_preparation_record(session, record.id)
             elif body.record_id is not None:
                 record = require_preparation_record(session, body.record_id)
-            gpu_uuid = _admit_resources(session, node, body)
+            gpu_uuid = _admit_resources(session, node, body, request_owner(request))
             timestamp = now()
             row = PolicyDeployment(id=uid(), name=body.name, node_id=node.id, profile_id=profile.id,
+                owner_user_id=request_owner(request),
                 checkpoint_path=checkpoint_path, config_name=config_name, port=body.port, gpu_uuid=gpu_uuid,
                 inference_backend=body.inference_backend, resolved_backend=None,
                 gpu_mode=body.gpu_mode, gpu_memory_mb=body.gpu_memory_mb,
@@ -644,7 +664,7 @@ def register_routes(app, admin, db, require_available_node, settings):
             return deployment_dict(session, row, settings)
 
     @app.post("/api/v1/policy-deployments/{deployment_id}/start", dependencies=admin, status_code=202)
-    def restart_deployment(deployment_id: str):
+    def restart_deployment(deployment_id: str, request: Request):
         from .checkpoint_transfer_models import PolicyDeploymentTransfer
 
         with db.write() as session:
@@ -686,7 +706,7 @@ def register_routes(app, admin, db, require_available_node, settings):
                 payload["source_training"] = deepcopy(frozen)
             elif latest.payload.get("source_training") is not None or latest.payload.get("portable_policy") is not None:
                 raise APIError(422, "POLICY_DEPLOY_SOURCE_CONFIG_MISMATCH", "原部署来源绑定不一致，无法重启")
-            payload["gpu_uuid"] = _admit_resources(session, node, row)
+            payload["gpu_uuid"] = _admit_resources(session, node, row, request_owner(request))
             payload.update(execution_id=uid(), expires_at=offset_time(120))
             for command in pending:
                 command.status = "REJECTED"
@@ -696,6 +716,7 @@ def register_routes(app, admin, db, require_available_node, settings):
             row.resolved_backend = None
             row.logs, row.checks = "", []
             row.gpu_uuid, row.config_name = payload["gpu_uuid"], payload["config_name"]
+            row.owner_user_id = request_owner(request)
             row.updated_at = now()
             started = _enqueue(session, row, "POLICY_DEPLOY_START", payload)
             row.observed_command_at = started.created_at

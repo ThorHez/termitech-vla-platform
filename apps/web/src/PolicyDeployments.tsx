@@ -69,6 +69,7 @@ import {
   type InferenceGpuMode,
 } from './inferenceGpu';
 import './policy-deployments.css';
+import { DeploymentRecordDeleteAction } from './DeploymentRecordDeleteAction';
 
 export default function PolicyDeployments({
   initialRun,
@@ -127,7 +128,11 @@ export default function PolicyDeployments({
               className="policy-deployment-records"
             >
               {entries.length ? (
-                <DeploymentWorkspaceList entries={entries} nodes={nodes.data || []} />
+                <DeploymentWorkspaceList
+                  entries={entries}
+                  nodes={nodes.data || []}
+                  changed={list.refresh}
+                />
               ) : (
                 <Empty
                   icon={Rocket}
@@ -195,9 +200,11 @@ function DeploymentListBack() {
 export function DeploymentWorkspaceList({
   entries,
   nodes,
+  changed,
 }: {
   entries: DeploymentWorkspaceEntry[];
   nodes: Node[];
+  changed?: () => void;
 }) {
   return (
     <ul className="policy-deployment-record-list">
@@ -205,7 +212,7 @@ export function DeploymentWorkspaceList({
         const machine =
           nodes.find((node) => node.id === record.node_id)?.name || record.node_id || '未选择机器';
         return (
-          <li key={key}>
+          <li key={key} className="policy-deployment-record-list-item">
             <a
               className="policy-deployment-summary-row"
               data-record-kind="record"
@@ -220,6 +227,7 @@ export function DeploymentWorkspaceList({
               <small>{date(record.created_at)}</small>
               <ArrowRight size={14} />
             </a>
+            <DeploymentRecordDeleteAction record={record} compact onDeleted={changed} />
           </li>
         );
       })}
@@ -408,6 +416,7 @@ export function DeploymentRecordView({
         recordName={record.name}
         initialItem={record.deployment}
         recordTransfers={record.transfers}
+        deletionRecord={record}
         tab={tab}
         changed={changed}
       />
@@ -430,16 +439,26 @@ export function DeploymentRecordView({
         title={record.name}
         description={`创建于 ${date(record.created_at)} · 尚未启动服务`}
         actions={
-          activeTab !== 'workflow' &&
-          can('training.write') && (
-            <button
-              className="button primary"
-              onClick={() => continueConfig(record, record.transfers[0])}
-            >
-              <Plus size={15} />
-              继续配置部署
-            </button>
-          )
+          <>
+            {activeTab !== 'workflow' && can('training.write') && (
+              <button
+                className="button primary"
+                onClick={() => continueConfig(record, record.transfers[0])}
+              >
+                <Plus size={15} />
+                继续配置部署
+              </button>
+            )}
+            <DeploymentRecordDeleteAction
+              record={record}
+              deployment={record.deployment}
+              transfers={record.transfers}
+              onDeleted={() => {
+                changed();
+                navigate('/deployments');
+              }}
+            />
+          </>
         }
       />
       <nav className="tabs policy-deployment-detail-tabs" role="tablist" aria-label="部署详情">
@@ -585,6 +604,7 @@ export function DeploymentDetail({
   recordId,
   recordName,
   recordTransfers,
+  deletionRecord,
   tab = 'overview',
 }: {
   id: string;
@@ -593,6 +613,7 @@ export function DeploymentDetail({
   recordId?: string;
   recordName?: string;
   recordTransfers?: CheckpointTransfer[];
+  deletionRecord?: DeploymentRecordDetail;
   tab?: string;
 }) {
   const { can } = useAuth();
@@ -710,17 +731,31 @@ export function DeploymentDetail({
             : `创建于 ${date(item.created_at)} · ${item.id}`
         }
         actions={
-          activeTab === 'workflow' ? (
-            <Badge state={item.state} label={deploymentLabels[item.state]} />
-          ) : (
-            <DeploymentStartActions
-              item={item}
-              node={node}
-              writable={writable}
-              busy={busy}
-              onStart={() => void request('start')}
-            />
-          )
+          <>
+            {activeTab === 'workflow' ? (
+              <Badge state={item.state} label={deploymentLabels[item.state]} />
+            ) : (
+              <DeploymentStartActions
+                item={item}
+                node={node}
+                writable={writable}
+                busy={busy}
+                onStart={() => void request('start')}
+              />
+            )}
+            {deletionRecord && (
+              <DeploymentRecordDeleteAction
+                record={deletionRecord}
+                deployment={item}
+                transfers={recordTransfers}
+                disabled={!!busy}
+                onDeleted={() => {
+                  changed();
+                  navigate('/deployments');
+                }}
+              />
+            )}
+          </>
         }
       />
       <nav className="tabs policy-deployment-detail-tabs" aria-label="部署详情" role="tablist">
@@ -1083,6 +1118,7 @@ function DeploymentForm({
   close: () => void;
   created: (item: PolicyDeployment) => void;
 }) {
+  const { user } = useAuth();
   const { nodes, profiles, runs } = useData();
   const [source, setSource] = useState(
     initialRun || initialRecord?.source_run_id || !initialRecord ? 'run' : 'path',
@@ -1194,7 +1230,7 @@ function DeploymentForm({
   });
   const gpuMemoryMb = gpuMode === 'shared' ? inferenceMemoryMb(gpuMemoryGiB) : null;
   const selectedGpu = node?.gpus?.find((item) => item.uuid === gpu);
-  const gpuBlocker = inferenceGpuError(selectedGpu, gpuMode, gpuMemoryMb, node);
+  const gpuBlocker = inferenceGpuError(selectedGpu, gpuMode, gpuMemoryMb, node, user?.id);
   const backendBlocker = inferenceBackendError(inferenceBackend, node);
   const valid =
     !!name.trim() &&
@@ -1683,10 +1719,13 @@ function DeploymentForm({
               <select value={gpu} required onChange={(event) => setGpu(event.target.value)}>
                 <option value="">选择推理 GPU</option>
                 {node?.gpus?.map((item, index) => {
-                  const reason = inferenceGpuError(item, gpuMode, gpuMemoryMb, node);
+                  const reason = inferenceGpuError(item, gpuMode, gpuMemoryMb, node, user?.id);
                   return (
                     <option key={item.uuid} value={item.uuid} disabled={!!reason}>
                       GPU {index} · {item.name} · 剩余 {inferenceGpuMemory(item.memory_free_mb)}
+                      {item.user_reservation && item.user_reservation.user_id === user?.id
+                        ? ' · 为你预留'
+                        : ''}
                       {reason ? ` · ${reason}` : ''}
                     </option>
                   );

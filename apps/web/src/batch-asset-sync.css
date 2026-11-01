@@ -1,0 +1,124 @@
+.asset-catalog-table .asset-selection-column {
+  width: 44px;
+  padding-right: 5px;
+}
+.asset-selection-column input {
+  accent-color: var(--teal);
+}
+.batch-asset-selection {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 18px;
+  margin: 0 0 16px;
+  padding: 12px 16px;
+  background: var(--bg-subtle, #f7f9fb);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.batch-asset-selection > span:first-child {
+  margin-right: auto;
+}
+.batch-asset-selection .batch-asset-sync-error {
+  flex-basis: 100%;
+  margin: 0;
+}
+.modal.wide.batch-asset-sync-modal {
+  width: 1100px;
+}
+.batch-asset-sync-target {
+  display: grid;
+  grid-template-columns: minmax(200px, 0.7fr) minmax(0, 1.3fr);
+  gap: 20px;
+}
+.batch-asset-sync-items > h3 {
+  margin: 12px 0 8px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.batch-asset-sync-items > p,
+.batch-asset-sync-notice,
+.batch-asset-sync-result p {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.8;
+}
+.batch-asset-sync-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px 22px;
+  padding: 18px;
+  margin: 14px 0;
+  border: 1px solid var(--border);
+  background: var(--bg-subtle, #f7f9fb);
+  border-radius: 8px;
+}
+.batch-asset-sync-source,
+.batch-asset-sync-destination {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+  min-width: 0;
+}
+.batch-asset-sync-source strong,
+.batch-asset-sync-result h3 {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.batch-asset-sync-source > span,
+.batch-asset-sync-destination > span {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.batch-asset-sync-item code {
+  font-size: 10px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+  color: var(--text-secondary);
+}
+.batch-asset-sync-destination .field {
+  margin-bottom: 0;
+}
+.batch-asset-sync-item .asset-sync-norm-option {
+  grid-column: 1 / -1;
+  padding: 12px;
+}
+.batch-asset-sync-error {
+  color: var(--text-danger, #c84e4e);
+  font-size: 12px;
+  line-height: 1.8;
+}
+.batch-asset-sync-result > svg {
+  color: var(--text-success, #258d76);
+}
+.batch-asset-sync-result ul {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.batch-asset-sync-result li {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.batch-asset-sync-result a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--teal);
+}
+@media (max-width: 700px) {
+  .batch-asset-sync-target,
+  .batch-asset-sync-item {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .batch-asset-selection {
+    padding: 12px;
+  }
+}

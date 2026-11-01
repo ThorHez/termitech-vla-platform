@@ -37,7 +37,8 @@ PASSWORD_MIN = 12
 PASSWORD_MAX = 256
 THROTTLE_WINDOW = 900
 THROTTLE_ROWS = 10000
-_AUDIT_FIELDS = {"target_user_id", "target_username", "role", "enabled", "permission", "code", "count"}
+_AUDIT_FIELDS = {"target_user_id", "target_username", "role", "enabled", "permission", "code", "count",
+                 "node_id", "terminal_id", "ssh_username", "reason"}
 
 
 def normalize_username(value: str) -> str:
@@ -206,7 +207,7 @@ class AuthManager:
         clean = {key: value[:200] if isinstance(value, str) else value for key, value in clean.items()}
         session.add(AuditEvent(id=uid(), created_at=now(), actor_id=actor_id or (principal.user_id if principal else None),
                                actor_username=actor_username or (principal.username if principal else None),
-                               action=action[:120], method=request.method if request else "CLI",
+                               action=action[:120], method=getattr(request, "method", "WS") if request else "CLI",
                                path=request.url.path[:600] if request else "local-console", status=status, details=clean,
                                remote_addr=(request.client.host[:100] if request and request.client else "local")))
 

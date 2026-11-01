@@ -201,11 +201,17 @@ def _field_annotations(info, features, warn):
         # "eef" or the dataset declares EEF movements for the arm.
         inferred_rep = "gripper" if component == "gripper" else "joint" if _kind(key) == "joint" else "eef" if "_eef_" in token else _representation(names)
         rep = next((value for value in (explicit.get("representation"), raw.get("representation"))
-                    if label(value, {"eef", "joint", "gripper"})), None)
+                    if label(value, {"eef", "joint", "gripper", "composite"})), None)
         if rep is None and component != "gripper":
             rep = next((value for value in (raw.get(role + "_representation"), info.get(role + "_representation"))
                         if label(value, {"eef", "joint"})), None)
-        if rep == "gripper" and component != "gripper":
+        if rep == "composite":
+            if ("component" in explicit or "component" in raw) and component != "other":
+                warn("字段 " + key + " 的组合向量不能声明为单一分量，请手动确认源字段标签。")
+                rep = "unknown"
+            else:
+                component = "other"
+        elif rep == "gripper" and component != "gripper":
             warn("字段 " + key + " 的夹爪开度表示与分量声明冲突，请手动确认源字段标签。")
             rep = "unknown"
         elif rep and inferred_rep and rep != inferred_rep and component != "gripper":
@@ -216,7 +222,7 @@ def _field_annotations(info, features, warn):
         # A dataset-wide movement declaration says nothing about a separate
         # gripper field, nor a packed vector mixing pose and gripper commands.
         mixed_gripper = any(_kind(name) == "gripper" for name in names)
-        if mode is None and component != "gripper" and not mixed_gripper:
+        if mode is None and component != "gripper" and rep != "composite" and not mixed_gripper:
             mode = label(info.get(role + "_mode"), {"absolute", "delta"})
         origin_relative = bool(re.search(r"_(?:wrt_start|from_start|episode_start|relative_start)_", token))
         if origin_relative:

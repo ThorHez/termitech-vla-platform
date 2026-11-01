@@ -47,15 +47,33 @@ _allow("platform.read", "GET",
        "/recipes", "/recipes/{recipe_id}", "/recipe-revisions/{revision_id}",
        "/recipe-writebacks/{operation_id}",
        "/run-previews/{preview_id}", "/runs", "/runs/{run_id}",
-       "/runs/{run_id}/events", "/runs/{run_id}/logs", "/alerts")
+       "/runs/{run_id}/events", "/runs/{run_id}/logs", "/runs/{run_id}/metrics", "/alerts")
 _allow("assets.write", "POST", "/assets", "/assets/{asset_id}/archive",
        "/nodes/{node_id}/path-suggestions")
 _allow("assets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
+_allow("assets.write", "GET", "/dataset-format-templates", "/dataset-format-templates/{template_id}")
+_allow("assets.write", "POST", "/dataset-format-templates")
+_allow("assets.write", "PUT", "/dataset-format-templates/{template_id}")
+_allow("assets.write", "DELETE", "/dataset-format-templates/{template_id}")
+_allow("assets.write", "POST", "/nodes/{node_id}/dataset-scans",
+       "/nodes/{node_id}/dataset-scans/{scan_id}/register")
+_allow("assets.write", "GET", "/nodes/{node_id}/dataset-scans/{scan_id}")
+_allow("assets.write", "PUT", "/assets/{asset_id}/norm-binding")
 _allow("assets.write", "POST", "/nodes/{node_id}/dataset-inspections")
 _allow("assets.write", "GET", "/nodes/{node_id}/dataset-inspections/{query_id}")
+_allow("platform.read", "GET", "/asset-transfers", "/asset-transfers/{transfer_id}")
+_allow("assets.write", "POST", "/asset-transfers", "/asset-transfers/{transfer_id}/retry",
+       "/asset-transfers/{transfer_id}/cancel")
+_allow("assets.write", "POST", "/asset-transfer-batches")
+_allow("assets.write", "DELETE", "/asset-transfers/{transfer_id}")
 _allow("training.write", "POST", "/run-previews", "/runs", "/runs/{run_id}/cancel")
+_allow("training.write", "DELETE", "/runs/{run_id}")
+_allow("platform.read", "GET", "/nodes/{node_id}/gpu-reservations")
+_allow("training.write", "PUT", "/nodes/{node_id}/gpu-reservations")
+_allow("training.write", "DELETE", "/nodes/{node_id}/gpu-reservations/{gpu_uuid}")
 _allow("platform.read", "GET", "/policy-deployments", "/policy-deployments/{deployment_id}")
 _allow("platform.read", "GET", "/deployment-records", "/deployment-records/{record_id}")
+_allow("training.write", "DELETE", "/deployment-records/{record_id}")
 _allow("training.write", "POST", "/policy-deployments", "/policy-deployments/{deployment_id}/refresh",
        "/policy-deployments/{deployment_id}/start",
        "/policy-deployments/{deployment_id}/stop", "/policy-deployments/{deployment_id}/test",
@@ -80,6 +98,7 @@ _allow("machines.manage", "GET", "/agent-config-defaults", "/agent-package",
        "/nodes/{node_id}/management", "/remote-deployments", "/remote-deployments/{job_id}",
        "/remote-deployments/{job_id}/logs/download")
 _allow("machines.manage", "POST", "/agent-configs", "/ssh-connections/test", "/ssh-connections/connect",
+       "/nodes/{node_id}/terminal-sessions",
        "/nodes/{node_id}/storage-configurations",
        "/nodes/{node_id}/profile-rebindings",
        "/ssh-connections/{connection_id}/path-suggestions", "/ssh-connections/{connection_id}/test",

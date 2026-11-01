@@ -1,4 +1,5 @@
 import type { Gpu, Node } from './types';
+import { gpuReservationError } from './trainingGpuSelection';
 
 export type InferenceGpuMode = 'exclusive' | 'shared';
 export const inferenceGpuReserveMb = 1024;
@@ -27,6 +28,7 @@ export function inferenceGpuError(
   mode: InferenceGpuMode,
   memoryMb: number | null,
   node?: Node,
+  userId?: string,
 ): string | undefined {
   if (mode === 'shared') {
     if (!sharedInferenceSupported(node)) return '当前 Agent 尚不支持共享 GPU，请先更新 Agent。';
@@ -38,6 +40,8 @@ export function inferenceGpuError(
     return '独占模式无需填写共享显存预算。';
   }
   if (!gpu) return '请选择推理 GPU。';
+  const reservationError = gpuReservationError(gpu, userId);
+  if (reservationError) return reservationError;
   if (gpu.reserved_by) return 'GPU 已被平台训练或部署预约。';
   if (!Array.isArray(gpu.processes)) return 'GPU 进程状态未知，请等待可靠采样。';
   if (

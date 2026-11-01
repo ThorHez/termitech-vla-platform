@@ -242,13 +242,15 @@ def normalize_field_annotations(value):
             _fail("字段标签缺少必填项或包含处理规则")
         row = {"key": _key(item["key"], "标签字段名")}
         for key, choices in (("role", {"state", "action"}),
-                             ("representation", {"eef", "joint", "gripper", "unknown"}),
+                             ("representation", {"eef", "joint", "gripper", "composite", "unknown"}),
                              ("value_mode", {"absolute", "delta", "unknown"}),
                              ("component", STATE_KINDS),
                              ("arm", {"left", "right", "shared", "unknown"})):
             row[key] = _enum(item[key], choices, "字段标签 " + key)
         if row["representation"] == "gripper" and row["component"] != "gripper":
             _fail("夹爪开度表示仅适用于夹爪分量")
+        if row["representation"] == "composite" and row["component"] != "other":
+            _fail("组合向量表示必须使用其他分量，具体分块在训练配置中声明")
         if "shape" in item:
             shape = item["shape"]
             if not isinstance(shape, list) or not 1 <= len(shape) <= 5:
@@ -283,7 +285,9 @@ def validate_composition_profile_input(profile, composition):
 
     The v1 composable processor repacks tensors; it does not convert EEF/Joint
     representations or absolute/delta encodings. A new field-label profile must
-    therefore explicitly describe each selected state/action input.
+    therefore explicitly describe each selected state/action input. A composite
+    label identifies an already packed vector, without declaring its internal
+    EEF/Joint layout; that layout still belongs to the explicit training plan.
     """
     spec = normalize_composition(composition)
     if not isinstance(profile, dict):
@@ -310,6 +314,11 @@ def validate_composition_profile_input(profile, composition):
         if (label["value_mode"] == "unknown" or
                 label["component"] not in {"gripper", "other"} and label["representation"] == "unknown"):
             raise ValueError("COMPOSITION_SOURCE_UNCONFIRMED: 状态字段的表示或绝对/增量标签待确认：" + field["key"])
+        if label["representation"] == "composite":
+            if field["kind"] != "other":
+                raise ValueError("COMPOSITION_SOURCE_MISMATCH: 组合状态字段只能整字段使用 other 类型，不能隐式拆分分量：" + field["key"])
+            if label.get("shape") and label["shape"][-1] != field["width"]:
+                raise ValueError("COMPOSITION_SOURCE_MISMATCH: 组合状态字段必须保留原始完整宽度：" + field["key"])
         if (label["component"] not in {"gripper", "other"} and label["representation"] != spec["state_representation"]
                 or label["component"] != "other" and label["component"] != field["kind"]
                 or label["arm"] != "unknown" and label["arm"] != field["arm"]):
@@ -319,7 +328,10 @@ def validate_composition_profile_input(profile, composition):
         raise ValueError("COMPOSITION_SOURCE_MISMATCH: 当前组合处理器需要完整 EEF/Joint 动作字段，不能仅用夹爪开度字段：" + spec["action_key"])
     if action is None or action["role"] != "action" or action["representation"] == "unknown":
         raise ValueError("COMPOSITION_SOURCE_UNCONFIRMED: 请先确认动作字段的 EEF/Joint 标签：" + spec["action_key"])
-    if (action["representation"] != spec["action_representation"] or
+    if action["representation"] == "composite" and action.get("shape"):
+        if action["shape"][-1] != sum(block["width"] for block in spec["action_layout"]):
+            raise ValueError("COMPOSITION_SOURCE_MISMATCH: 动作分块合计宽度与组合动作字段原始宽度不一致：" + spec["action_key"])
+    if (action["representation"] not in {"composite", spec["action_representation"]} or
             spec["action_mode"] and action["value_mode"] not in {"unknown", spec["action_mode"]}):
         raise ValueError("COMPOSITION_SOURCE_MISMATCH: 处理器不支持自动转换动作字段的表示或绝对/增量编码")
     return spec

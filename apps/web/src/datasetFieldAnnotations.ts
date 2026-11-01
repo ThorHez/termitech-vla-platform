@@ -1,7 +1,7 @@
 export interface DatasetFieldAnnotation {
   key: string;
   role: 'state' | 'action';
-  representation: 'eef' | 'joint' | 'gripper' | 'unknown';
+  representation: 'eef' | 'joint' | 'gripper' | 'composite' | 'unknown';
   value_mode: 'absolute' | 'delta' | 'unknown';
   component: 'position' | 'rotation' | 'joint' | 'gripper' | 'other';
   arm: 'left' | 'right' | 'shared' | 'unknown';
@@ -51,7 +51,7 @@ export function fieldAnnotationErrors(value: unknown): string[] {
       Object.keys(row).some((key) => !allowed.has(key)) ||
       !text(row.key, 256) ||
       !['state', 'action'].includes(row.role) ||
-      !['eef', 'joint', 'gripper', 'unknown'].includes(row.representation) ||
+      !['eef', 'joint', 'gripper', 'composite', 'unknown'].includes(row.representation) ||
       !['absolute', 'delta', 'unknown'].includes(row.value_mode) ||
       !['position', 'rotation', 'joint', 'gripper', 'other'].includes(row.component) ||
       !['left', 'right', 'shared', 'unknown'].includes(row.arm)
@@ -59,6 +59,8 @@ export function fieldAnnotationErrors(value: unknown): string[] {
       return [`请完整填写字段标签 ${index + 1}。`];
     if (row.representation === 'gripper' && row.component !== 'gripper')
       return [`字段标签 ${index + 1} 的夹爪开度表示必须使用夹爪分量。`];
+    if (row.representation === 'composite' && row.component !== 'other')
+      return [`字段标签 ${index + 1} 的组合向量不能标记为单一分量。`];
     if (keys.has(row.key.trim())) return ['同一个原始字段只能登记一组标签。'];
     keys.add(row.key.trim());
     if (

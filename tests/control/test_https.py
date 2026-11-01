@@ -125,6 +125,9 @@ def test_native_tls_validates_pair_and_uses_tls_12_minimum(certificate):
     settings = Settings(enrollment_token="separate", tls_cert_file=cert_file, tls_key_file=key_file)
     options = uvicorn_options(settings)
     assert options["server_header"] is False and options["proxy_headers"] is True
+    assert options["ws"] == "websockets-sansio"
+    assert options["ws_max_size"] == 32768
+    assert options["ws_per_message_deflate"] is False
     assert options["forwarded_allow_ips"] == "127.0.0.1,::1"
     config = Config(lambda: None, **options)
     config.load()
@@ -342,4 +345,7 @@ def test_main_uses_one_settings_instance_and_explicit_server_options(monkeypatch
     main()
     assert calls[0] is settings
     assert calls[1] == ("test-app", {"host": "127.0.0.1", "port": 8001, "proxy_headers": True,
-                                      "forwarded_allow_ips": "127.0.0.1", "server_header": False})
+                                      "forwarded_allow_ips": "127.0.0.1", "server_header": False,
+                                      "ws": "websockets-sansio", "ws_max_size": 32768,
+                                      "ws_per_message_deflate": False, "ws_ping_interval": 20.0,
+                                      "ws_ping_timeout": 20.0})

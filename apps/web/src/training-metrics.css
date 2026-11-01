@@ -173,6 +173,88 @@
 .training-metric-history-note {
   margin: 0 0 14px;
 }
+.training-metric-range {
+  min-width: 0;
+  border: 1px solid var(--border, #e7ecf0);
+  border-radius: 8px;
+  margin: 0 0 18px;
+  padding: 12px;
+}
+.training-metric-range legend {
+  padding: 0 6px;
+  color: var(--text-secondary, #546672);
+  font-size: 11px;
+}
+.training-metric-range-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.training-metric-range-presets button {
+  padding: 7px 10px;
+  border: 1px solid var(--border, #e7ecf0);
+  border-radius: 6px;
+  color: var(--text-secondary, #546672);
+  background: var(--bg-subtle, #f7f9fb);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.training-metric-range-presets button[aria-pressed='true'] {
+  color: var(--text-accent, #087f76);
+  background: var(--bg-selected, #eaf7f4);
+  border-color: var(--text-accent, #0c968a);
+}
+.training-metric-range-presets button:focus-visible,
+.training-metric-range-custom input:focus-visible {
+  outline: 2px solid var(--text-accent, #0c968a);
+  outline-offset: 2px;
+}
+.training-metric-range-custom {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 13px;
+}
+.training-metric-range-custom label {
+  display: flex;
+  flex: 1 1 140px;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-secondary, #546672);
+  font-size: 11px;
+}
+.training-metric-range-custom input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border, #e7ecf0);
+  border-radius: 6px;
+  color: var(--text-primary, #24333f);
+  background: var(--bg-surface, #fff);
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.training-metric-range-custom input[aria-invalid='true'] {
+  border-color: var(--text-danger, #c7544f);
+}
+.training-metric-range-custom p,
+.training-metric-range-summary {
+  flex-basis: 100%;
+  margin: 9px 0 0;
+  color: var(--text-muted, #82909c);
+  font-size: 10px;
+  line-height: 1.8;
+}
+.training-metric-range-custom p {
+  margin: 0;
+}
+.training-metric-range-custom p.training-metric-range-error {
+  color: var(--text-danger, #c7544f);
+}
 @media (max-width: 680px) {
   .training-metric-view {
     padding: 0 13px 15px;

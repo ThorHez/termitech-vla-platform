@@ -1,0 +1,333 @@
+.asset-sync-form {
+  display: grid;
+  gap: 14px;
+}
+.asset-sync-form > .field {
+  margin-bottom: 0;
+}
+.asset-sync-norm-option,
+.asset-transfer-norm {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-subtle, #f7f9fb);
+}
+.asset-sync-norm-option .checkbox-label {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  margin: 0;
+  color: var(--text-primary, #345668);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.asset-sync-norm-option input {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--teal);
+}
+.asset-sync-norm-description {
+  display: grid;
+  gap: 5px;
+  padding-left: 25px;
+  color: var(--text-secondary, #607d8d);
+  font-size: 11px;
+}
+.asset-sync-norm-description code {
+  font-size: 10px;
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+}
+.asset-transfer-norm {
+  margin: 16px 0;
+}
+.asset-transfer-norm-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.asset-transfer-norm-heading strong {
+  color: var(--text-primary, #345668);
+  font-size: 12px;
+}
+.asset-transfer-norm > span {
+  color: var(--text-secondary, #607d8d);
+  font-size: 11px;
+}
+.asset-transfer-norm .asset-transfer-paths {
+  margin: 0;
+}
+.asset-sync-source {
+  display: grid;
+  gap: 7px;
+  padding: 15px 17px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-subtle, #f6fafb);
+  min-width: 0;
+}
+.asset-sync-source strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.asset-sync-source > span {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.asset-sync-source code,
+.asset-sync-destination code {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.asset-sync-destination {
+  display: grid;
+  gap: 7px;
+  padding: 13px 15px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-surface);
+}
+.asset-sync-destination > span {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.asset-sync-notice {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.8;
+  color: var(--text-secondary);
+}
+.asset-sync-background-notice {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 20px;
+  padding: 14px 18px;
+  border: 1px solid var(--border-success, #b6ded7);
+  border-radius: 8px;
+  background: var(--bg-success, #eaf8f5);
+  color: var(--text-success, #168669);
+}
+.asset-sync-background-notice > svg {
+  flex-shrink: 0;
+}
+.asset-sync-background-notice > div {
+  display: grid;
+  flex: 1 1 240px;
+  gap: 5px;
+  min-width: 0;
+}
+.asset-sync-background-notice strong {
+  font-size: 12px;
+}
+.asset-sync-background-notice span {
+  color: var(--text-secondary, #607d8d);
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.asset-transfers-panel {
+  margin-top: 24px;
+}
+.asset-transfer-progress-modal .asset-transfer-card {
+  padding: 0;
+  border-bottom: 0;
+}
+.asset-transfer-progress-modal .asset-sync-notice:last-child {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.asset-transfer-filter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 15px;
+  flex-wrap: wrap;
+  padding: 14px 22px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.asset-transfer-filter label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.asset-transfer-filter select {
+  max-width: 300px;
+}
+.asset-transfer-card {
+  padding: 20px 22px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+.asset-transfer-card:last-child {
+  border-bottom: 0;
+}
+.asset-transfer-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 14px;
+}
+.asset-transfer-heading > div {
+  min-width: 0;
+}
+.asset-transfer-heading strong {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-primary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.asset-transfer-heading strong svg {
+  flex-shrink: 0;
+}
+.asset-transfer-heading > div > span {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.asset-transfer-progress {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 0 10px;
+}
+.asset-transfer-progress > .progress {
+  flex: 1;
+}
+.asset-transfer-progress > span {
+  min-width: 42px;
+  color: var(--text-accent);
+  text-align: right;
+  font-size: 11px;
+}
+.asset-transfer-indeterminate {
+  overflow: hidden;
+}
+.asset-transfer-indeterminate > span {
+  width: 32%;
+  animation: asset-transfer-pending 1.6s ease-in-out infinite alternate;
+}
+@keyframes asset-transfer-pending {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(212%);
+  }
+}
+.asset-transfer-metrics,
+.asset-transfer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+.asset-transfer-metrics {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.8;
+}
+.asset-transfer-paths {
+  display: grid;
+  gap: 8px;
+  margin: 15px 0;
+  font-size: 11px;
+}
+.asset-transfer-paths > div {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  gap: 10px;
+}
+.asset-transfer-paths dt {
+  color: var(--text-secondary);
+}
+.asset-transfer-paths dd {
+  margin: 0;
+  min-width: 0;
+}
+.asset-transfer-paths code {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  line-height: 1.7;
+}
+.asset-transfer-verified {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  color: var(--text-accent);
+  font-size: 11px;
+  line-height: 1.8;
+}
+.asset-transfer-verified svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+.asset-transfer-logs {
+  margin-top: 15px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.asset-transfer-logs summary {
+  cursor: pointer;
+  padding: 4px 0;
+}
+.asset-transfer-logs pre {
+  max-height: 230px;
+  padding: 12px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border-radius: 6px;
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.7;
+}
+@media (max-width: 600px) {
+  .asset-transfer-card,
+  .asset-transfer-filter {
+    padding: 16px;
+  }
+  .asset-transfer-heading {
+    flex-wrap: wrap;
+  }
+  .asset-transfer-filter label {
+    width: 100%;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .asset-transfer-filter select {
+    width: 100%;
+    max-width: 100%;
+  }
+  .asset-transfer-paths > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .asset-transfer-indeterminate > span {
+    animation: none;
+  }
+}

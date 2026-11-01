@@ -35,7 +35,7 @@ class DatasetFieldAnnotation(_ProfileModel):
     """Labels describe a source field; they never prescribe a training layout."""
     key: str = Field(min_length=1, max_length=256)
     role: Literal["state", "action"]
-    representation: Literal["eef", "joint", "gripper", "unknown"] = "unknown"
+    representation: Literal["eef", "joint", "gripper", "composite", "unknown"] = "unknown"
     value_mode: Literal["absolute", "delta", "unknown"] = "unknown"
     component: Literal["position", "rotation", "joint", "gripper", "other"] = "other"
     arm: Literal["left", "right", "shared", "unknown"] = "unknown"
@@ -55,6 +55,8 @@ class DatasetFieldAnnotation(_ProfileModel):
     def validate_gripper_representation(self):
         if self.representation == "gripper" and self.component != "gripper":
             raise ValueError("夹爪开度表示只允许用于夹爪分量")
+        if self.representation == "composite" and self.component != "other":
+            raise ValueError("组合向量表示必须使用其他分量，具体分块在训练配置中声明")
         return self
 
     @model_validator(mode="after")

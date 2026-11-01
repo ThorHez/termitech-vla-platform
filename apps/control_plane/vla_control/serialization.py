@@ -6,6 +6,7 @@ from .models import Allocation, Asset, Attempt
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .remote_models import RemoteConnection, RemoteDeployment
 from .remote_schemas import SSHAuthenticationInput
+from .gpu_reservations import reservation_dicts
 
 
 def _connection_address(session, node):
@@ -34,6 +35,7 @@ def _connection_address(session, node):
 
 
 def node_dict(session, node):
+    user_reservations = {item["gpu_uuid"]: item for item in reservation_dicts(session, node.id)}
     reserved = {item.gpu_uuid: item.attempt_id for item in session.scalars(select(Allocation).where(Allocation.node_id == node.id))}
     for item in session.scalars(select(PolicyDeployment).where(
             PolicyDeployment.node_id == node.id, PolicyDeployment.state.in_(RESOURCE_STATES))):
@@ -42,7 +44,8 @@ def node_dict(session, node):
     return {"id": node.id, "name": node.effective_name, "hostname": node.hostname, "status": node.status,
             "connection_address": _connection_address(session, node),
             "last_seen": node.last_seen, "roots": node.roots, "output_root": node.output_root, "cache_root": node.cache_root,
-            "gpus": [{**gpu, "reserved_by": reserved.get(gpu["uuid"])} for gpu in node.gpus],
+            "gpus": [{**gpu, "reserved_by": reserved.get(gpu["uuid"]),
+                      "user_reservation": user_reservations.get(gpu["uuid"])} for gpu in node.gpus],
             "metrics": node.metrics, "created_at": node.created_at}
 
 
@@ -57,6 +60,7 @@ def asset_dict(asset):
     return {"id": asset.id, "node_id": asset.node_id, "name": asset.name, "kind": asset.kind,
             "path": asset.path, "version": asset.version, "state": asset.state,
             "metadata": asset.metadata_json, "created_at": asset.created_at,
+            "norm_asset_id": asset.norm_asset_id if asset.kind == "DATASET" else None,
             "origin_attempt_id": asset.origin_attempt_id}
 
 
@@ -74,6 +78,7 @@ def attempt_dict(attempt):
 
 def run_dict(session, run):
     result = {key: getattr(run, key) for key in ("id", "name", "node_id", "profile_id", "template_id",
+              "owner_user_id",
               "state", "created_at", "updated_at", "finished_at", "inputs", "parameters", "gpu_count", "requested_gpu_uuids",
               "code_expectation", "queue_reason", "error")}
     attempts = list(session.scalars(select(Attempt).where(Attempt.run_id == run.id).order_by(Attempt.number)))

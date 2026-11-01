@@ -6,6 +6,7 @@ from pathlib import Path
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import time
 
@@ -20,13 +21,17 @@ class LocalChannel:
         self.stdout_eof = False
         self.stderr_eof = False
         self.stderr = bytearray()
+        self.timeout = None
 
-    def settimeout(self, _value):
-        pass
+    def settimeout(self, value):
+        self.timeout = value
+        if self.process is not None:
+            os.set_blocking(self.process.stdin.fileno(), value != 0)
 
     def exec_command(self, command):
         self.process = subprocess.Popen(['/bin/sh', '-c', command], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
+        os.set_blocking(self.process.stdin.fileno(), self.timeout != 0)
 
     def recv_ready(self):
         return not self.stdout_eof and bool(select.select([self.process.stdout], [], [], 0)[0])
@@ -51,6 +56,15 @@ class LocalChannel:
         while value:
             size = os.write(self.process.stdin.fileno(), value)
             value = value[size:]
+
+    def send_ready(self):
+        return bool(select.select([], [self.process.stdin], [], 0)[1])
+
+    def send(self, value):
+        try:
+            return os.write(self.process.stdin.fileno(), value)
+        except BlockingIOError:
+            raise socket.timeout() from None
 
     def shutdown_write(self):
         if self.process.stdin and not self.process.stdin.closed:

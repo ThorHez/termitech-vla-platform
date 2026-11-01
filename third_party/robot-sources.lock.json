@@ -614,7 +614,10 @@
       ],
       "excluded": [
         ".vscode/settings.json"
-      ]
+      ],
+      "published_commit": "216141b40cbff1d1fb1745024446e993570e205d",
+      "published_url": "https://github.com/ThorHez/arx5-sdk.git",
+      "published_branch": "codex/robot-deployment-snapshot"
     },
     {
       "name": "umi-arx-deploy",
@@ -5744,7 +5747,10 @@
         "shellgame_grasp_h16_trace.log",
         "tools/robot_latency/installation.json",
         "tools/robot_latency/zmq_server.before.py"
-      ]
+      ],
+      "published_commit": "b3d91afaa582c474d9c9b6d4dbe07602d60e7abd",
+      "published_url": "https://github.com/ThorHez/umi-arx.git",
+      "published_branch": "codex/robot-deployment-snapshot"
     }
   ]
 }

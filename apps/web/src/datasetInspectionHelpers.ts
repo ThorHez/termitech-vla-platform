@@ -46,6 +46,21 @@ const related = (a: string, b: string) =>
 export const inspectionFieldTouched = (state: InspectionDraftState, path: string) =>
   [...state.touched].some((entry) => related(entry, path));
 
+export function replaceInspectionDraftFromTemplate(
+  profile: DatasetProfile,
+  state: InspectionDraftState,
+): DatasetProfile {
+  const next = copy(profile);
+  // A template is an explicit source declaration, including default-looking
+  // enums and empty annotation arrays. Absent optional facts may still be read.
+  state.automatic.clear();
+  state.originals?.clear();
+  state.touched = new Set(
+    Object.keys(next).filter((key) => next[key as keyof DatasetProfile] !== undefined),
+  );
+  return next;
+}
+
 function fieldAt(value: unknown, path: string): unknown {
   if (!path) return value;
   return path

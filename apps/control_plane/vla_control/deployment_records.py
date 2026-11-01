@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+from fastapi.responses import Response
 from sqlalchemy import select
 
 from .auth_models import AuditEvent
@@ -9,7 +10,7 @@ from .checkpoint_transfer_models import CheckpointTransfer, PolicyDeploymentTran
 from .common import APIError, now, uid
 from .deployment_record_models import DeploymentRecord, DeploymentRecordRuntime, DeploymentRecordTransfer
 from .models import Command
-from .policy_deployment_models import PolicyDeployment
+from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 
 
 def _record_name(name):
@@ -56,7 +57,7 @@ def backfill_deployment_records(connection):
             provenance={"origin": "backfill_standalone_transfer", "linked_at": row["created_at"]}))
 
 
-def resolve_record(session, identifier, *, lock=False):
+def resolve_record(session, identifier, *, lock=False, include_deleted=False):
     """Canonical IDs take priority; aliases use only the durable relationship FK."""
     record = session.get(DeploymentRecord, identifier)
     if record is None:
@@ -70,12 +71,26 @@ def resolve_record(session, identifier, *, lock=False):
             raise APIError(409, "DEPLOYMENT_RECORD_CONFLICT", "部署记录的历史归属关系无效")
         visited.add(record.id)
         record = session.get(DeploymentRecord, record.merged_into_id)
-    if record is None:
+    if record is None or (not include_deleted and record.deleted_at is not None):
         raise APIError(404, "DEPLOYMENT_RECORD_NOT_FOUND", "部署记录不存在")
     if lock:
         record = session.scalar(select(DeploymentRecord).where(DeploymentRecord.id == record.id)
             .with_for_update().execution_options(populate_existing=True))
+        if record is None or (not include_deleted and record.deleted_at is not None):
+            raise APIError(404, "DEPLOYMENT_RECORD_NOT_FOUND", "部署记录不存在")
     return record
+
+
+def require_runtime_record(session, deployment_id, *, lock=False):
+    """Keep legacy unlinked runtimes visible; deleted parents cannot be reused."""
+    link = session.get(DeploymentRecordRuntime, deployment_id)
+    return resolve_record(session, link.record_id, lock=lock) if link is not None else None
+
+
+def require_transfer_record(session, transfer_id, *, lock=False):
+    """Check the exact transfer owner, without inferring lineage from assets."""
+    link = session.get(DeploymentRecordTransfer, transfer_id)
+    return resolve_record(session, link.record_id, lock=lock) if link is not None else None
 
 
 def record_runtime(session, record_id):
@@ -146,7 +161,8 @@ def record_dict(session, record, settings, *, detail=False):
         if isinstance(provenance, dict) and isinstance(provenance.get("linked_at"), str):
             dates.append(provenance["linked_at"])
     result = {"id": record.id, "name": record.name, "node_id": node_id, "profile_id": profile_id,
-        "source_run_id": source_run_id, "state": state, "created_at": record.created_at, "updated_at": max(dates),
+        "source_run_id": source_run_id,
+        "state": state, "created_at": record.created_at, "updated_at": max(dates),
         "deployment_id": runtime.id if runtime else None,
         "selected_transfer_id": selected.transfer_id if selected else representative.id if runtime is None and representative else None,
         "transfer_ids": [row.id for row in transfers]}
@@ -155,6 +171,42 @@ def record_dict(session, record, settings, *, detail=False):
         result.update(deployment=serialized_runtime,
             transfers=[transfer_dict(row, session) for row in transfers])
     return result
+
+
+def delete_record(session, identifier):
+    record = resolve_record(session, identifier, lock=True, include_deleted=True)
+    if record.deleted_at is not None:
+        return
+    # Human mutations lock the owning record before its runtime/transfer.
+    # No node locks follow this point, so this order also works with their
+    # existing node-first lifecycle operations and background Agent receipts.
+    runtime, _, transfers = _children(session, record)
+    if runtime is not None:
+        runtime = session.scalar(select(PolicyDeployment).where(PolicyDeployment.id == runtime.id)
+            .with_for_update().execution_options(populate_existing=True))
+        from .policy_deployments import _pending
+        if (runtime.state in RESOURCE_STATES or runtime.state not in {"STOPPED", "FAILED"}
+                or runtime.pid is not None or runtime.endpoint is not None or _pending(session, runtime.id)):
+            raise APIError(409, "DEPLOYMENT_RECORD_ACTIVE", "请先停止推理服务并确认执行已结束，再删除部署记录")
+    transfer_ids = [row.id for row in transfers]
+    if transfer_ids:
+        locked = session.scalars(select(CheckpointTransfer).where(CheckpointTransfer.id.in_(transfer_ids))
+            .order_by(CheckpointTransfer.id).with_for_update().execution_options(populate_existing=True))
+        if any(row.state not in TRANSFER_TERMINAL for row in locked):
+            raise APIError(409, "DEPLOYMENT_RECORD_ACTIVE", "请先等待或取消权重同步，确认同步已结束后再删除部署记录")
+        owned_ids = select(DeploymentRecordTransfer.transfer_id).where(
+            DeploymentRecordTransfer.record_id == record.id)
+        dependent = session.scalar(select(DeploymentRecord.id)
+            .join(DeploymentRecordRuntime, DeploymentRecordRuntime.record_id == DeploymentRecord.id)
+            .join(PolicyDeploymentTransfer, PolicyDeploymentTransfer.deployment_id == DeploymentRecordRuntime.deployment_id)
+            .where(DeploymentRecord.id != record.id, DeploymentRecord.deleted_at.is_(None),
+                   PolicyDeploymentTransfer.transfer_id.in_(owned_ids)).limit(1))
+        if dependent is not None:
+            raise APIError(409, "DEPLOYMENT_RECORD_IN_USE", "该记录的权重同步仍被其他部署记录引用，请先删除引用它的部署记录",
+                {"record_id": dependent})
+    # Receipts and files remain intact; removing their parent prevents further
+    # human actions while retaining foreign keys, provenance and Agent retries.
+    record.deleted_at = now()
 
 
 def _historical_portable_witness(session, transfer):
@@ -236,9 +288,16 @@ def register_routes(app, admin, db, settings):
     def list_records():
         with db.read() as session:
             return [record_dict(session, row, settings) for row in session.scalars(select(DeploymentRecord).where(
-                DeploymentRecord.merged_into_id.is_(None)).order_by(DeploymentRecord.created_at.desc(), DeploymentRecord.id.desc()))]
+                DeploymentRecord.merged_into_id.is_(None), DeploymentRecord.deleted_at.is_(None))
+                .order_by(DeploymentRecord.created_at.desc(), DeploymentRecord.id.desc()))]
 
     @app.get("/api/v1/deployment-records/{record_id}", dependencies=admin)
     def get_record(record_id: str):
         with db.read() as session:
             return record_dict(session, resolve_record(session, record_id), settings, detail=True)
+
+    @app.delete("/api/v1/deployment-records/{record_id}", dependencies=admin, status_code=204)
+    def remove_record(record_id: str):
+        with db.write() as session:
+            delete_record(session, record_id)
+        return Response(status_code=204)

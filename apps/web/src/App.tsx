@@ -28,6 +28,8 @@ import { Badge, ErrorNotice, Field, PageHeading, Panel } from './components';
 import { DataProvider, useData } from './data';
 import { AssetsPage, NodePage, NodesPage, OverviewPage, RunsPage, TemplatesPage } from './pages';
 import RunDetail from './RunDetail';
+import { AssetTransferTaskDetail } from './AssetTransfers';
+import { backgroundTaskActiveCounts } from './backgroundTaskEntries';
 import RunWizard from './RunWizard';
 import PolicyDeployments from './PolicyDeployments';
 import { ThemeControl, ThemeProvider, ThemeSettings } from './theme';
@@ -77,7 +79,9 @@ function Shell() {
   const queryParams = new URLSearchParams(route.split('?')[1] || '');
   const [mobileNav, setMobileNav] = useState(false);
   const [wizard, setWizard] = useState<{ nodeId?: string; templateId?: string; sourceRun?: Run }>();
-  const { overview, alerts, runs, refresh } = useData();
+  const { overview, alerts, runs, assetTransfers, refresh } = useData();
+  const activeTasks = backgroundTaskActiveCounts(runs.data, assetTransfers.data);
+  const taskCountsReady = runs.data !== undefined && assetTransfers.data !== undefined;
   const section =
     navigation.find((item) => path.startsWith(item.path)) ||
     (path === '/users' ? { label: '用户与权限' } : undefined);
@@ -140,8 +144,10 @@ function Shell() {
             >
               <item.icon size={19} strokeWidth={1.7} />
               <span>{item.label}</span>
-              {item.path === '/runs' && !!overview.data?.runs_active && (
-                <b>{overview.data.runs_active}</b>
+              {item.path === '/runs' && taskCountsReady && activeTasks.total > 0 && (
+                <b title={`进行中：${activeTasks.training} 个训练，${activeTasks.sync} 个数据同步`}>
+                  {activeTasks.total}
+                </b>
               )}
             </a>
           ))}
@@ -256,6 +262,11 @@ function Shell() {
               <TemplatesPage createRun={createRun} />
             ) : path === '/runs' ? (
               <RunsPage createRun={() => createRun()} />
+            ) : path.startsWith('/runs/sync/') ? (
+              <AssetTransferTaskDetail
+                key={path}
+                id={decodeURIComponent(path.slice('/runs/sync/'.length))}
+              />
             ) : path.startsWith('/runs/') ? (
               <RunDetail
                 key={path}

@@ -23,6 +23,30 @@ try {
   } = await server.ssrLoadModule('/src/metricChartData.ts');
   const render = (props) => renderToStaticMarkup(React.createElement(MetricChart, props));
 
+  await test('requested step domains display exact boundaries without inventing edge observations', () => {
+    const html = render({
+      metricName: 'loss',
+      stepDomain: { start: 0, end: 1000 },
+      values: [
+        { step: 100, value: 0.5 },
+        { step: 900, value: 0.1 },
+      ],
+    });
+    assert.match(html, /共 2 个有效采样点/);
+    assert.match(html, />0<\/text>/);
+    assert.match(html, />1000 step<\/text>/);
+    assert.match(html, /126\.30/);
+    for (const stepDomain of [
+      { start: 100, end: 10 },
+      { start: -1, end: 100 },
+      { start: 0, end: NaN },
+    ]) {
+      const fallback = render({ values: [{ step: 10, value: 1 }], stepDomain });
+      assert.match(fallback, />10 step<\/text>/);
+      assert.doesNotMatch(fallback, /NaN|Infinity/);
+    }
+  });
+
   await test('generic metrics render zero, negative and tiny values with their own accessible name', () => {
     for (const [metricName, value] of [
       ['accuracy', 0],

@@ -9,11 +9,12 @@ from pathlib import Path
 import secrets
 import threading
 
-from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request, WebSocketException
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.requests import HTTPConnection
 from sqlalchemy import case, func, select, text
 from sqlalchemy.exc import IntegrityError
 from vla_adapters import get_templates
@@ -23,13 +24,15 @@ from .auth import AuthManager, register_auth_routes
 from .authorization import permission_for, request_route_path
 from .common import ACTIVE, APIError, TERMINAL, digest, now, offset_time, require_path, token_hash, uid, valid_snapshot
 from .db import Database
-from .models import Allocation, Asset, Attempt, Command, Event, Idempotency, Node, Preview, Profile, Run, RunInput
+from .models import Allocation, Asset, Attempt, Command, Event, GPUReservation, Idempotency, Node, Preview, Profile, Run, RunInput
 from .onboarding import generate_agent_config, resolve_agent_config_defaults
 from .path_suggestions import acknowledge as acknowledge_path_query, create_query, expire_pending as expire_path_queries, matching_profile as matching_path_profile, query_dict as path_query_dict
 from .recipe_suggestions import acknowledge as acknowledge_recipe_query, create_query as create_recipe_query, expire_pending as expire_recipe_queries, matching_profile as matching_recipe_profile, query_dict as recipe_query_dict
 from .recipe_details import acknowledge as acknowledge_recipe_detail
 from .data_processors import acknowledge as acknowledge_data_processors, register_routes as register_data_processor_routes
 from .dataset_inspections import acknowledge as acknowledge_dataset_inspection, expire_pending as expire_dataset_inspections, register_routes as register_dataset_inspection_routes
+from .dataset_norm_bindings import (_lock_norm_path, canonical_norm_path, resolve_norm_path,
+                                    update_norm_binding, validate_norm_binding)
 from .recipe_library import register_recipe_routes
 from .recipe_writeback import acknowledge as acknowledge_recipe_writeback, register_routes as register_writeback_routes, require_no_pending_writeback
 from .profile_rebindings import acknowledge as acknowledge_profile_rebind, register_routes as register_profile_rebinding_routes
@@ -37,6 +40,9 @@ from .storage_configurations import acknowledge as acknowledge_storage_configura
 from .policy_deployments import acknowledge as acknowledge_policy_deployment, register_routes as register_policy_deployment_routes, COMMANDS as POLICY_DEPLOYMENT_COMMANDS
 from .checkpoint_transfers import (CheckpointTransferManager, acknowledge_export,
                                   register_routes as register_checkpoint_transfer_routes, EXPORT_COMMANDS)
+from .asset_transfers import (AssetTransferManager, active_asset_transfers,
+                             register_routes as register_asset_transfer_routes)
+from .node_terminals import NodeTerminalManager, register_routes as register_node_terminal_routes
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES as POLICY_RESOURCE_STATES
 from .remote_deployment import DeploymentManager, register_remote_routes
 from .remote_models import RemoteDeployment
@@ -47,8 +53,14 @@ from .settings import Settings
 from .transport_security import TransportSecurityMiddleware, uvicorn_options
 from .training_drafts import register_routes as register_training_draft_routes
 from .training_templates import register_routes as register_training_template_routes
+from .dataset_templates import register_routes as register_dataset_template_routes
+from .dataset_batches import DatasetBatchManager, register_routes as register_dataset_batch_routes
+from .asset_transfer_batches import register_routes as register_asset_transfer_batch_routes
 from .resource_history import capture_sample, register_routes as register_resource_history_routes
+from .run_records import delete_run_record, require_replayable_run, require_visible_run
+from .training_metrics import register_routes as register_training_metric_routes
 from .deployment_records import register_routes as register_deployment_record_routes
+from .gpu_reservations import register_routes as register_gpu_reservation_routes, request_owner, require_gpu_access
 
 logger = logging.getLogger(__name__)
 RETIRED_NODE_STATES = {"DISCONNECTED", "REMOVED"}
@@ -62,6 +74,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     auth = AuthManager(db, settings)
     remote_manager = DeploymentManager(db, settings)
     transfer_manager = CheckpointTransferManager(db, settings, remote_manager)
+    asset_transfer_manager = AssetTransferManager(db, settings, remote_manager)
+    node_terminal_manager = NodeTerminalManager(db, settings, remote_manager, auth)
+    dataset_batch_manager = DatasetBatchManager(db, settings, remote_manager, auth)
     stop = threading.Event()
 
     def scheduler_loop():
@@ -76,6 +91,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         worker = None
         remote_manager.start()
         transfer_manager.start()
+        asset_transfer_manager.start()
+        dataset_batch_manager.start()
         if settings.scheduler_enabled:
             worker = threading.Thread(target=scheduler_loop, name="vla-scheduler", daemon=True)
             worker.start()
@@ -83,14 +100,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             stop.set()
+            node_terminal_manager.close()
+            dataset_batch_manager.close()
             transfer_manager.close()
+            asset_transfer_manager.close()
             remote_manager.close()
             if worker:
                 worker.join(timeout=35)
             db.close()
 
-    def require_human(request: Request):
+    def require_human(request: HTTPConnection):
+        # Terminal WebSockets authenticate their cookie, origin and single-use
+        # ticket in the dedicated handler; HTTP method/CSRF checks apply below.
         route_path = request_route_path(request)
+        if request.scope["type"] != "http":
+            if route_path != "/api/v1/node-terminals/{terminal_id}/ws":
+                raise WebSocketException(code=1008)
+            return
         if not route_path.startswith("/api/v1/"):
             return
         permission = permission_for(request.method, route_path)
@@ -103,6 +129,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.remote_manager = remote_manager
     app.state.transfer_manager = transfer_manager
+    app.state.asset_transfer_manager = asset_transfer_manager
+    app.state.node_terminal_manager = node_terminal_manager
+    app.state.dataset_batch_manager = dataset_batch_manager
     app.state.auth = auth
 
     @app.middleware("http")
@@ -179,7 +208,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     admin = [Depends(require_human)]
     register_training_draft_routes(app, admin, db, auth)
     register_training_template_routes(app, admin, db, auth)
+    register_dataset_template_routes(app, admin, db, auth)
+    register_dataset_batch_routes(app, admin, dataset_batch_manager)
+    register_asset_transfer_batch_routes(app, admin, asset_transfer_manager, auth)
+    register_gpu_reservation_routes(app, admin, db, auth, settings)
     register_resource_history_routes(app, admin, db)
+    register_training_metric_routes(app, admin, db)
     register_remote_routes(app, admin, remote_manager)
 
     def require_available_node(session, node_id):
@@ -204,6 +238,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_storage_configuration_routes(app, admin, db, require_available_node, settings)
     register_policy_deployment_routes(app, admin, db, require_available_node, settings)
     register_checkpoint_transfer_routes(app, admin, transfer_manager)
+    register_asset_transfer_routes(app, admin, asset_transfer_manager)
+    register_node_terminal_routes(app, node_terminal_manager)
     register_deployment_record_routes(app, admin, db, settings)
 
     @app.get("/healthz")
@@ -245,11 +281,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             allocations = {(a.node_id, a.gpu_uuid) for a in session.scalars(select(Allocation))}
             allocations.update((item.node_id, item.gpu_uuid) for item in session.scalars(select(PolicyDeployment).where(
                 PolicyDeployment.state.in_(POLICY_RESOURCE_STATES))) if item.gpu_uuid)
+            user_reserved = {(item.node_id, item.gpu_uuid) for item in session.scalars(select(GPUReservation))}
             return {"nodes_online": sum(n.status == "ONLINE" for n in nodes), "nodes_total": len(nodes),
                     "gpus_total": sum(len(n.gpus) for n in nodes),
-                    "gpus_available": sum(n.status == "ONLINE" and (n.id, gpu["uuid"]) not in allocations and gpu_available(gpu) for n in nodes for gpu in n.gpus),
-                    "runs_active": session.scalar(select(func.count()).select_from(Run).where(Run.state.not_in(TERMINAL))),
-                    "runs_failed": session.scalar(select(func.count()).select_from(Run).where(Run.state == "FAILED")),
+                    "gpus_reserved": sum((n.id, gpu["uuid"]) in user_reserved for n in nodes for gpu in n.gpus),
+                    "gpus_available": sum(n.status == "ONLINE" and (n.id, gpu["uuid"]) not in allocations
+                                          and (n.id, gpu["uuid"]) not in user_reserved and gpu_available(gpu)
+                                          for n in nodes for gpu in n.gpus),
+                    "runs_active": session.scalar(select(func.count()).select_from(Run).where(Run.deleted_at.is_(None), Run.state.not_in(TERMINAL))),
+                    "runs_failed": session.scalar(select(func.count()).select_from(Run).where(Run.deleted_at.is_(None), Run.state == "FAILED")),
                     "assets_total": session.scalar(select(func.count()).select_from(Asset).where(Asset.state != "ARCHIVED"))}
 
     @app.get("/api/v1/nodes", dependencies=admin)
@@ -266,7 +306,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             result = node_dict(session, get_required(session, Node, node_id, "Node"))
             result["assets"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.node_id == node_id))]
             result["profiles"] = [profile_dict(p) for p in session.scalars(select(Profile).where(Profile.node_id == node_id))]
-            result["runs"] = [run_dict(session, r) for r in session.scalars(select(Run).where(Run.node_id == node_id).order_by(Run.created_at.desc()).limit(100))]
+            result["runs"] = [run_dict(session, r) for r in session.scalars(select(Run).where(Run.node_id == node_id, Run.deleted_at.is_(None)).order_by(Run.created_at.desc()).limit(100))]
             return result
 
     @app.patch("/api/v1/nodes/{node_id}", dependencies=admin)
@@ -367,20 +407,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with db.write() as session:
             node = get_required(session, Node, body.node_id, "Node")
             require_path(body.path, node.roots)
+            if body.kind == "NORM":
+                # Explicit versioned registrations retain their own identity,
+                # but share the automatic path mutex so batch prelocking sees
+                # a stable set of NORM candidates before acquiring Node FK locks.
+                try:
+                    norm_path_key = canonical_norm_path(body.path)
+                except APIError:
+                    pass  # Preserve legacy manual-registration path semantics.
+                else:
+                    _lock_norm_path(session, node.id, norm_path_key)
+            norm_asset_id = body.norm_asset_id
+            if body.norm_path is not None:
+                if body.kind != "DATASET":
+                    raise APIError(409, "ASSET_KIND_MISMATCH", "只有数据集资产可以绑定 norm_stats")
+                norm_asset_id = resolve_norm_path(session, node_id=node.id, path=body.norm_path,
+                                                  dataset_name=body.name).id
+            else:
+                validate_norm_binding(session, kind=body.kind, node_id=node.id, norm_asset_id=norm_asset_id)
             asset = Asset(id=uid(), node_id=node.id, name=body.name, kind=body.kind, path=body.path,
-                          version=body.version, metadata_json=body.metadata, state="REGISTERED", created_at=now())
+                          version=body.version, metadata_json=body.metadata, state="REGISTERED", created_at=now(),
+                          norm_asset_id=norm_asset_id)
             session.add(asset)
             session.flush()
             return asset_dict(asset)
 
+    @app.put("/api/v1/assets/{asset_id}/norm-binding", dependencies=admin)
+    def put_dataset_norm_binding(asset_id: str, body: schemas.AssetNormBindingInput):
+        with db.write() as session:
+            return asset_dict(update_norm_binding(session, asset_id, body.norm_asset_id, norm_path=body.norm_path))
+
     @app.post("/api/v1/assets/{asset_id}/archive", dependencies=admin)
     def archive_asset(asset_id: str):
         with db.write() as session:
-            asset = get_required(session, Asset, asset_id, "Asset")
+            asset = session.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
+            if asset is None:
+                raise APIError(404, "NOT_FOUND", "Asset not found")
             session.scalar(select(Node).where(Node.id == asset.node_id).with_for_update())
             active_run = session.scalar(select(RunInput.run_id).join(Run, RunInput.run_id == Run.id).where(RunInput.asset_id == asset_id, Run.state.not_in(TERMINAL)).limit(1))
             if active_run:
                 raise APIError(409, "ASSET_IN_USE", "An active training run still references this asset")
+            if active_asset_transfers(session, asset_id=asset_id):
+                raise APIError(409, "ASSET_IN_USE", "资产正在同步，请等待完成或先取消同步")
             asset.state = "ARCHIVED"
             return asset_dict(asset)
 
@@ -394,17 +462,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise APIError(409, "ASSET_KIND_MISMATCH", "只有数据集资产可以编辑数据集描述")
             if asset.state == "ARCHIVED":
                 raise APIError(409, "ASSET_ARCHIVED", "已归档资产不能编辑数据集描述")
+            if active_asset_transfers(session, asset_id=asset_id):
+                raise APIError(409, "ASSET_IN_USE", "资产正在同步，请等待完成或先取消同步")
             asset.metadata_json = {**asset.metadata_json,
                                    "dataset_profile": body.dataset_profile.model_dump(mode="json", exclude_none=True)}
             session.flush()
             return asset_dict(asset)
 
     @app.post("/api/v1/run-previews", dependencies=admin, status_code=202)
-    def preview_create(body: schemas.PreviewInput):
+    def preview_create(body: schemas.PreviewInput, request: Request):
         data = body.model_dump()
         with db.write() as session:
             node, profile, parameters = validate_request(session, data)
             require_available_node(session, node.id)
+            require_gpu_access(session, node.id, request_owner(request), data.get("requested_gpu_uuids"))
             require_no_pending_writeback(session, node.id, profile.code_dir)
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
@@ -456,7 +527,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return result
 
     @app.post("/api/v1/runs", dependencies=admin, status_code=201)
-    def run_create(body: schemas.RunInput, idempotency_key: str | None = Header(default=None)):
+    def run_create(body: schemas.RunInput, request: Request, idempotency_key: str | None = Header(default=None)):
         key = key_required(idempotency_key)
         request_digest = digest(body.model_dump())
         with db.write() as session:
@@ -464,7 +535,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if existing:
                 if existing.digest != request_digest:
                     raise APIError(409, "IDEMPOTENCY_CONFLICT", "Idempotency key was used for a different request")
-                return run_dict(session, session.get(Run, existing.run_id))
+                return run_dict(session, require_replayable_run(session, existing.run_id))
             baseline = get_required(session, Preview, body.preflight_id, "Preflight")
             session.scalar(select(Node).where(Node.id == baseline.node_id).with_for_update())
             # A concurrent submission may have committed while PostgreSQL
@@ -473,7 +544,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if existing:
                 if existing.digest != request_digest:
                     raise APIError(409, "IDEMPOTENCY_CONFLICT", "Idempotency key was used for a different request")
-                return run_dict(session, session.get(Run, existing.run_id))
+                return run_dict(session, require_replayable_run(session, existing.run_id))
             preview = session.scalar(select(Preview).where(Preview.id == body.preflight_id).with_for_update().execution_options(populate_existing=True))
             if not preview:
                 raise APIError(404, "NOT_FOUND", "Preflight not found")
@@ -504,6 +575,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise APIError(409, confirmation_error["code"], confirmation_error["message"])
             session.scalar(select(Node).where(Node.id == node.id).with_for_update())
             require_available_node(session, node.id)
+            require_gpu_access(session, node.id, request_owner(request), data.get("requested_gpu_uuids"))
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             created = now()
@@ -517,7 +589,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if data.get("requested_gpu_uuids") is not None:
                 expectation["requested_gpu_uuids"] = deepcopy(data["requested_gpu_uuids"])
             run = Run(id=uid(), **run_fields, state="QUEUED", code_expectation=expectation,
-                      created_at=created, updated_at=created, queue_reason="AWAITING_SCHEDULER")
+                      owner_user_id=request_owner(request), created_at=created, updated_at=created, queue_reason="AWAITING_SCHEDULER")
             session.add(run)
             session.flush()
             for role, asset_id in data["inputs"].items():
@@ -530,19 +602,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/runs", dependencies=admin)
     def runs():
         with db.read() as session:
-            return [run_dict(session, run) for run in session.scalars(select(Run).order_by(Run.created_at.desc()).limit(500))]
+            return [run_dict(session, run) for run in session.scalars(select(Run).where(Run.deleted_at.is_(None)).order_by(Run.created_at.desc()).limit(500))]
 
     @app.get("/api/v1/runs/{run_id}", dependencies=admin)
     def run_detail(run_id: str):
         with db.read() as session:
-            return run_dict(session, get_required(session, Run, run_id, "Run"))
+            return run_dict(session, require_visible_run(session, run_id))
+
+    @app.delete("/api/v1/runs/{run_id}", dependencies=admin, status_code=204)
+    def run_delete(run_id: str):
+        with db.write() as session:
+            delete_run_record(session, run_id)
+        return Response(status_code=204)
 
     @app.post("/api/v1/runs/{run_id}/cancel", dependencies=admin, status_code=202)
     def cancel_run(run_id: str):
         with db.write() as session:
-            run = get_required(session, Run, run_id, "Run")
+            run = require_visible_run(session, run_id)
             session.scalar(select(Node).where(Node.id == run.node_id).with_for_update())
-            run = session.scalar(select(Run).where(Run.id == run_id).with_for_update().execution_options(populate_existing=True))
+            run = require_visible_run(session, run_id, lock=True)
             if run.state in TERMINAL or run.state == "CANCELLING" or run.previous_state == "CANCELLING":
                 return run_dict(session, run)
             run.updated_at = now()
@@ -563,14 +641,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/runs/{run_id}/events", dependencies=admin)
     def run_events(run_id: str, after_seq: int = Query(default=0, ge=0), limit: int = Query(default=1000, ge=1, le=1000)):
         with db.read() as session:
-            get_required(session, Run, run_id, "Run")
+            require_visible_run(session, run_id)
             events = session.scalars(select(Event).join(Attempt, Event.attempt_id == Attempt.id).where(Attempt.run_id == run_id, Event.seq > after_seq).order_by(Event.seq).limit(limit))
             return [{"attempt_id": e.attempt_id, "seq": e.seq, "type": e.type, "timestamp": e.timestamp, "data": e.data} for e in events]
 
     @app.get("/api/v1/runs/{run_id}/logs", dependencies=admin)
     def run_logs(run_id: str, after_seq: int = Query(default=0, ge=0), limit: int = Query(default=1000, ge=1, le=1000)):
         with db.read() as session:
-            get_required(session, Run, run_id, "Run")
+            require_visible_run(session, run_id)
             events = list(session.scalars(select(Event).join(Attempt, Event.attempt_id == Attempt.id).where(Attempt.run_id == run_id, Event.seq > after_seq, Event.type == "LOG").order_by(Event.seq).limit(limit)))
             return {"items": [{"seq": e.seq, "text": e.data["text"], "timestamp": e.timestamp} for e in events], "next_seq": events[-1].seq if events else after_seq}
 
@@ -581,7 +659,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for node in session.scalars(select(Node).where(Node.status.in_(["OFFLINE", "RECOVERING"]))):
                 result.append({"id": "node:" + node.id, "severity": "error", "code": "NODE_" + node.status,
                                "node_id": node.id, "run_id": None, "message": f"{node.effective_name}: {node.status}", "timestamp": node.last_seen})
-            for run in session.scalars(select(Run).where(Run.state.in_(["FAILED", "UNKNOWN"])).order_by(Run.updated_at.desc()).limit(100)):
+            for run in session.scalars(select(Run).where(Run.deleted_at.is_(None), Run.state.in_(["FAILED", "UNKNOWN"])).order_by(Run.updated_at.desc()).limit(100)):
                 error = run.error or {"code": "EXECUTION_UNKNOWN", "message": "Awaiting agent reconciliation; GPU reservation is retained"}
                 result.append({"id": "run:" + run.id, "severity": "error", "code": error.get("code", "TRAINING_FAILED"),
                                "node_id": run.node_id, "run_id": run.id, "message": error.get("message", "Training failed"), "timestamp": run.updated_at})

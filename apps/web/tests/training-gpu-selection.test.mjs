@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { createServer } from 'vite';
 
 const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)),
@@ -11,6 +13,8 @@ try {
   const codec = await server.ssrLoadModule('/src/trainingDraft.ts');
   const retry = await server.ssrLoadModule('/src/runRetry.ts');
   const templates = await server.ssrLoadModule('/src/trainingTemplate.ts');
+  const { TrainingGpuSelector } = await server.ssrLoadModule('/src/TrainingGpuSelector.tsx');
+  const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
   const devices = [0,1,2].map((index) => ({ uuid:`GPU-${index}`, name:'A100', processes:[], utilization_pct:0,
     memory_used_mb:0, memory_total_mb:81920 }));
   const node = { id:'node-a',name:'Machine A',hostname:'host',status:'ONLINE',gpus:devices };
@@ -47,6 +51,38 @@ try {
     assert.equal(gpu.gpuSelectionState({...devices[0],processes:null}),'unknown');
     assert.equal(gpu.gpuSelectionState({...devices[0],memory_used_mb:null}),'unknown');
     assert.equal(gpu.requestedGpuError({gpu_count:1,requested_gpu_uuids:[busy.uuid]},{gpus:[busy]}),undefined);
+  });
+  await test('per-user reservations exclude foreign cards while preserving owner telemetry', () => {
+    const reserved = { ...devices[0], user_reservation: {
+      user_id:'alice',username:'alice',display_name:'Alice',created_at:'now',
+    }};
+    assert.equal(gpu.gpuSelectionState(reserved,'alice'),'available');
+    assert.equal(gpu.gpuSelectionState(reserved,'bob'),'reserved');
+    assert.equal(gpu.gpuSelectionState({...reserved,reserved_by:'attempt'},'alice'),'busy');
+    const request = {gpu_count:1,requested_gpu_uuids:[reserved.uuid]};
+    assert.equal(gpu.requestedGpuError(request,{gpus:[reserved]},1,'alice'),undefined);
+    assert.match(gpu.requestedGpuError(request,{gpus:[reserved]},1,'bob'),/Alice.*预留/);
+    assert.equal(gpu.requestedGpuError({gpu_count:1},{gpus:[reserved]},1,'bob'),undefined);
+  });
+  await test('foreign reserved cards are disabled unless an old selection needs to be removed', () => {
+    const reserved = { ...devices[0], user_reservation: {
+      user_id:'alice',username:'alice',display_name:'Alice',created_at:'now',
+    }};
+    const render = (userId,selected) => renderToStaticMarkup(React.createElement(
+      AuthContext.Provider,{value:{user:{id:userId}}},React.createElement(TrainingGpuSelector,{
+        request:{gpu_count:selected.length,requested_gpu_uuids:selected},
+        node:{...node,gpus:[reserved]},minimum:1,onChange(){},
+      }),
+    ));
+    const foreign=render('bob',[]);
+    assert.match(foreign,/aria-label="选择 GPU 0"[^>]*disabled=""/);
+    assert.match(foreign,/Alice 已预留/);
+    const stale=render('bob',[reserved.uuid]);
+    assert.match(stale,/role="alert"[^>]*>GPU 已由 Alice 预留/);
+    assert.doesNotMatch(stale,/aria-label="选择 GPU 0"[^>]*disabled=""/);
+    const owner=render('alice',[reserved.uuid]);
+    assert.match(owner,/为你预留/);
+    assert.doesNotMatch(owner,/aria-label="选择 GPU 0"[^>]*disabled=""/);
   });
   await test('display numbering follows inventory while the persisted identity stays the exact UUID', () => {
     assert.equal(gpu.requestedGpuSummary(['GPU-2','GPU-0'],node),'GPU 2、GPU 0');

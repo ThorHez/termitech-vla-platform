@@ -11,6 +11,7 @@ class DeploymentRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[str] = mapped_column(String(40), index=True)
+    deleted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     merged_into_id: Mapped[str | None] = mapped_column(ForeignKey("deployment_records.id", ondelete="RESTRICT"), nullable=True)
 
 

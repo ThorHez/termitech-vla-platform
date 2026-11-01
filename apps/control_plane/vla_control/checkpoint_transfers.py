@@ -551,12 +551,18 @@ def portable_deployment(session, body, settings):
 
 
 def register_routes(app, admin, manager):
+    from .deployment_record_models import DeploymentRecord, DeploymentRecordTransfer
+    from .deployment_records import require_transfer_record
+
     db, settings = manager.db, manager.settings
 
     @app.get("/api/v1/checkpoint-transfers", dependencies=admin)
     def list_transfers():
         with db.read() as session:
-            return [transfer_dict(row, session) for row in session.scalars(select(CheckpointTransfer).order_by(
+            return [transfer_dict(row, session) for row in session.scalars(select(CheckpointTransfer)
+                .outerjoin(DeploymentRecordTransfer, DeploymentRecordTransfer.transfer_id == CheckpointTransfer.id)
+                .outerjoin(DeploymentRecord, DeploymentRecord.id == DeploymentRecordTransfer.record_id)
+                .where(DeploymentRecord.deleted_at.is_(None)).order_by(
                 CheckpointTransfer.created_at.desc(), CheckpointTransfer.id.desc()))]
 
     @app.get("/api/v1/checkpoint-transfers/{transfer_id}", dependencies=admin)
@@ -565,6 +571,7 @@ def register_routes(app, admin, manager):
             row = session.get(CheckpointTransfer, transfer_id)
             if row is None:
                 raise APIError(404, "NOT_FOUND", "同步任务不存在")
+            require_transfer_record(session, transfer_id)
             return transfer_dict(row, session)
 
     @app.post("/api/v1/checkpoint-transfers", dependencies=admin, status_code=202)
@@ -621,10 +628,12 @@ def register_routes(app, admin, manager):
             row = session.get(CheckpointTransfer, transfer_id)
             if row is None:
                 raise APIError(404, "NOT_FOUND", "同步任务不存在")
+            require_transfer_record(session, transfer_id)
             if row.state not in TRANSFER_RETRYABLE:
                 raise APIError(409, "TRANSFER_NOT_RETRYABLE", "只有失败、取消或中断的同步可以重试")
             bindings = _check_snapshot(session, row, settings)
             _verify_saved_ssh_credentials(session, bindings, manager)
+            require_transfer_record(session, transfer_id, lock=True)
             row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id)
                 .with_for_update().execution_options(populate_existing=True))
             if row.state not in TRANSFER_RETRYABLE:
@@ -650,6 +659,7 @@ def register_routes(app, admin, manager):
     @app.post("/api/v1/checkpoint-transfers/{transfer_id}/cancel", dependencies=admin, status_code=202)
     def cancel_transfer(transfer_id: str):
         with db.write() as session:
+            require_transfer_record(session, transfer_id, lock=True)
             row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id).with_for_update())
             if row is None:
                 raise APIError(404, "NOT_FOUND", "同步任务不存在")

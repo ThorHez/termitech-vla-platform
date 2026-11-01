@@ -530,6 +530,7 @@ function RunWizardContent({
     request,
     node,
     template?.min_gpus ?? (template?.id === 'smoke' ? 0 : 1),
+    userId,
   );
   const stageParameterSpecs = specs(trainingStage);
   const inputRequirements = requiredInputs(trainingStage || template);

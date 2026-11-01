@@ -24,6 +24,114 @@ try {
   const { finiteMetric, formatMetricValue, metricNames, metricProgress, trainingMetricSeries } =
     await server.ssrLoadModule('/src/trainingMetricData.ts');
   const { TrainingMetrics } = await server.ssrLoadModule('/src/TrainingMetrics.tsx');
+  const { parseTrainingMetricRange, trainingMetricRangeBounds, trainingMetricPointsInRange } =
+    await server.ssrLoadModule('/src/trainingMetricRange.ts');
+
+  await test('custom step ranges accept zero, inclusive single-step ranges and an open latest bound', () => {
+    assert.deepEqual(parseTrainingMetricRange('0', '0'), {
+      range: { mode: 'custom', start: 0, end: 0 },
+    });
+    assert.deepEqual(parseTrainingMetricRange(' 100 ', ' 100 '), {
+      range: { mode: 'custom', start: 100, end: 100 },
+    });
+    assert.deepEqual(parseTrainingMetricRange('', ''), {
+      range: { mode: 'custom', start: 0, end: null },
+    });
+    assert.deepEqual(parseTrainingMetricRange('100', ''), {
+      range: { mode: 'custom', start: 100, end: null },
+    });
+    for (const value of ['-1', '0.5', '1e3', 'Infinity', 'NaN', '9007199254740992']) {
+      assert.ok(parseTrainingMetricRange(value, '').error, value);
+      assert.ok(parseTrainingMetricRange('0', value).error, value);
+    }
+    assert.match(parseTrainingMetricRange('500', '499').error, /结束步数不能小于起始步数/);
+  });
+
+  await test('all and recent ranges follow the current step; fixed custom ranges remain stable', () => {
+    assert.deepEqual(trainingMetricRangeBounds({ mode: 'all' }, 20700), { start: 0, end: 20700 });
+    assert.deepEqual(trainingMetricRangeBounds({ mode: 'all' }, 0), { start: 0, end: 0 });
+    assert.deepEqual(trainingMetricRangeBounds({ mode: 'all' }, null), { start: 0, end: null });
+    const recent = { mode: 'recent', steps: 1000 };
+    assert.deepEqual(trainingMetricRangeBounds(recent, 20700), { start: 19700, end: 20700 });
+    assert.deepEqual(trainingMetricRangeBounds(recent, 20800), { start: 19800, end: 20800 });
+    assert.deepEqual(trainingMetricRangeBounds(recent, 100), { start: 0, end: 100 });
+    const fixed = { mode: 'custom', start: 500, end: 1500 };
+    assert.deepEqual(trainingMetricRangeBounds(fixed, 20700), { start: 500, end: 1500 });
+    assert.deepEqual(trainingMetricRangeBounds(fixed, 20800), { start: 500, end: 1500 });
+    const follow = { mode: 'custom', start: 500, end: null };
+    assert.deepEqual(trainingMetricRangeBounds(follow, 20700), { start: 500, end: 20700 });
+    assert.deepEqual(trainingMetricRangeBounds(follow, 20800), { start: 500, end: 20800 });
+  });
+
+  await test('range filtering retains sparse observations and explicit gaps without inventing boundary samples', () => {
+    const points = [
+      { step: 0, value: 0 },
+      { step: 200, value: 0.5 },
+      { step: 500, value: null },
+      { step: 1000, value: 0.2 },
+      { step: 20700, value: 0.1 },
+    ];
+    assert.deepEqual(
+      trainingMetricPointsInRange(points, { start: 200, end: 1000 }),
+      points.slice(1, 4),
+    );
+    assert.deepEqual(trainingMetricPointsInRange(points, { start: 0, end: 0 }), [points[0]]);
+    assert.deepEqual(trainingMetricPointsInRange(points, { start: 201, end: 499 }), []);
+    assert.deepEqual(
+      trainingMetricPointsInRange(points, { start: 1000, end: null }),
+      points.slice(3),
+    );
+    assert.deepEqual(
+      points.map((point) => point.step),
+      [0, 200, 500, 1000, 20700],
+    );
+  });
+
+  await test('default controls expose full-history and custom ranges while incomplete history stays explicit', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(TrainingMetrics, {
+        events: [event(1, { step: 17400, loss: 0.004 })],
+        latestMetrics: { step: 20700, loss: 0.0035 },
+        historyComplete: false,
+      }),
+    );
+    assert.match(html, /<legend>显示步数<\/legend>/);
+    assert.match(html, /aria-pressed="true">从开始到现在/);
+    assert.match(html, /最近 1,000 步/);
+    assert.match(html, /最近 5,000 步/);
+    assert.match(html, /最近 10,000 步/);
+    assert.match(html, />自定义<\/button>/);
+    assert.match(html, /正在补齐全程指标/);
+    assert.match(html, /已载入 1 次有效上报/);
+    assert.doesNotMatch(html, /全程 1 次有效上报/);
+    assert.match(html, /显示 Step 0 – 20,700/);
+  });
+
+  await test('failed partial-history reads show retry and incomplete coverage rather than a completed whole run', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(TrainingMetrics, {
+        events: [event(1, { step: 17400, loss: 0.004 })],
+        historyComplete: false,
+        error: new Error('history unavailable'),
+        retry: () => {},
+      }),
+    );
+    assert.match(html, /训练指标读取失败/);
+    assert.match(html, /全程指标尚未补齐/);
+    assert.doesNotMatch(html, /正在补齐/);
+    assert.match(html, /重试/);
+  });
+
+  await test('history leading a stale run snapshot is not clipped from the full-range chart', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(TrainingMetrics, {
+        events: [event(1, { step: 0, loss: 1 }), event(2, { step: 200, loss: 0.5 })],
+        latestMetrics: { step: 100, loss: 0.8 },
+      }),
+    );
+    assert.match(html, /显示 Step 0 – 200/);
+    assert.match(html, /区间 2 个曲线采样点/);
+  });
 
   await test('all reported finite numeric keys are discovered, with metadata and other event types excluded', () => {
     const names = metricNames(

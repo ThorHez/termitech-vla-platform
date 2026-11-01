@@ -59,6 +59,18 @@ try {
       /计算进程或平台任务/,
     );
   });
+  await test('user reservations protect both inference modes and allow the owner', () => {
+    const reservation = {user_id:'alice',username:'alice',display_name:'Alice',created_at:'now'};
+    const reservedGraphics = {...graphics,user_reservation:reservation};
+    const idle = {...reservedGraphics,processes:[],utilization_pct:0,memory_used_mb:0,
+      memory_free_mb:24564};
+    for (const [gpu,mode,budget] of [[reservedGraphics,'shared',16384],[idle,'exclusive',null]]) {
+      assert.match(inferenceGpuError(gpu,mode,budget,node,'bob'),/Alice.*预留/);
+      assert.equal(inferenceGpuError(gpu,mode,budget,node,'alice'),undefined);
+      assert.match(inferenceGpuError(gpu,mode,budget,node),/Alice.*预留/);
+    }
+    assert.match(inferenceGpuError({...idle,reserved_by:'active'},'exclusive',null,node,'alice'),/已被平台/);
+  });
   await test('shared memory admission uses reported free memory plus the full 1 GiB reserve', () => {
     const boundary = { ...graphics, memory_used_mb: 1000, memory_free_mb: 17408 };
     assert.equal(inferenceGpuError(boundary, 'shared', 16384, node), undefined);

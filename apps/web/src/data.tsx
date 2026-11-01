@@ -2,6 +2,7 @@ import { createContext, useContext } from 'react';
 import type { ReactNode } from 'react';
 import { useApi } from './api';
 import type { Alert, Asset, Gpu, Node, Overview, Profile, Run, Template } from './types';
+import type { AssetTransfer } from './assetTransfer';
 
 function useResources(enabled: boolean) {
   const overview = useApi<Overview>(enabled ? '/overview' : null);
@@ -10,6 +11,10 @@ function useResources(enabled: boolean) {
   const profiles = useApi<Profile[]>(enabled ? '/profiles' : null, 15000);
   const templates = useApi<Template[]>(enabled ? '/templates' : null, 30000);
   const runs = useApi<Run[]>(enabled ? '/runs' : null);
+  const assetTransfers = useApi<AssetTransfer[]>(
+    enabled ? '/asset-transfers?limit=200' : null,
+    3000,
+  );
   const alerts = useApi<Alert[]>(enabled ? '/alerts' : null);
   const refresh = () => {
     overview.refresh();
@@ -18,9 +23,21 @@ function useResources(enabled: boolean) {
     profiles.refresh();
     templates.refresh();
     runs.refresh();
+    assetTransfers.refresh();
     alerts.refresh();
   };
-  return { enabled, overview, nodes, assets, profiles, templates, runs, alerts, refresh };
+  return {
+    enabled,
+    overview,
+    nodes,
+    assets,
+    profiles,
+    templates,
+    runs,
+    assetTransfers,
+    alerts,
+    refresh,
+  };
 }
 const DataContext = createContext<ReturnType<typeof useResources> | null>(null);
 export function DataProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
@@ -46,6 +63,7 @@ export const activeStates = new Set(['QUEUED', 'STARTING', 'RUNNING', 'CANCELLIN
 export function gpuIdle(gpu: Gpu) {
   return (
     !gpu.reserved_by &&
+    !gpu.user_reservation &&
     Array.isArray(gpu.processes) &&
     gpu.processes.length === 0 &&
     gpu.utilization_pct != null &&

@@ -1,0 +1,162 @@
+.gpu-reservations-modal {
+  width: 760px;
+}
+.training-gpu-state.reserved {
+  color: #9b6417;
+}
+.training-gpu-option:has(input:disabled) {
+  opacity: 0.7;
+}
+.gpu-reservation-explanation {
+  color: var(--muted);
+  line-height: 1.7;
+  margin: 0 0 18px;
+}
+.node-gpu-resources .gpu-resource-tabs {
+  margin: 0;
+  padding: 0 20px;
+  gap: 24px;
+}
+.node-gpu-resources .gpu-resource-tabs > button {
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 20px;
+}
+.gpu-reservation-tab-hint {
+  margin: 0;
+  padding: 15px 20px 8px;
+  font-size: 12px;
+  color: var(--text-muted, #7b8d98);
+  line-height: 1.6;
+}
+.gpu-reservation-device-table {
+  min-width: 540px;
+}
+.gpu-reservation-device-table td {
+  vertical-align: middle;
+}
+.gpu-reservation-device-uuid {
+  display: block;
+  max-width: 190px;
+  margin-top: 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted, #7b8d98);
+  font-size: 10px;
+}
+.gpu-reservation-public {
+  font-size: 12px;
+  color: var(--text-muted, #7b8d98);
+}
+.gpu-reservation-active {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  white-space: nowrap;
+  color: var(--text-accent, #087f76);
+  font-size: 12px;
+}
+.gpu-reservation-empty {
+  margin: 0;
+  padding: 20px;
+  color: var(--text-muted, #7b8d98);
+  font-size: 13px;
+}
+.gpu-reservation-save-receipt {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--text-accent, #087f76);
+  border-radius: 9px;
+  padding: 14px;
+  margin: 0 0 16px;
+  background: var(--bg-success, #effaf6);
+  color: var(--text-primary, #284e47);
+  font-size: 13px;
+}
+.gpu-reservation-save-receipt > svg {
+  color: var(--text-accent, #087f76);
+  flex-shrink: 0;
+}
+.gpu-reservation-save-receipt p {
+  margin: 6px 0 0;
+  line-height: 1.6;
+}
+.run-summary .run-gpu-reservation-notice {
+  display: grid;
+  gap: 5px;
+}
+.run-gpu-reservation-notice small {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  overflow-wrap: anywhere;
+}
+.run-gpu-reservation-notice a {
+  font-size: 12px;
+}
+.gpu-reservation-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+}
+.gpu-reservation-options {
+  display: grid;
+  gap: 10px;
+}
+.gpu-reservation-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 14px;
+}
+.gpu-reservation-option.mine {
+  border-color: var(--accent, #00877b);
+}
+.gpu-reservation-option label {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
+}
+.gpu-reservation-option label > span {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.gpu-reservation-option label > span > span,
+.gpu-reservation-option code,
+.gpu-user-reservation {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.gpu-reservation-option input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  accent-color: var(--accent, #00877b);
+}
+.gpu-user-reservation {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+@media (max-width: 560px) {
+  .gpu-reservation-option,
+  .gpu-reservation-toolbar {
+    flex-wrap: wrap;
+  }
+}

@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { appendTrainingMetricPage } from './trainingMetricFeed';
+import type { TrainingMetricFeed, TrainingMetricPage } from './trainingMetricFeed';
+import type { RunEvent } from './types';
 
 const LEGACY_TOKEN_KEY = 'termitech.admin-token';
 const SESSION_EXPIRED = 'termitech:session-expired';
@@ -277,6 +280,120 @@ export function useRunFeed<T extends { seq: number }>(
   }, [live]);
   return { data, error, loading, complete, refresh };
 }
+export function useRunMetrics(runId: string, attemptId: string | undefined, live = true) {
+  const path = attemptId
+    ? `/runs/${encodeURIComponent(runId)}/metrics?attempt_id=${encodeURIComponent(attemptId)}`
+    : null;
+  const [state, setState] = useState<{
+    path: string | null;
+    data: RunEvent[];
+    loading: boolean;
+    complete: boolean;
+    totalCount: number;
+    error?: Error;
+  }>({ path: null, data: [], loading: false, complete: false, totalCount: 0 });
+  const [revision, setRevision] = useState(0);
+  const liveRef = useRef(live);
+  const previousLive = useRef(live);
+  const wake = useRef<(() => void) | undefined>(undefined);
+  liveRef.current = live;
+  const refresh = useCallback(() => setRevision((value) => value + 1), []);
+  useEffect(() => {
+    if (!path || !attemptId) return;
+    let active = true;
+    let feed: TrainingMetricFeed = { items: [], cursor: 0, totalCount: 0 };
+    let recoveringHistory = false;
+    let inFlight = false;
+    let requested = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const controller = new AbortController();
+    setState({ path, data: [], loading: true, complete: false, totalCount: 0 });
+    const poll = async () => {
+      if (!active || inFlight) return;
+      inFlight = true;
+      requested = false;
+      let more = false;
+      let failed = false;
+      try {
+        const page = await api<TrainingMetricPage>(`${path}&after_seq=${feed.cursor}&limit=1000`, {
+          signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]),
+        });
+        if (!active) return;
+        feed = appendTrainingMetricPage(feed, page, attemptId);
+        more = page.has_more;
+        if (!more && feed.items.length !== feed.totalCount) {
+          // A late event can be inserted before the acknowledged cursor. A
+          // fresh metric-only scan repairs that gap without touching log state.
+          if (recoveringHistory) throw new Error('指标历史正在变化，请重新读取完整记录。');
+          recoveringHistory = true;
+          feed = { items: [], cursor: 0, totalCount: page.total_count };
+          more = true;
+          setState((current) => ({ ...current, complete: false, totalCount: page.total_count }));
+        } else {
+          if (!more) recoveringHistory = false;
+          setState({
+            path,
+            data: feed.items,
+            loading: false,
+            complete: !more && !requested,
+            totalCount: feed.totalCount,
+          });
+        }
+      } catch (error) {
+        failed = true;
+        if (recoveringHistory) {
+          feed = { items: [], cursor: 0, totalCount: feed.totalCount };
+          recoveringHistory = false;
+        }
+        if (active)
+          setState((current) => ({
+            ...current,
+            loading: false,
+            complete: false,
+            error: error instanceof Error ? error : new Error(String(error)),
+          }));
+      } finally {
+        inFlight = false;
+        if (active && (requested || more || failed || liveRef.current)) {
+          timer = setTimeout(poll, requested ? 0 : more ? 50 : 3000);
+        }
+      }
+    };
+    wake.current = () => {
+      requested = true;
+      setState((current) => ({ ...current, complete: false }));
+      if (!inFlight) {
+        clearTimeout(timer);
+        void poll();
+      }
+    };
+    void poll();
+    return () => {
+      active = false;
+      controller.abort();
+      clearTimeout(timer);
+      wake.current = undefined;
+    };
+  }, [path, attemptId, revision]);
+  useEffect(() => {
+    if (previousLive.current === live) return;
+    previousLive.current = live;
+    wake.current?.();
+  }, [live]);
+  // A route/attempt change must never render the previous execution's data,
+  // including the render before this effect clears its state.
+  return path && state.path === path
+    ? { ...state, refresh }
+    : {
+        data: [] as RunEvent[],
+        loading: Boolean(path),
+        complete: !path,
+        totalCount: 0,
+        error: undefined,
+        refresh,
+      };
+}
+
 export function useRoute() {
   const [route, setRoute] = useState(window.location.hash.slice(1) || '/overview');
   useEffect(() => {

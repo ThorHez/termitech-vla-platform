@@ -38,8 +38,12 @@ class Database:
         from . import remote_models  # noqa: F401
         from . import recipe_models  # noqa: F401
         from . import auth_models  # noqa: F401
+        from . import dataset_template_models  # noqa: F401
+        from . import dataset_batch_models  # noqa: F401
         from . import policy_deployment_models  # noqa: F401
         from . import checkpoint_transfer_models  # noqa: F401
+        from . import asset_transfer_models  # noqa: F401
+        from . import asset_transfer_batch_models  # noqa: F401
         from . import deployment_record_models  # noqa: F401
         Base.metadata.create_all(self.engine)
         # One stable row serializes administrator invariants across processes.
@@ -52,6 +56,10 @@ class Database:
             # sessions while preserving users, Agents and all business data.
             if self.engine.dialect.name == "postgresql":
                 connection.exec_driver_sql("SELECT id FROM auth_guard WHERE id = 1 FOR UPDATE")
+            # Metric history must not scan a run's potentially large LOG tail.
+            # create_all skips indexes on existing tables, so upgrade those too.
+            connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_events_attempt_type_seq "
+                                       "ON events (attempt_id, type, seq)")
             columns = {column["name"] for column in inspect(connection).get_columns("user_sessions")}
             missing = {"last_activity_at", "reauthenticated_at"} - columns
             for column in sorted(missing):
@@ -66,10 +74,29 @@ class Database:
                 connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN display_name VARCHAR(200)")
             if "cache_root" not in node_columns:
                 connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN cache_root TEXT")
+            asset_columns = {column["name"] for column in inspect(connection).get_columns("assets")}
+            if "norm_asset_id" not in asset_columns:
+                connection.exec_driver_sql("ALTER TABLE assets ADD COLUMN norm_asset_id VARCHAR(36) REFERENCES assets(id) ON DELETE RESTRICT")
+            transfer_columns = {column["name"] for column in inspect(connection).get_columns("asset_transfers")}
+            if "deleted_at" not in transfer_columns:
+                connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN deleted_at VARCHAR(40)")
+            if "include_norm_stats" not in transfer_columns:
+                connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN include_norm_stats BOOLEAN NOT NULL DEFAULT false")
+            if "norm_sync" not in transfer_columns:
+                connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN norm_sync JSON")
             run_columns = {column["name"] for column in inspect(connection).get_columns("runs")}
+            if "deleted_at" not in run_columns:
+                connection.exec_driver_sql("ALTER TABLE runs ADD COLUMN deleted_at VARCHAR(40)")
             if "requested_gpu_uuids" not in run_columns:
                 connection.exec_driver_sql("ALTER TABLE runs ADD COLUMN requested_gpu_uuids JSON")
+            if "owner_user_id" not in run_columns:
+                connection.exec_driver_sql("ALTER TABLE runs ADD COLUMN owner_user_id VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
+            record_columns = {column["name"] for column in inspect(connection).get_columns("deployment_records")}
+            if "deleted_at" not in record_columns:
+                connection.exec_driver_sql("ALTER TABLE deployment_records ADD COLUMN deleted_at VARCHAR(40)")
             policy_columns = {column["name"] for column in inspect(connection).get_columns("policy_deployments")}
+            if "owner_user_id" not in policy_columns:
+                connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN owner_user_id VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
             if "inference_backend" not in policy_columns:
                 connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN inference_backend VARCHAR(16) NOT NULL DEFAULT 'auto'")
             if "resolved_backend" not in policy_columns:

@@ -285,7 +285,7 @@ with tempfile.TemporaryDirectory(prefix='termitech-rsync-') as temporary:
     signal.signal(signal.SIGHUP,interrupted)
     signal.signal(signal.SIGINT,interrupted)
     try:
-        child=subprocess.Popen(['rsync','-rct','--partial','--inplace','--progress']+__CHECKPOINT_RSYNC_EXCLUDES__+['-e',rsh,'--','checkpoint-source:/checkpoint/',p['path']+'/'],
+        child=subprocess.Popen(['rsync','-rct','--partial','--inplace','--progress']+p.get('excludes',__CHECKPOINT_RSYNC_EXCLUDES__)+['-e',rsh,'--','checkpoint-source:/checkpoint/',p['path']+'/'],
             stdin=subprocess.DEVNULL,stdout=sys.stderr,stderr=sys.stderr,close_fds=True,start_new_session=True)
         connection,_=listener.accept()
         def upload():
@@ -336,15 +336,15 @@ def _open_channel(remote, command):
     return channel
 
 
-def _remote_json(remote, payload, cancelled, timeout=3600):
-    channel = _open_channel(remote, shlex.join(["python3", "-u", "-c", _REMOTE_SCRIPT]))
+def _remote_json(remote, payload, cancelled, timeout=3600, *, script=None, max_bytes=16*1024*1024):
+    channel = _open_channel(remote, shlex.join(["python3", "-u", "-c", _REMOTE_SCRIPT if script is None else script]))
     output, errors = bytearray(), bytearray()
     deadline = time.monotonic() + timeout
     try:
         if cancelled():
             raise TransferError("TRANSFER_CANCELLED", "Checkpoint transfer was cancelled")
         encoded=json.dumps(payload, ensure_ascii=False).encode()
-        if len(encoded)>16*1024*1024:
+        if len(encoded)>max_bytes:
             raise TransferError("TRANSFER_MANIFEST_LIMIT", "Checkpoint verification request exceeded its limit")
         channel.sendall(str(len(encoded)).encode()+b"\n"+encoded)
         while True:
@@ -358,7 +358,7 @@ def _remote_json(remote, payload, cancelled, timeout=3600):
                     chunk=receive(65536)
                     if not chunk:break
                     buffer.extend(chunk)
-                    if len(buffer)>16*1024*1024:
+                    if len(buffer)>max_bytes:
                         raise TransferError("TRANSFER_MANIFEST_LIMIT", "Remote verification result exceeded its limit")
             if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                 status=channel.recv_exit_status()
@@ -384,7 +384,13 @@ def _bridge(source, target, cancelled, progress, bytes_total, files_total, initi
     moved=0
     last_emit=0
     tail=bytearray()
+    # SSH sendall may write a prefix before timing out without reporting its
+    # length. Keep one bounded block per direction and advance only by send's
+    # confirmed count, while continuing to drain the reverse rsync protocol.
+    pending={source:bytearray(),target:bytearray()}
     try:
+        source.settimeout(0)
+        target.settimeout(0)
         while True:
             if cancelled():
                 raise TransferError("TRANSFER_CANCELLED", "Checkpoint transfer was cancelled; partial files are retained")
@@ -393,28 +399,54 @@ def _bridge(source, target, cancelled, progress, bytes_total, files_total, initi
                 raise TransferError("TRANSFER_IDLE_TIMEOUT", "No rsync progress was received; retry resumes the partial checkpoint")
             activity=False
             for incoming,outgoing in ((source,target),(target,source)):
+                buffer=pending[incoming]
                 for _ in range(8):
-                    if not incoming.recv_ready():break
-                    chunk=incoming.recv(65536)
-                    if not chunk:break
-                    try:outgoing.sendall(chunk)
+                    if not buffer and incoming.recv_ready():
+                        try:chunk=incoming.recv(65536)
+                        except socket.timeout:break
+                        except (OSError,EOFError):
+                            raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已断开；已传文件保留，可手动重试继续同步") from None
+                        if not chunk:break
+                        buffer.extend(chunk)
+                        activity=True
+                    if not buffer or not outgoing.send_ready():break
+                    try:count=outgoing.send(bytes(buffer))
+                    except socket.timeout:
+                        # A full SSH send window is temporary backpressure,
+                        # not a failed transfer. No bytes were accepted by send.
+                        break
                     except (OSError,EOFError):
-                        if not outgoing.exit_status_ready():raise
-                    if incoming is source:moved+=len(chunk)
+                        if not outgoing.exit_status_ready():
+                            raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已断开；已传文件保留，可手动重试继续同步") from None
+                        buffer.clear()
+                        break
+                    if not count:
+                        if not outgoing.exit_status_ready():
+                            raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已关闭；已传文件保留，可手动重试继续同步")
+                        buffer.clear()
+                        break
+                    del buffer[:count]
+                    if incoming is source:moved+=count
                     activity=True
-                while incoming.recv_stderr_ready():
-                    chunk=incoming.recv_stderr(32768)
+                # Bound stderr work too, so cancellation and the other peer
+                # cannot be starved by a continuously producing progress log.
+                for _ in range(8):
+                    if not incoming.recv_stderr_ready():break
+                    try:chunk=incoming.recv_stderr(32768)
+                    except socket.timeout:break
+                    except (OSError,EOFError):
+                        raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已断开；已传文件保留，可手动重试继续同步") from None
                     if not chunk:break
                     if incoming is target:
                         tail.extend(chunk)
                         if len(tail)>8192:del tail[:-8192]
                     activity=True
-            if activity:last_activity=now
-            if not source_eof and source.exit_status_ready() and not source.recv_ready():
+            if activity:last_activity=time.monotonic()
+            if not source_eof and source.exit_status_ready() and not source.recv_ready() and not pending[source]:
                 source_eof=True
                 try:target.shutdown_write()
                 except OSError:pass
-            if not target_eof and target.exit_status_ready() and not target.recv_ready():
+            if not target_eof and target.exit_status_ready() and not target.recv_ready() and not pending[target]:
                 target_eof=True
                 try:source.shutdown_write()
                 except OSError:pass
@@ -431,7 +463,7 @@ def _bridge(source, target, cancelled, progress, bytes_total, files_total, initi
                 if any(codes):
                     raise TransferError("TRANSFER_RSYNC_FAILED", "rsync did not complete; partial files are retained for retry")
                 return
-            time.sleep(.005)
+            if not activity:time.sleep(.005)
     finally:
         source.close();target.close()
 

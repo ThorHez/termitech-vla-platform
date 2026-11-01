@@ -1,0 +1,71 @@
+.dataset-norm-summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  color: var(--text-secondary, #607d8d);
+  font-size: 10px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.dataset-norm-summary.unavailable {
+  color: var(--text-warning, #a87524);
+}
+.dataset-norm-error {
+  color: var(--text-danger, #b42318);
+}
+.dataset-norm-summary svg {
+  flex-shrink: 0;
+}
+.dataset-norm-form {
+  display: grid;
+  gap: 16px;
+}
+.dataset-norm-form .field {
+  margin-bottom: 0;
+}
+.dataset-norm-field {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+.dataset-norm-field > .field {
+  margin-bottom: 0;
+}
+.dataset-norm-path-entry {
+  margin-top: 5px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-subtle, #f7f9fb);
+  min-width: 0;
+}
+.dataset-norm-path-entry .field {
+  margin-bottom: 0;
+}
+.dataset-norm-source {
+  display: grid;
+  gap: 7px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-subtle, #f7f9fb);
+}
+.dataset-norm-source strong {
+  font-size: 12px;
+  color: var(--text-primary, #345668);
+}
+.dataset-norm-path,
+.dataset-norm-source code {
+  display: block;
+  margin-top: 6px;
+  font-size: 10px;
+  line-height: 1.7;
+  color: var(--text-secondary, #607d8d);
+  overflow-wrap: anywhere;
+}
+.dataset-norm-error {
+  margin: 7px 0 0;
+  font-size: 11px;
+  line-height: 1.7;
+}

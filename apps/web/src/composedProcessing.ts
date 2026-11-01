@@ -53,7 +53,9 @@ export interface ProcessingProfileSeed {
   arm_mode: 'single' | 'bimanual';
   action_representation: 'eef' | 'joint' | 'unknown';
   action_mode: 'absolute' | 'delta' | 'unknown';
-  rotation_representation: Exclude<ComposedProcessingSpec['rotation_representation'], ''> | 'unknown';
+  rotation_representation:
+    | Exclude<ComposedProcessingSpec['rotation_representation'], ''>
+    | 'unknown';
   cameras: { name: string; key: string; kind: 'rgb' | 'depth' }[];
   /** Read-only source facts for this training binding, never a saved asset composition. */
   image_features?: readonly ImageFeature[];
@@ -66,7 +68,7 @@ export interface ProcessingProfileSeed {
 export interface ProcessingFieldAnnotation {
   key: string;
   role: 'state' | 'action';
-  representation: 'eef' | 'joint' | 'gripper' | 'unknown';
+  representation: 'eef' | 'joint' | 'gripper' | 'composite' | 'unknown';
   value_mode: 'absolute' | 'delta' | 'unknown';
   component: StateKind;
   arm: Arm | 'shared' | 'unknown';
@@ -98,8 +100,13 @@ const ROOT_KEYS = [
   'aux_keys',
 ];
 const OPTIONAL_ROOT_KEYS = [
-  'position_unit', 'joint_unit', 'coordinate_frame', 'gripper_range',
-  'action_mode', 'rotation_representation', 'prompt_key',
+  'position_unit',
+  'joint_unit',
+  'coordinate_frame',
+  'gripper_range',
+  'action_mode',
+  'rotation_representation',
+  'prompt_key',
 ];
 const STATE_KEYS = ['key', 'width', 'arm', 'kind', 'normalize'];
 const ACTION_KEYS = ['arm', 'kind', 'width', 'normalize'];
@@ -152,8 +159,10 @@ export function composedProcessingErrors(value: unknown): string[] {
     errors.push('任务文本字段需为真实字段名，不能填写文件路径或表达式；留空则自动读取。');
   if (!blankDeclaration(value.action_mode) && !choice(value.action_mode, ['absolute', 'delta']))
     errors.push('动作模式只支持绝对量或增量；可留空沿用原始数据。');
-  if (!blankDeclaration(value.rotation_representation) &&
-      !choice(value.rotation_representation, ['axis_angle', 'quaternion', 'rotation_6d', 'none']))
+  if (
+    !blankDeclaration(value.rotation_representation) &&
+    !choice(value.rotation_representation, ['axis_angle', 'quaternion', 'rotation_6d', 'none'])
+  )
     errors.push('动作旋转编码不受支持；可留空沿用原始数据。');
   if (!blankDeclaration(value.position_unit) && !choice(value.position_unit, ['m', 'mm']))
     errors.push('位置单位只支持米或毫米；不确定时可留空。');
@@ -261,14 +270,19 @@ export function composedProcessingErrors(value: unknown): string[] {
         const actualRotationWidth = blocks.get(`${arm}:rotation`);
         if (!actualRotationWidth || ![3, 4, 6].includes(actualRotationWidth))
           errors.push(`${arm === 'left' ? '左' : '右'}臂 EEF 旋转分块必须是 3、4 或 6 维。`);
-        if (!blankDeclaration(value.rotation_representation) &&
-            (!rotationWidth || actualRotationWidth !== rotationWidth))
+        if (
+          !blankDeclaration(value.rotation_representation) &&
+          (!rotationWidth || actualRotationWidth !== rotationWidth)
+        )
           errors.push(`${arm === 'left' ? '左' : '右'}臂旋转分块宽度必须与动作旋转编码一致。`);
       } else if (value.action_representation === 'joint' && !blocks.has(`${arm}:joint`))
         errors.push(`${arm === 'left' ? '左' : '右'}臂必须有 Joint 关节动作分块。`);
     }
-    if (value.action_representation === 'joint' && !blankDeclaration(value.rotation_representation) &&
-        value.rotation_representation !== 'none')
+    if (
+      value.action_representation === 'joint' &&
+      !blankDeclaration(value.rotation_representation) &&
+      value.rotation_representation !== 'none'
+    )
       errors.push('Joint 动作的旋转编码必须选择“无独立旋转”。');
   }
   if (!Array.isArray(value.cameras) || value.cameras.length < 1 || value.cameras.length > 3)
@@ -319,9 +333,7 @@ export function composedProcessingErrors(value: unknown): string[] {
       Array.isArray(value.aux_keys) &&
       value.aux_keys.some(
         (key) =>
-          unique.has(String(key)) ||
-          key === String(value.action_key).trim() ||
-          key === promptKey,
+          unique.has(String(key)) || key === String(value.action_key).trim() || key === promptKey,
       )
     )
       errors.push('辅助字段不能与其它输入字段重名。');
@@ -335,7 +347,9 @@ export function normalizeComposedProcessing(spec: ComposedProcessingSpec): Compo
     robot_model: spec.robot_model.trim(),
     action_key: spec.action_key.trim(),
     action_mode: blankDeclaration(spec.action_mode) ? '' : spec.action_mode,
-    rotation_representation: blankDeclaration(spec.rotation_representation) ? '' : spec.rotation_representation,
+    rotation_representation: blankDeclaration(spec.rotation_representation)
+      ? ''
+      : spec.rotation_representation,
     prompt_key: spec.prompt_key == null ? '' : spec.prompt_key.trim(),
     position_unit: blankDeclaration(spec.position_unit) ? '' : spec.position_unit,
     joint_unit: blankDeclaration(spec.joint_unit) ? '' : spec.joint_unit,
@@ -361,10 +375,15 @@ export function composedProfileErrors(
       profile.action_representation !== spec.action_representation)
   )
     errors.push('组合方案的臂数或动作表示与数据特征不一致。');
-  if (spec.action_mode && profile.action_mode !== 'unknown' && profile.action_mode !== spec.action_mode)
+  if (
+    spec.action_mode &&
+    profile.action_mode !== 'unknown' &&
+    profile.action_mode !== spec.action_mode
+  )
     errors.push('组合动作模式与数据特征不一致。');
   if (
-    spec.rotation_representation && profile.rotation_representation !== 'unknown' &&
+    spec.rotation_representation &&
+    profile.rotation_representation !== 'unknown' &&
     profile.rotation_representation !== spec.rotation_representation
   )
     errors.push('组合旋转编码与数据特征不一致。');
@@ -613,9 +632,16 @@ export function trainingCompositionProfileErrors(
     if (fact && fact.role !== 'state') errors.push(`字段 ${field.key} 未标记为状态字段。`);
     if (fact?.shape?.length && fact.shape.at(-1) !== field.width)
       errors.push(`状态字段 ${field.key} 宽度与原始形状不一致。`);
+    if (fact?.representation === 'composite') {
+      if (field.kind !== 'other')
+        errors.push(`组合状态字段 ${field.key} 必须整体保留，不能标记为单一分量。`);
+      if (fact.arm !== 'unknown' && fact.arm !== field.arm)
+        errors.push(`组合状态字段 ${field.key} 的归属与源字段标签不一致。`);
+    }
     if (
       fact &&
       fact.representation !== 'unknown' &&
+      fact.representation !== 'composite' &&
       fact.representation !== spec.state_representation &&
       fact.component !== 'gripper'
     )
@@ -633,6 +659,7 @@ export function trainingCompositionProfileErrors(
   if (
     action &&
     action.representation !== 'unknown' &&
+    action.representation !== 'composite' &&
     action.representation !== spec.action_representation
   )
     errors.push('处理方案的动作表示与源字段标签不一致；当前组合不会执行 EEF/Joint 转换。');
@@ -677,7 +704,9 @@ export function updateComposedProcessingFromProfile(
       kind: camera.kind,
       slot,
       layout:
-        inferImageLayout(profile.image_features, camera.key, camera.kind).layout || prior?.layout || '',
+        inferImageLayout(profile.image_features, camera.key, camera.kind).layout ||
+        prior?.layout ||
+        '',
       time_index: prior?.time_index ?? null,
       depth_min: prior?.depth_min ?? 0,
       depth_max: prior?.depth_max ?? 1,

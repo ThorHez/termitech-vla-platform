@@ -18,7 +18,7 @@ import {
   Terminal,
   Workflow,
 } from 'lucide-react';
-import { date, displayNumber, post, useApi, useRunFeed } from './api';
+import { date, displayNumber, navigate, post, useApi, useRunFeed, useRunMetrics } from './api';
 import { useAuth } from './auth';
 import {
   Back,
@@ -40,8 +40,12 @@ import { deployableOutputs, sourceDeploymentBlocker } from './policyDeployment';
 import { TrainingMetrics } from './TrainingMetrics';
 import { retryableRun } from './runRetry';
 import { requestedGpuSummary } from './trainingGpuSelection';
+import { RunDeleteAction } from './RunDeleteAction';
+import { RunGpuReservationNotice } from './GpuReservations';
 
 const queueReasonLabels: Record<string, string> = {
+  GPU_RESERVED: '空闲 GPU 已由其他用户预留，等待公共资源或本人的预留 GPU 可用',
+  REQUESTED_GPU_RESERVED: '指定 GPU 已由其他用户预留，等待预留释放或重新选择 GPU',
   GPU_UNAVAILABLE: '可用 GPU 数量不足，等待资源释放',
   REQUESTED_GPU_UNAVAILABLE: '指定 GPU 正在使用、已预约或状态尚未确认，等待所选设备可用',
   REQUESTED_GPU_MISSING: '部分指定 GPU 尚未上报，等待设备恢复；不会自动替换其他卡',
@@ -70,6 +74,7 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const attempt = run?.attempts?.[run.attempts.length - 1];
+  const metrics = useRunMetrics(id, attempt?.id, live);
   const outputs = useMemo(
     () =>
       [...(run?.outputs || [])].sort((left, right) => {
@@ -83,10 +88,10 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
   );
   const metricEvents = useMemo(
     () =>
-      events.data.filter(
+      metrics.data.filter(
         (event) => event.type === 'METRIC' && (!attempt?.id || event.attempt_id === attempt.id),
       ),
-    [events.data, attempt?.id],
+    [metrics.data, attempt?.id],
   );
   const node = nodes.data?.find((item) => item.id === run?.node_id);
   const template = templates.data?.find((item) => item.id === run?.template_id);
@@ -166,6 +171,13 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                   取消训练
                 </button>
               )}
+              <RunDeleteAction
+                run={run}
+                onDeleted={() => {
+                  refresh();
+                  navigate('/runs');
+                }}
+              />
             </>
           )
         }
@@ -231,6 +243,7 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                     实际：{requestedGpuSummary(attempt.gpu_uuids, node)}
                   </small>
                 )}
+                <RunGpuReservationNotice node={node} gpuUuids={attempt?.gpu_uuids || run.requested_gpu_uuids || undefined} />
               </div>
               <div>
                 <span>
@@ -268,10 +281,10 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                       events={metricEvents}
                       latestMetrics={attempt?.latest_metrics}
                       totalSteps={run.parameters?.steps}
-                      loading={events.loading}
-                      error={events.error}
-                      retry={events.refresh}
-                      historyLimited={events.data.length >= 5000}
+                      loading={metrics.loading}
+                      error={metrics.error}
+                      retry={metrics.refresh}
+                      historyComplete={metrics.complete}
                     />
                   </Panel>
                   <Panel

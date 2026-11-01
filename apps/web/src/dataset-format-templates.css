@@ -1,0 +1,68 @@
+.dataset-format-templates {
+  display: grid;
+  gap: 10px;
+  padding: 15px 16px;
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-subtle, #f7fafb);
+}
+.dataset-format-templates h3 {
+  color: var(--text-primary);
+  font-size: 12px;
+  margin: 0;
+}
+.dataset-format-templates .field,
+.dataset-format-templates p {
+  margin: 0;
+}
+.dataset-format-template-select,
+.dataset-format-template-save {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+.dataset-format-template-select > .field,
+.dataset-format-template-save > .field {
+  flex: 1;
+  min-width: 0;
+}
+.dataset-format-template-select > button,
+.dataset-format-template-save > button {
+  flex-shrink: 0;
+  margin-bottom: 1px;
+}
+.dataset-format-template-message {
+  font-size: 11px;
+  line-height: 1.8;
+  color: var(--text-success, #248c70);
+}
+.dataset-format-template-confirm {
+  padding: 12px;
+  border: 1px solid var(--border-danger, #f1bcbc);
+  border-radius: 6px;
+  background: var(--bg-danger, #fff3f2);
+}
+.dataset-format-template-confirm p {
+  margin-bottom: 10px;
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.dataset-format-template-confirm button + button {
+  margin-left: 8px;
+}
+@media (max-width: 600px) {
+  .dataset-format-template-select,
+  .dataset-format-template-save {
+    flex-wrap: wrap;
+  }
+  .dataset-format-template-save > .field {
+    flex-basis: 100%;
+  }
+  .dataset-format-template-select > .field {
+    flex-basis: calc(100% - 80px);
+  }
+}

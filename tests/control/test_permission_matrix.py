@@ -92,7 +92,8 @@ def test_operator_training_asset_recipe_requests_reach_validation(secured):
                 assert result.status_code == 200
                 assert result.json() == {"content": None, "revision": 0, "updated_at": None}
                 continue
-            if (method, path) == ("GET", "/api/v1/training-templates"):
+            if (method, path) in {("GET", "/api/v1/training-templates"),
+                                  ("GET", "/api/v1/dataset-format-templates")}:
                 assert result.status_code == 200
                 assert result.json() == []
                 continue

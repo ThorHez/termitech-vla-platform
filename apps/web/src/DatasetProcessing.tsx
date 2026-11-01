@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { DataProcessorPicker, processorParameterErrors, selectBindingProcessor } from './DataProcessorPicker';
+import {
+  DataProcessorPicker,
+  processorParameterErrors,
+  selectBindingProcessor,
+} from './DataProcessorPicker';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
 import { recommendDatasetProcessor } from './datasetRecommendations';
 import {
@@ -108,7 +112,9 @@ export function DatasetProcessing(props: {
                           ? '待确认'
                           : field.representation === 'gripper'
                             ? '夹爪开度'
-                            : field.representation.toUpperCase()}
+                            : field.representation === 'composite'
+                              ? '组合向量（多分量）'
+                              : field.representation.toUpperCase()}
                       </td>
                       <td>
                         {field.value_mode === 'unknown'
@@ -269,7 +275,9 @@ function LegacyDatasetProcessing({
             <div>
               <strong>处理器配置错误</strong>
               <ul className="training-validation-errors">
-                {parameterErrors.map((error) => <li key={error}>{error}</li>)}
+                {parameterErrors.map((error) => (
+                  <li key={error}>{error}</li>
+                ))}
               </ul>
             </div>
           </div>
@@ -292,7 +300,13 @@ function LegacyDatasetProcessing({
           role={!selectionValid ? 'alert' : 'status'}
         >
           <div>
-            <strong>{!selectionValid ? '数据处理方案未确认，无法预检' : matched ? `已自动选择：${binding.processor!.name}` : '处理器推荐'}</strong>
+            <strong>
+              {!selectionValid
+                ? '数据处理方案未确认，无法预检'
+                : matched
+                  ? `已自动选择：${binding.processor!.name}`
+                  : '处理器推荐'}
+            </strong>
             <p>
               {autoSelected && !matched
                 ? '数据特征或处理器目录已变化，请重新确认处理方式。'
@@ -308,7 +322,8 @@ function LegacyDatasetProcessing({
                 <code>{entry.name}</code>
                 {missing.length > 0 && (
                   <p className={selectionValid ? 'field-hint' : undefined}>
-                    {selectionValid ? '待核对：' : '配置错误：'}{missing.slice(0, 8).join('、')}
+                    {selectionValid ? '待核对：' : '配置错误：'}
+                    {missing.slice(0, 8).join('、')}
                     {missing.length > 8 ? '…' : ''}
                   </p>
                 )}

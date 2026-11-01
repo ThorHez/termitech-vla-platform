@@ -39,6 +39,16 @@ class NodeResourceSample(Base):
     metrics: Mapped[dict] = mapped_column(JSON)
 
 
+class GPUReservation(Base):
+    """A durable human reservation, independent of a task's active allocation."""
+
+    __tablename__ = "gpu_reservations"
+    node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="RESTRICT"), primary_key=True)
+    gpu_uuid: Mapped[str] = mapped_column(String(200), primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
 class Profile(Base):
     __tablename__ = "profiles"
     node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="RESTRICT"), primary_key=True)
@@ -70,6 +80,7 @@ class Asset(Base):
     metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[str] = mapped_column(String(40))
     origin_attempt_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    norm_asset_id: Mapped[str | None] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=True)
 
 
 class Preview(Base):
@@ -94,6 +105,7 @@ class Run(Base):
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
     node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="RESTRICT"), index=True)
     profile_id: Mapped[str] = mapped_column(String(200))
     template_id: Mapped[str] = mapped_column(String(100))
@@ -102,6 +114,8 @@ class Run(Base):
     created_at: Mapped[str] = mapped_column(String(40), index=True)
     updated_at: Mapped[str] = mapped_column(String(40))
     finished_at: Mapped[str | None] = mapped_column(String(40))
+    # Hide deleted records while retaining asset lineage and Agent deduplication.
+    deleted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     inputs: Mapped[dict] = mapped_column(JSON)
     parameters: Mapped[dict] = mapped_column(JSON)
     gpu_count: Mapped[int] = mapped_column(Integer)
@@ -177,6 +191,7 @@ class Command(Base):
 
 class Event(Base):
     __tablename__ = "events"
+    __table_args__ = (Index("ix_events_attempt_type_seq", "attempt_id", "type", "seq"),)
     attempt_id: Mapped[str] = mapped_column(ForeignKey("attempts.id", ondelete="RESTRICT"), primary_key=True)
     seq: Mapped[int] = mapped_column(Integer, primary_key=True)
     type: Mapped[str] = mapped_column(String(32))

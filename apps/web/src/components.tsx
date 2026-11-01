@@ -228,6 +228,7 @@ export function Modal({
   footer,
   wide = false,
   className = '',
+  preserveTerminalKeys = false,
 }: {
   title: string;
   subtitle?: string;
@@ -236,6 +237,7 @@ export function Modal({
   footer?: ReactNode;
   wide?: boolean;
   className?: string;
+  preserveTerminalKeys?: boolean;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const resize = useDialogResize(ref);
@@ -248,6 +250,15 @@ export function Modal({
     const handleKey = (event: KeyboardEvent) => {
       const dialogs = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
       if (dialogs[dialogs.length - 1] !== ref.current) return;
+      if (
+        event.defaultPrevented ||
+        (preserveTerminalKeys &&
+          event.target instanceof Element &&
+          ref.current?.contains(event.target) &&
+          event.target.closest('[data-terminal-input]'))
+      ) {
+        return;
+      }
       if (event.key === 'Escape') closeRef.current();
       if (event.key === 'Tab') {
         const elements = ref.current?.querySelectorAll<HTMLElement>(
@@ -281,7 +292,7 @@ export function Modal({
       if (last?.isConnected) last.focus();
       else remainingDialog?.focus();
     };
-  }, []);
+  }, [preserveTerminalKeys]);
   return (
     <div
       className="modal-backdrop"
@@ -403,14 +414,24 @@ export function CodeVersion({
 export function MetricChart({
   values,
   metricName = 'loss',
+  stepDomain,
 }: {
   values: readonly MetricChartInput[];
   metricName?: string;
+  stepDomain?: { start: number; end: number };
 }) {
   const gradientId = useId();
   const descriptionId = useId();
   const [selected, setSelected] = useState<number | null>(null);
   const model = useMemo(() => buildMetricChartModel(values), [values]);
+  const domainValid =
+    stepDomain &&
+    Number.isFinite(stepDomain.start) &&
+    Number.isFinite(stepDomain.end) &&
+    stepDomain.start >= 0 &&
+    stepDomain.end >= stepDomain.start;
+  const firstStep = domainValid ? stepDomain.start : model.first;
+  const lastStep = domainValid ? stepDomain.end : model.last;
   if (!model.knownCount)
     return (
       <div className="chart-empty">
@@ -427,7 +448,7 @@ export function MetricChart({
   const chartWidth = width - left - right;
   const chartHeight = height - top - bottom;
   const x = (point: MetricChartPoint) =>
-    left + metricFraction(point.step, model.first, model.last) * chartWidth;
+    left + metricFraction(point.step, firstStep, lastStep) * chartWidth;
   const y = (value: number) =>
     top + (1 - metricFraction(value, model.domain.low, model.domain.high)) * chartHeight;
   const pointCoordinates = (point: MetricChartPoint) =>
@@ -451,7 +472,7 @@ export function MetricChart({
               (((event.clientX - bounds.left) / bounds.width) * width - left) / chartWidth,
             ),
           );
-          setSelected(nearestMetricPoint(model.points, fraction, model.first, model.last));
+          setSelected(nearestMetricPoint(model.points, fraction, firstStep, lastStep));
         }}
         onPointerLeave={() => setSelected(null)}
         onFocus={() => setSelected(model.points.length - 1)}
@@ -556,10 +577,10 @@ export function MetricChart({
           </g>
         )}
         <text x={left} y={height - 9}>
-          {formatMetricValue(model.first)}
+          {formatMetricValue(firstStep)}
         </text>
         <text x={width - right} y={height - 9} textAnchor="end">
-          {formatMetricValue(model.last)} step
+          {formatMetricValue(lastStep)} step
         </text>
       </svg>
       <div

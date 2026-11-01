@@ -407,8 +407,9 @@ class DeploymentManager:
         deployment = session.scalar(select(PolicyDeployment.id).where(
             PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES)).limit(1))
         from .checkpoint_transfers import active_transfers
-        if run or command or allocation or deployment or active_transfers(session, node_id):
-            raise APIError(409, "NODE_BUSY", "该机器仍有训练、权重同步、真机部署、资源预约或待执行命令，暂不能管理 Agent")
+        from .asset_transfers import active_asset_transfers
+        if run or command or allocation or deployment or active_transfers(session, node_id) or active_asset_transfers(session, node_id=node_id):
+            raise APIError(409, "NODE_BUSY", "该机器仍有训练、资产同步、真机部署、资源预约或待执行命令，暂不能管理 Agent")
 
     @staticmethod
     def _assert_no_other_job(session, node_id: str | None, exclude_id: str | None = None):

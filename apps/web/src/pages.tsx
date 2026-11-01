@@ -1,8 +1,7 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
-  Archive,
   ArrowDownRight,
   ArrowRight,
   Box,
@@ -16,6 +15,7 @@ import {
   HardDrive,
   Layers3,
   LoaderCircle,
+  LockKeyhole,
   Network,
   Pencil,
   Plus,
@@ -25,6 +25,7 @@ import {
   ShieldCheck,
   Sparkles,
   Terminal,
+  Trash2,
   Workflow,
 } from 'lucide-react';
 import { date, displayNumber, navigate, post, useApi } from './api';
@@ -47,12 +48,27 @@ import type { Asset, Gpu, Node, NodeDetail, Run } from './types';
 import { NodeOnboarding, RuntimeCheckView, runtimeCheckFor } from './NodeOnboarding';
 import { NodeManagement } from './NodeManagement';
 import { NodeRename } from './NodeRename';
+import { NodeTerminal } from './NodeTerminal';
 import { ResourceHistory } from './ResourceHistory';
+import { GpuReservations } from './GpuReservations';
+import { NodeGpuResources } from './NodeGpuResources';
 import { ProfileRebinding } from './ProfileRebinding';
 import { StorageConfiguration } from './StorageConfiguration';
 import { matchesNodeQuery, nodeAddressText } from './nodeAddress';
 import { PathAutocomplete } from './PathAutocomplete';
+import { AssetSyncDialog, AssetSyncBackgroundNotice, AssetTransfers } from './AssetTransfers';
+import type { AssetTransfer } from './assetTransfer';
+import { assetTransferTaskPath } from './assetTransfer';
+import { BackgroundTasksPage } from './BackgroundTasks';
+import { RunDeleteAction } from './RunDeleteAction';
 import { DatasetInspection, useDatasetInspectionDraft } from './DatasetInspection';
+import { DatasetNormBindingDialog, DatasetNormField, DatasetNormSummary } from './DatasetNormBinding';
+import { AssetDetail } from './AssetDetail';
+import { BatchDatasetRegistration } from './BatchDatasetRegistration';
+import { BatchAssetSync } from './BatchAssetSync';
+import { BATCH_ASSET_SYNC_LIMIT, batchSyncSourceError, reconcileBatchSyncSelection, toggleBatchSyncVisible } from './batchAssetSyncData';
+import { DatasetFormatTemplates, DatasetFormatTemplateDialog } from './DatasetFormatTemplates';
+import { datasetNormBindingPayload, datasetNormInputError } from './datasetNormAssets';
 import './asset-registration.css';
 import {
   DatasetProfileEditor,
@@ -65,7 +81,7 @@ import {
 } from './DatasetProfileForm';
 
 export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boolean }) {
-  const { nodes, templates } = useData();
+  const { nodes, templates, refresh } = useData();
   return (
     <div className="table-scroll">
       <table>
@@ -76,7 +92,7 @@ export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boo
             {!compact && <th>训练模板</th>}
             <th>运行机器</th>
             <th>创建时间</th>
-            <th aria-label="打开详情" />
+            <th aria-label="任务操作" />
           </tr>
         </thead>
         <tbody>
@@ -112,7 +128,7 @@ export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boo
                 </a>
               </td>
               <td className="muted nowrap">{date(run.created_at)}</td>
-              <td>
+              <td className="nowrap">
                 <a
                   className="icon-button"
                   href={`#/runs/${run.id}`}
@@ -120,6 +136,7 @@ export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boo
                 >
                   <ChevronRight size={16} />
                 </a>
+                <RunDeleteAction run={run} compact onDeleted={refresh} />
               </td>
             </tr>
           ))}
@@ -185,7 +202,7 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
             color: 'blue',
           },
           {
-            label: '可分配 GPU',
+            label: '公共可分配 GPU',
             value: stats?.gpus_available,
             extra: `共 ${stats?.gpus_total ?? '—'} 张 GPU`,
             icon: Cpu,
@@ -265,7 +282,7 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
                     <span>{node.gpus?.length || 0} 张 GPU</span>
                     <span>
                       {node.status === 'ONLINE' ? node.gpus?.filter(gpuIdle).length || 0 : '—'}{' '}
-                      张空闲
+                      张公共空闲
                     </span>
                   </div>
                   <ProgressBar value={gpuAverage(node.gpus)} />
@@ -375,11 +392,13 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
         <span className="gpu-index">GPU {index}</span>
         <strong>{gpu.name}</strong>
         <span
-          className={`tiny-status ${gpu.reserved_by ? 'amber' : unknown ? 'gray' : gpuIdle(gpu) ? 'green' : 'blue'}`}
+          className={`tiny-status ${gpu.reserved_by || gpu.user_reservation ? 'amber' : unknown ? 'gray' : gpuIdle(gpu) ? 'green' : 'blue'}`}
         >
           {gpu.reserved_by
-            ? '平台已预约'
-            : unknown
+            ? '任务占用'
+            : gpu.user_reservation
+              ? '用户预留'
+              : unknown
               ? '占用未知'
               : gpuIdle(gpu)
                 ? '空闲'
@@ -407,8 +426,12 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
       </div>
       <div className="gpu-meta">
         <code title={gpu.uuid}>{gpu.uuid}</code>
-        {reservedRun && <a href={`#/runs/${reservedRun.id}`}>查看预约</a>}
+        {reservedRun && <a href={`#/runs/${reservedRun.id}`}>查看任务</a>}
       </div>
+      {gpu.user_reservation && <div className="gpu-user-reservation">
+        <LockKeyhole size={13} />
+        预留给 {gpu.user_reservation.display_name || gpu.user_reservation.username}（{gpu.user_reservation.username}）
+      </div>}
       {!!gpu.processes?.length && (
         <div className="process-info">
           {gpu.processes.map((process) => (
@@ -443,6 +466,8 @@ export function NodesPage() {
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [managing, setManaging] = useState<Node>();
   const [renaming, setRenaming] = useState<Node>();
+  const [terminalNode, setTerminalNode] = useState<Node>();
+  const [reservationNode, setReservationNode] = useState<Node>();
   const filtered = nodes.data?.filter((node) => matchesNodeQuery(node, query)) || [];
   return (
     <>
@@ -528,7 +553,7 @@ export function NodesPage() {
                     <strong>
                       {node.status === 'ONLINE' ? node.gpus?.filter(gpuIdle).length || 0 : '—'}
                     </strong>
-                    <span>空闲 GPU</span>
+                    <span>公共空闲 GPU</span>
                   </div>
                 </div>
                 <div className="machine-footer">
@@ -540,10 +565,16 @@ export function NodesPage() {
                 </div>
               </a>
               <div className="machine-card-management">
+                <button className="text-link" onClick={() => setReservationNode(node)}>
+                  <LockKeyhole size={13} />GPU 预留
+                </button>
                 <a className="text-link machine-history-link" href={`#/nodes/${node.id}`}>
                   <Activity size={13} />占用历史
                 </a>
                 {can('machines.manage') && <>
+                  <button className="text-link" onClick={() => setTerminalNode(node)}>
+                    <Terminal size={13} />终端
+                  </button>
                   <button className="text-link" onClick={() => setRenaming(node)}>
                     <Pencil size={13} />
                     重命名
@@ -599,6 +630,10 @@ export function NodesPage() {
       {can('machines.manage') && renaming && (
         <NodeRename node={renaming} close={() => setRenaming(undefined)} />
       )}
+      {can('machines.manage') && terminalNode && (
+        <NodeTerminal node={terminalNode} close={() => setTerminalNode(undefined)} />
+      )}
+      {reservationNode && <GpuReservations key={reservationNode.id} node={reservationNode} close={() => setReservationNode(undefined)} />}
     </>
   );
 }
@@ -610,6 +645,9 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
   const [showManagement, setShowManagement] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showRename, setShowRename] = useState(false);
+  const [showTerminal, setShowTerminal] = useState(false);
+  const [showReservations, setShowReservations] = useState(false);
+  const [reservationRevision, setReservationRevision] = useState(0);
   const raw = details.data;
   const node =
     (raw && 'node' in raw ? raw.node : (raw as NodeDetail | undefined)) ||
@@ -635,6 +673,13 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
           <>
             {can('machines.manage') && (
               <>
+                <button
+                  className="button outline"
+                  disabled={!node}
+                  onClick={() => setShowTerminal(true)}
+                >
+                  <Terminal size={16} />终端
+                </button>
                 <button
                   className="button outline"
                   disabled={!node}
@@ -716,10 +761,10 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               <strong>{nodeRuns.filter((run) => activeStates.has(run.state)).length}</strong>
             </div>
           </div>
-          <ResourceHistory key={id} nodeId={id} status={node.status} />
+          <ResourceHistory key={`history-${id}`} nodeId={id} status={node.status} />
           <div className="detail-columns">
             <div>
-              <Panel title="GPU 资源" subtitle="利用率为整卡指标；预约与实测占用分别展示">
+              <NodeGpuResources key={`gpu-${id}`} node={node} refreshToken={reservationRevision} onManage={() => setShowReservations(true)}>
                 {node.gpus?.length ? (
                   <div className="gpu-list">
                     {node.gpus.map((gpu, index) => (
@@ -733,7 +778,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                     description="Agent 需要在 NVIDIA 环境中读取显卡指标，未知值不会按零展示。"
                   />
                 )}
-              </Panel>
+              </NodeGpuResources>
               <Panel
                 title="本机资产"
                 subtitle="仅可供这台机器上的训练使用"
@@ -911,22 +956,67 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
       {can('machines.manage') && showRename && node && (
         <NodeRename node={node} close={() => setShowRename(false)} changed={details.refresh} />
       )}
+      {can('machines.manage') && showTerminal && node && (
+        <NodeTerminal node={node} close={() => setShowTerminal(false)} />
+      )}
+      {showReservations && node && <GpuReservations key={node.id} node={node} close={() => setShowReservations(false)} changed={() => { details.refresh(); setReservationRevision((value) => value + 1); }} />}
     </>
   );
 }
 
 export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
-  const { can } = useAuth();
+  const { user, can } = useAuth();
   const { assets, nodes, enabled, refresh } = useData();
   const [kind, setKind] = useState('ALL');
   const [nodeId, setNodeId] = useState(nodeFilter || '');
   const [query, setQuery] = useState('');
   const [register, setRegister] = useState(false);
+  const [batchRegister, setBatchRegister] = useState(false);
+  const [syncSelection, setSyncSelection] = useState<{ owner: string; ids: string[] }>({
+    owner: '',
+    ids: [],
+  });
+  const [batchSyncOwner, setBatchSyncOwner] = useState('');
   const [archiving, setArchiving] = useState<Asset>();
   const [editingProfile, setEditingProfile] = useState<Asset>();
+  const [bindingDataset, setBindingDataset] = useState<Asset>();
+  const [templateAsset, setTemplateAsset] = useState<Asset>();
+  const [detailId, setDetailId] = useState<string>();
+  const detailAsset = assets.data?.find((asset) => asset.id === detailId);
+  const [syncAsset, setSyncAsset] = useState<Asset>();
+  const [backgroundSync, setBackgroundSync] = useState<AssetTransfer>();
+  const [syncRevision, setSyncRevision] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [showArchived, setShowArchived] = useState(false);
+  const canWriteAssets = can('assets.write');
+  const selectionOwner = user?.id || '';
+  const selectedSyncIds =
+    canWriteAssets && selectionOwner && syncSelection.owner === selectionOwner
+      ? reconcileBatchSyncSelection(syncSelection.ids, assets.data || [], nodes.data || [])
+      : [];
+  useEffect(() => {
+    setSyncSelection((previous) => {
+      const ids =
+        canWriteAssets && selectionOwner && previous.owner === selectionOwner
+          ? reconcileBatchSyncSelection(previous.ids, assets.data || [], nodes.data || [])
+          : [];
+      return previous.owner === selectionOwner &&
+        JSON.stringify(previous.ids) === JSON.stringify(ids)
+        ? previous
+        : { owner: selectionOwner, ids };
+    });
+    if (!canWriteAssets || batchSyncOwner !== selectionOwner) setBatchSyncOwner('');
+  }, [selectionOwner, canWriteAssets, assets.data, nodes.data, batchSyncOwner]);
+  useEffect(() => {
+    if (canWriteAssets) return;
+    setBatchRegister(false);
+    setEditingProfile(undefined);
+    setBindingDataset(undefined);
+    setTemplateAsset(undefined);
+    setSyncAsset(undefined);
+    setArchiving(undefined);
+  }, [canWriteAssets]);
   const filtered = (assets.data || []).filter(
     (asset) =>
       (kind === 'ALL' || asset.kind === kind) &&
@@ -936,6 +1026,25 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         .toLowerCase()
         .includes(query.toLowerCase()),
   );
+  const visibleSyncIds = filtered
+    .filter((asset) => !batchSyncSourceError(asset, nodes.data || []))
+    .map((asset) => asset.id);
+  const selectedVisibleSyncCount = visibleSyncIds.filter((id) =>
+    selectedSyncIds.includes(id),
+  ).length;
+  const allVisibleSyncSelected =
+    visibleSyncIds.length > 0 && selectedVisibleSyncCount === visibleSyncIds.length;
+  const updateSyncSelection = (visibleIds: string[], checked: boolean) =>
+    setSyncSelection((previous) => ({
+      owner: selectionOwner,
+      ids: toggleBatchSyncVisible(
+        previous.owner === selectionOwner
+          ? reconcileBatchSyncSelection(previous.ids, assets.data || [], nodes.data || [])
+          : [],
+        visibleIds,
+        checked,
+      ),
+    }));
   return (
     <>
       <PageHeading
@@ -944,21 +1053,35 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         description="统一登记本地资产，清晰关联机器、训练与产出。"
         actions={
           can('assets.write') && (
-            <button
-              className="button primary"
-              disabled={!enabled || !nodes.data?.length}
-              onClick={() => setRegister(true)}
-            >
-              <Plus size={17} />
-              登记资产
-            </button>
+            <>
+              <button
+                type="button"
+                className="button outline"
+                disabled={!enabled || !nodes.data?.length}
+                onClick={() => setBatchRegister(true)}
+              >
+                <Database size={17} />
+                批量登记数据集
+              </button>
+              <button
+                className="button primary"
+                disabled={!enabled || !nodes.data?.length}
+                onClick={() => setRegister(true)}
+              >
+                <Plus size={17} />
+                登记资产
+              </button>
+            </>
           )
         }
       />
       <div className="info-strip">
         <HardDrive size={17} />
-        <span>数据和模型保存在各自机器本地。创建训练时，平台只提供同一台机器的可用资产。</span>
+        <span>
+          数据和模型保存在各自机器本地，可同步到其他机器，完成文件校验后登记副本。训练使用所选机器上的资产。
+        </span>
       </div>
+      {backgroundSync && <AssetSyncBackgroundNotice transfer={backgroundSync} />}
       <div className="toolbar wrap">
         <div className="segmented">
           {[
@@ -1000,6 +1123,42 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           </div>
         </div>
       </div>
+      {canWriteAssets && (
+        <div className="batch-asset-selection" aria-label="资产批量选择">
+          <span>
+            已选择 {selectedSyncIds.length} 项 · 当前筛选中 {selectedVisibleSyncCount} 项
+            {selectedSyncIds.length > selectedVisibleSyncCount
+              ? ` · 另有 ${selectedSyncIds.length - selectedVisibleSyncCount} 项来自其他筛选`
+              : ''}
+          </span>
+          <button
+            type="button"
+            className="text-link"
+            disabled={!selectedSyncIds.length}
+            onClick={() => setSyncSelection({ owner: selectionOwner, ids: [] })}
+          >
+            清空所有选择
+          </button>
+          <button
+            type="button"
+            className="button outline small"
+            disabled={
+              !enabled ||
+              !selectionOwner ||
+              !selectedSyncIds.length ||
+              selectedSyncIds.length > BATCH_ASSET_SYNC_LIMIT
+            }
+            onClick={() => setBatchSyncOwner(selectionOwner)}
+          >
+            批量同步（{selectedSyncIds.length}）
+          </button>
+          {selectedSyncIds.length > BATCH_ASSET_SYNC_LIMIT && (
+            <p className="batch-asset-sync-error" role="status">
+              一次最多同步 {BATCH_ASSET_SYNC_LIMIT} 项，请减少选择后分批操作。
+            </p>
+          )}
+        </div>
+      )}
       <div className="table-meta">
         <span>{filtered.length} 项资产</span>
         <label className="checkbox-label">
@@ -1017,9 +1176,26 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           <Loading />
         ) : filtered.length ? (
           <div className="table-scroll">
-            <table>
+            <table className="asset-catalog-table" aria-label="资产目录">
               <thead>
                 <tr>
+                  <th className="asset-selection-column">
+                    <input
+                      type="checkbox"
+                      aria-label="全选当前筛选结果"
+                      title="只选择或取消当前筛选结果中的可同步资产"
+                      checked={allVisibleSyncSelected}
+                      ref={(input) => {
+                        if (input)
+                          input.indeterminate =
+                            selectedVisibleSyncCount > 0 && !allVisibleSyncSelected;
+                      }}
+                      disabled={!canWriteAssets || !selectionOwner || !visibleSyncIds.length}
+                      onChange={(event) =>
+                        updateSyncSelection(visibleSyncIds, event.target.checked)
+                      }
+                    />
+                  </th>
                   <th>资产名称</th>
                   <th>类型 / 版本</th>
                   <th>所在机器</th>
@@ -1031,8 +1207,29 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
               <tbody>
                 {filtered.map((asset) => (
                   <tr key={asset.id}>
+                    <td className="asset-selection-column">
+                      <input
+                        type="checkbox"
+                        aria-label={`选择同步资产 ${asset.name}`}
+                        checked={selectedSyncIds.includes(asset.id)}
+                        disabled={
+                          !canWriteAssets ||
+                          !selectionOwner ||
+                          Boolean(batchSyncSourceError(asset, nodes.data || []))
+                        }
+                        title={
+                          batchSyncSourceError(asset, nodes.data || []) || `选择 ${asset.name}`
+                        }
+                        onChange={(event) => updateSyncSelection([asset.id], event.target.checked)}
+                      />
+                    </td>
                     <td>
-                      <div className="row-link">
+                      <button
+                        type="button"
+                        className="row-link asset-name-link"
+                        aria-label={`查看资产：${asset.name}`}
+                        onClick={() => setDetailId(asset.id)}
+                      >
                         <span className={`row-icon ${asset.kind === 'DATASET' ? 'blue' : 'teal'}`}>
                           {asset.kind === 'DATASET' ? (
                             <Database size={16} />
@@ -1043,8 +1240,13 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                           )}
                         </span>
                         <strong>{asset.name}</strong>
-                      </div>
-                      {asset.kind === 'DATASET' && <DatasetAssetFeatures asset={asset} />}
+                      </button>
+                      {asset.kind === 'DATASET' && (
+                        <>
+                          <DatasetAssetFeatures asset={asset} />
+                          <DatasetNormSummary asset={asset} assets={assets.data || []} />
+                        </>
+                      )}
                     </td>
                     <td>
                       <span>{assetKinds[asset.kind] || asset.kind}</span>
@@ -1066,28 +1268,18 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                       <Badge state={asset.status || asset.state || 'REGISTERED'} />
                     </td>
                     <td>
-                      {can('assets.write') &&
-                        asset.kind === 'DATASET' &&
-                        (asset.status || asset.state) !== 'ARCHIVED' && (
-                          <button
-                            type="button"
-                            className="button ghost small"
-                            onClick={() => setEditingProfile(asset)}
-                          >
-                            <Pencil size={14} />
-                            {readDatasetProfile(asset.metadata?.dataset_profile)
-                              ? '编辑数据特征'
-                              : '补录数据特征'}
-                          </button>
-                        )}
                       {can('assets.write') && (asset.status || asset.state) !== 'ARCHIVED' && (
                         <button
+                          type="button"
                           className="icon-button"
-                          aria-label={`归档 ${asset.name}`}
-                          title="归档登记"
-                          onClick={() => setArchiving(asset)}
+                          aria-label={`删除登记 ${asset.name}`}
+                          title="删除登记"
+                          onClick={() => {
+                            setError(undefined);
+                            setArchiving(asset);
+                          }}
                         >
-                          <Archive size={16} />
+                          <Trash2 size={16} />
                         </button>
                       )}
                     </td>
@@ -1122,15 +1314,91 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           />
         )}
       </div>
+      <AssetTransfers
+        revision={syncRevision}
+        viewProgress={(transfer) => navigate(assetTransferTaskPath(transfer.id))}
+        viewTarget={(targetNodeId) => {
+          setNodeId(targetNodeId);
+          setKind('ALL');
+          setQuery('');
+          setShowArchived(false);
+          refresh();
+          window.scrollTo({ top: 0, behavior: 'smooth' });
+        }}
+      />
+      {detailAsset &&
+        !(batchSyncOwner && batchSyncOwner === selectionOwner) &&
+        !batchRegister &&
+        !syncAsset &&
+        !editingProfile &&
+        !bindingDataset &&
+        !archiving &&
+        !templateAsset && (
+          <AssetDetail
+            asset={detailAsset}
+            node={nodes.data?.find((node) => node.id === detailAsset.node_id)}
+            assets={assets.data || []}
+            close={() => setDetailId(undefined)}
+            bindNorm={() => setBindingDataset(detailAsset)}
+            editProfile={() => setEditingProfile(detailAsset)}
+            sync={() => setSyncAsset(detailAsset)}
+            saveTemplate={() => setTemplateAsset(detailAsset)}
+            remove={() => {
+              setError(undefined);
+              setArchiving(detailAsset);
+            }}
+          />
+        )}
+      {can('assets.write') && syncAsset && (
+        <AssetSyncDialog
+          key={syncAsset.id}
+          asset={syncAsset}
+          close={() => setSyncAsset(undefined)}
+          created={(transfer) => {
+            setSyncAsset(undefined);
+            setBackgroundSync(transfer);
+            setSyncRevision((value) => value + 1);
+            refresh();
+          }}
+        />
+      )}
+      {canWriteAssets && selectionOwner && batchSyncOwner === selectionOwner && (
+        <BatchAssetSync
+          assetIds={selectedSyncIds}
+          close={() => setBatchSyncOwner('')}
+          created={() => {
+            setSyncSelection({ owner: selectionOwner, ids: [] });
+            setSyncRevision((value) => value + 1);
+            refresh();
+          }}
+        />
+      )}
+      {can('assets.write') && batchRegister && (
+        <BatchDatasetRegistration initialNode={nodeId} close={() => setBatchRegister(false)} />
+      )}
       {can('assets.write') && register && (
         <RegisterAsset key={nodeId} initialNode={nodeId} close={() => setRegister(false)} />
       )}
       {can('assets.write') && editingProfile && (
         <DatasetProfileEditor asset={editingProfile} close={() => setEditingProfile(undefined)} />
       )}
+      {can('assets.write') && bindingDataset && (
+        <DatasetNormBindingDialog
+          key={bindingDataset.id}
+          asset={bindingDataset}
+          close={() => setBindingDataset(undefined)}
+        />
+      )}
+      {can('assets.write') && templateAsset && (
+        <DatasetFormatTemplateDialog
+          key={templateAsset.id}
+          asset={templateAsset}
+          close={() => setTemplateAsset(undefined)}
+        />
+      )}
       {can('assets.write') && archiving && (
         <Modal
-          title="归档资产登记"
+          title="删除资产登记"
           close={() => {
             if (!busy) setArchiving(undefined);
           }}
@@ -1153,6 +1421,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                   try {
                     await post(`/assets/${archiving.id}/archive`);
                     setArchiving(undefined);
+                    setDetailId(undefined);
                     refresh();
                   } catch (err) {
                     setError(err as Error);
@@ -1161,19 +1430,21 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                   }
                 }}
               >
-                {busy && <LoaderCircle size={16} className="spin" />}确认归档
+                {busy && <LoaderCircle size={16} className="spin" />}确认删除登记
               </button>
             </>
           }
         >
-          <p>将「{archiving.name}」从可选资产中归档。历史训练仍保留其关联，本机文件会继续保留。</p>
+          <p>
+            删除「{archiving.name}
+            」的资产登记，将其从新训练的可选资产中移除。历史训练关联和本机文件会继续保留。
+          </p>
           {error && <ErrorNotice error={error} />}
         </Modal>
       )}
     </>
   );
 }
-
 function DatasetAssetFeatures({ asset }: { asset: Asset }) {
   const profile = readDatasetProfile(asset.metadata?.dataset_profile);
   if (!profile) return <span className="dataset-profile-summary">尚未登记数据特征</span>;
@@ -1200,8 +1471,21 @@ function RegisterAsset(props: { close: () => void; initialNode?: string }) {
   return <RegisterAssetContent {...props} />;
 }
 
+function assetNameFromPath(path: string) {
+  const basename = path.replace(/\/+$/, '').split('/').at(-1) || '';
+  if (basename === '.' || basename === '..') return '';
+  let name = '';
+  for (const character of basename) {
+    if (name.length + character.length > 160) break;
+    name += character;
+  }
+  return name;
+}
+
 function RegisterAssetContent({ close, initialNode }: { close: () => void; initialNode?: string }) {
-  const { nodes, refresh } = useData();
+  const { nodes, assets, refresh } = useData();
+  const [normAssetId, setNormAssetId] = useState('');
+  const [normPath, setNormPath] = useState('');
   const [form, setForm] = useState({
     name: '',
     kind: 'DATASET',
@@ -1215,10 +1499,23 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
   const inspectionDraft = useDatasetInspectionDraft(datasetProfile, setDatasetProfile);
   const [deferProfile, setDeferProfile] = useState(false);
   const pending = useRef(false);
+  const nameEdited = useRef(false);
   const profileErrors =
     form.kind === 'DATASET' && !deferProfile ? datasetProfileErrors(datasetProfile) : [];
-  const set = (key: keyof typeof form, value: string) =>
-    setForm((previous) => ({ ...previous, [key]: value }));
+  const normError = form.kind === 'DATASET' ? datasetNormInputError(form.node_id, normAssetId, normPath, assets.data || []) : undefined;
+  const set = (key: keyof typeof form, value: string) => {
+    if (key === 'name') nameEdited.current = true;
+    const fillName = key === 'path' && !nameEdited.current;
+    setForm((previous) => ({
+      ...previous,
+      [key]: value,
+      ...(fillName ? { name: assetNameFromPath(value) } : {}),
+    }));
+    if (key === 'node_id' || key === 'kind') {
+      setNormAssetId('');
+      setNormPath('');
+    }
+  };
   const node = nodes.data?.find((item) => item.id === form.node_id);
   const showDatasetConfig = form.kind === 'DATASET' && !deferProfile;
   return (
@@ -1245,7 +1542,7 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
             className="button primary"
             form="register-asset"
             type="submit"
-            disabled={busy || profileErrors.length > 0}
+            disabled={busy || profileErrors.length > 0 || Boolean(normError)}
           >
             {busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}登记资产
           </button>
@@ -1257,13 +1554,14 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
         className={`asset-registration-layout ${showDatasetConfig ? 'with-dataset-config' : ''}`}
         onSubmit={async (event) => {
           event.preventDefault();
-          if (pending.current || profileErrors.length > 0) return;
+          if (pending.current || profileErrors.length > 0 || normError) return;
           pending.current = true;
           setBusy(true);
           setError(undefined);
           try {
             await post('/assets', {
               ...form,
+              ...(form.kind === 'DATASET' ? datasetNormBindingPayload(normAssetId, normPath) : { norm_asset_id: null }),
               metadata:
                 form.kind === 'DATASET' && !deferProfile
                   ? { dataset_profile: normalizedDatasetProfile(datasetProfile) }
@@ -1281,7 +1579,7 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
       >
         <section className="asset-registration-basics" aria-label="资产信息">
           <h3>资产信息</h3>
-          <Field label="资产名称" required>
+          <Field label="资产名称" required hint="根据所选目录或文件名自动填写，可手动修改。">
             <input
               required
               disabled={busy}
@@ -1339,6 +1637,18 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
             disabled={busy}
             hint="可输入完整路径，也可逐级选择目录。"
           />
+          {form.kind === 'DATASET' && (
+            <DatasetNormField
+              nodeId={form.node_id}
+              node={node}
+              assets={assets.data || []}
+              value={normAssetId}
+              onChange={setNormAssetId}
+              pathValue={normPath}
+              onPathChange={setNormPath}
+              disabled={busy}
+            />
+          )}
           {showDatasetConfig && (
             <Field label="任务描述" required>
               <textarea
@@ -1390,6 +1700,7 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
         </section>
         {showDatasetConfig && (
           <section className="asset-registration-features" aria-label="数据集配置">
+            <DatasetFormatTemplates value={datasetProfile} onApply={inspectionDraft.applyTemplate} disabled={busy} />
             <DatasetProfileForm
               compact
               showTaskDescription={false}
@@ -1526,91 +1837,5 @@ export function TemplatesPage({
 }
 
 export function RunsPage({ createRun }: { createRun: () => void }) {
-  const { can } = useAuth();
-  const { runs, enabled } = useData();
-  const [filter, setFilter] = useState('ALL');
-  const [query, setQuery] = useState('');
-  const filtered = useMemo(
-    () =>
-      (runs.data || [])
-        .filter(
-          (run) =>
-            (filter === 'ALL' ||
-              (filter === 'ACTIVE' ? activeStates.has(run.state) : run.state === filter)) &&
-            run.name.toLowerCase().includes(query.toLowerCase()),
-        )
-        .sort((a, b) => b.created_at.localeCompare(a.created_at)),
-    [runs.data, filter, query],
-  );
-  return (
-    <>
-      <PageHeading
-        eyebrow="TRAINING RUNS"
-        title="训练任务"
-        description="追踪训练状态、资源消耗与实际执行代码。"
-        actions={
-          can('training.write') && (
-            <button className="button primary" disabled={!enabled} onClick={createRun}>
-              <Plus size={17} />
-              新建训练
-            </button>
-          )
-        }
-      />
-      <div className="toolbar wrap">
-        <div className="segmented">
-          {[
-            ['ALL', '全部任务'],
-            ['ACTIVE', '进行中'],
-            ['SUCCEEDED', '已完成'],
-            ['FAILED', '失败'],
-          ].map(([key, label]) => (
-            <button
-              className={filter === key ? 'selected' : ''}
-              key={key}
-              onClick={() => setFilter(key)}
-            >
-              {label}
-              {key === 'ALL' && <b>{runs.data?.length ?? '—'}</b>}
-            </button>
-          ))}
-        </div>
-        <div className="search-field">
-          <Search size={16} />
-          <input
-            aria-label="搜索训练任务"
-            placeholder="搜索训练名称"
-            value={query}
-            onChange={(event) => setQuery(event.target.value)}
-          />
-        </div>
-      </div>
-      <ErrorNotice error={runs.error} retry={runs.refresh} />
-      <div className="panel">
-        {runs.loading && enabled && !runs.data ? (
-          <Loading />
-        ) : filtered.length ? (
-          <RunTable runs={filtered} />
-        ) : (
-          <Empty
-            icon={Workflow}
-            title={query || filter !== 'ALL' ? '没有匹配的训练任务' : '开始你的第一次训练'}
-            description={
-              query || filter !== 'ALL'
-                ? '尝试调整筛选条件，查看其他训练任务。'
-                : '选择机器和训练模板，平台将检查本地资产、运行环境及代码版本。'
-            }
-            action={
-              can('training.write') && (
-                <button className="button outline" disabled={!enabled} onClick={createRun}>
-                  <Plus size={16} />
-                  新建训练
-                </button>
-              )
-            }
-          />
-        )}
-      </div>
-    </>
-  );
+  return <BackgroundTasksPage createRun={createRun} />;
 }

@@ -96,11 +96,13 @@ def _camera(value, processing=False):
 def _annotation(value):
     _obj(value, {"key", "role", "representation", "value_mode", "component", "arm"}, {"shape", "dtype", "names", "horizon"})
     result = {"key": _text(value["key"]), "role": _enum(value["role"], {"state", "action"}),
-              "representation": _enum(value["representation"], {"eef", "joint", "gripper", "unknown"}),
+              "representation": _enum(value["representation"], {"eef", "joint", "gripper", "composite", "unknown"}),
               "value_mode": _enum(value["value_mode"], {"absolute", "delta", "unknown"}),
               "component": _enum(value["component"], {"position", "rotation", "joint", "gripper", "other"}),
               "arm": _enum(value["arm"], {"left", "right", "shared", "unknown"})}
     if result["representation"] == "gripper" and result["component"] != "gripper":
+        _fail()
+    if result["representation"] == "composite" and result["component"] != "other":
         _fail()
     if "shape" in value:
         result["shape"] = [_int(n, 2**31 - 1) for n in _list(value["shape"], 5, 1)]

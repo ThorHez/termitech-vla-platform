@@ -1,0 +1,75 @@
+.background-task-table table {
+  min-width: 940px;
+}
+.background-task-table .row-link strong {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 300px;
+}
+.background-task-type {
+  white-space: nowrap;
+}
+.background-task-type.sync {
+  color: var(--text-info, #477ba6);
+  background: var(--bg-info, #edf5fc);
+}
+.background-task-progress {
+  display: grid;
+  gap: 7px;
+  min-width: 150px;
+  max-width: 230px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.background-task-progress > span {
+  color: var(--text-primary, #435b68);
+}
+.background-task-progress small {
+  font-size: 10px;
+  color: var(--text-muted, var(--muted));
+}
+.background-task-indeterminate > span {
+  width: 32%;
+  animation: background-task-preparing 1.6s ease-in-out infinite alternate;
+}
+@keyframes background-task-preparing {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(212%);
+  }
+}
+.background-task-machines {
+  display: grid;
+  gap: 5px;
+  justify-items: start;
+  color: var(--text-muted, var(--muted));
+}
+.background-task-search,
+.background-task-type-filter {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.background-task-type-filter {
+  color: var(--text-muted, var(--muted));
+  font-size: 11px;
+}
+.background-task-type-filter select {
+  width: 126px;
+  height: 35px;
+  font-size: 11px;
+}
+.background-task-history-note {
+  margin: 12px 0 0;
+  color: var(--text-muted, var(--muted));
+  font-size: 11px;
+  line-height: 1.7;
+}
+@media (prefers-reduced-motion: reduce) {
+  .background-task-indeterminate > span {
+    animation: none;
+  }
+}

@@ -20,6 +20,7 @@ from .recipe_writeback import pending_for_checkout
 from .remote_models import RemoteDeployment
 from .settings import Settings
 from .gpu_selection import requested_gpu_uuids
+from .gpu_reservations import reservation_owners
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,13 @@ def tick(db: Database, settings: Settings) -> int:
             reserved.update(row.gpu_uuid for row in session.scalars(select(PolicyDeployment).where(
                 PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES))) if row.gpu_uuid)
             free = [gpu["uuid"] for gpu in node.gpus if gpu["uuid"] not in reserved and gpu_available(gpu)]
+            user_reservations = reservation_owners(session, node_id)
             for run in queued:
+                eligible = [uuid for uuid in free if uuid not in user_reservations
+                            or user_reservations[uuid] == run.owner_user_id]
+                # A user's own reservation should leave the shared pool free
+                # for others, regardless of the Agent's GPU inventory order.
+                eligible.sort(key=lambda uuid: uuid not in user_reservations)
                 if pending_for_checkout(session, node_id, run.code_expectation.get("code_dir")):
                     run.queue_reason = "RECIPE_WRITEBACK_PENDING"
                     continue
@@ -115,15 +122,18 @@ def tick(db: Database, settings: Settings) -> int:
                     if not set(requested) <= {gpu["uuid"] for gpu in node.gpus}:
                         run.queue_reason = "REQUESTED_GPU_MISSING"
                         continue
-                    if not set(requested) <= set(free):
+                    if any(uuid in user_reservations and user_reservations[uuid] != run.owner_user_id for uuid in requested):
+                        run.queue_reason = "REQUESTED_GPU_RESERVED"
+                        continue
+                    if not set(requested) <= set(eligible):
                         run.queue_reason = "REQUESTED_GPU_UNAVAILABLE"
                         continue
                     chosen = requested
                 else:
-                    if run.gpu_count > len(free):
-                        run.queue_reason = "GPU_UNAVAILABLE"
+                    if run.gpu_count > len(eligible):
+                        run.queue_reason = "GPU_RESERVED" if run.gpu_count <= len(free) else "GPU_UNAVAILABLE"
                         continue
-                    chosen = free[:run.gpu_count]
+                    chosen = eligible[:run.gpu_count]
                 attempt = Attempt(id=uid(), run_id=run.id, node_id=node_id, number=1,
                                   execution_token=secrets.token_hex(32), state="STARTING",
                                   created_at=now(), gpu_uuids=chosen, last_event_seq=0)

@@ -1,6 +1,14 @@
 import type { DatasetProfile } from './DatasetProfileForm';
 
 export type JsonObject = Record<string, unknown>;
+export interface GpuReservation {
+  node_id: string;
+  gpu_uuid: string;
+  user_id: string;
+  username: string;
+  display_name: string;
+  created_at: string;
+}
 export interface Gpu {
   uuid: string;
   name: string;
@@ -18,6 +26,7 @@ export interface Gpu {
       }[]
     | null;
   reserved_by?: string | null;
+  user_reservation?: GpuReservation | null;
 }
 export interface Node {
   id: string;
@@ -46,6 +55,7 @@ export interface Asset {
   status?: string;
   state?: string;
   metadata?: JsonObject;
+  norm_asset_id?: string | null;
   created_at?: string;
 }
 export interface PathSuggestion {
@@ -468,6 +478,7 @@ export interface Attempt {
   code_changed_during_run?: boolean;
 }
 export interface Run {
+  owner_user_id?: string | null;
   auto_config?: AutoTrainingConfig | null;
   confirmed_config_sha256?: string | null;
   dataset_profiles?: Record<string, DatasetProfile> | null;

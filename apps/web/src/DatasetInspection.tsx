@@ -11,6 +11,7 @@ import {
   inspectionScope,
   mergeDatasetInspection,
   recordInspectionEdits,
+  replaceInspectionDraftFromTemplate,
   type DatasetInspectionDTO,
   type DatasetInspectionQuery,
   type InspectionDraftState,
@@ -40,6 +41,11 @@ export function useDatasetInspectionDraft(
   const touch = useCallback((path: string) => {
     state.current!.touched.add(path);
   }, []);
+  const applyTemplate = useCallback((profile: DatasetProfile) => {
+    const next = replaceInspectionDraftFromTemplate(profile, state.current!);
+    latest.current.value = next;
+    latest.current.onChange(next);
+  }, []);
   const apply = useCallback((inspection: DatasetInspectionDTO) => {
     const merged = mergeDatasetInspection(latest.current.value, inspection, state.current!);
     if (JSON.stringify(merged.profile) !== JSON.stringify(latest.current.value)) {
@@ -59,7 +65,7 @@ export function useDatasetInspectionDraft(
     }
     currentScope.current = scope;
   }, []);
-  return { manualChange, touch, apply, resetScope };
+  return { manualChange, touch, applyTemplate, apply, resetScope };
 }
 
 function failure(error: unknown) {

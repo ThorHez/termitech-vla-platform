@@ -124,9 +124,13 @@ def prepare(root, item):
     base = item.get("base_commit")
     if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}", base):
         raise SourceError("Source base commit must be a full Git SHA")
+    published = item.get("published_commit")
+    if "published_commit" in item and (
+            not isinstance(published, str) or not re.fullmatch(r"[0-9a-f]{40}", published)):
+        raise SourceError("Source published commit must be a full lowercase Git SHA")
     head = git(project, "rev-parse", "HEAD").stdout.decode().strip()
-    if head != base:
-        raise SourceError(f"{name}: HEAD differs from the pinned base; no checkout or reset was performed")
+    if head != base and head != published:
+        raise SourceError(f"{name}: HEAD differs from the pinned base or published commit; no checkout or reset was performed")
     patch_info = item.get("patch")
     if not isinstance(patch_info, dict) or not isinstance(patch_info.get("path"), str):
         raise SourceError("Source patch identity is missing")
@@ -159,6 +163,7 @@ def prepare(root, item):
     for path in changed:
         local_path(project, path)
     return {"name": name, "project": project, "patch": patch, "base_commit": base,
+            "head_commit": head, "published_commit": published,
             "files": expected, "excluded": excluded}
 
 
@@ -192,6 +197,8 @@ def run(root, operation, selected=None):
     for plan in plans:
         if snapshot_matches(plan):
             continue
+        if plan["head_commit"] == plan["published_commit"]:
+            raise SourceError(f"{plan['name']}: published source files differ from the locked snapshot; nothing was overwritten")
         if git(plan["project"], "status", "--porcelain=v1", "--untracked-files=no").stdout.strip():
             raise SourceError(f"{plan['name']}: tracked local changes differ from the locked snapshot; nothing was overwritten")
         git(plan["project"], "apply", "--check", str(plan["patch"]))
@@ -205,6 +212,7 @@ def run(root, operation, selected=None):
     return {"operation": operation, "projects": [
         {"name": plan["name"], "status": "patch_required" if operation == "check" and plan in pending else "ready",
          "base_commit": plan["base_commit"], "expected_files": len(plan["files"]),
+         "head_commit": plan["head_commit"], "published_commit": plan["published_commit"],
          "verified_files": 0 if operation == "check" and plan in pending else len(plan["files"])} for plan in plans]}
 
 

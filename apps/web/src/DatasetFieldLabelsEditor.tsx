@@ -53,6 +53,7 @@ export function DatasetFieldLabelsEditor({
       </div>
       <p className="field-hint">
         这里只描述原始数据；无法确认的语义保留“未知”。拼接和归一化在新建训练中配置。
+        已拼接的字段可选“组合向量（多分量）”，字段内部顺序与分块在新建训练中配置，不会自动猜测。
       </p>
       {!value.length ? (
         <p className="field-hint">读取数据集后自动填入状态与动作字段，也可手动添加。</p>
@@ -174,9 +175,11 @@ export function DatasetFieldLabelsEditor({
                         const component =
                           representation === 'gripper'
                             ? 'gripper'
-                            : row.representation === 'gripper' && row.component === 'gripper'
+                            : representation === 'composite'
                               ? 'other'
-                              : row.component;
+                              : row.representation === 'gripper' && row.component === 'gripper'
+                                ? 'other'
+                                : row.component;
                         onFieldEdit?.(`field_annotations[${index}].representation`);
                         if (component !== row.component)
                           onFieldEdit?.(`field_annotations[${index}].component`);
@@ -191,6 +194,7 @@ export function DatasetFieldLabelsEditor({
                       <option value="eef">EEF</option>
                       <option value="joint">Joint</option>
                       <option value="gripper">夹爪开度</option>
+                      <option value="composite">组合向量（多分量）</option>
                     </select>
                   </td>
                   <td>
@@ -244,7 +248,7 @@ export function DatasetFieldLabelsEditor({
                     <select
                       aria-label={`字段分量 ${index + 1}`}
                       value={row.component}
-                      disabled={disabled}
+                      disabled={disabled || row.representation === 'composite'}
                       onChange={(event) => {
                         const component = event.target.value as DatasetFieldAnnotation['component'];
                         const representation =
@@ -261,7 +265,9 @@ export function DatasetFieldLabelsEditor({
                         );
                       }}
                     >
-                      <option value="other">其他</option>
+                      <option value="other">
+                        {row.representation === 'composite' ? '组合向量' : '其他'}
+                      </option>
                       <option value="position">位置</option>
                       <option value="rotation">旋转</option>
                       <option value="joint">关节</option>

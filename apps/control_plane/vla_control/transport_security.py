@@ -106,7 +106,9 @@ def uvicorn_options(settings) -> dict:
     """Return explicit server transport settings, including native TLS when set."""
     settings.validate()
     options = {"proxy_headers": True, "forwarded_allow_ips": settings.forwarded_allow_ips,
-               "server_header": False}
+               "server_header": False, "ws": "websockets-sansio",
+               "ws_max_size": 32 * 1024, "ws_per_message_deflate": False,
+               "ws_ping_interval": 20.0, "ws_ping_timeout": 20.0}
     if settings.tls_cert_file:
         # PROTOCOL_TLS_SERVER has TLS 1.2 as its minimum on supported Python
         # (>=3.11). Keep this compatible with Uvicorn >=0.30, before context
@@ -137,7 +139,7 @@ class TransportSecurityMiddleware:
             hostname = _hostname(host.hostname or "")
             # Port 80 also accepts ordinary browser HTTP->HTTPS navigation.
             # HTTPS requests must match the canonical TLS endpoint exactly.
-            default = 443 if scope.get("scheme") == "https" else 80
+            default = 443 if scope.get("scheme") in {"https", "wss"} else 80
             port = host.port if host.port is not None else default
             return any(hostname == origin.hostname and
                        port in ({origin.port} if default == 443 else {80, origin.port})

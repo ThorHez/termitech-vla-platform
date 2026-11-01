@@ -80,9 +80,11 @@ def _in_use(session, node_id):
             RemoteDeployment.state.not_in({"SUCCEEDED", "FAILED", "INTERRUPTED", "DISCONNECTED", "UNINSTALLED"})).limit(1)):
         return True
     from .checkpoint_transfer_models import CheckpointTransfer, TRANSFER_ACTIVE
-    return bool(session.scalar(select(CheckpointTransfer.id).where(
+    checkpoint = session.scalar(select(CheckpointTransfer.id).where(
         or_(CheckpointTransfer.source_node_id == node_id, CheckpointTransfer.target_node_id == node_id),
-        CheckpointTransfer.state.in_(TRANSFER_ACTIVE)).limit(1)))
+        CheckpointTransfer.state.in_(TRANSFER_ACTIVE)).limit(1))
+    from .asset_transfers import active_asset_transfers
+    return bool(checkpoint or active_asset_transfers(session, node_id=node_id))
 
 
 def _require_idle(session, node_id, *, except_command=None):

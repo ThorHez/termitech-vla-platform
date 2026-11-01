@@ -1,0 +1,278 @@
+.modal.wide.batch-dataset-modal {
+  width: 1200px;
+}
+.batch-dataset-source {
+  display: grid;
+  grid-template-columns: minmax(190px, 0.6fr) minmax(0, 1.4fr);
+  gap: 16px 22px;
+}
+.batch-dataset-source .field {
+  margin-bottom: 0;
+}
+.batch-dataset-scan-options {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 16px;
+}
+.batch-dataset-scan-options > .field {
+  width: 110px;
+}
+.batch-dataset-scan-options .checkbox-label {
+  min-height: 36px;
+}
+.batch-dataset-scanning {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.8;
+}
+.batch-dataset-preview,
+.batch-dataset-common {
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+.batch-dataset-preview-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.batch-dataset-preview-heading h3,
+.batch-dataset-common h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+.batch-dataset-preview-heading > span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.batch-dataset-table {
+  min-width: 850px;
+}
+.batch-dataset-preview .table-scroll {
+  max-height: 360px;
+  overflow: auto;
+}
+.batch-dataset-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-subtle, #f7f9fb);
+}
+.batch-dataset-table th:first-child,
+.batch-dataset-table td:first-child {
+  width: 38px;
+  padding-right: 5px;
+}
+.batch-dataset-table td {
+  vertical-align: top;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+.batch-dataset-table td:nth-child(2) {
+  min-width: 180px;
+}
+.batch-dataset-table td:nth-child(3) {
+  min-width: 230px;
+  max-width: 330px;
+}
+.batch-dataset-table td:nth-child(4) {
+  min-width: 150px;
+  max-width: 220px;
+}
+.batch-dataset-table .batch-dataset-info-row:has(+ .batch-dataset-norm-row) td {
+  border-bottom: 0;
+  padding-bottom: 8px;
+}
+.batch-dataset-table .batch-dataset-norm-row > td {
+  width: auto;
+  min-width: 0;
+  max-width: none;
+  padding: 0 14px 18px 38px;
+}
+.batch-dataset-row-norm {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-subtle, #f7f9fb);
+}
+.batch-dataset-row-norm.unselected {
+  border-style: dashed;
+}
+.batch-dataset-row-norm-heading {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.batch-dataset-row-norm-heading strong,
+.batch-dataset-shared-norm > strong {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.batch-dataset-row-norm-heading span {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+.batch-dataset-row-norm .field {
+  margin-bottom: 0;
+}
+.batch-dataset-row-norm .dataset-norm-field {
+  display: grid;
+  grid-template-columns: minmax(210px, 0.7fr) minmax(0, 1.3fr);
+  gap: 8px 18px;
+}
+.batch-dataset-row-norm .dataset-norm-path-entry {
+  margin-top: 0;
+}
+.batch-dataset-row-norm .dataset-norm-error,
+.batch-dataset-row-norm .dataset-norm-path,
+.batch-dataset-row-norm .dataset-norm-field > .field-hint {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+.batch-dataset-shared-norm {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.batch-dataset-shared-norm > strong {
+  display: block;
+  margin-bottom: 12px;
+}
+.batch-dataset-shared-norm > .button {
+  margin-top: 10px;
+}
+.batch-dataset-table code {
+  font-size: 10px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.batch-dataset-table .subtext {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.batch-dataset-warning {
+  color: var(--text-warning, #a87524);
+  font-size: 11px;
+  line-height: 1.8;
+}
+.batch-dataset-error {
+  color: var(--text-danger, #c84e4e);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.batch-dataset-muted {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.batch-dataset-warnings {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.8;
+  margin-bottom: 14px;
+}
+.batch-dataset-common-basics {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.55fr) minmax(0, 1.45fr);
+  gap: 18px;
+  margin: 16px 0 12px;
+}
+.batch-dataset-common .checkbox-label {
+  margin-bottom: 16px;
+}
+.batch-dataset-profile-review {
+  margin-bottom: 14px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.8;
+}
+.batch-dataset-profile-review summary {
+  cursor: pointer;
+  margin-bottom: 12px;
+}
+.batch-dataset-result > svg {
+  color: var(--text-success, #258d76);
+}
+.batch-dataset-result h3 {
+  font-size: 17px;
+  color: var(--text-primary);
+}
+.batch-dataset-result p {
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--text-secondary);
+}
+.batch-dataset-result ul {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+.batch-dataset-result li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  font-size: 12px;
+}
+.batch-dataset-result li code {
+  font-size: 10px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+@media (max-width: 700px) {
+  .batch-dataset-source,
+  .batch-dataset-common-basics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .batch-dataset-preview-heading {
+    align-items: flex-start;
+  }
+  .batch-dataset-row-norm .dataset-norm-field {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .batch-dataset-preview .batch-dataset-table,
+  .batch-dataset-table tbody {
+    display: block;
+    min-width: 0;
+  }
+  .batch-dataset-table thead {
+    display: none;
+  }
+  .batch-dataset-table .batch-dataset-info-row {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    padding: 12px 4px 6px;
+    border-top: 1px solid var(--border);
+  }
+  .batch-dataset-table .batch-dataset-info-row > td {
+    min-width: 0;
+    max-width: none;
+    width: auto;
+    padding: 4px;
+    border: 0;
+  }
+  .batch-dataset-table .batch-dataset-info-row > td:nth-child(n + 3) {
+    grid-column: 2;
+  }
+  .batch-dataset-table .batch-dataset-norm-row,
+  .batch-dataset-table .batch-dataset-norm-row > td {
+    display: block;
+    padding: 0 4px 14px;
+    border: 0;
+  }
+  .batch-dataset-row-norm {
+    padding: 10px;
+  }
+}

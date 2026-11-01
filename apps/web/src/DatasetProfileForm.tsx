@@ -13,6 +13,7 @@ import {
 } from './datasetFieldAnnotations';
 import { RobotTypeField } from './RobotTypeField';
 import { DatasetInspection, useDatasetInspectionDraft } from './DatasetInspection';
+import { DatasetFormatTemplates } from './DatasetFormatTemplates';
 import {
   composedProcessingErrors,
   normalizeComposedProcessing,
@@ -510,6 +511,7 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
     >
       <p className="field-hint">用于后续新建训练的处理器匹配；已创建训练保留原配置。</p>
       <code className="dataset-profile-path">{asset.path}</code>
+      <DatasetFormatTemplates value={value} onApply={inspectionDraft.applyTemplate} disabled={busy} initialName={`${asset.name} 格式`} />
       <div ref={errorArea}>
         <ErrorNotice error={error} title="数据特征保存失败" />
       </div>
