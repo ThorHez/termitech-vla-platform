@@ -176,7 +176,11 @@ export function ComposedProcessingEditor({
         </Field>
         <Field label="状态表示" required>
           <select
-            value={value.state_representation}
+            value={
+              value.state_representation === 'eef' || value.state_representation === 'joint'
+                ? value.state_representation
+                : ''
+            }
             onChange={(event) =>
               set(
                 'state_representation',
@@ -184,13 +188,18 @@ export function ComposedProcessingEditor({
               )
             }
           >
+            <option value="">请选择状态表示</option>
             <option value="eef">EEF · 末端状态</option>
             <option value="joint">Joint · 关节状态</option>
           </select>
         </Field>
         <Field label="组合动作表示" required>
           <select
-            value={value.action_representation}
+            value={
+              value.action_representation === 'eef' || value.action_representation === 'joint'
+                ? value.action_representation
+                : ''
+            }
             onChange={(event) =>
               set(
                 'action_representation',
@@ -198,6 +207,7 @@ export function ComposedProcessingEditor({
               )
             }
           >
+            <option value="">请选择动作表示</option>
             <option value="eef">EEF · 末端动作</option>
             <option value="joint">Joint · 关节动作</option>
           </select>

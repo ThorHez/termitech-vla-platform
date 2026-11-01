@@ -31,6 +31,21 @@ try {
   const binding = { dataset_asset_id: 'dataset', norm_asset_id: 'norm', weight: 20, recipe_index: 0 };
   const configuredBinding = (processing = spec) => ({ ...binding, recipe_index: undefined, processor: composedChoice(processing) });
   const stateFor = (changes = {}) => compositionBindingState({ binding: configuredBinding(), dataset: asset(), entries: [capability], slots: [], index: 0, stage: 'sft', ...changes });
+  const representationFields = [
+    ['state_representation', '状态表示', '请选择状态表示。'],
+    ['action_representation', '组合动作表示', '请选择动作表示。'],
+  ];
+  const selectedRepresentationOption = (html, label) => {
+    const start = html.indexOf(label);
+    assert.notEqual(start, -1, `missing field: ${label}`);
+    const field = html.slice(start, html.indexOf('</label>', start));
+    const select = field.match(/<select\b[^>]*>([\s\S]*?)<\/select>/);
+    assert.ok(select, `missing select: ${label}`);
+    const selected = [...select[1].matchAll(/<option\b([^>]*)>([^<]*)<\/option>/g)]
+      .filter(([, attributes]) => /(?:^|\s)selected(?:=|\s|$)/.test(attributes));
+    assert.equal(selected.length, 1, `exactly one explicit selection is required: ${label}`);
+    return { attributes: selected[0][1], text: selected[0][2] };
+  };
 
   for (const [index, value] of fixtures.valid.entries()) await test(`shared composition v1 valid fixture ${index + 1}`, () => {
     assert.deepEqual(errors(value), []); assert.deepEqual(errors(normalize(value)), []);
@@ -98,6 +113,43 @@ try {
     assert.doesNotMatch(html, /夹爪原始最小值|夹爪原始最大值/);
     const enabled = render(spec);
     assert.match(enabled, /夹爪原始最小值/); assert.match(enabled, /夹爪原始最大值/);
+  });
+  await test('unconfirmed representations select a visible placeholder and remain required without defaulting to EEF', async () => {
+    const { ComposedProcessingEditor } = await server.ssrLoadModule('/src/ComposedProcessingEditor.tsx');
+    for (const [key, label, requiredError] of representationFields) {
+      for (const unconfirmed of ['', 'unknown', 'composite', null, undefined, 42]) {
+        const draft = { ...clone(spec), [key]: unconfirmed };
+        const before = clone(draft);
+        const html = renderToStaticMarkup(React.createElement(ComposedProcessingEditor, {
+          value: draft, profile: profileFor(spec), onChange() {},
+        }));
+        const selected = selectedRepresentationOption(html, label);
+        assert.match(selected.attributes, /(?:^|\s)value=""(?:\s|$)/, `${key}: ${String(unconfirmed)}`);
+        assert.match(selected.text, /请选择/);
+        assert.doesNotMatch(selected.text, /EEF|Joint/);
+        assert.ok(errors(draft).includes(requiredError), `${key} remains required`);
+        assert.ok(html.includes(requiredError), `${key} displays its validation error`);
+        assert.equal(composedChoice(draft).parameters.composition[key], unconfirmed);
+        assert.deepEqual(draft, before, 'rendering must not silently infer source semantics');
+      }
+    }
+  });
+  await test('explicit EEF and Joint representation selections are displayed and persisted unchanged', async () => {
+    const { ComposedProcessingEditor } = await server.ssrLoadModule('/src/ComposedProcessingEditor.tsx');
+    for (const [key, label, requiredError] of representationFields) {
+      for (const representation of ['eef', 'joint']) {
+        const draft = clone(key === 'action_representation' && representation === 'joint' ? fixtures.valid[1] : spec);
+        draft[key] = representation;
+        const html = renderToStaticMarkup(React.createElement(ComposedProcessingEditor, {
+          value: draft, profile: profileFor(draft), onChange() {},
+        }));
+        const selected = selectedRepresentationOption(html, label);
+        assert.match(selected.attributes, new RegExp(`(?:^|\\s)value="${representation}"(?:\\s|$)`));
+        assert.match(selected.text, representation === 'eef' ? /EEF/ : /Joint/);
+        assert.ok(!errors(draft).includes(requiredError));
+        assert.equal(composedChoice(draft).parameters.composition[key], representation);
+      }
+    }
   });
   await test('composition schema keys allow real nested fields and reject paths or code', () => {
     for (const key of ['observation.state', 'observation/robot0/joints', 'camera_0_rgb', ' 字段 ']) assert.equal(compositionSchemaKey(key), true, key);
