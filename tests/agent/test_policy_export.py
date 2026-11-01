@@ -142,15 +142,31 @@ def test_export_command_reports_durable_async_result_without_loading_training(mo
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', 'GPU-must-not-be-used')
     monkeypatch.setenv('JAX_PLATFORMS', 'cuda')
     monkeypatch.setattr('vla_agent.metrics.gpu_inventory', lambda: pytest.fail('Export must not require an idle GPU'))
-    worker.write_text("import json,sys,time,os\nfrom pathlib import Path\nassert os.environ['CUDA_VISIBLE_DEVICES']==''\nassert os.environ['JAX_PLATFORMS']==os.environ['JAX_PLATFORM_NAME']=='cpu'\np=Path(sys.argv[1]);time.sleep(.15)\n(p.parent/'result.json').write_text(json.dumps({'state':'READY','portable_config':{'fixture':True},'portable_digest':'a'*64}))\n")
+    worker.write_text(
+        "import json,sys,time,os\n"
+        "from pathlib import Path\n"
+        "assert os.environ['CUDA_VISIBLE_DEVICES']==''\n"
+        "assert os.environ['JAX_PLATFORMS']==os.environ['JAX_PLATFORM_NAME']=='cpu'\n"
+        "p=Path(sys.argv[1])\n"
+        "while not (p.parent/'release-worker').exists():\n"
+        "    time.sleep(.01)\n"
+        "temporary=p.parent/'result.tmp'\n"
+        "temporary.write_text(json.dumps({'state':'READY','portable_config':{'fixture':True},'portable_digest':'a'*64}))\n"
+        "os.replace(temporary,p.parent/'result.json')\n"
+    )
     monkeypatch.setattr(exporter, "WORKER", worker)
     payload = {"export_id": "export-1", "profile_id": "smoke-profile", "checkpoint_path": str(checkpoint), "source_training": {"run_id": "run-1"}}
-    assert handle_export_command(config, "POLICY_EXPORT", payload) == ({"state": "RUNNING", "warnings": warnings}
-            if unrecorded_checkpoint else {"state": "RUNNING"})
     directory = Path(config["state_dir"]) / "policy-exports/export-1"
-    identity = json.loads((directory / "identity.json").read_text())
-    assert handle_export_command(config, "POLICY_EXPORT", payload)["state"] == "RUNNING"
-    assert json.loads((directory / "identity.json").read_text()) == identity
+    try:
+        assert handle_export_command(config, "POLICY_EXPORT", payload) == ({"state": "RUNNING", "warnings": warnings}
+                if unrecorded_checkpoint else {"state": "RUNNING"})
+        identity = json.loads((directory / "identity.json").read_text())
+        assert handle_export_command(config, "POLICY_EXPORT", payload)["state"] == "RUNNING"
+        assert json.loads((directory / "identity.json").read_text()) == identity
+    finally:
+        # Release even on assertion failure so the fixture child cannot linger.
+        if directory.is_dir():
+            (directory / "release-worker").touch()
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         result = handle_export_command(config, "POLICY_EXPORT_STATUS", payload)

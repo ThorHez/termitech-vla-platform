@@ -58,6 +58,7 @@ git submodule update --init third_party/openpi-umi
 ARX SDK 与实机 eval 工程也已纳入 `third_party`。它们保留 `server-lenovo-111` 当前使用的源码修订；上游基础提交与实机补丁分别记录，避免遗漏未推送或未提交的代码。首次检出后执行：
 
 ```bash
+git submodule sync -- third_party/arx5-sdk third_party/umi-arx-deploy
 git submodule update --init third_party/arx5-sdk third_party/umi-arx-deploy
 python scripts/robot_sources.py check
 ```

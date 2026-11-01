@@ -24,11 +24,12 @@ ARX SDK 的原始上游为 `https://github.com/real-stanford/arx5-sdk.git`；平
 在平台仓库根目录执行：
 
 ```sh
+git submodule sync -- third_party/arx5-sdk third_party/umi-arx-deploy
 git submodule update --init third_party/arx5-sdk third_party/umi-arx-deploy
 python scripts/robot_sources.py check
 ```
 
-两个子模块现在直接固定包含实机修订的发布提交，首次检出无需再打补丁。`check` 仍核对补丁身份与完整文件清单。对于保留在旧公开基线的工作区，`apply` 继续支持从本仓库保存的补丁恢复源码；它不获取网络数据、不切换分支、不执行 `reset`，也不触碰已有的 `openpi-umi`。Git 子模块初始化单独执行，因此检查命令不会隐式克隆或改写其他检出目录。
+两个子模块现在直接固定包含实机修订的发布提交，首次检出无需再打补丁。`sync` 为已有检出同步 ARX 用户 fork 的 URL，避免继续向原上游请求未发布于该上游的修订；它不切换源码版本。`check` 仍核对补丁身份与完整文件清单。对于保留在旧公开基线的工作区，`apply` 继续支持从本仓库保存的补丁恢复源码；它不获取网络数据、不切换分支、不执行 `reset`，也不触碰已有的 `openpi-umi`。Git 子模块初始化单独执行，因此检查命令不会隐式克隆或改写其他检出目录。
 
 也可分别处理一个工程：
 
