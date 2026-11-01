@@ -58,7 +58,7 @@ def machine_identity():
         root=os.stat('/')
         value=(socket.gethostname()+':'+str(root.st_dev)+':'+str(root.st_ino)).encode()
     return hashlib.sha256(value).hexdigest()
-def scan(path,source=False):
+def scan(path,source=False,exclude_train_state=False):
     before=path.lstat()
     if stat.S_ISREG(before.st_mode):
         kind='file';directories=[]
@@ -104,6 +104,11 @@ def scan(path,source=False):
                 info=os.stat(name,dir_fd=fd,follow_symlinks=False)
                 if unsafe_name(name) or not stat.S_ISDIR(info.st_mode):
                     fail('TRANSFER_UNSAFE_FILE','Asset contains a linked or special directory')
+            # Only an ordinary directory at the asset root is excluded.  Check
+            # its own type before pruning; a symlink never becomes authority
+            # to bypass the normal safe-file contract.
+            if source and exclude_train_state and str(relative)=='.' and 'train_state' in dirs:
+                dirs.remove('train_state')
             for name in children:read_file(name,str(relative/name) if str(relative)!='.' else name,fd)
     end=path.lstat()
     if (before.st_dev,before.st_ino,before.st_mode)!=(end.st_dev,end.st_ino,end.st_mode):
@@ -120,6 +125,14 @@ def receipt_read(path):
         if not stat.S_ISREG(info.st_mode) or info.st_size>MAX_BYTES:
             fail('TRANSFER_PARTIAL_CONFLICT','Transfer receipt must be a bounded regular file')
         return json.load(reader)
+def reject_excluded_target(path,exclude_train_state):
+    if not exclude_train_state:return
+    try:info=(path/'train_state').lstat()
+    except FileNotFoundError:return
+    if stat.S_ISDIR(info.st_mode):
+        fail('TRANSFER_PARTIAL_CONFLICT','Excluded train_state directory is present in the owned destination; create a new transfer directory instead of reusing this partial copy')
+    if not stat.S_ISREG(info.st_mode):
+        fail('TRANSFER_UNSAFE_FILE','Destination contains a linked or special train_state entry')
 def rename_noreplace(staging,final):
     libc=ctypes.CDLL(None,use_errno=True)
     left,right=os.fsencode(staging),os.fsencode(final)
@@ -142,10 +155,13 @@ def rename_noreplace(staging,final):
         raise OSError(code,os.strerror(code))
 try:
     mode=p['mode']
+    exclude_train_state=p.get('exclude_train_state',False)
+    if type(exclude_train_state) is not bool:
+        fail('TRANSFER_PROFILE_INVALID','exclude_train_state must be a boolean')
     if mode=='source':
         root=safe(p['path'],p['roots'])
         if root==pathlib.Path('/'):fail('TRANSFER_PATH_INVALID','The filesystem root cannot be copied as an asset')
-        result=scan(root,True);result['path']=str(root);result['machine_id']=machine_identity()
+        result=scan(root,True,exclude_train_state);result['path']=str(root);result['machine_id']=machine_identity()
         if shutil.which('rsync') is None:fail('TRANSFER_RSYNC_MISSING','rsync is not installed on the source machine')
     elif mode=='prepare':
         parent=safe(p['parent'],p['roots'],False);name=component(p['name'])
@@ -159,10 +175,15 @@ try:
         ownership={'schema_version':1,'transfer_id':p['id'],'target_name':name,'source':p['source_identity'],
                    'source_kind':p['source_kind'],'source_name':p['source_name'],
                    'directories':p['directories'],'manifest':p['manifest']}
+        if exclude_train_state:ownership['exclude_train_state']=True
         if len(canonical(ownership))>MAX_BYTES:fail('TRANSFER_MANIFEST_LIMIT','Transfer receipt exceeds the 64 MiB limit')
         if receipt.exists() or receipt.is_symlink():
             if receipt.is_symlink():fail('TRANSFER_PARTIAL_CONFLICT','Transfer receipt cannot be a symlink')
-            if receipt_read(receipt)!=ownership:fail('TRANSFER_SOURCE_CHANGED','Source asset or destination changed since this transfer began')
+            previous=receipt_read(receipt)
+            if not isinstance(previous,dict):fail('TRANSFER_SOURCE_CHANGED','Source asset or destination changed since this transfer began')
+            if previous.get('exclude_train_state',False)!=exclude_train_state:
+                fail('TRANSFER_PROFILE_CHANGED','The train_state exclusion profile changed; create a new transfer directory instead of reusing this copy')
+            if previous!=ownership:fail('TRANSFER_SOURCE_CHANGED','Source asset or destination changed since this transfer began')
         else:
             if any(value.exists() or value.is_symlink() for value in (final,staging)):
                 fail('TRANSFER_TARGET_EXISTS','Destination already exists and is not owned by this transfer')
@@ -171,13 +192,14 @@ try:
                 writer.write(canonical(ownership));writer.flush();os.fsync(writer.fileno())
         expected_dirs=p['directories'] if p['source_kind']=='directory' else []
         if final.exists() or final.is_symlink():
-            safe(str(final),p['roots']);actual=scan(final)
+            safe(str(final),p['roots']);reject_excluded_target(final,exclude_train_state);actual=scan(final)
             if actual['kind']=='directory' and actual['manifest']==p['manifest'] and actual['directories']==expected_dirs:
                 result={'target_path':str(final),'published':True}
                 print(json.dumps({'result':result},separators=(',',':'),ensure_ascii=False));sys.exit(0)
             fail('TRANSFER_TARGET_EXISTS','Published destination differs from this verified asset')
         if staging.is_symlink():fail('TRANSFER_PATH_INVALID','Partial destination cannot be a symlink')
         staging.mkdir(mode=0o700,exist_ok=True);safe(str(staging),p['roots'])
+        reject_excluded_target(staging,exclude_train_state)
         existing=scan(staging)
         expected={item['path']:item for item in p['manifest']['files']}
         if (any(item['path'] not in expected for item in existing['manifest']['files'])
@@ -189,12 +211,14 @@ try:
             fail('TRANSFER_SPACE_INSUFFICIENT','Target has insufficient free storage for this asset')
         if shutil.which('rsync') is None:fail('TRANSFER_RSYNC_MISSING','rsync is not installed on the target machine')
         result={'staging_path':str(staging),'target_path':str(final),'bytes_existing':correct}
-    elif mode=='inspect':result=scan(safe(p['path'],p['roots']))
+    elif mode=='inspect':
+        inspected=safe(p['path'],p['roots']);reject_excluded_target(inspected,exclude_train_state);result=scan(inspected)
     elif mode=='publish':
         staging=safe(p['path'],p['roots']);final=safe(p['target'],p['roots'],False)
         if final.parent!=staging.parent or final.name!=component(p['name']) or staging.name!='.'+p['id']+'.partial':
             fail('TRANSFER_PATH_INVALID','Invalid asset publication destination')
         if final.exists() or final.is_symlink():fail('TRANSFER_TARGET_EXISTS','Destination already exists')
+        reject_excluded_target(staging,exclude_train_state)
         # No reservation directory or check-then-replace window: interruption
         # leaves either the complete partial tree or the complete owned final.
         rename_noreplace(staging,final)
@@ -217,13 +241,16 @@ def _asset_json(remote, payload, cancelled):
 
 
 def transfer_asset(source_remote, target_remote, source_path, target_parent, transfer_id,
-                   source_roots, target_roots, progress=None, cancelled=None, target_name=None):
+                   source_roots, target_roots, progress=None, cancelled=None, target_name=None,
+                   exclude_train_state=False):
     """Copy a directory or single file into a new owned destination directory.
 
     Only bounded metadata and progress reach the controller; file bytes move
     directly from the source machine to the target machine.
     Retry reuses this task's partial directory; unrelated destinations are never adopted.
     """
+    if type(exclude_train_state) is not bool:
+        raise TransferError('TRANSFER_PROFILE_INVALID', 'exclude_train_state must be a boolean')
     if not isinstance(transfer_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', transfer_id):
         raise TransferError('TRANSFER_ID_INVALID', 'Invalid asset transfer identifier')
     name = transfer_id if target_name is None else target_name
@@ -232,8 +259,9 @@ def transfer_asset(source_remote, target_remote, source_path, target_parent, tra
         raise TransferError('TRANSFER_PATH_INVALID', 'Destination name must be one safe directory name')
     progress = progress or (lambda _event: None)
     cancelled = cancelled or (lambda: False)
+    profile = {'exclude_train_state': True} if exclude_train_state else {}
     progress({'stage': 'INSPECTING', 'message': '检查源资产文件与 SHA-256 清单'})
-    source = _asset_json(source_remote, {'mode': 'source', 'path': source_path, 'roots': source_roots}, cancelled)
+    source = _asset_json(source_remote, {'mode': 'source', 'path': source_path, 'roots': source_roots, **profile}, cancelled)
     original = source['manifest']
     progress({'stage': 'PREPARING', 'bytes_total': original['bytes_total'], 'files_total': original['files_total'],
               'message': '检查目标空间和本任务的可恢复目录'})
@@ -242,21 +270,21 @@ def transfer_asset(source_remote, target_remote, source_path, target_parent, tra
         'source_name': source['name'], 'directories': source['directories'], 'source_machine_id': source['machine_id'],
         'source_identity': {'path': source['path'], 'host': getattr(source_remote, 'host', None),
                             'port': getattr(source_remote, 'port', None),
-                            'username': getattr(source_remote, 'username', None)}}, cancelled)
+                            'username': getattr(source_remote, 'username', None)}, **profile}, cancelled)
     if not prepared.get('published'):
         from .direct_asset_transfer import direct_copy
         direct_copy(source_remote, target_remote, source, prepared['staging_path'], transfer_id,
-                    progress=progress, cancelled=cancelled, initial_bytes=prepared['bytes_existing'])
+                    progress=progress, cancelled=cancelled, initial_bytes=prepared['bytes_existing'], **profile)
         progress({'stage': 'VERIFYING', 'bytes_total': original['bytes_total'], 'files_total': original['files_total'],
                   'message': '复核源数据稳定性和目标全部文件哈希'})
-        after = _asset_json(source_remote, {'mode': 'source', 'path': source_path, 'roots': source_roots}, cancelled)
+        after = _asset_json(source_remote, {'mode': 'source', 'path': source_path, 'roots': source_roots, **profile}, cancelled)
         if any(after[key] != source[key] for key in ('manifest', 'directories', 'kind', 'name', 'path')):
             raise TransferError('TRANSFER_SOURCE_CHANGED', 'Source asset changed during synchronization; partial files are retained')
-        actual = _asset_json(target_remote, {'mode': 'inspect', 'path': prepared['staging_path'], 'roots': target_roots}, cancelled)
+        actual = _asset_json(target_remote, {'mode': 'inspect', 'path': prepared['staging_path'], 'roots': target_roots, **profile}, cancelled)
         if actual['manifest'] != original or actual['directories'] != source['directories']:
             raise TransferError('TRANSFER_CHECKSUM_MISMATCH', 'Target file hashes or directory layout differ from the source asset')
         _asset_json(target_remote, {'mode': 'publish', 'path': prepared['staging_path'], 'target': prepared['target_path'],
-                                  'roots': target_roots, 'id': transfer_id, 'name': name}, cancelled)
+                                  'roots': target_roots, 'id': transfer_id, 'name': name, **profile}, cancelled)
     target = prepared['target_path']
     if cancelled():
         raise TransferError('TRANSFER_CANCELLED', 'Asset synchronization was cancelled; owned files are retained for retry')

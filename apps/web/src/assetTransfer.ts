@@ -31,6 +31,7 @@ export interface AssetTransfer {
   asset_path?: string | null;
   target_asset_id?: string | null;
   include_norm_stats?: boolean;
+  exclude_train_state?: boolean;
   norm_sync?: AssetNormTransfer | null;
   state: string;
   bytes_total: number;
@@ -71,6 +72,7 @@ export function assetTransferCreateRequest(
   directory: string,
   targetName: string,
   includeNormStats = false,
+  excludeTrainState = false,
 ) {
   return {
     source_asset_id: asset.id,
@@ -79,6 +81,7 @@ export function assetTransferCreateRequest(
     target_name: targetName.trim(),
     include_norm_stats: includeNormStats,
     ...(includeNormStats ? { expected_norm_asset_id: asset.norm_asset_id } : {}),
+    ...(asset.kind === 'MODEL' && excludeTrainState ? { exclude_train_state: true } : {}),
   };
 }
 

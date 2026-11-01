@@ -164,6 +164,90 @@ try {
     assert.notEqual(JSON.stringify(original), JSON.stringify(cancelled));
     assert.equal(h.batchSyncError(input({ rows })), undefined);
   });
+  await test('only model rows can explicitly exclude root train_state and default requests retain their prior shape', () => {
+    const rows = h.batchSyncRows(assets);
+    assert.ok(rows.every((row) => row.excludeTrainState === false));
+    const complete = h.batchSyncRequest(rows, 'target', '/data/shared', assets);
+    assert.ok(complete.entries.every((entry) => !Object.hasOwn(entry, 'exclude_train_state')));
+    rows[1].excludeTrainState = true;
+    assert.equal(h.batchSyncError(input({ rows })), undefined);
+    const excluded = h.batchSyncRequest(rows, 'target', '/data/shared', assets);
+    assert.equal(excluded.entries[1].exclude_train_state, true);
+    assert.equal(Object.hasOwn(excluded.entries[0], 'exclude_train_state'), false);
+    assert.equal(Object.hasOwn(excluded.entries[2], 'exclude_train_state'), false);
+    assert.equal(
+      Object.hasOwn(
+        h.batchSyncRequest(rows, 'target', '/data/shared').entries[1],
+        'exclude_train_state',
+      ),
+      false,
+    );
+    const identity = h.batchSyncIdentity(undefined, complete, () => 'complete');
+    const changed = h.batchSyncIdentity(identity, excluded, () => 'excluded');
+    assert.equal(changed.key, 'excluded');
+    assert.equal(
+      h.batchSyncIdentity(changed, excluded, () => 'unexpected'),
+      changed,
+    );
+    for (const index of [0, 2]) {
+      const forged = rows.map((row, position) => ({
+        ...row,
+        excludeTrainState: position === index,
+      }));
+      assert.match(h.batchSyncError(input({ rows: forged })), /只有模型/);
+      assert.equal(
+        Object.hasOwn(
+          h.batchSyncRequest(forged, 'target', '/data/shared', assets).entries[index],
+          'exclude_train_state',
+        ),
+        false,
+      );
+    }
+  });
+  await test('batch receipts must preserve each frozen model exclusion policy, including omitted false for older tasks', () => {
+    const rows = h.batchSyncRows(assets);
+    rows[1].excludeTrainState = true;
+    const request = h.batchSyncRequest(rows, 'target', '/data/shared', assets);
+    const receipt = {
+      idempotency_key: 'key',
+      transfers: request.entries.map((entry, index) => ({
+        id: 'sync-' + index,
+        ...entry,
+        target_node_id: 'target',
+        target_directory: '/data/shared',
+      })),
+    };
+    assert.equal(h.batchSyncReceiptMatches(receipt, 'key', request), true);
+    assert.equal(
+      h.batchSyncReceiptMatches(
+        {
+          ...receipt,
+          transfers: receipt.transfers.map((item) => ({ ...item, exclude_train_state: false })),
+        },
+        'key',
+        request,
+      ),
+      false,
+    );
+    assert.equal(
+      h.batchSyncReceiptMatches(
+        {
+          ...receipt,
+          transfers: receipt.transfers.map((item) => ({ ...item, exclude_train_state: true })),
+        },
+        'key',
+        request,
+      ),
+      false,
+    );
+    rows[1].excludeTrainState = false;
+    const complete = h.batchSyncRequest(rows, 'target', '/data/shared', assets);
+    const legacy = {
+      ...receipt,
+      transfers: receipt.transfers.map(({ exclude_train_state, ...item }) => item),
+    };
+    assert.equal(h.batchSyncReceiptMatches(legacy, 'key', complete), true);
+  });
   await test('one through twenty items are allowed; empty, repeated sources and twenty-one items are blocked', () => {
     assert.equal(h.batchSyncError(input()), undefined);
     assert.match(h.batchSyncError(input({ rows: [] })), /选择/);

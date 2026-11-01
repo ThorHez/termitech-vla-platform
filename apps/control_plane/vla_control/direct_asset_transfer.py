@@ -201,6 +201,8 @@ try:
         if not stat.S_ISREG(info.st_mode) or info.st_size>8192:raise ValueError('scope')
         scope=json.load(stream)
     source=scope['path'];kind=scope['kind']
+    exclude_train_state=scope.get('exclude_train_state',False)
+    if type(exclude_train_state) is not bool:fail('DIRECT_PROFILE_INVALID','Invalid source exclusion profile')
     if time.time()>scope['deadline']:fail('DIRECT_SOURCE_SCOPE_EXPIRED','Temporary sender authorization expired')
     if kind=='directory':
         source_fd=path_fd(source)
@@ -218,7 +220,8 @@ try:
     os.set_inheritable(source_fd,True)
     binary=shutil.which('rsync')
     if not binary:fail('DIRECT_RSYNC_MISSING','rsync is not installed on the source machine')
-    os.execv(binary,[binary,'--server','--sender','-rct','--partial','.',argument])
+    exclusions=['--exclude=/train_state/'] if exclude_train_state else []
+    os.execv(binary,[binary,'--server','--sender','-rct','--partial']+exclusions+['.',argument])
 except BaseException:
     print('Scoped direct sender could not start',file=sys.stderr)
     sys.exit(126)
@@ -241,6 +244,8 @@ ssh=None;temporary=None;temporary_identity=None;line=None;watchdog=None;restore=
 try:
     p=request()
     if p is None:raise ValueError('missing request')
+    exclude_train_state=p.get('exclude_train_state',False)
+    if type(exclude_train_state) is not bool:fail('DIRECT_PROFILE_INVALID','Invalid source exclusion profile')
     home=pwd.getpwuid(os.geteuid()).pw_dir
     ssh=safe_ssh_directory(home)
     # Validate the path again at authorization time, and again in the forced
@@ -248,7 +253,9 @@ try:
     source_fd=path_fd(p['path'],p['kind']=='directory');os.close(source_fd)
     temporary=tempfile.mkdtemp(prefix='.termitech-direct-'+p['token']+'-',dir=os.path.join(home,'.ssh'))
     info=os.lstat(temporary);temporary_identity=[info.st_dev,info.st_ino]
-    for name,value in [('sender.py',SENDER_SCRIPT.encode()),('scope.json',json.dumps({'path':p['path'],'kind':p['kind'],'deadline':time.time()+p['auth_seconds']}).encode())]:
+    scope={'path':p['path'],'kind':p['kind'],'deadline':time.time()+p['auth_seconds']}
+    if exclude_train_state:scope['exclude_train_state']=True
+    for name,value in [('sender.py',SENDER_SCRIPT.encode()),('scope.json',json.dumps(scope).encode())]:
         fd=os.open(os.path.join(temporary,name),os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
         with os.fdopen(fd,'wb') as stream:stream.write(value)
     command=shlex.join([sys.executable,os.path.join(temporary,'sender.py')])
@@ -318,6 +325,8 @@ temporary=None;temporary_identity=None;child=None;staging_fd=None;success=False
 try:
     p=request()
     if p is None:raise ValueError('missing request')
+    exclude_train_state=p.get('exclude_train_state',False)
+    if type(exclude_train_state) is not bool:fail('DIRECT_PROFILE_INVALID','Invalid target exclusion profile')
     if any(shutil.which(binary) is None for binary in ('rsync','ssh','ssh-keygen')):
         fail('DIRECT_TOOLS_MISSING','Direct transfer requires rsync, ssh and ssh-keygen on the target machine')
     staging_fd=path_fd(p['staging'])
@@ -352,7 +361,8 @@ try:
     origin=('['+host+']' if ':' in host else host)+':./'
     # Fixed source sender chooses its own path; client argv never carries a
     # dataset path through an intermediate login shell.
-    child=subprocess.Popen(['rsync','-rct','--partial','--inplace','--progress','-e',rsh,'--',origin,'./'],
+    exclusions=['--exclude=/train_state/'] if exclude_train_state else []
+    child=subprocess.Popen(['rsync','-rct','--partial','--inplace','--progress']+exclusions+['-e',rsh,'--',origin,'./'],
         stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True,bufsize=0,
         env={**{key:value for key,value in os.environ.items() if not key.startswith('RSYNC_')},'LC_ALL':'C'})
     pathlib.Path(temporary,'child.json').write_text(json.dumps({'pid':child.pid,'identity':process_stamp(child.pid)}))
@@ -501,8 +511,11 @@ def _finish(channel):
 
 
 def direct_copy(source_remote, target_remote, source_info, target_staging, transfer_id,
-                progress=None, cancelled=None, *, initial_bytes=0, timeout=86400):
+                progress=None, cancelled=None, *, initial_bytes=0, timeout=86400,
+                exclude_train_state=False):
     """Pull directly from source to target; never silently fall back to a relay."""
+    if type(exclude_train_state) is not bool:
+        raise TransferError('DIRECT_PROFILE_INVALID', 'exclude_train_state must be a boolean')
     if not isinstance(transfer_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', transfer_id):
         raise TransferError('DIRECT_ID_INVALID', 'Invalid direct transfer identifier')
     if type(timeout) not in (int, float) or not 1 <= timeout <= 86400:
@@ -524,13 +537,14 @@ def direct_copy(source_remote, target_remote, source_info, target_staging, trans
     progress = progress or (lambda _event: None)
     cancelled = cancelled or (lambda: False)
     token, channels = secrets.token_hex(16), []
+    profile = {'exclude_train_state': True} if exclude_train_state else {}
     setup_deadline = time.monotonic() + 60
     try:
         if cancelled():raise TransferError('TRANSFER_CANCELLED', 'Asset synchronization was cancelled')
         target = _open_channel(target_remote, shlex.join(['python3', '-u', '-c', _TARGET_SCRIPT]))
         channels.append(target)
         _send(target, {'token': token, 'transfer_id': transfer_id, 'source': identity,
-                       'staging': target_staging, 'timeout': timeout, 'initial_bytes': initial_bytes, **totals})
+                       'staging': target_staging, 'timeout': timeout, 'initial_bytes': initial_bytes, **totals, **profile})
         target_messages = _Messages(target)
         public_key = None
         while public_key is None:
@@ -548,7 +562,7 @@ def direct_copy(source_remote, target_remote, source_info, target_staging, trans
         source = _open_channel(source_remote, shlex.join(['python3', '-u', '-c', _SOURCE_SCRIPT]))
         channels.append(source)
         _send(source, {'token': token, 'public_key': public_key, 'path': source_info['path'],
-                       'kind': source_info['kind'], 'auth_seconds': 600, 'timeout': timeout})
+                       'kind': source_info['kind'], 'auth_seconds': 600, 'timeout': timeout, **profile})
         source_messages = _Messages(source)
         authorized = False
         while not authorized:

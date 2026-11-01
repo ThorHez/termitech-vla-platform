@@ -1,6 +1,7 @@
 """Real direct rsync copies with isolated SSH peers and asset filesystem guards."""
 import hashlib
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 
@@ -360,3 +361,187 @@ def test_cancellation_after_publish_receipt_does_not_report_success(asset, monke
     assert (asset[2] / 'fold cloth v1' / 'data' / 'episode.parquet').is_file()
     monkeypatch.setattr(module, '_asset_json', original)
     assert Path(transfer(asset)['target_path']).is_dir()
+
+
+def test_model_exclusion_copies_only_root_train_state_directory_out_of_profile(asset):
+    source = asset[1]
+    (source / 'params').mkdir()
+    (source / 'params' / 'weights').write_bytes(b'model parameters')
+    (source / 'nested' / 'foo' / 'train_state').mkdir(parents=True)
+    nested = source / 'nested' / 'foo' / 'train_state' / 'keep-optimizer-name'
+    nested.write_bytes(b'nested user data remains part of the model asset')
+    (source / 'train_state' / 'optimizer-state').write_bytes(b'optimizer' * 10000)
+
+    def change_excluded_data(event):
+        if event['stage'] == 'VERIFYING':
+            (source / 'train_state' / 'optimizer-state').write_bytes(b'changed excluded state')
+
+    result = transfer(asset, exclude_train_state=True, progress=change_excluded_data)
+    final = Path(result['target_path'])
+    assert not (final / 'train_state').exists()
+    assert (final / 'params' / 'weights').read_bytes() == b'model parameters'
+    assert (final / 'nested' / 'foo' / 'train_state' / nested.name).read_bytes() == nested.read_bytes()
+    expected = [item for item in source.rglob('*') if item.is_file() and item.relative_to(source).parts[0] != 'train_state']
+    assert result['files_total'] == len(expected)
+    assert result['bytes_total'] == sum(item.stat().st_size for item in expected)
+    assert all(not entry['path'].startswith('train_state/') for entry in result['manifest']['files'])
+    receipt = json.loads((asset[2] / '.asset-123.asset-transfer.json').read_text())
+    assert receipt['exclude_train_state'] is True
+    assert 'train_state' not in receipt['directories']
+    assert Path(transfer(asset, exclude_train_state=True)['target_path']) == final
+
+
+def test_model_exclusion_never_hashes_or_descends_into_excluded_state(asset, monkeypatch):
+    script = module._ASSET_REMOTE_SCRIPT.replace(
+        '        if unsafe_name(display):',
+        "        if display.startswith('train_state/'):fail('TRANSFER_EXCLUDED_READ','Excluded optimizer state was read')\n"
+        '        if unsafe_name(display):')
+    assert script != module._ASSET_REMOTE_SCRIPT
+    monkeypatch.setattr(module, '_ASSET_REMOTE_SCRIPT', script)
+    assert transfer(asset, exclude_train_state=True)['files_total'] == 2
+
+
+def test_target_capacity_uses_excluded_manifest_instead_of_optimizer_state_size(asset, monkeypatch):
+    (asset[1] / 'train_state' / 'optimizer-state').write_bytes(b'x' * 4 * 1024 * 1024)
+    script = module._ASSET_REMOTE_SCRIPT.replace('if shutil.disk_usage(parent).free<', 'if 3*1024*1024<')
+    assert script != module._ASSET_REMOTE_SCRIPT
+    monkeypatch.setattr(module, '_ASSET_REMOTE_SCRIPT', script)
+    result = transfer(asset, exclude_train_state=True)
+    assert result['bytes_total'] < 2 * 1024 * 1024
+    with pytest.raises(TransferError) as error:
+        transfer(asset, transfer_id='full-model', target_name='full model', exclude_train_state=False)
+    assert error.value.code == 'TRANSFER_SPACE_INSUFFICIENT'
+
+
+def test_train_state_plain_file_is_kept_and_single_file_profile_is_a_noop(asset):
+    shutil.rmtree(asset[1] / 'train_state')
+    (asset[1] / 'train_state').write_bytes(b'this is a regular file, not optimizer state directory')
+    result = transfer(asset, exclude_train_state=True)
+    assert (Path(result['target_path']) / 'train_state').read_bytes() == (asset[1] / 'train_state').read_bytes()
+    single = transfer(asset, source_path=str(asset[1] / 'train_state'), transfer_id='single-file',
+                      target_name='single train state file', exclude_train_state=True)
+    assert Path(single['asset_path']).read_bytes() == (asset[1] / 'train_state').read_bytes()
+
+
+def test_source_asset_itself_named_train_state_is_not_wholly_excluded(asset):
+    source = asset[1] / 'train_state'
+    (source / 'params').write_bytes(b'parameters at asset root')
+    (source / 'train_state').mkdir()
+    (source / 'train_state' / 'excluded').write_bytes(b'only this inner root directory is excluded')
+    result = transfer(asset, source_path=str(source), exclude_train_state=True)
+    final = Path(result['target_path'])
+    assert (final / 'params').read_bytes() == b'parameters at asset root'
+    assert (final / 'retain-all-data').is_file()
+    assert not (final / 'train_state').exists()
+
+
+def test_empty_train_state_directory_is_not_counted_or_published(asset):
+    shutil.rmtree(asset[1] / 'train_state')
+    (asset[1] / 'train_state').mkdir()
+    result = transfer(asset, exclude_train_state=True)
+    assert result['files_total'] == 2
+    assert not (Path(result['target_path']) / 'train_state').exists()
+
+
+@pytest.mark.parametrize('nested', [False, True])
+def test_train_state_symlinks_cannot_hide_behind_exclusion(asset, nested):
+    outside = asset[0] / 'private-state'
+    outside.mkdir()
+    (outside / 'secret').write_bytes(b'not authorized by an exclusion rule')
+    if nested:
+        link = asset[1] / 'nested' / 'train_state'
+        link.parent.mkdir()
+    else:
+        link = asset[1] / 'train_state'
+        shutil.rmtree(link)
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(TransferError) as error:
+        transfer(asset, exclude_train_state=True)
+    assert error.value.code == 'TRANSFER_UNSAFE_FILE'
+    assert list(asset[2].iterdir()) == []
+
+
+def test_legacy_false_receipt_shape_and_partial_retry_are_unchanged(asset):
+    cancelled = False
+    def cancel(event):
+        nonlocal cancelled
+        if event['stage'] == 'TRANSFERRING':cancelled = True
+    with pytest.raises(TransferError):
+        transfer(asset, progress=cancel, cancelled=lambda: cancelled)
+    receipt_path = asset[2] / '.asset-123.asset-transfer.json'
+    before = receipt_path.read_bytes()
+    receipt = json.loads(before)
+    assert set(receipt) == {'schema_version', 'transfer_id', 'target_name', 'source',
+                            'source_kind', 'source_name', 'directories', 'manifest'}
+    result = transfer(asset, exclude_train_state=False)
+    assert receipt_path.read_bytes() == before
+    assert (Path(result['target_path']) / 'train_state' / 'retain-all-data').is_file()
+
+
+def test_exclusion_cannot_adopt_a_partial_created_with_a_different_profile(asset):
+    cancelled = False
+    def cancel(event):
+        nonlocal cancelled
+        if event['stage'] == 'TRANSFERRING':cancelled = True
+    with pytest.raises(TransferError):
+        transfer(asset, progress=cancel, cancelled=lambda: cancelled)
+    partial = asset[2] / '.asset-123.partial'
+    (partial / 'train_state').mkdir()
+    keep = partial / 'train_state' / 'keep-existing'
+    keep.write_bytes(b'previous full-transfer partial files')
+    with pytest.raises(TransferError) as error:
+        transfer(asset, exclude_train_state=True)
+    assert error.value.code == 'TRANSFER_PROFILE_CHANGED'
+    assert 'new transfer directory' in error.value.message
+    assert keep.read_bytes() == b'previous full-transfer partial files'
+    assert 'exclude_train_state' not in json.loads((asset[2] / '.asset-123.asset-transfer.json').read_text())
+
+
+def test_excluded_state_left_in_owned_partial_is_a_conflict_and_is_not_deleted(asset):
+    cancelled = False
+    def cancel(event):
+        nonlocal cancelled
+        if event['stage'] == 'TRANSFERRING':cancelled = True
+    with pytest.raises(TransferError):
+        transfer(asset, exclude_train_state=True, progress=cancel, cancelled=lambda: cancelled)
+    partial = asset[2] / '.asset-123.partial'
+    (partial / 'train_state').mkdir()
+    keep = partial / 'train_state' / 'leftover'
+    keep.write_bytes(b'never silently remove or publish old state')
+    with pytest.raises(TransferError) as error:
+        transfer(asset, exclude_train_state=True)
+    assert error.value.code == 'TRANSFER_PARTIAL_CONFLICT'
+    assert 'new transfer directory' in error.value.message
+    assert keep.read_bytes() == b'never silently remove or publish old state'
+    assert not (asset[2] / 'fold cloth v1').exists()
+
+
+def test_excluded_state_introduced_after_copy_is_rejected_before_publish(asset):
+    def mutate(event):
+        if event['stage'] == 'VERIFYING':
+            (asset[2] / '.asset-123.partial' / 'train_state').mkdir()
+    with pytest.raises(TransferError) as error:
+        transfer(asset, exclude_train_state=True, progress=mutate)
+    assert error.value.code == 'TRANSFER_PARTIAL_CONFLICT'
+    assert not (asset[2] / 'fold cloth v1').exists()
+
+
+def test_excluded_state_introduced_after_inspect_is_rejected_at_publish(asset, monkeypatch):
+    original = module._asset_json
+    def mutate_before_publish(remote, payload, cancelled):
+        if payload['mode'] == 'publish':
+            (asset[2] / '.asset-123.partial' / 'train_state').mkdir()
+        return original(remote, payload, cancelled)
+    monkeypatch.setattr(module, '_asset_json', mutate_before_publish)
+    with pytest.raises(TransferError) as error:
+        transfer(asset, exclude_train_state=True)
+    assert error.value.code == 'TRANSFER_PARTIAL_CONFLICT'
+    assert not (asset[2] / 'fold cloth v1').exists()
+
+
+@pytest.mark.parametrize('value', [None, 0, 1, 'true', [], {}])
+def test_exclusion_profile_requires_a_strict_boolean_before_remote_work(asset, value):
+    with pytest.raises(TransferError) as error:
+        transfer(asset, exclude_train_state=value)
+    assert error.value.code == 'TRANSFER_PROFILE_INVALID'
+    assert list(asset[2].iterdir()) == []

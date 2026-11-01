@@ -55,6 +55,7 @@ try {
     AssetTransferProgressDialog,
     AssetSyncBackgroundNotice,
     AssetTransferTaskDetail,
+    AssetSyncModelOption,
   } = await server.ssrLoadModule('/src/AssetTransfers.tsx');
   const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
   const { DataProvider } = await server.ssrLoadModule('/src/data.tsx');
@@ -145,6 +146,100 @@ try {
       { targetNode: { ...targetNode, status: 'OFFLINE' } },
     ])
       assert.ok(helpers.assetSyncBlocker({ ...input, ...changes }));
+  });
+  await test('only a deliberate model choice adds exclude_train_state without changing the default request shape', () => {
+    const model = { ...asset, kind: 'MODEL' };
+    const complete = helpers.assetTransferCreateRequest(model, 'target', '/data', 'model');
+    assert.equal(Object.hasOwn(complete, 'exclude_train_state'), false);
+    assert.deepEqual(
+      helpers.assetTransferCreateRequest(model, 'target', '/data', 'model', false, false),
+      complete,
+    );
+    const excluded = helpers.assetTransferCreateRequest(
+      model,
+      'target',
+      '/data',
+      'model',
+      false,
+      true,
+    );
+    assert.equal(excluded.exclude_train_state, true);
+    assert.notEqual(JSON.stringify(excluded), JSON.stringify(complete));
+    for (const kind of ['DATASET', 'NORM'])
+      assert.equal(
+        Object.hasOwn(
+          helpers.assetTransferCreateRequest(
+            { ...asset, kind },
+            'target',
+            '/data',
+            'copy',
+            false,
+            true,
+          ),
+          'exclude_train_state',
+        ),
+        false,
+      );
+  });
+  await test('model exclusion option is cancellable, disabled while pending, and hidden for data and norms', () => {
+    const model = { ...asset, kind: 'MODEL' };
+    const complete = render(
+      React.createElement(AssetSyncModelOption, { asset: model, checked: false, onChange() {} }),
+    );
+    assert.match(complete, /不同步 train_state\//);
+    assert.match(complete, /根部的 train_state\//);
+    assert.match(complete, /params 与其他文件保留/);
+    assert.match(complete, /恢复完整训练状态/);
+    assert.doesNotMatch(complete, /checked=""/);
+    const pending = render(
+      React.createElement(AssetSyncModelOption, {
+        asset: model,
+        checked: true,
+        disabled: true,
+        onChange() {},
+      }),
+    );
+    assert.match(pending, /checked=""/);
+    assert.match(pending, /disabled=""/);
+    for (const kind of ['DATASET', 'NORM'])
+      assert.equal(
+        render(
+          React.createElement(AssetSyncModelOption, {
+            asset: { ...asset, kind },
+            checked: true,
+            onChange() {},
+          }),
+        ),
+        '',
+      );
+  });
+  await test('model sync receipts display frozen train-state policy without claiming source optimizer files exist', () => {
+    const excluded = renderCard({ source_kind: 'MODEL', exclude_train_state: true });
+    assert.match(excluded, /<section[^>]*aria-label="模型同步范围"/);
+    assert.match(excluded, /排除 train_state\//);
+    assert.match(excluded, /不参与同步/);
+    assert.match(excluded, /若保存了优化器/);
+    assert.match(excluded, /params 与其他文件/);
+    assert.match(excluded, /正常同步（如存在）/);
+    assert.match(excluded, /本任务配置已固定，重试沿用/);
+    assert.ok(excluded.indexOf('模型同步范围') < excluded.indexOf('asset-transfer-progress'));
+    for (const exclude_train_state of [false, undefined]) {
+      const complete = renderCard({ source_kind: 'MODEL', exclude_train_state });
+      assert.match(complete, /aria-label="模型同步范围"/);
+      assert.match(complete, /完整复制/);
+      assert.match(complete, /参与同步（如存在）/);
+      assert.doesNotMatch(complete, /排除 train_state\/|不参与同步/);
+    }
+    for (const source_kind of ['DATASET', 'NORM'])
+      assert.doesNotMatch(
+        renderCard({ source_kind, exclude_train_state: true }),
+        /模型同步范围|排除 train_state\//,
+      );
+    assert.doesNotMatch(excluded, /type="checkbox"/);
+    const queued = renderCard({ source_kind: 'MODEL', exclude_train_state: true, state: 'QUEUED' });
+    assert.match(queued, /不参与同步/);
+    assert.match(queued, /准备中/);
+    assert.doesNotMatch(queued, /同步完成，已登记|文件完整性校验通过/);
   });
   await test('queued and preparing records do not pretend transfer has begun', () => {
     for (const state of ['QUEUED', 'PREPARING', 'SCANNING']) {

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { ArrowRight, CheckCircle2, FolderSync, LoaderCircle } from 'lucide-react';
 import { api } from './api';
 import { useAuth } from './auth';
-import { AssetSyncNormOption } from './AssetTransfers';
+import { AssetSyncModelOption, AssetSyncNormOption } from './AssetTransfers';
 import { assetTargetPath, assetTransferTaskPath } from './assetTransfer';
 import type { AssetTransfer } from './assetTransfer';
 import { ErrorNotice, Field, Modal } from './components';
@@ -143,7 +143,7 @@ function BatchAssetSyncContent({
       !current.current.allowed
     )
       return;
-    const request = batchSyncRequest(rows, targetId, directory);
+    const request = batchSyncRequest(rows, targetId, directory, assets.data || []);
     const identity = batchSyncIdentity(requestIdentity.current, request, () => crypto.randomUUID());
     requestIdentity.current = identity;
     const abort = new AbortController();
@@ -309,6 +309,12 @@ function BatchAssetSyncContent({
                         expectedNormAssetId: value ? asset.norm_asset_id || undefined : undefined,
                       })
                     }
+                  />
+                  <AssetSyncModelOption
+                    asset={asset}
+                    checked={row.excludeTrainState}
+                    disabled={busy}
+                    onChange={(value) => update(index, { excludeTrainState: value })}
                   />
                 </article>
               );

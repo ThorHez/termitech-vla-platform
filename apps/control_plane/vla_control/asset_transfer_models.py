@@ -30,6 +30,7 @@ class AssetTransfer(Base):
     asset_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     target_asset_id: Mapped[str | None] = mapped_column(ForeignKey('assets.id', ondelete='RESTRICT'), nullable=True)
     include_norm_stats: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    exclude_train_state: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
     norm_sync: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     state: Mapped[str] = mapped_column(String(32), index=True)
     attempt: Mapped[int] = mapped_column(Integer, default=1)

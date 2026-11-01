@@ -40,6 +40,7 @@ class AssetTransferBatchEntry(InputModel):
     source_asset_id: str = Field(min_length=1, max_length=36, strict=True)
     target_name: str = Field(min_length=1, max_length=160, strict=True)
     include_norm_stats: bool = Field(default=False, strict=True)
+    exclude_train_state: bool = Field(default=False, strict=True)
     expected_norm_asset_id: str | None = Field(default=None, min_length=1, max_length=36, strict=True)
 
     @field_validator("source_asset_id", "target_name", "expected_norm_asset_id")
@@ -136,7 +137,13 @@ def create_batch(manager, user_id, body):
     names = [entry.target_name for entry in body.entries]
     if len(set(names)) != len(names):
         raise APIError(422, "ASSET_TRANSFER_BATCH_TARGET_CONFLICT", "本批次目标目录名不能重复")
-    request_digest = canonical_digest(body.model_dump())
+    digest_fields = body.model_dump()
+    # A default false flag must preserve receipts created before filtering was
+    # introduced, including explicit false browser submissions after upgrade.
+    for entry in digest_fields['entries']:
+        if not entry['exclude_train_state']:
+            entry.pop('exclude_train_state')
+    request_digest = canonical_digest(digest_fields)
     launches = []
     try:
         with manager.db.write() as session:
@@ -181,6 +188,7 @@ def create_batch(manager, user_id, body):
                     source_kind=source["kind"], target_node_id=body.target_node_id,
                     target_directory=bindings["target_directory"], target_name=bindings["target_name"],
                     include_norm_stats=companion is not None, norm_sync=companion,
+                    exclude_train_state=bindings.get('exclude_train_state', False),
                     state="QUEUED", attempt=1, logs="", binding_snapshot=bindings, created_at=now(), updated_at=now())
                 session.add(row)
                 session.flush()

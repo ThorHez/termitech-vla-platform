@@ -13,6 +13,7 @@ export interface BatchAssetSyncRow {
   assetId: string;
   targetName: string;
   includeNormStats: boolean;
+  excludeTrainState: boolean;
   expectedNormAssetId?: string;
 }
 
@@ -63,6 +64,7 @@ export function batchSyncRows(
       assetId: asset.id,
       targetName: defaultAssetTargetName(asset),
       includeNormStats,
+      excludeTrainState: false,
       ...(includeNormStats ? { expectedNormAssetId: asset.norm_asset_id! } : {}),
     };
   });
@@ -72,6 +74,7 @@ export function batchSyncRequest(
   rows: BatchAssetSyncRow[],
   targetNodeId: string,
   directory: string,
+  availableAssets: Asset[] = [],
 ) {
   return {
     target_node_id: targetNodeId,
@@ -82,6 +85,10 @@ export function batchSyncRequest(
       include_norm_stats: row.includeNormStats,
       ...(row.includeNormStats && row.expectedNormAssetId
         ? { expected_norm_asset_id: row.expectedNormAssetId }
+        : {}),
+      ...(row.excludeTrainState &&
+      availableAssets.find((asset) => asset.id === row.assetId)?.kind === 'MODEL'
+        ? { exclude_train_state: true }
         : {}),
     })),
   };
@@ -110,6 +117,8 @@ export function batchSyncError({
     const asset = assets.find((item) => item.id === row.assetId);
     const sourceError = batchSyncSourceError(asset, nodes);
     if (sourceError) return `${asset?.name || row.assetId}：${sourceError}`;
+    if (row.excludeTrainState && asset!.kind !== 'MODEL')
+      return `${asset!.name}：只有模型资产可以排除 train_state/。`;
     const nameError = assetTargetNameError(row.targetName);
     if (nameError) return `${asset!.name}：${nameError}`;
     const name = row.targetName.trim();
@@ -135,7 +144,7 @@ export function batchSyncError({
   if (
     new TextEncoder().encode(
       JSON.stringify({
-        ...batchSyncRequest(rows, targetNodeId, directory),
+        ...batchSyncRequest(rows, targetNodeId, directory, assets),
         idempotency_key: '0'.repeat(36),
       }),
     ).byteLength >
@@ -179,6 +188,7 @@ export function batchSyncReceiptMatches(
       canonicalDirectory(transfer.target_directory) !==
         canonicalDirectory(request.target_directory) ||
       Boolean(transfer.include_norm_stats) !== entry.include_norm_stats ||
+      Boolean(transfer.exclude_train_state) !== Boolean(entry.exclude_train_state) ||
       transfer.target_name !== entry.target_name
     )
       return false;

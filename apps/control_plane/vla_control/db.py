@@ -82,6 +82,8 @@ class Database:
                 connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN deleted_at VARCHAR(40)")
             if "include_norm_stats" not in transfer_columns:
                 connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN include_norm_stats BOOLEAN NOT NULL DEFAULT false")
+            if "exclude_train_state" not in transfer_columns:
+                connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN exclude_train_state BOOLEAN NOT NULL DEFAULT false")
             if "norm_sync" not in transfer_columns:
                 connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN norm_sync JSON")
             run_columns = {column["name"] for column in inspect(connection).get_columns("runs")}

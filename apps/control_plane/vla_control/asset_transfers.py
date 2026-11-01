@@ -30,7 +30,7 @@ from .storage_configurations import require_not_pending
 LOG = logging.getLogger(__name__)
 PUBLIC_FIELDS = ('id', 'name', 'source_asset_id', 'source_node_id', 'source_path', 'source_kind',
     'target_node_id', 'target_directory', 'target_name', 'target_path', 'asset_path', 'target_asset_id',
-    'include_norm_stats', 'norm_sync',
+    'include_norm_stats', 'norm_sync', 'exclude_train_state',
     'state', 'attempt', 'bytes_total', 'bytes_transferred', 'files_total', 'files_transferred',
     'speed_bytes_per_second', 'progress_pct', 'logs', 'error', 'manifest_sha256',
     'created_at', 'updated_at', 'finished_at')
@@ -70,6 +70,7 @@ class AssetTransferInput(InputModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
     include_norm_stats: bool = Field(default=False, strict=True)
+    exclude_train_state: bool = Field(default=False, strict=True)
     expected_norm_asset_id: str | None = Field(default=None, min_length=1, max_length=36)
 
     @field_validator('target_name')
@@ -147,6 +148,8 @@ def _bindings(session, body, settings):
         raise APIError(404, 'NOT_FOUND', '来源资产不存在')
     if asset.kind not in {'DATASET', 'NORM', 'MODEL'} or asset.state in {'ARCHIVED', 'UNAVAILABLE'}:
         raise APIError(409, 'ASSET_TRANSFER_SOURCE_UNAVAILABLE', '来源资产已归档、不可用或不支持同步')
+    if body.exclude_train_state and asset.kind != 'MODEL':
+        raise APIError(422, 'ASSET_TRANSFER_EXCLUDE_MODEL_ONLY', '仅模型资产可以排除根目录下的 train_state/ 子目录')
     if asset.node_id == body.target_node_id:
         raise APIError(422, 'ASSET_TRANSFER_SAME_NODE', '请选择另一台目标机器')
     norm = None
@@ -183,6 +186,10 @@ def _bindings(session, body, settings):
         'source_connection_id': connections['source'].id, 'target_connection_id': connections['target'].id,
         'source_connection': _identity(connections['source']), 'target_connection': _identity(connections['target']),
         'target_node_id': target.id, 'target_directory': directory, 'target_name': target_name}
+    # Keep false absent so historical snapshots and in-flight retries remain
+    # byte-for-byte compatible with the complete-copy contract.
+    if body.exclude_train_state:
+        result['exclude_train_state'] = True
     if body.include_norm_stats:
         norm_path = _path(norm.path, source.roots)
         if same_machine:
@@ -197,7 +204,7 @@ def _bindings(session, body, settings):
 def _check_snapshot(session, row, settings):
     body = AssetTransferInput(source_asset_id=row.source_asset_id, target_node_id=row.target_node_id,
         target_directory=row.target_directory, target_name=row.target_name,
-        include_norm_stats=row.include_norm_stats)
+        include_norm_stats=row.include_norm_stats, exclude_train_state=row.exclude_train_state)
     current = _bindings(session, body, settings)
     if current != row.binding_snapshot:
         raise APIError(409, 'ASSET_TRANSFER_BINDING_CHANGED', '源资产、机器目录或 SSH 接入已变化，请新建同步任务')
@@ -312,6 +319,8 @@ def _copy_asset(row, source, asset_path, digest, *, part=None):
         'training_preflight_required': True, 'copied_at': now()}
     if part:
         metadata['asset_sync']['part'] = part
+    if row.exclude_train_state and source['kind'] == 'MODEL':
+        metadata['asset_sync'].update(exclude_train_state=True, excluded_root_directories=['train_state'])
     return Asset(id=uid(), node_id=row.target_node_id, kind=source['kind'],
         name=source['name'], path=asset_path, version=source['version'], state='REGISTERED',
         metadata_json=metadata, created_at=now())
@@ -464,7 +473,8 @@ class AssetTransferManager:
             result = transfer(*remotes, bindings['source_asset']['path'], bindings['target_directory'], transfer_id,
                 bindings['source_roots'], bindings['target_roots'], target_name=bindings['target_name'],
                 progress=lambda event: self._progress(transfer_id, attempt, event),
-                cancelled=lambda: self._cancelled(transfer_id, attempt))
+                cancelled=lambda: self._cancelled(transfer_id, attempt),
+                **({'exclude_train_state': True} if bindings.get('exclude_train_state') else {}))
             if self._cancelled(transfer_id, attempt):
                 return
             manifest, expected, asset_path = _validate_result(result, bindings['source_asset'],
@@ -598,6 +608,8 @@ def register_routes(app, admin, manager):
         key = body.idempotency_key or uid()
         try:
             digest_fields = body.model_dump(exclude={'idempotency_key'})
+            if not body.exclude_train_state:
+                digest_fields.pop('exclude_train_state')
             if not body.include_norm_stats:
                 digest_fields.pop('include_norm_stats')  # Preserve pre-feature idempotency keys.
                 digest_fields.pop('expected_norm_asset_id')
@@ -629,6 +641,7 @@ def register_routes(app, admin, manager):
                     source_kind=source['kind'], target_node_id=body.target_node_id,
                     target_directory=bindings['target_directory'], target_name=bindings['target_name'],
                     include_norm_stats=body.include_norm_stats, norm_sync=companion,
+                    exclude_train_state=body.exclude_train_state,
                     state='QUEUED', attempt=1, logs='', binding_snapshot=bindings, created_at=now(), updated_at=now())
                 session.add(row)
                 session.flush()

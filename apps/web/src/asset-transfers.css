@@ -205,6 +205,66 @@
   color: var(--text-secondary);
   font-size: 11px;
 }
+.asset-transfer-model-scope {
+  margin: 18px 0;
+  padding: 16px 18px;
+  border: 1px solid var(--border-strong, var(--border));
+  border-left: 3px solid var(--teal);
+  border-radius: 8px;
+  background: var(--bg-subtle, #f7f9fb);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.asset-transfer-model-scope-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  justify-content: space-between;
+}
+.asset-transfer-model-scope h4 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 14px;
+}
+.asset-transfer-policy {
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-surface, #fff);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.asset-transfer-policy.excludes-state {
+  background: var(--bg-warning, #fff8e8);
+  border-color: var(--border-warning, #e7d6ad);
+  color: var(--text-warning, #94621a);
+}
+.asset-transfer-model-scope dl {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0;
+}
+.asset-transfer-model-scope dl > div {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.6fr) minmax(0, 1.4fr);
+  gap: 4px 18px;
+}
+.asset-transfer-model-scope dt {
+  color: var(--text-primary);
+}
+.asset-transfer-model-scope dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.asset-transfer-model-scope p {
+  margin: 7px 0 0;
+  font-size: 12px;
+}
 .asset-transfer-progress {
   display: flex;
   align-items: center;
@@ -304,6 +364,12 @@
   line-height: 1.7;
 }
 @media (max-width: 600px) {
+  .asset-transfer-model-scope {
+    padding: 14px;
+  }
+  .asset-transfer-model-scope dl > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
   .asset-transfer-card,
   .asset-transfer-filter {
     padding: 16px;

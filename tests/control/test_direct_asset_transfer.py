@@ -320,3 +320,14 @@ def test_direct_stalled_connection_has_bounded_deadline_and_cleans_authorization
     assert error.value.code == 'DIRECT_TIMEOUT'
     assert time.monotonic() - started < 8
     assert (source.home / '.ssh' / 'authorized_keys').read_bytes() == b''
+
+
+@pytest.mark.parametrize('value', [None, 0, 1, 'true', [], {}])
+def test_direct_exclusion_profile_rejects_non_boolean_before_opening_any_channel(tmp_path, peers, value):
+    source, target = peers
+    file = tmp_path / 'parameters'
+    file.write_bytes(b'weights')
+    with pytest.raises(TransferError) as error:
+        module.direct_copy(source, target, source_info(file), str(tmp_path), 'strict-profile', exclude_train_state=value)
+    assert error.value.code == 'DIRECT_PROFILE_INVALID'
+    assert not source.channels and not target.channels

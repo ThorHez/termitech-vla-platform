@@ -63,6 +63,7 @@ export function AssetSyncDialog({
   const [includeNormStats, setIncludeNormStats] = useState(() =>
     defaultDatasetNormSync(asset, assets.data || []),
   );
+  const [excludeTrainState, setExcludeTrainState] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const pending = useRef(false);
@@ -122,6 +123,7 @@ export function AssetSyncDialog({
             directory,
             targetName,
             includeNormStats,
+            excludeTrainState,
           );
           const signature = JSON.stringify(request);
           if (lastRequest.current?.signature !== signature) {
@@ -158,6 +160,12 @@ export function AssetSyncDialog({
           assets={assets.data || []}
           checked={includeNormStats}
           onChange={setIncludeNormStats}
+          disabled={busy}
+        />
+        <AssetSyncModelOption
+          asset={asset}
+          checked={excludeTrainState}
+          onChange={setExcludeTrainState}
           disabled={busy}
         />
         <Field label="目标机器" required>
@@ -275,6 +283,37 @@ export function AssetSyncNormOption({
           归一化参数保存到独立的 norm-stats 目录；两份文件均校验完成后，自动绑定到目标数据集。
         </p>
       )}
+    </div>
+  );
+}
+
+export function AssetSyncModelOption({
+  asset,
+  checked,
+  onChange,
+  disabled = false,
+}: {
+  asset: Asset;
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  disabled?: boolean;
+}) {
+  if (asset.kind !== 'MODEL') return null;
+  return (
+    <div className="asset-sync-norm-option">
+      <label className="checkbox-label">
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+        不同步 train_state/
+      </label>
+      <p className="asset-sync-notice">
+        仅跳过所选模型目录根部的 train_state/，params
+        与其他文件保留。需要恢复完整训练状态时，请保留该目录。
+      </p>
     </div>
   );
 }
@@ -491,6 +530,34 @@ export function AssetTransferCard({
           }
         />
       </div>
+      {item.source_kind === 'MODEL' && (
+        <section className="asset-transfer-model-scope" aria-label="模型同步范围">
+          <div className="asset-transfer-model-scope-heading">
+            <h4>模型同步范围</h4>
+            <span
+              className={`asset-transfer-policy ${item.exclude_train_state ? 'excludes-state' : ''}`}
+            >
+              {item.exclude_train_state ? '排除 train_state/' : '完整复制'}
+            </span>
+          </div>
+          <dl>
+            <div>
+              <dt>模型根部 train_state/</dt>
+              <dd>{item.exclude_train_state ? '不参与同步' : '参与同步（如存在）'}</dd>
+            </div>
+            <div>
+              <dt>params 与其他文件</dt>
+              <dd>正常同步（如存在）</dd>
+            </div>
+          </dl>
+          <p>
+            本任务配置已固定，重试沿用。排除选项只影响模型根部 train_state/，嵌套同名目录仍会同步。
+          </p>
+          {item.exclude_train_state && (
+            <p>该目录若保存了优化器等训练状态，本副本不会包含这些状态。</p>
+          )}
+        </section>
+      )}
       {preparing ? (
         <div className="asset-transfer-progress" role="status">
           <div
