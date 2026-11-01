@@ -18,6 +18,7 @@ from vla_control.common import APIError, offset_time, uid
 from vla_control.models import Asset, Command, Node, Run
 from vla_control.remote_deployment import DeploymentManager
 from vla_control.remote_models import RemoteConnection
+from vla_control.ssh_remote import RemoteError
 from vla_control.storage_configurations import _in_use
 
 from .conftest import ADMIN
@@ -266,6 +267,107 @@ def test_retry_uses_same_owned_target_and_a_new_attempt(fixture, monkeypatch):
     final = run_copy(fixture, task['id'], monkeypatch)
     assert final['state'] == 'SUCCEEDED' and final['attempt'] == 2
     assert final['target_name'] == task['target_name']
+
+
+@pytest.mark.parametrize('failures,expected_state,expected_calls', [(1, 'SUCCEEDED', 2), (2, 'FAILED', 2)])
+def test_control_ssh_connection_failure_retries_once_before_copy(
+        fixture, monkeypatch, failures, expected_state, expected_calls):
+    _, manager, *_ = fixture
+    task = create(fixture).json()
+    remotes, copied, waits = [], [], []
+
+    class FlakyRemote(FakeRemote):
+        calls = 0
+
+        def connect(self):
+            self.calls += 1
+            if self.calls <= failures:
+                raise RemoteError('SSH_CONNECTION_FAILED', 'SSH unavailable: ' + SECRET)
+            super().connect()
+
+    def remote(_connection):
+        value = FlakyRemote() if not remotes else FakeRemote()
+        remotes.append(value)
+        return value
+
+    monkeypatch.setattr(manager.remote_manager, '_remote', remote)
+    monkeypatch.setattr(manager._stop, 'wait', lambda seconds: waits.append(seconds) or False)
+
+    def transfer(*args, **kwargs):
+        copied.append(True)
+        return result_for(args, kwargs)
+
+    manager.transfer_function = transfer
+    manager._run(task['id'])
+    final = receipt(fixture, task['id'])
+    assert final['state'] == expected_state and final['attempt'] == 1
+    assert remotes[0].calls == expected_calls and waits == [.5]
+    assert copied == ([True] if expected_state == 'SUCCEEDED' else [])
+    assert '0.5 秒后重试一次' in final['logs'] and SECRET not in str(final)
+    assert all(r.closed for r in remotes)
+    if expected_state == 'FAILED':
+        assert final['error']['code'] == 'SSH_CONNECTION_FAILED'
+
+
+@pytest.mark.parametrize('error', [
+    RemoteError('SSH_AUTH_FAILED', 'Authentication failed'),
+    RemoteError('SSH_HOST_KEY_MISMATCH', 'Host key changed'),
+    RemoteError('SSH_CANCELLED', 'Cancelled'),
+    APIError(503, 'SSH_CONNECTION_FAILED', 'Unrelated typed failure'),
+])
+def test_control_ssh_authentication_host_key_and_other_errors_are_not_retried(fixture, monkeypatch, error):
+    _, manager, *_ = fixture
+    task = create(fixture).json()
+    calls, copied = [], []
+
+    class FailedRemote(FakeRemote):
+        def connect(self):
+            calls.append(True)
+            raise error
+
+    monkeypatch.setattr(manager.remote_manager, '_remote', lambda _connection: FailedRemote())
+    monkeypatch.setattr(manager._stop, 'wait', lambda _seconds: pytest.fail('Must not retry this error'))
+    manager.transfer_function = lambda *_args, **_kwargs: copied.append(True)
+    manager._run(task['id'])
+    final = receipt(fixture, task['id'])
+    assert final['state'] == 'FAILED' and final['error']['code'] == error.code
+    assert calls == [True] and copied == []
+    assert '0.5 秒后重试一次' not in final['logs']
+
+
+def test_cancellation_during_control_ssh_retry_wait_prevents_reconnect_and_copy(fixture, monkeypatch):
+    platform, manager, *_ = fixture
+    task = create(fixture).json()
+    waiting, release = threading.Event(), threading.Event()
+    calls, copied = [], []
+
+    class FailedRemote(FakeRemote):
+        def connect(self):
+            calls.append(True)
+            raise RemoteError('SSH_CONNECTION_FAILED', 'Connection temporarily unavailable')
+
+    def retry_wait(seconds):
+        assert seconds == .5
+        waiting.set()
+        assert release.wait(5)
+        return manager._stop.is_set()
+
+    monkeypatch.setattr(manager.remote_manager, '_remote', lambda _connection: FailedRemote())
+    monkeypatch.setattr(manager._stop, 'wait', retry_wait)
+    manager.transfer_function = lambda *_args, **_kwargs: copied.append(True)
+    worker = threading.Thread(target=manager._run, args=(task['id'],), daemon=True)
+    manager._workers[task['id']] = worker
+    worker.start()
+    try:
+        assert waiting.wait(5)
+        response = platform.client.post(BASE + '/' + task['id'] + '/cancel', headers=ADMIN)
+        assert response.status_code == 202
+    finally:
+        release.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert receipt(fixture, task['id'])['state'] == 'CANCELLED'
+    assert calls == [True] and copied == []
 
 
 @pytest.mark.parametrize('failure,code,message', [

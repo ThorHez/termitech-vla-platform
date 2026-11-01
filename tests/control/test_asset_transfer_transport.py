@@ -204,6 +204,147 @@ def test_source_links_are_not_followed(asset, where):
     assert not (asset[2] / 'fold cloth v1').exists()
 
 
+def checkpoint_alias(asset):
+    checkout = asset[0] / 'registered-project'
+    checkout.mkdir()
+    (checkout / 'checkpoints').symlink_to(asset[1].parent, target_is_directory=True)
+    return checkout / 'checkpoints' / asset[1].name
+
+
+@pytest.mark.parametrize('excluded', [False, True])
+def test_registered_source_ancestor_alias_is_resolved_and_canonical_identity_is_frozen(asset, excluded):
+    alias = checkpoint_alias(asset)
+    result = transfer(asset, source_path=str(alias), exclude_train_state=excluded)
+    final = Path(result['target_path'])
+    assert (final / 'data' / 'episode.parquet').read_bytes() == (asset[1] / 'data' / 'episode.parquet').read_bytes()
+    assert (final / 'train_state').exists() is not excluded
+    receipt_path = asset[2] / '.asset-123.asset-transfer.json'
+    before = receipt_path.read_bytes()
+    identity = json.loads(before)['source']
+    assert identity['path'] == str(asset[1]) and identity['registered_path'] == str(alias)
+    assert identity['root_identity']['device'] == asset[1].stat().st_dev
+    assert identity['root_identity']['inode'] == asset[1].stat().st_ino
+    assert Path(transfer(asset, source_path=str(alias), exclude_train_state=excluded)['target_path']) == final
+    assert receipt_path.read_bytes() == before
+
+
+def test_source_file_alias_with_different_basename_is_rejected_before_target_prepare(asset):
+    source = asset[0] / 'norm_stats.json'
+    source.write_bytes(b'normalization statistics')
+    alias = asset[0] / 'registered-norm-alias'
+    alias.symlink_to(source)
+    with pytest.raises(TransferError) as error:
+        transfer(asset, source_path=str(alias))
+    assert error.value.code == 'TRANSFER_PATH_INVALID'
+    assert 'canonical file path' in error.value.message
+    assert list(asset[2].iterdir()) == []
+
+
+def test_source_file_under_aliased_ancestor_preserves_registered_basename(asset):
+    folder = asset[0] / 'norm-directory'
+    folder.mkdir()
+    source = folder / 'norm_stats.json'
+    source.write_bytes(b'normalization statistics')
+    alias = asset[0] / 'registered-norm-directory'
+    alias.symlink_to(folder, target_is_directory=True)
+    registered = alias / source.name
+    result = transfer(asset, source_path=str(registered))
+    assert Path(result['asset_path']).read_bytes() == source.read_bytes()
+    assert Path(result['asset_path']).name == registered.name
+
+
+@pytest.mark.parametrize('unauthorized', ['lexical', 'physical'])
+def test_source_alias_requires_lexical_and_physical_managed_root_authorization(asset, unauthorized):
+    allowed = asset[0] / 'allowed'
+    allowed.mkdir()
+    outside = asset[0] / 'outside-source'
+    outside.mkdir()
+    if unauthorized == 'physical':
+        alias = allowed / 'alias'
+        alias.symlink_to(asset[1], target_is_directory=True)
+    else:
+        source = allowed / 'checkpoint'
+        source.mkdir()
+        (source / 'weights').write_bytes(b'authorized content')
+        alias = outside / 'alias'
+        alias.symlink_to(source, target_is_directory=True)
+    with pytest.raises(TransferError) as error:
+        transfer(asset, source_path=str(alias), source_roots=[str(allowed)])
+    assert error.value.code == 'TRANSFER_PATH_OUTSIDE_ROOTS'
+    assert list(asset[2].iterdir()) == []
+
+
+@pytest.mark.parametrize('where', ['file', 'directory'])
+def test_root_alias_does_not_authorize_internal_symlinks(asset, where):
+    alias = checkpoint_alias(asset)
+    outside = asset[0] / 'other-content'
+    outside.mkdir()
+    (outside / 'private').write_bytes(b'do not dereference')
+    (asset[1] / 'internal-link').symlink_to(outside if where == 'directory' else outside / 'private')
+    with pytest.raises(TransferError) as error:
+        transfer(asset, source_path=str(alias))
+    assert error.value.code == 'TRANSFER_UNSAFE_FILE'
+    assert list(asset[2].iterdir()) == []
+
+
+def test_retargeted_source_alias_is_rejected_before_publication(asset):
+    alias = asset[0] / 'registered-root'
+    alias.symlink_to(asset[1], target_is_directory=True)
+    other = asset[0] / 'other-checkpoint'
+    shutil.copytree(asset[1], other)
+    def retarget(event):
+        if event['stage'] == 'VERIFYING':
+            alias.unlink()
+            alias.symlink_to(other, target_is_directory=True)
+    with pytest.raises(TransferError) as error:
+        transfer(asset, source_path=str(alias), progress=retarget)
+    assert error.value.code == 'TRANSFER_SOURCE_CHANGED'
+    assert not (asset[2] / 'fold cloth v1').exists()
+    assert (asset[2] / '.asset-123.partial').is_dir()
+
+
+@pytest.mark.parametrize('change', ['alias-target', 'same-path-new-inode'])
+def test_alias_resume_does_not_adopt_another_root_even_with_identical_bytes(asset, change):
+    alias = asset[0] / 'registered-root'
+    alias.symlink_to(asset[1], target_is_directory=True)
+    cancelled = False
+    def cancel(event):
+        nonlocal cancelled
+        if event['stage'] == 'TRANSFERRING':cancelled = True
+    with pytest.raises(TransferError):
+        transfer(asset, source_path=str(alias), progress=cancel, cancelled=lambda: cancelled)
+    receipt_path = asset[2] / '.asset-123.asset-transfer.json'
+    original = receipt_path.read_bytes()
+    if change == 'alias-target':
+        other = asset[0] / 'other-checkpoint'
+        shutil.copytree(asset[1], other)
+        alias.unlink()
+        alias.symlink_to(other, target_is_directory=True)
+    else:
+        retained = asset[0] / 'original-checkpoint'
+        asset[1].rename(retained)
+        shutil.copytree(retained, asset[1])
+    with pytest.raises(TransferError) as error:
+        transfer(asset, source_path=str(alias))
+    assert error.value.code == 'TRANSFER_SOURCE_CHANGED'
+    assert receipt_path.read_bytes() == original
+    assert not (asset[2] / 'fold cloth v1').exists()
+
+
+def test_source_alias_is_not_followed_in_target_modes_or_same_machine_overlap(asset):
+    alias = checkpoint_alias(asset)
+    target_alias = asset[0] / 'target-alias'
+    target_alias.symlink_to(asset[2], target_is_directory=True)
+    with pytest.raises(TransferError) as error:
+        transfer(asset, source_path=str(alias), target_parent=str(target_alias))
+    assert error.value.code == 'TRANSFER_PATH_INVALID'
+    assert list(asset[2].iterdir()) == []
+    with pytest.raises(TransferError) as error:
+        transfer(asset, source_path=str(alias), target_parent=str(asset[1] / 'overlapping-child'))
+    assert error.value.code == 'TRANSFER_PATH_OVERLAP'
+    assert not (asset[1] / 'overlapping-child').exists()
+
+
 @pytest.mark.parametrize('name', ['../escape', '/absolute', '.', '..', 'bad\nname', 'a\\b', ''])
 def test_invalid_destination_names_are_rejected_before_transfer(asset, name):
     with pytest.raises(TransferError) as exc:
@@ -473,6 +614,7 @@ def test_legacy_false_receipt_shape_and_partial_retry_are_unchanged(asset):
     receipt = json.loads(before)
     assert set(receipt) == {'schema_version', 'transfer_id', 'target_name', 'source',
                             'source_kind', 'source_name', 'directories', 'manifest'}
+    assert set(receipt['source']) == {'path', 'host', 'port', 'username'}
     result = transfer(asset, exclude_train_state=False)
     assert receipt_path.read_bytes() == before
     assert (Path(result['target_path']) / 'train_state' / 'retain-all-data').is_file()

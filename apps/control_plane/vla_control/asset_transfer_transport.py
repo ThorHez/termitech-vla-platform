@@ -34,6 +34,21 @@ def safe(value,roots,exists=True):
     if not any(resolved==pathlib.Path(root).resolve() or pathlib.Path(root).resolve() in resolved.parents for root in roots):
         fail('TRANSFER_PATH_OUTSIDE_ROOTS','Asset path is outside machine managed directories')
     return resolved
+def source_root(value,roots):
+    # Only the registered source boundary may be an alias. Both spellings
+    # need authorization; a link inside one root cannot grant access outside
+    # the configured physical roots, nor can an unregistered lexical location
+    # borrow permission merely by pointing at an allowed directory.
+    path=pathlib.Path(value)
+    if not path.is_absolute() or '..' in path.parts or unsafe_name(value):
+        fail('TRANSFER_PATH_INVALID','Asset path must be an absolute path without traversal or control characters')
+    if not any(path==pathlib.Path(root) or pathlib.Path(root) in path.parents for root in roots):
+        fail('TRANSFER_PATH_OUTSIDE_ROOTS','Registered asset path is outside machine managed directories')
+    resolved=safe(str(path.resolve(strict=True)),roots)
+    return path,resolved
+def root_identity(path):
+    info=path.lstat()
+    return {'device':info.st_dev,'inode':info.st_ino,'type':stat.S_IFMT(info.st_mode)}
 def managed_mkdir(value,roots):
     path=safe(value,roots,False)
     bases=[pathlib.Path(root).resolve() for root in roots if path==pathlib.Path(root).resolve() or pathlib.Path(root).resolve() in path.parents]
@@ -159,9 +174,19 @@ try:
     if type(exclude_train_state) is not bool:
         fail('TRANSFER_PROFILE_INVALID','exclude_train_state must be a boolean')
     if mode=='source':
-        root=safe(p['path'],p['roots'])
+        registered,root=source_root(p['path'],p['roots'])
         if root==pathlib.Path('/'):fail('TRANSFER_PATH_INVALID','The filesystem root cannot be copied as an asset')
+        identity=root_identity(root)
+        if identity['type']==stat.S_IFREG and registered.name!=root.name:
+            fail('TRANSFER_PATH_INVALID','Registered file alias changes the source filename; register the canonical file path before synchronizing')
         result=scan(root,True,exclude_train_state);result['path']=str(root);result['machine_id']=machine_identity()
+        _,current_root=source_root(p['path'],p['roots'])
+        if current_root!=root or root_identity(current_root)!=identity:
+            fail('TRANSFER_SOURCE_CHANGED','Registered source alias or canonical asset root changed while scanning')
+        # No new fields for canonical sources: existing receipts, including
+        # false-profile partial copies, retain their historical identity shape.
+        if registered!=root:
+            result.update(registered_path=str(registered),root_identity=identity)
         if shutil.which('rsync') is None:fail('TRANSFER_RSYNC_MISSING','rsync is not installed on the source machine')
     elif mode=='prepare':
         parent=safe(p['parent'],p['roots'],False);name=component(p['name'])
@@ -263,14 +288,17 @@ def transfer_asset(source_remote, target_remote, source_path, target_parent, tra
     progress({'stage': 'INSPECTING', 'message': '检查源资产文件与 SHA-256 清单'})
     source = _asset_json(source_remote, {'mode': 'source', 'path': source_path, 'roots': source_roots, **profile}, cancelled)
     original = source['manifest']
+    source_identity = {'path': source['path'], 'host': getattr(source_remote, 'host', None),
+                       'port': getattr(source_remote, 'port', None),
+                       'username': getattr(source_remote, 'username', None)}
+    if 'registered_path' in source:
+        source_identity.update(registered_path=source['registered_path'], root_identity=source['root_identity'])
     progress({'stage': 'PREPARING', 'bytes_total': original['bytes_total'], 'files_total': original['files_total'],
               'message': '检查目标空间和本任务的可恢复目录'})
     prepared = _asset_json(target_remote, {'mode': 'prepare', 'parent': target_parent, 'roots': target_roots,
         'id': transfer_id, 'name': name, 'manifest': original, 'source_kind': source['kind'],
         'source_name': source['name'], 'directories': source['directories'], 'source_machine_id': source['machine_id'],
-        'source_identity': {'path': source['path'], 'host': getattr(source_remote, 'host', None),
-                            'port': getattr(source_remote, 'port', None),
-                            'username': getattr(source_remote, 'username', None)}, **profile}, cancelled)
+        'source_identity': source_identity, **profile}, cancelled)
     if not prepared.get('published'):
         from .direct_asset_transfer import direct_copy
         direct_copy(source_remote, target_remote, source, prepared['staging_path'], transfer_id,
@@ -278,7 +306,8 @@ def transfer_asset(source_remote, target_remote, source_path, target_parent, tra
         progress({'stage': 'VERIFYING', 'bytes_total': original['bytes_total'], 'files_total': original['files_total'],
                   'message': '复核源数据稳定性和目标全部文件哈希'})
         after = _asset_json(source_remote, {'mode': 'source', 'path': source_path, 'roots': source_roots, **profile}, cancelled)
-        if any(after[key] != source[key] for key in ('manifest', 'directories', 'kind', 'name', 'path')):
+        if (any(after[key] != source[key] for key in ('manifest', 'directories', 'kind', 'name', 'path'))
+                or any(after.get(key) != source.get(key) for key in ('registered_path', 'root_identity'))):
             raise TransferError('TRANSFER_SOURCE_CHANGED', 'Source asset changed during synchronization; partial files are retained')
         actual = _asset_json(target_remote, {'mode': 'inspect', 'path': prepared['staging_path'], 'roots': target_roots, **profile}, cancelled)
         if actual['manifest'] != original or actual['directories'] != source['directories']:

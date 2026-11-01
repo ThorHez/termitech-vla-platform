@@ -222,8 +222,13 @@ try:
     if not binary:fail('DIRECT_RSYNC_MISSING','rsync is not installed on the source machine')
     exclusions=['--exclude=/train_state/'] if exclude_train_state else []
     os.execv(binary,[binary,'--server','--sender','-rct','--partial']+exclusions+['.',argument])
-except BaseException:
-    print('Scoped direct sender could not start',file=sys.stderr)
+except BaseException as error:
+    code=str(error).partition(': ')[0]
+    if code not in {'DIRECT_PATH_INVALID','DIRECT_SOURCE_SCOPE_INVALID','DIRECT_SOURCE_SCOPE_EXPIRED','DIRECT_RSYNC_MISSING'}:
+        code='DIRECT_SOURCE_SCOPE_UNAVAILABLE'
+    # A fixed marker supplies actionable scope failures without returning a
+    # source path, exception text or the untrusted original SSH command.
+    print('TERMITECH_DIRECT_SOURCE_ERROR '+code,file=sys.stderr)
     sys.exit(126)
 '''
 
@@ -311,7 +316,94 @@ finally:remove_temp(p['temp'],p['temp_identity'])
 '''
 
 
-_TARGET_SCRIPT = _REMOTE_COMMON + r'''
+_DIAGNOSTIC_HELPERS = r'''
+def read_ssh_diagnostic(path):
+    try:
+        fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+        with os.fdopen(fd,'rb') as stream:
+            info=os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.geteuid():return b'',True
+            if info.st_size>128*1024:fail('DIRECT_OUTPUT_LIMIT','Direct SSH diagnostics exceeded their size limit')
+            raw=stream.read(32768)
+            truncated=info.st_size>32768
+            if truncated:
+                stream.seek(max(0,info.st_size-8192));raw+=b'\n'+stream.read(8192)
+            return raw,truncated
+    except FileNotFoundError:return b'',False
+    except OSError:return b'',True
+def authenticated_ssh(raw):
+    lowered=raw.lower()
+    return any(marker in lowered for marker in (b'authenticated to ',b'authentication succeeded (',
+        b'debug1: sending command:',b'debug1: exit status '))
+def classify_direct_failure(exit_code,ssh_raw,rsync_raw,authenticated,activity,diagnostic_truncated=False):
+    # SSH -E is independent of remote stderr/file names.  Only fixed labels
+    # leave the machine, and a missing/truncated diagnostic is never retry proof.
+    ssh=ssh_raw.decode('utf-8','replace').lower()
+    output=rsync_raw.decode('utf-8','replace').lower()
+    phase='RSYNC_FILES' if activity else 'SSH_AUTHENTICATED' if authenticated else 'UNKNOWN'
+    def result(code,message,reason,retry=False,where=None):
+        return {'code':code,'message':message,'reason':reason,'retryable':retry,'phase':where or phase}
+    if any(marker in ssh for marker in ('host key verification failed','remote host identification has changed',
+            'requested strict checking','offending ','host key has changed')):
+        return result('DIRECT_HOST_KEY_REJECTED','Direct SSH rejected the pinned source host key; verify machine identity before retrying','host_key',where='SSH_HOST_KEY')
+    if any(marker in ssh for marker in ('permission denied (','authentication failed',
+            'no more authentication methods to try','too many authentication failures')):
+        return result('DIRECT_AUTHENTICATION_FAILED','The source rejected the task-scoped SSH authorization; check source SSH authorization and account policy','authentication',where='SSH_AUTH')
+    if any(marker in ssh for marker in ('no matching host key type found','no matching key exchange method found',
+            'no matching cipher found','no mutual signature algorithm')):
+        return result('DIRECT_SSH_NEGOTIATION_FAILED','Source and target SSH algorithms are incompatible; check SSH configuration','negotiation',where='SSH_NEGOTIATION')
+    if any(marker in ssh for marker in ('load key ','identity file ')) and any(marker in ssh for marker in (
+            'invalid format','not accessible','no such file or directory','error in libcrypto','permissions are too open')):
+        return result('DIRECT_TEMPORARY_KEY_UNAVAILABLE','The task temporary SSH key could not be loaded; start a fresh transfer attempt','key_unavailable',where='SSH_KEY')
+    if 'termitech_direct_source_error ' in output:
+        return result('DIRECT_SOURCE_SCOPE_UNAVAILABLE','The source scoped sender could not open its approved asset or its authorization expired; recheck the source asset','source_scope')
+    if exit_code==24:
+        return result('DIRECT_SOURCE_CHANGED','rsync reported source files disappearing during the transfer; verify the source snapshot','file_vanished')
+    if exit_code in (11,23) and re.search(r'(?:failed|error)[^\r\n]*no space left on device',output):
+        return result('DIRECT_TARGET_SPACE_INSUFFICIENT','rsync reported insufficient filesystem space; check target free space','space')
+    if exit_code in (11,23) and re.search(r'(?:failed|error)[^\r\n]*permission denied',output):
+        return result('DIRECT_RSYNC_PERMISSION_DENIED','rsync could not access an asset file or destination; check filesystem permissions','file_permission')
+    if exit_code in (11,23):
+        return result('DIRECT_RSYNC_FILE_ERROR','rsync reported a file access, read or write error; inspect source and target filesystems','file_io')
+    # Only recognized local SSH establishment errors, before authentication or
+    # any rsync activity, permit a single connection retry.  Never retry a
+    # generic rsync error merely because its counter remains at zero.
+    transient=None
+    if 'exceeded maxstartups' in ssh:
+        transient=('ssh_busy','The source SSH server rejected a new unauthenticated session because its MaxStartups capacity was exceeded')
+    elif re.search(r'ssh: connect to host [^\r\n]+ port [0-9]+: connection refused(?:\r?\n|$)',ssh):
+        transient=('connect_refused','The source SSH port refused the direct connection')
+    elif re.search(r'ssh: connect to host [^\r\n]+ port [0-9]+: (?:connection timed out|operation timed out)(?:\r?\n|$)',ssh) or 'connection timed out during banner exchange' in ssh:
+        transient=('connect_timeout','The direct SSH connection timed out before authentication')
+    elif re.search(r'ssh: connect to host [^\r\n]+ port [0-9]+: (?:no route to host|network is unreachable)(?:\r?\n|$)',ssh):
+        transient=('network_unreachable','The target cannot currently route to the source SSH port')
+    elif re.search(r'(?:kex_exchange_identification|ssh_exchange_identification):[^\r\n]*(?:connection reset by peer|connection closed by remote host)',ssh):
+        transient=('preauth_closed','The source closed or reset SSH before authentication; check SSH connection limits and network policy')
+    elif re.search(r'(?:^|\n)connection (?:reset|closed) by [^\r\n]+ port [0-9]+(?:\r?\n|$)',ssh):
+        transient=('preauth_reset','The direct SSH connection was reset before authentication')
+    elif 'could not resolve hostname ' in ssh and 'temporary failure in name resolution' in ssh:
+        transient=('dns_temporary','Source hostname resolution temporarily failed on the target')
+    if transient:
+        retry=(not authenticated and not activity and not diagnostic_truncated and exit_code in (12,255))
+        if authenticated or activity:
+            return result('DIRECT_CONNECTION_LOST','The direct SSH connection was interrupted after the session started; partial files are retained','connection_lost')
+        return result('DIRECT_SSH_BUSY' if transient[0]=='ssh_busy' else 'DIRECT_CONNECTION_UNAVAILABLE',
+            transient[1],transient[0],retry,where='SSH_CONNECT')
+    if 'could not resolve hostname ' in ssh:
+        return result('DIRECT_DNS_FAILED','The target could not resolve the configured source hostname; check machine connection settings','dns_failed',where='SSH_CONNECT')
+    if exit_code==30:
+        return result('DIRECT_TRANSFER_STALLED','rsync exceeded its data I/O deadline; partial files are retained','stalled')
+    if exit_code in (10,12) and (authenticated or activity):
+        return result('DIRECT_RSYNC_PROTOCOL_FAILED','The established rsync session failed or its stream was interrupted; partial files are retained','protocol')
+    if exit_code==255 and authenticated:
+        return result('DIRECT_CONNECTION_LOST','The authenticated direct SSH session ended unexpectedly; partial files are retained','connection_lost')
+    return result('DIRECT_CONNECTION_UNAVAILABLE' if exit_code in (12,255) else 'DIRECT_RSYNC_FAILED',
+        'Direct rsync stopped without a recognized connection-establishment diagnosis; inspect machine SSH and rsync logs',
+        'unknown')
+'''
+
+
+_TARGET_SCRIPT = _REMOTE_COMMON + _DIAGNOSTIC_HELPERS + r'''
 def ssh_arguments(identity,keyfile,knownhosts,alias):
     return ['ssh','-F','/dev/null','-i',keyfile,'-p',str(identity['port']),'-l',identity['username'],
         '-o','HostKeyAlias='+alias,'-o','UserKnownHostsFile='+knownhosts,'-o','GlobalKnownHostsFile=/dev/null',
@@ -356,46 +448,70 @@ try:
         finally:disconnected.set()
     threading.Thread(target=eof,daemon=True).start()
     os.fchdir(staging_fd)
-    rsh=shlex.join(ssh_arguments(p['source'],keyfile,knownhosts,alias))
     host=p['source']['host']
     origin=('['+host+']' if ':' in host else host)+':./'
     # Fixed source sender chooses its own path; client argv never carries a
     # dataset path through an intermediate login shell.
     exclusions=['--exclude=/train_state/'] if exclude_train_state else []
-    child=subprocess.Popen(['rsync','-rct','--partial','--inplace','--progress']+exclusions+['-e',rsh,'--',origin,'./'],
-        stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True,bufsize=0,
-        env={**{key:value for key,value in os.environ.items() if not key.startswith('RSYNC_')},'LC_ALL':'C'})
-    pathlib.Path(temporary,'child.json').write_text(json.dumps({'pid':child.pid,'identity':process_stamp(child.pid)}))
-    os.set_blocking(child.stdout.fileno(),False)
-    started=last_emit=time.monotonic();tail=b'';last=completed=0;done=p['initial_bytes'];rsync_output_bytes=0
+    started=last_emit=time.monotonic();rsync_output_bytes=0;attempts=0
     while True:
-        chunk=b''
-        if disconnected.is_set():fail('DIRECT_CANCELLED','Control connection closed; owned partial files are retained')
-        elapsed=time.monotonic()-started
-        if elapsed>p['timeout']:fail('DIRECT_TIMEOUT','Direct transfer exceeded its configured deadline')
-        if select.select([child.stdout],[],[],.1)[0]:
-            chunk=os.read(child.stdout.fileno(),65536)
-            rsync_output_bytes+=len(chunk)
-            if rsync_output_bytes>16*1024*1024:fail('DIRECT_OUTPUT_LIMIT','Direct rsync produced excessive diagnostic output')
-            tail+=chunk
-            pieces=re.split(rb'[\r\n]',tail);tail=pieces.pop()[-8192:]
-            for text in pieces:
-                match=re.match(rb'\s*([0-9][0-9,]*)\s+([0-9]{1,3})%',text)
-                if match:
-                    count=int(match.group(1).replace(b',',b''))
-                    if count<last:completed+=last
-                    last=count;done=min(p['bytes_total'],p['initial_bytes']+completed+count)
-        if time.monotonic()-last_emit>=1:
-            last_emit=time.monotonic()
-            send({'type':'progress','event':{'stage':'TRANSFERRING','bytes_done':done,'bytes_total':p['bytes_total'],
-                'files_done':None,'files_total':p['files_total'],'speed_bps':max(0,done-p['initial_bytes'])/max(elapsed,.001),
-                'percent':min(99,100*done/p['bytes_total']) if p['bytes_total'] else 0}})
-        if child.poll() is not None and not select.select([child.stdout],[],[],0)[0]:break
-        if child.poll() is not None and not chunk:break
-    if child.returncode:
-        # Do not forward SSH diagnostics, paths, filenames or key material.
-        fail('DIRECT_CONNECTION_UNAVAILABLE','Machines could not complete a direct SSH rsync connection; partial files are retained and no relay fallback was used')
-    success=True
+        attempts+=1
+        ssh_log=os.path.join(temporary,'ssh-'+str(attempts)+'.log')
+        # -E separates local SSH establishment diagnostics from remote stderr
+        # and file names.  Never forward this DEBUG1 file to the controller.
+        rsh=shlex.join(ssh_arguments(p['source'],keyfile,knownhosts,alias)+['-E',ssh_log,'-o','LogLevel=DEBUG1'])
+        child=subprocess.Popen(['rsync','-rct','--partial','--inplace','--progress']+exclusions+['-e',rsh,'--',origin,'./'],
+            stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True,bufsize=0,
+            env={**{key:value for key,value in os.environ.items() if not key.startswith('RSYNC_')},'LC_ALL':'C'})
+        pathlib.Path(temporary,'child.json').write_text(json.dumps({'pid':child.pid,'identity':process_stamp(child.pid)}))
+        os.set_blocking(child.stdout.fileno(),False)
+        tail=b'';diagnostic_tail=b'';last=completed=0;done=p['initial_bytes']
+        authenticated=activity=diagnostic_truncated=False;ssh_raw=b'';stdout_eof=False
+        while True:
+            chunk=b''
+            if disconnected.is_set():fail('DIRECT_CANCELLED','Control connection closed; owned partial files are retained')
+            elapsed=time.monotonic()-started
+            if elapsed>p['timeout']:fail('DIRECT_TIMEOUT','Direct transfer exceeded its configured deadline')
+            if select.select([child.stdout],[],[],.1)[0]:
+                chunk=os.read(child.stdout.fileno(),65536)
+                if not chunk:stdout_eof=True
+                rsync_output_bytes+=len(chunk)
+                if rsync_output_bytes>16*1024*1024:fail('DIRECT_OUTPUT_LIMIT','Direct rsync produced excessive diagnostic output')
+                diagnostic_tail=(diagnostic_tail+chunk)[-8192:]
+                tail+=chunk
+                pieces=re.split(rb'[\r\n]',tail);tail=pieces.pop()[-8192:]
+                for text in pieces:
+                    match=re.match(rb'\s*([0-9][0-9,]*)\s+([0-9]{1,3})%',text)
+                    if match:
+                        activity=True
+                        count=int(match.group(1).replace(b',',b''))
+                        if count<last:completed+=last
+                        last=count;done=min(p['bytes_total'],p['initial_bytes']+completed+count)
+                    elif text.strip() and not re.match(rb'^(?:rsync(?::| error:|\([0-9]+\):))',text.strip()):
+                        activity=True
+            latest,truncated=read_ssh_diagnostic(ssh_log)
+            if latest:ssh_raw=latest
+            authenticated=authenticated or authenticated_ssh(latest)
+            diagnostic_truncated=diagnostic_truncated or truncated
+            if time.monotonic()-last_emit>=1:
+                last_emit=time.monotonic()
+                send({'type':'progress','event':{'stage':'TRANSFERRING','bytes_done':done,'bytes_total':p['bytes_total'],
+                    'files_done':None,'files_total':p['files_total'],'speed_bps':max(0,done-p['initial_bytes'])/max(elapsed,.001),
+                    'percent':min(99,100*done/p['bytes_total']) if p['bytes_total'] else 0}})
+            if child.poll() is not None and stdout_eof:break
+        if not child.returncode:
+            success=True;break
+        diagnosis=classify_direct_failure(child.returncode,ssh_raw,diagnostic_tail,authenticated,activity,diagnostic_truncated)
+        if diagnosis['retryable'] and attempts==1:
+            send({'type':'connection_retry','reason':diagnosis['reason'],'rsync_exit':child.returncode,'attempt':2})
+            child.stdout.close();child=None
+            until=time.monotonic()+.5
+            while time.monotonic()<until:
+                if disconnected.wait(.05):fail('DIRECT_CANCELLED','Control connection closed before direct SSH retry')
+                if time.monotonic()-started>p['timeout']:fail('DIRECT_TIMEOUT','Direct transfer exceeded its configured deadline')
+            continue
+        fail(diagnosis['code'],diagnosis['message']+' [phase='+diagnosis['phase']+', rsync_exit='+str(child.returncode)
+             +', attempts='+str(attempts)+']. Partial files are retained; no relay fallback was used')
 except BaseException as error:
     failure=error_result(error)
 finally:
@@ -601,6 +717,21 @@ def direct_copy(source_remote, target_remote, source_info, target_staging, trans
                             or set(values) != {'stage', 'bytes_done', 'bytes_total', 'files_done', 'files_total', 'speed_bps', 'percent'}):
                         raise TransferError('DIRECT_PROTOCOL_INVALID', 'Invalid direct transfer progress')
                     progress(values)
+                elif event.get('type') == 'connection_retry':
+                    if (set(event) != {'type', 'reason', 'rsync_exit', 'attempt'} or event.get('attempt') != 2
+                            or type(event.get('rsync_exit')) is not int or event['rsync_exit'] not in (12, 255)
+                            or event.get('reason') not in {'ssh_busy', 'connect_refused', 'connect_timeout', 'network_unreachable',
+                                                           'preauth_closed', 'preauth_reset', 'dns_temporary'}):
+                        raise TransferError('DIRECT_PROTOCOL_INVALID', 'Invalid direct connection retry report')
+                    label = {'ssh_busy': '源 SSH 未认证连接数达到 MaxStartups 上限',
+                             'connect_refused': '源 SSH 端口暂时拒绝连接', 'connect_timeout': 'SSH 建连超时',
+                             'network_unreachable': '目标暂时无法路由到源机器',
+                             'preauth_closed': '源机器在 SSH 认证前关闭连接',
+                             'preauth_reset': 'SSH 认证前连接被重置',
+                             'dns_temporary': '目标机器暂时无法解析源主机名'}[event['reason']]
+                    progress({'stage': 'TRANSFERRING', 'message':
+                              '直连 SSH 在认证和文件传输前暂时失败（' + label + '，rsync exit '
+                              + str(event['rsync_exit']) + '）；0.5 秒后仅重试一次连接，已传文件保持。'})
                 elif event.get('type') == 'complete':
                     expected = {'transport': 'direct-ssh', **totals}
                     if event.get('result') != expected:

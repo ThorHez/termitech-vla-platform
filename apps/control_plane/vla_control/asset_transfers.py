@@ -24,6 +24,7 @@ from .common import APIError, now, require_path, uid
 from .models import Asset
 from .remote_models import RemoteConnection
 from .schemas import InputModel
+from .ssh_remote import RemoteError
 from .storage_configurations import require_not_pending
 
 
@@ -390,6 +391,23 @@ class AssetTransferManager:
             message = self.remote_manager._safe(message, connection)
         return message
 
+    def _connect_remote(self, remote, transfer_id, attempt):
+        try:
+            remote.connect()
+        except RemoteError as error:
+            if error.code != 'SSH_CONNECTION_FAILED':
+                raise
+            if self._cancelled(transfer_id, attempt):
+                return False
+            self._progress(transfer_id, attempt, {'stage': 'PREPARING',
+                'message': 'SSH 连接暂时不可用，0.5 秒后重试一次；尚未开始传输文件'})
+            if self._stop.wait(.5) or self._cancelled(transfer_id, attempt):
+                return False
+            # SSHRemote closes a failed client and creates a fresh client on
+            # connect(). Only connection setup is retried, never file copying.
+            remote.connect()
+        return not self._cancelled(transfer_id, attempt)
+
     def _progress(self, transfer_id, attempt, event, *, part='dataset'):
         with self.db.write() as session:
             row = _locked(session, transfer_id)
@@ -465,7 +483,8 @@ class AssetTransferManager:
             for remote in remotes:
                 if self._cancelled(transfer_id, attempt):
                     return
-                remote.connect()
+                if not self._connect_remote(remote, transfer_id, attempt):
+                    return
             transfer = self.transfer_function
             if transfer is None:
                 from .asset_transfer_transport import transfer_asset
