@@ -207,7 +207,7 @@ def test_runtime_independent_processors_replace_recipe_children_without_inheriti
     assert [child.image_horizon for child in config.data.datasets] == [1, 2]
     assert all(type(child) is processor_module.IndependentFactory for child in config.data.datasets)
     assert all(child.temperature == 0.1 for child in config.data.datasets)
-    assert config.data.state_pad_dim == base.data.state_pad_dim and config.data.use_merged_norm_stats == base.data.use_merged_norm_stats
+    assert config.data.state_pad_dim == base.data.state_pad_dim and config.data.use_merged_norm_stats is False
     assert base == original
     plan = inspect_training_config(config, spec, checks=[])
     assert plan['dataset_bindings'] == spec['dataset_bindings']

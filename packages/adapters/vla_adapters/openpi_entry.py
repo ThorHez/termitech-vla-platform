@@ -130,12 +130,21 @@ def resolve_config(base, spec, config_module, weight_loaders):
             raise ValueError("RECIPE_UNSUPPORTED: unsupported or empty multi-dataset factory")
         children = [selected_factory(row, i) for i, row in enumerate(bindings)]
         updates = {"datasets": children, "weights": [row["weight"] for row in bindings]}
-        if spec.get("auto_config") is not None or any(type(child).__name__ == "ComposableDataConfig" for child in children):
-            if "use_merged_norm_stats" not in {field.name for field in dataclasses.fields(base.data)}:
-                raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 多数据集容器必须支持每个资产独立的归一化统计")
-            # Different robots/layouts need their own bound statistics. A shared
-            # recipe default must not merge incompatible raw feature spaces.
+        fields = {field.name for field in dataclasses.fields(base.data)}
+        if "use_merged_norm_stats" not in fields:
+            raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 多数据集容器必须支持显式归一化选择，请升级训练代码")
+        norm_files = [local_path(paths[pair][1] / "norm_stats.json", spec) for pair in pairs]
+        shared = len(bindings) > 1 and len(set(norm_files)) == 1
+        if shared:
+            if "shared_norm_stats_path" not in fields:
+                raise ValueError("SHARED_NORM_UNSUPPORTED: 当前训练代码不支持原始样本共享归一化，请升级 openpi-umi 后重新预检")
+            updates.update(use_merged_norm_stats=True, shared_norm_stats_path=str(norm_files[0]))
+        else:
+            # Existing per-source assets remain supported. Never invoke the old
+            # merger, which averages already-computed source quantiles.
             updates["use_merged_norm_stats"] = False
+            if "shared_norm_stats_path" in fields:
+                updates["shared_norm_stats_path"] = None
         data = dataclasses.replace(base.data, **updates)
     else:
         if bindings is not None:

@@ -3,9 +3,12 @@ import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from 
 import { flushSync } from 'react-dom';
 import { Field } from './components';
 import {
-  copyDatasetBinding,
+  appendDatasetBinding,
+  bindSharedNormalization,
+  datasetNormalizationMode,
   normalizedAssetPath,
   selectDatasetBinding,
+  sharedNormalizationAssetId,
 } from './datasetBindingHelpers';
 import {
   DataProcessorCatalogStatus,
@@ -93,7 +96,17 @@ export function DatasetBindings({
     dispatchDisclosure({ type: 'sync', count: bindings.length });
   }, [bindings.length]);
   const datasets = assets.filter((asset) => asset.kind === 'DATASET');
-  const norms = assets.filter((asset) => asset.kind === 'NORM');
+  const norms = assets.filter(
+    (asset) =>
+      asset.kind === 'NORM' &&
+      (!node || asset.node_id === node.id) &&
+      asset.state !== 'ARCHIVED' &&
+      asset.state !== 'UNAVAILABLE',
+  );
+  const normalizationMode = datasetNormalizationMode(bindings);
+  const sharedNormalization = normalizationMode === 'shared';
+  const sharedNormId = sharedNormalizationAssetId(bindings);
+  const sharedNorm = norms.find((asset) => asset.id === sharedNormId);
   const processingChoices = slots.length
     ? slots
     : [{ recipe_index: 0, weight: 1, processing: '配方默认处理' }];
@@ -191,9 +204,67 @@ export function DatasetBindings({
         </div>
       </div>
       <p className="field-hint">
-        本次训练只使用这里选择的已登记资产；配方中的目录仅作源码参考。每个数据集绑定自己的归一化参数，混采权重决定相对采样比例。
-        新增数据集会复制第 1 组的处理配置与混采权重，请选择各自的数据集和归一化参数。
+        本次训练只使用这里选择的已登记资产；配方中的目录仅作源码参考。
+        {bindings.length > 1
+          ? '多数据集推荐使用一份共享归一化参数，按全部源数据与本次混采权重重新统计。'
+          : '请选择此数据集对应的归一化参数。'}
+        新增数据集会复制第 1 组的处理配置与混采权重；共享归一化时也会保留同一份参数。
       </p>
+      {normalizationMode === 'legacy' && (
+        <div className="inline-note" role="status">
+          <strong>逐组归一化（旧配置）</strong>
+          <span>
+            已保留草稿或模板中原有的逐组选择。切换后会清空这些归一化选择，请重新选择一份共享参数。
+            多源统计应按原始样本及混采权重重新计算，不能平均或合并旧 norm 文件。
+          </span>
+          {!readOnly && (
+            <button
+              type="button"
+              className="button outline small"
+              onClick={() => onChange(bindSharedNormalization(bindings, ''))}
+            >
+              切换为共享归一化
+            </button>
+          )}
+        </div>
+      )}
+      {sharedNormalization && (
+        <div className="form-grid">
+          <Field
+            label="共享归一化参数"
+            required
+            hint={
+              sharedNorm?.path ||
+              (norms.length
+                ? '为所有数据集选择同一份按本次数据与混采权重重新统计的参数。'
+                : '请先在「数据与模型」登记当前机器的共享归一化参数。')
+            }
+          >
+            {readOnly ? (
+              <span>{sharedNorm?.name || sharedNormId || '未选择共享归一化参数'}</span>
+            ) : (
+              <select
+                required
+                value={sharedNormId}
+                onChange={(event) =>
+                  onChange(bindSharedNormalization(bindings, event.target.value))
+                }
+              >
+                <option value="">选择共享归一化参数</option>
+                {norms.map((asset) => (
+                  <option value={asset.id} key={asset.id}>
+                    {asset.name} · {asset.version}
+                  </option>
+                ))}
+              </select>
+            )}
+          </Field>
+          <p className="field-hint">
+            所有数据集共用此参数。新增或更换数据集、修改混采权重或处理布局后需要重新统计；
+            预检会核对统计来源，单源参数不能冒充多源统计。此处只选择已有参数，不会启动全量统计任务。
+          </p>
+        </div>
+      )}
       {showProcessing && <DataProcessorCatalogStatus {...catalogState} />}
       {showProcessing && !automatic && !slots.length && (
         <p className="recipe-detail-warning">
@@ -211,7 +282,7 @@ export function DatasetBindings({
         const contentId = `${disclosureId}-dataset-${index}`;
         const selectionIssues = [
           !dataset ? '请选择数据集' : '',
-          !norm ? '请选择归一化参数' : '',
+          !norm ? (sharedNormalization ? '请选择共享归一化参数' : '请选择归一化参数') : '',
           !Number.isFinite(binding.weight) || binding.weight <= 0 ? '混采权重需大于 0' : '',
         ].filter(Boolean);
         const validation = automaticValidity[bindingKey(binding, index)];
@@ -280,7 +351,7 @@ export function DatasetBindings({
               <span>
                 混采权重：{Number.isFinite(binding.weight) ? binding.weight : '未填写'}
                 {share !== undefined && binding.weight > 0
-                  ? ` · 采样比例约 ${share.toFixed(2)}%`
+                  ? ` · 权重占比（未考虑样本数）约 ${share.toFixed(2)}%`
                   : ''}
               </span>
               <span>处理方案：{processingLabel}</span>
@@ -341,6 +412,7 @@ export function DatasetBindings({
                           },
                           processingChoices[0].recipe_index,
                           preserveProcessingOnDatasetChange,
+                          sharedNormalization ? sharedNormId : undefined,
                         );
                         setProcessingModes((previous) => {
                           const modes = { ...previous };
@@ -363,36 +435,39 @@ export function DatasetBindings({
                       ))}
                     </select>
                   </Field>
-                  <Field
-                    label={`归一化参数 ${index + 1}`}
-                    required
-                    hint={
-                      norm?.path ||
-                      (norms.length
-                        ? '选择此数据集对应的归一化参数。'
-                        : '请先在「数据与模型」登记当前机器的归一化参数。')
-                    }
-                  >
-                    <select
+                  {!sharedNormalization && (
+                    <Field
+                      label={`归一化参数 ${index + 1}`}
                       required
-                      value={binding.norm_asset_id}
-                      onChange={(event) => update(index, { norm_asset_id: event.target.value })}
+                      hint={
+                        norm?.path ||
+                        (norms.length
+                          ? '选择此数据集对应的归一化参数。'
+                          : '请先在「数据与模型」登记当前机器的归一化参数。')
+                      }
                     >
-                      <option value="">选择归一化参数</option>
-                      {norms.map((asset) => (
-                        <option value={asset.id} key={asset.id}>
-                          {asset.name} · {asset.version}
-                        </option>
-                      ))}
-                    </select>
-                  </Field>
+                      <select
+                        required
+                        value={binding.norm_asset_id}
+                        onChange={(event) => update(index, { norm_asset_id: event.target.value })}
+                      >
+                        <option value="">选择归一化参数</option>
+                        {norms.map((asset) => (
+                          <option value={asset.id} key={asset.id}>
+                            {asset.name} · {asset.version}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  )}
                   <Field
                     label={`混采权重 ${index + 1}`}
                     required
                     hint={
-                      share === undefined
+                      '每条样本的重复权重；实际来源占比还取决于样本数。' +
+                      (share === undefined
                         ? '请输入大于 0 的权重。'
-                        : `当前采样比例约 ${share.toFixed(2)}%`
+                        : `当前权重占比（未考虑样本数）约 ${share.toFixed(2)}%`)
                     }
                   >
                     <input
@@ -461,10 +536,7 @@ export function DatasetBindings({
             onClick={() => {
               pendingDatasetFocus.current = bindings.length;
               dispatchDisclosure({ type: 'append' });
-              onChange([
-                ...bindings,
-                copyDatasetBinding(bindings[0], processingChoices[0].recipe_index),
-              ]);
+              onChange(appendDatasetBinding(bindings, processingChoices[0].recipe_index));
             }}
           >
             <Plus size={14} />

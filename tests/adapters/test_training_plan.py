@@ -119,7 +119,7 @@ def test_multi_binds_all_selected_assets_and_routes_actual_entry(training):
     config = resolve_config(base, spec, module, loaders)
     assert config.data.datasets[:2] == base.data.datasets[:2]
     assert config.data.weights == [1., 20., 50.]
-    assert config.data.state_pad_dim == 32 and config.data.use_merged_norm_stats
+    assert config.data.state_pad_dim == 32 and config.data.use_merged_norm_stats is False
     assert config.data.datasets[2].repo_id == spec["inputs"]["dataset_2"]["path"]
     assert base == original
     checks = []

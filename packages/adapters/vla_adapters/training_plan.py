@@ -7,6 +7,7 @@ batched dataloader, or performs an SGD step.
 
 import ast
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -331,11 +332,12 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
             **video_evidence, **derived, **declared, **composed}
 
 
-def check_composed_mixture(data_factory, datasets):
+def check_composed_mixture(data_factory, datasets, *, shared_validated=False):
     compositions = [data["composition"] for data in datasets if "composition" in data]
     if not compositions or not hasattr(data_factory, "datasets"):
         return
-    if getattr(data_factory, "use_merged_norm_stats", None) is not False:
+    if (getattr(data_factory, "use_merged_norm_stats", None) is not False
+            and not (shared_validated and getattr(data_factory, "shared_norm_stats_path", None))):
         raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 组合数据集必须分别使用所绑定的归一化统计，不能跨布局合并")
     target = getattr(data_factory, "state_pad_dim", None)
     for composition in compositions:
@@ -383,6 +385,43 @@ def norm_contract(factory, spec):
         if (getattr(base, "use_quantile_norm", False) or composition is not None and composition["normalization"] == "quantile") and not all(values.get(k) is not None for k in ("q01", "q99")):
             raise ValueError(f"NORM_FORMAT: {norm_path} 缺少分位数归一化统计")
     return {"norm_path": str(norm_path), "norm_sha256": sha}
+
+
+def shared_norm_contract(data_factory, factories, datasets, spec):
+    """Use the selected checkout's lightweight provenance checker, never scan raw samples."""
+    path = getattr(data_factory, "shared_norm_stats_path", None)
+    if not path:
+        if getattr(data_factory, "use_merged_norm_stats", False):
+            raise ValueError("SHARED_NORM_INVALID: 禁止合并已有数据集统计；请显式选择按原始样本计算的共享归一化资产")
+        return {"mode": "per_dataset"}
+    norm = local_path(path, spec)
+    if (getattr(data_factory, "use_merged_norm_stats", None) is not True
+            or len(factories) < 2 or any(data["norm_path"] != str(norm) for data in datasets)
+            or len({data["norm_sha256"] for data in datasets}) != 1):
+        raise ValueError("SHARED_NORM_INVALID: 所有数据集必须使用本次显式绑定的同一个共享归一化文件")
+    source_path = Path(spec["code_dir"]) / "src/openpi/training/shared_norm.py"
+    if not source_path.is_file():
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 训练代码缺少共享归一化校验器，请升级 openpi-umi 后重新预检")
+    source = local_path(source_path, spec)
+    contents = source.read_bytes()
+    if len(contents) > 256 * 1024:
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 共享归一化校验器超出受限源码大小，请检查训练代码")
+    digest = hashlib.sha256(contents).hexdigest()
+    loader = importlib.util.spec_from_file_location("_platform_shared_norm_" + digest, source)
+    if loader is None or loader.loader is None:
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 无法读取共享归一化校验器，请升级训练代码")
+    module = importlib.util.module_from_spec(loader)
+    # Execute the exact source whose digest will be frozen into the plan.
+    exec(compile(contents, str(source), "exec"), module.__dict__)
+    validate = getattr(module, "validate_shared_metadata", None)
+    if not callable(validate):
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 缺少原始样本共享统计校验接口，请升级训练代码")
+    document, sha = read_json(norm, spec)
+    if sha != datasets[0]["norm_sha256"]:
+        raise ValueError("SHARED_NORM_INVALID: 共享统计文件在预检期间改变，请重新预检")
+    metadata = validate(document, factories, list(data_factory.weights))
+    return {"mode": "shared", "shared": {"path": str(norm), "sha256": sha, "metadata": metadata,
+            "validator": {"path": "src/openpi/training/shared_norm.py", "sha256": digest}}}
 
 
 def model_contract(spec):
@@ -467,7 +506,6 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
                                 model_config=getattr(config, "model", None),
                                 binding=bindings[index] if bindings is not None else None, checks=checks)
         datasets.append(data)
-    check_composed_mixture(config.data, datasets)
     passed("data_contract", "已核对所有数据集的 LeRobot 元数据与 parquet 文件：" + "、".join(d["path"] for d in datasets))
     for data in datasets:
         try:
@@ -478,6 +516,8 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
     passed("dataset_timestamps", "已按本次生效 FPS 和训练加载器容差，逐帧核对所有数据集的真实时间戳")
     for data, factory in zip(datasets, factories):
         data.update(norm_contract(factory, spec))
+    normalization = shared_norm_contract(config.data, factories, datasets, spec) if multi else {"mode": "per_dataset"}
+    check_composed_mixture(config.data, datasets, shared_validated=normalization["mode"] == "shared")
     for i, (data, (dataset_role, norm_role)) in enumerate(zip(datasets, roles)):
         norm = local_path(spec["inputs"][norm_role]["path"], spec)
         data["norm_asset_path"] = str(norm)
@@ -572,5 +612,6 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),
+            "normalization": normalization,
             "model": model, "storage": storage_estimate(config, model, reference), "training_cache": cache,
             "evidence_scope": "metadata hashes, file path/size/mtime manifests, all source timestamp/episode rows, and bounded decoded samples for composable processing; model tensors and training steps are not loaded"}

@@ -40,7 +40,7 @@ _PROTECTED_FIELDS = {"name", "code_dir", "python", "entrypoint", "output_dir", "
                      "exp_name", "resume", "overwrite", "wandb_enabled"}
 _FIELD_PATH = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:(?:\.[A-Za-z][A-Za-z0-9_]*)|(?:\[(?:0|[1-9][0-9]?)\]))*")
 _ASSET_FIELDS = {"repo_id", "repo_ids", "assets", "assets_dir", "asset_id", "asset_ids", "composition",
-                 "norm_stats", "norm_stats_path", "norm_stats_dir", "norm_path", "norm_dir",
+                 "norm_stats", "norm_stats_path", "norm_stats_dir", "norm_path", "norm_dir", "shared_norm_stats_path",
                  "normalization_path", "normalization_dir", "dataset_path", "dataset_dir",
                  "data_path", "data_dir", "rlds_data_dir", "filter_dict_path", "weight_loader", "weight_loaders", "init_weights",
                  "pretrained_path", "pretrained_dir", "weights_path", "weight_path",
