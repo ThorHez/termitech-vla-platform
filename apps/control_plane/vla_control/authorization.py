@@ -51,6 +51,9 @@ _allow("platform.read", "GET",
 _allow("assets.write", "POST", "/assets", "/assets/{asset_id}/archive",
        "/nodes/{node_id}/path-suggestions")
 _allow("assets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
+_allow("assets.write", "POST", "/assets/{asset_id}/validations")
+_allow("platform.read", "GET", "/assets/{asset_id}/validation")
+_allow("platform.read", "GET", "/assets/{asset_id}/statistics")
 _allow("assets.write", "GET", "/dataset-format-templates", "/dataset-format-templates/{template_id}")
 _allow("assets.write", "POST", "/dataset-format-templates")
 _allow("assets.write", "PUT", "/dataset-format-templates/{template_id}")
@@ -62,6 +65,7 @@ _allow("assets.write", "PUT", "/assets/{asset_id}/norm-binding")
 _allow("assets.write", "POST", "/nodes/{node_id}/dataset-inspections")
 _allow("assets.write", "GET", "/nodes/{node_id}/dataset-inspections/{query_id}")
 _allow("platform.read", "GET", "/asset-transfers", "/asset-transfers/{transfer_id}")
+_allow("platform.read", "GET", "/background-tasks")
 _allow("assets.write", "POST", "/asset-transfers", "/asset-transfers/{transfer_id}/retry",
        "/asset-transfers/{transfer_id}/cancel")
 _allow("assets.write", "POST", "/asset-transfer-batches")
@@ -102,7 +106,7 @@ _allow("machines.manage", "POST", "/agent-configs", "/ssh-connections/test", "/s
        "/nodes/{node_id}/storage-configurations",
        "/nodes/{node_id}/profile-rebindings",
        "/ssh-connections/{connection_id}/path-suggestions", "/ssh-connections/{connection_id}/test",
-       "/nodes/{node_id}/disconnect", "/nodes/{node_id}/uninstall",
+       "/nodes/{node_id}/disconnect", "/nodes/{node_id}/uninstall", "/nodes/{node_id}/upgrade",
        "/remote-deployments", "/remote-deployments/{job_id}/retry")
 _allow("machines.manage", "PATCH", "/nodes/{node_id}")
 _allow("users.manage", "GET", "/users")

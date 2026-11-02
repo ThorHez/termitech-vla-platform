@@ -20,6 +20,7 @@ from .common import APIError, digest, now, offset_time, require_path, uid
 from .dataset_batch_models import DatasetBatchRegistration, DatasetScan
 from .dataset_norm_bindings import _lock_norm_path, canonical_norm_path, resolve_norm_path, validate_norm_binding
 from .dataset_profiles import normalize_dataset_profile
+from .dataset_validations import queue_validation
 from .models import Asset, Node
 from .remote_models import RemoteConnection, RemoteDeployment
 from .schemas import InputModel
@@ -465,6 +466,7 @@ class DatasetBatchManager:
                               norm_asset_id=norm_id, created_at=now())
                 session.add(asset)
                 session.flush()
+                queue_validation(session, asset, heartbeat_timeout_seconds=self.settings.heartbeat_timeout_seconds)
                 created.append(asset_dict(asset))
             result = {"scan_id": scan.id, "idempotency_key": body.idempotency_key, "created": created,
                       "skipped": skipped, "created_count": len(created), "skipped_count": len(skipped)}

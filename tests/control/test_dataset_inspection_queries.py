@@ -52,7 +52,9 @@ def test_query_cache_safe_ack_and_asset_data_are_independent(platform):
     assert get(platform, node, query).json() == ready
     with platform.app.state.db.read() as session:
         asset = session.get(Asset, registered['id'])
-        assert asset.metadata_json == {'keep': True} and asset.state == registered['state']
+        assert {key: value for key, value in asset.metadata_json.items() if key != '_dataset_validation'} == {'keep': True}
+        assert asset.metadata_json['_dataset_validation'] == registered['validation']
+        assert asset.state == registered['state']
         assert session.get(Command, query['id']).result == result()
 
 

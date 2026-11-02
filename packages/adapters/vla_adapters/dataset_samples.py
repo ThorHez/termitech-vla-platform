@@ -20,11 +20,15 @@ import time
 
 
 SAMPLE_SECONDS = 60
+LOAD_SECONDS = 180
 MAX_SOURCE_BYTES = 1024 * 1024
 MAX_ARRAY_BYTES = 128 * 1024 * 1024
 LOADER_MODULE = "openpi.training.data_loader"
 FACTORY_MODULE = "openpi.training.config"
-CHILD_TIMEOUT_SECONDS = 70
+# Cold local parquet builders may need to materialize their Arrow cache before
+# the first native sample is available. Bound that initialization separately
+# from the unchanged decode/transform budget, plus interpreter startup grace.
+CHILD_TIMEOUT_SECONDS = LOAD_SECONDS + SAMPLE_SECONDS + 30
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 
@@ -228,8 +232,14 @@ def inspect_composed_samples(factory, config, spec, dataset_evidence):
         horizon = config.model.action_horizon
         if type(horizon) is not int or horizon <= 0:
             _fail("训练动作预测长度必须是正整数")
+        load_deadline = time.monotonic() + LOAD_SECONDS
         raw_dataset = loader(data_config, horizon, config.model)
-        _remaining(deadline)
+        if time.monotonic() > load_deadline:
+            _fail(f"数据集 {path} 的真实加载器初始化超过 {LOAD_SECONDS} 秒，请检查本地数据缓存和磁盘读取",
+                  "DATASET_SAMPLE_CHECK_LIMIT")
+        # Decoder and transform work receives the same 60-second budget after
+        # the native loader has completed its separately bounded initialization.
+        deadline = time.monotonic() + SAMPLE_SECONDS
         length = len(raw_dataset)
         if type(length) is not int or length <= 0 or length != dataset_evidence.get("frames"):
             _fail("真实加载器数据集为空，或帧数与已核验元信息不一致")
@@ -323,6 +333,9 @@ def inspect_composed_samples_isolated(factory, config, spec, dataset_evidence):
         stdout, stderr = process.communicate(request, timeout=CHILD_TIMEOUT_SECONDS)
         if len(stdout) > MAX_RESPONSE_BYTES or len(stderr) > MAX_RESPONSE_BYTES:
             _fail("样本子进程输出超过大小限制", "DATASET_SAMPLE_CHECK_LIMIT")
+        if process.returncode == -signal.SIGALRM:
+            _fail(f"数据集 {dataset_evidence['path']} 的真实样本子进程超过 {CHILD_TIMEOUT_SECONDS - 1} 秒硬期限（含环境初始化和数据读取）",
+                  "DATASET_SAMPLE_CHECK_LIMIT")
         try:
             response = json.loads(stdout)
         except (ValueError, UnicodeDecodeError) as exc:
@@ -346,7 +359,8 @@ def inspect_composed_samples_isolated(factory, config, spec, dataset_evidence):
             _fail("样本子进程未提供与本次绑定一致的正向验证结果", "DATASET_SAMPLE_CHECK_UNAVAILABLE")
         return result
     except subprocess.TimeoutExpired:
-        _fail("真实解码样本子进程超过 70 秒硬期限", "DATASET_SAMPLE_CHECK_LIMIT")
+        _fail(f"数据集 {dataset_evidence['path']} 的真实解码样本子进程超过 {CHILD_TIMEOUT_SECONDS} 秒硬期限",
+              "DATASET_SAMPLE_CHECK_LIMIT")
     except (OSError, subprocess.SubprocessError) as exc:
         _fail("无法执行独立样本检查子进程：" + str(exc)[:300], "DATASET_SAMPLE_CHECK_UNAVAILABLE")
     finally:

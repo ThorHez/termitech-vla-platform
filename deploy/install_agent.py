@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import codecs
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -236,6 +238,77 @@ def require_no_active_attempts(state_dir: str, runtime_python: Path | None = Non
         raise RuntimeError("该 Agent 仍有活动或待对账任务；请先在中台确认任务结束再升级")
 
 
+def require_upgrade_safe(state_dir: str, runtime_python: Path | None = None) -> dict:
+    """Legacy work stays guarded; only the installed supervisor can prove safety."""
+    try:
+        require_no_active_attempts(state_dir, runtime_python)
+        return {"active_attempts": 0, "upgrade_safe": True}
+    except RuntimeError as original:
+        database = absolute_path(state_dir) / "agent.sqlite3"
+        if runtime_python is None or not runtime_python.is_file() or not database.is_file():
+            raise original
+        reader = ("import json,sys; from vla_agent.runner_runtime import upgrade_status; "
+                  "print(json.dumps(upgrade_status(sys.argv[1])))")
+        args = [str(runtime_python), "-I", "-c", reader, state_dir]
+        owner = database.stat().st_uid
+        if os.geteuid() == 0 and owner != 0:
+            args = ["runuser", "-u", pwd.getpwuid(owner).pw_name, "--"] + args
+        try:
+            status = json.loads(subprocess.check_output(args, text=True, timeout=20, stderr=subprocess.DEVNULL))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise original from None
+        if (not isinstance(status, dict) or status.get("protocol_version") != 1
+                or status.get("upgrade_safe") is not True or type(status.get("active_attempts")) is not int
+                or status["active_attempts"] <= 0):
+            raise original
+        return status
+
+
+@contextmanager
+def installation_lock(state_dir: str):
+    """Exclude local START handling while checking and switching releases."""
+    directory = absolute_path(state_dir)
+    database = directory / "agent.sqlite3"
+    if not database.exists():
+        # Before the first local database exists there is no Agent able to
+        # accept START; avoid creating root-owned state on a fresh install.
+        yield
+        return
+    locks = directory / "locks"
+    if directory.is_symlink() or locks.is_symlink():
+        raise ValueError("Agent 维护锁目录不能是符号链接")
+    owner = database.stat()
+    try:
+        locks.mkdir(mode=0o700)
+    except FileExistsError:
+        if not locks.is_dir():
+            raise ValueError("Agent 维护锁目录不可用") from None
+    else:
+        os.chown(locks, owner.st_uid, owner.st_gid)
+    path = locks / "maintenance.lock"
+    created = False
+    try:
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        created = True
+    except FileExistsError:
+        descriptor = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("Agent 维护锁不是普通文件")
+        if created:
+            os.fchown(descriptor, owner.st_uid, owner.st_gid)
+        elif metadata.st_uid != owner.st_uid:
+            raise ValueError("Agent 维护锁属主与状态数据库不一致")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Agent 正在启动训练或执行其他升级，请稍后重试") from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def run(*args: str, events: InstallEvents, phase: str, label: str,
         heartbeat_seconds: float = 10, **kwargs):
     """Drain both pipes as one UTF-8 stream, including CR and unterminated lines."""
@@ -434,7 +507,15 @@ def runtime_request(args, prefix: Path) -> tuple[str, str | None]:
             raise ValueError("Conda 可执行文件不可用；请修复 Conda 后重试")
     runtime = prefix / ".venv"
     if runtime.is_symlink():
-        raise ValueError("Agent Python 环境不能是指向其他环境的符号链接")
+        target = runtime.resolve(strict=True)
+        releases = prefix / "runtimes"
+        marker = target / "vla-training-runtime.json"
+        if (releases.is_symlink() or target.parent != releases.resolve()
+                or marker.is_symlink() or not marker.is_file()):
+            raise ValueError("Agent Python 环境不能是指向其他环境的符号链接")
+        identity = json.loads(marker.read_text())
+        if identity.get("schema_version") != 1 or identity.get("runtime_path") != str(target):
+            raise ValueError("Agent Python 版本环境身份无效")
     if runtime.exists():
         conda_marker, venv_marker = runtime / "conda-meta", runtime / "pyvenv.cfg"
         if (not runtime.is_dir() or conda_marker.is_symlink() or venv_marker.is_symlink()
@@ -448,12 +529,27 @@ class AgentRuntime:
         self.path = path
         self.kind = kind
         self.backup = backup
+        self.link: Path | None = None
+        self.previous_target: str | None = None
+        self.activated = False
 
     @property
     def python(self) -> Path:
         return self.path / "bin/python"
 
     def rollback(self, events: InstallEvents) -> None:
+        if self.link is not None:
+            if self.activated:
+                if self.link.is_symlink():
+                    self.link.unlink()
+                if self.backup is not None:
+                    self.backup.replace(self.link)
+                    self.backup = None
+                elif self.previous_target is not None:
+                    self.link.symlink_to(self.previous_target, target_is_directory=True)
+                self.activated = False
+                events.emit("ENVIRONMENT", "已恢复升级前的 Agent Python 环境链接", level="warning")
+            return
         if self.backup is not None:
             if self.path.is_symlink():
                 self.path.unlink()
@@ -463,22 +559,41 @@ class AgentRuntime:
             self.backup = None
             events.emit("ENVIRONMENT", "已恢复升级前的 Agent Python 环境", level="warning")
 
+    def activate(self, prefix: Path, build_id: str | None = None) -> None:
+        """Publish only after dependencies and package checks have succeeded."""
+        marker = self.path / "vla-training-runtime.json"
+        marker.write_text(json.dumps({"schema_version": 1, "runtime_path": str(self.path.resolve()),
+                                      "build_id": build_id}))
+        marker.chmod(0o644)
+        link = prefix / ".venv"
+        self.link = link
+        if link.is_symlink():
+            self.previous_target = os.readlink(link)
+        elif link.exists():
+            self.backup = prefix / (".venv.before-release-" + secrets.token_hex(8))
+            link.replace(self.backup)
+        staged = prefix / (".venv.activating-" + secrets.token_hex(8))
+        try:
+            staged.symlink_to(self.path, target_is_directory=True)
+            os.replace(staged, link)
+            self.activated = True
+        except BaseException:
+            if self.backup is not None and not link.exists():
+                self.backup.replace(link)
+                self.backup = None
+            raise
+        finally:
+            staged.unlink(missing_ok=True)
+
 
 def prepare_runtime(prefix: Path, kind: str, conda: str | None, events: InstallEvents) -> AgentRuntime:
-    """Create only an Agent-owned runtime; never install into Conda base or training."""
-    path = prefix / ".venv"
-    if path.exists() and (path / "conda-meta").is_dir():
-        events.emit("ENVIRONMENT", f"复用 Agent 专用 Conda 环境：{path}")
-        return AgentRuntime(path, "conda")
-    if path.exists() and kind == "venv":
-        events.emit("ENVIRONMENT", f"复用 Agent 独立 Python venv：{path}")
-        return AgentRuntime(path, "venv")
+    """Stage a new runtime; installed releases are immutable while jobs use them."""
+    releases = prefix / "runtimes"
+    if releases.is_symlink():
+        raise ValueError("Agent 版本环境目录不能是符号链接")
+    releases.mkdir(mode=0o755, exist_ok=True)
+    path = releases / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + secrets.token_hex(8))
     runtime = AgentRuntime(path, kind)
-    if path.exists():
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        runtime.backup = prefix / (".venv.before-conda-" + stamp + "-" + secrets.token_hex(4))
-        path.replace(runtime.backup)
-        events.emit("ENVIRONMENT", "已备份原 Agent venv，开始迁移到专用 Conda 环境")
     try:
         if kind == "conda":
             env = runtime_environment()
@@ -489,9 +604,7 @@ def prepare_runtime(prefix: Path, kind: str, conda: str | None, events: InstallE
             run(sys.executable, "-I", "-m", "venv", str(path), env=runtime_environment(),
                 events=events, phase="ENVIRONMENT", label="创建 Agent 独立 Python venv")
     except BaseException:
-        if runtime.backup is not None:
-            runtime.rollback(events)
-        elif path.is_symlink():
+        if path.is_symlink():
             path.unlink()
         elif path.exists():
             # Only this invocation created the path. Remove an incomplete Conda
@@ -571,6 +684,11 @@ def _install(args, events: InstallEvents) -> None:
     source = Path(args.config).resolve(strict=True)
     events.protect_configuration(json.loads(source.read_text()))
     config = read_configuration(source, prefix)
+    with installation_lock(config["state_dir"]):
+        return _install_locked(args, events, prefix, account, kind, conda, config)
+
+
+def _install_locked(args, events: InstallEvents, prefix: Path, account, kind: str, conda: str | None, config: dict) -> None:
     events.emit("CHECKING", "配置检查通过；训练 Python 环境保持独立")
     wheel = verify_bundle()
     events.emit("CHECKING", "安装包 manifest 与所有文件 SHA256 校验通过")
@@ -587,9 +705,19 @@ def _install(args, events: InstallEvents) -> None:
         previous_config = old
         if old.get("state_dir") != config["state_dir"]:
             raise RuntimeError("升级不能更换 Agent state_dir；请保留已有节点凭据和执行状态")
-        require_no_active_attempts(old["state_dir"], prefix / ".venv/bin/python")
+        require_upgrade_safe(old["state_dir"], prefix / ".venv/bin/python")
         previous_account = previous_service_account(unit)
-    require_no_active_attempts(config["state_dir"], prefix / ".venv/bin/python")
+    status = require_upgrade_safe(config["state_dir"], prefix / ".venv/bin/python")
+    def check_live_service(status):
+        if not status["active_attempts"]:
+            return
+        if (previous_account is None or previous_account.pw_uid != account.pw_uid
+                or previous_account.pw_gid != account.pw_gid or not (prefix / ".venv").is_symlink()):
+            raise RuntimeError("该 Agent 仍有活动训练，不能迁移运行账户或旧版 Python 环境；请等待训练结束")
+        kill_mode = subprocess.check_output(["systemctl", "show", unit, "--property=KillMode", "--value"], text=True).strip()
+        if kill_mode != "process":
+            raise RuntimeError("该 Agent 仍有活动训练，当前 systemd 服务不能保留独立训练进程；请等待训练结束")
+    check_live_service(status)
     unit_path = SYSTEMD_UNIT_DIRECTORY / unit
     config_snapshot, unit_snapshot = FileSnapshot(old_config), FileSnapshot(unit_path)
     prefix.mkdir(parents=True, exist_ok=True)
@@ -605,8 +733,9 @@ def _install(args, events: InstallEvents) -> None:
     service_start_attempted = False
     files_changed = False
     try:
-        require_no_active_attempts(config["state_dir"], prefix / ".venv/bin/python")
-        ownership = ownership_migration(account, previous_account) if previous_account is not None else None
+        status = require_upgrade_safe(config["state_dir"], prefix / ".venv/bin/python")
+        check_live_service(status)
+        ownership = ownership_migration(account, previous_account) if previous_account is not None and not status["active_attempts"] else None
         for path, mode, recursive in [(prefix / "home", 0o700, True), (prefix / "tmp", 0o700, True),
                                       (absolute_path(config["state_dir"]), 0o700, True),
                                       (absolute_path(config["output_root"]), 0o755, False)]:
@@ -626,6 +755,9 @@ def _install(args, events: InstallEvents) -> None:
             events=events, phase="PACKAGE", label="安装 Agent 平台程序")
         run(str(runtime.python), "-I", "-m", "pip", "check", env=env,
             events=events, phase="VERIFY", label="检查 Agent 依赖完整性")
+        release = json.loads((BUNDLE / "release.json").read_text()) if (BUNDLE / "release.json").is_file() else {}
+        runtime.activate(prefix, release.get("build_id"))
+        events.emit("PACKAGE", "新版本环境已就绪并切换；保留旧版本供现有训练监控继续使用")
         events.emit("CONFIG", "写入受限访问的 Agent 配置，保留原配置备份")
         config_dir = prefix / "config"
         config_dir.mkdir(exist_ok=True)

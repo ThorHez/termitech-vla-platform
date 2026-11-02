@@ -6,7 +6,9 @@ import { assetKinds } from './data';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
 import { datasetFormatProfile } from './datasetFormatTemplateData';
 import { boundDatasetNorm, datasetNormSelectionError } from './datasetNormAssets';
-import type { Asset, Node } from './types';
+import { DatasetValidation } from './DatasetValidation';
+import { DatasetStatistics } from './DatasetStatistics';
+import type { Asset, Node, Profile } from './types';
 import './asset-detail.css';
 
 export function AssetDetail({
@@ -19,6 +21,10 @@ export function AssetDetail({
   sync,
   remove,
   saveTemplate,
+  profiles,
+  validationChanged,
+  datasetChoices,
+  selectDataset,
 }: {
   asset: Asset;
   node?: Node;
@@ -29,6 +35,10 @@ export function AssetDetail({
   sync: () => void;
   remove: () => void;
   saveTemplate?: () => void;
+  profiles?: Profile[];
+  validationChanged?: () => void;
+  datasetChoices?: Asset[];
+  selectDataset?: (id: string) => void;
 }) {
   const { can } = useAuth();
   const state = asset.status || asset.state || 'REGISTERED';
@@ -37,7 +47,9 @@ export function AssetDetail({
   const writable = can('assets.write') && !archived;
   const dataset = asset.kind === 'DATASET';
   const profile = dataset ? readDatasetProfile(asset.metadata?.dataset_profile) : undefined;
-  const templateProfile = dataset ? datasetFormatProfile(asset.metadata?.dataset_profile) : undefined;
+  const templateProfile = dataset
+    ? datasetFormatProfile(asset.metadata?.dataset_profile)
+    : undefined;
   const norm = dataset ? boundDatasetNorm(asset, assets) : undefined;
   const normError = dataset
     ? datasetNormSelectionError(asset.node_id, asset.norm_asset_id, assets)
@@ -69,8 +81,24 @@ export function AssetDetail({
     >
       <div className="asset-detail-heading">
         <h3>{asset.name}</h3>
-        <Badge state={state} />
+        <Badge state={state} label={dataset && state === 'REGISTERED' ? '已登记' : undefined} />
       </div>
+      {dataset && selectDataset && (datasetChoices?.length || 0) > 1 && (
+        <label className="asset-detail-dataset-picker">
+          <span>集合中的数据集</span>
+          <select
+            aria-label="集合中的数据集"
+            value={asset.id}
+            onChange={(event) => selectDataset(event.target.value)}
+          >
+            {datasetChoices!.map((choice) => (
+              <option key={choice.id} value={choice.id}>
+                {choice.name}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       {writable && (
         <section className="asset-detail-section asset-detail-action-section">
           <h4>资产操作</h4>
@@ -89,7 +117,8 @@ export function AssetDetail({
             )}
             {templateProfile && saveTemplate && (
               <button type="button" className="button outline" onClick={saveTemplate}>
-                <Save size={15} />保存为格式模板
+                <Save size={15} />
+                保存为格式模板
               </button>
             )}
             {['DATASET', 'MODEL', 'NORM'].includes(asset.kind) && (
@@ -137,6 +166,22 @@ export function AssetDetail({
           </dd>
         </div>
       </dl>
+      {dataset && (
+        <DatasetStatistics
+          key={`${asset.id}:${asset.norm_asset_id || ''}`}
+          asset={asset}
+          node={node}
+        />
+      )}
+      {dataset && (
+        <DatasetValidation
+          key={asset.id}
+          asset={asset}
+          node={node}
+          profiles={profiles}
+          changed={validationChanged}
+        />
+      )}
       {dataset && (
         <section className="asset-detail-section">
           <h4>数据集特征</h4>

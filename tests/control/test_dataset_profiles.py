@@ -120,7 +120,16 @@ def test_profile_update_only_changes_its_namespace_preserving_asset_and_frozen_r
     response = patch_profile(platform, asset, changed)
     assert response.status_code == 200, response.text
     after = asset_row(platform, asset["id"])
-    assert after == {**before, "metadata": {**before["metadata"], "dataset_profile": normalize_dataset_profile(changed)}}
+    assert {key: value for key, value in after.items() if key != "metadata"} == {
+        key: value for key, value in before.items() if key != "metadata"}
+    assert {key: value for key, value in after["metadata"].items() if key != "_dataset_validation"} == {
+        **{key: value for key, value in before["metadata"].items() if key != "_dataset_validation"},
+        "dataset_profile": normalize_dataset_profile(changed)}
+    validation = after["metadata"]["_dataset_validation"]
+    assert validation["status"] == "STALE" and validation["error"]["code"] == "DATASET_VALIDATION_INPUT_CHANGED"
+    assert {key: value for key, value in validation.items() if key not in {"status", "error"}} == {
+        key: value for key, value in before["metadata"]["_dataset_validation"].items() if key not in {"status", "error"}}
+    assert response.json()["validation"]["status"] == "STALE" and "_dataset_validation" not in response.json()["metadata"]
     assert response.json()["state"] == "READY"
     assert platform.get_run(run)["code_expectation"] == frozen_before["code_expectation"]
     assert platform.get_run(run)["parameters"] == frozen_before["parameters"]

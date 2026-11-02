@@ -45,6 +45,19 @@ export interface Node {
   gpus?: Gpu[];
   metrics?: JsonObject;
 }
+export interface DatasetSourceValidation {
+  id?: string | null;
+  status: 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'STALE' | 'BLOCKED';
+  scope: 'dataset_source';
+  profile_id?: string | null;
+  requested_at?: string | null;
+  completed_at?: string | null;
+  checked_at?: string | null;
+  reason?: string | null;
+  error?: { code: string; message: string } | null;
+  checks?: { name: string; ok: boolean; message?: string }[];
+  source_fingerprint?: unknown;
+}
 export interface Asset {
   id: string;
   name: string;
@@ -56,7 +69,9 @@ export interface Asset {
   state?: string;
   metadata?: JsonObject;
   norm_asset_id?: string | null;
+  origin_attempt_id?: string | null;
   created_at?: string;
+  validation?: DatasetSourceValidation | null;
 }
 export interface PathSuggestion {
   name: string;
@@ -259,6 +274,7 @@ export interface Profile {
   execution_mode?: string;
   docker_image?: string;
   metadata?: JsonObject;
+  active?: boolean;
 }
 export interface RuntimeCheck {
   profile_id: string;
@@ -327,7 +343,7 @@ export interface RemoteDeployment {
     | 'INTERRUPTED'
     | 'DISCONNECTED'
     | 'UNINSTALLED';
-  operation?: 'install' | 'disconnect' | 'uninstall';
+  operation?: 'install' | 'upgrade' | 'disconnect' | 'uninstall';
   operation_result?: {
     backup_dir?: string;
     removed_paths?: string[];
@@ -363,6 +379,13 @@ export interface NodeManagementInfo {
   deployment_id?: string | null;
   can_disconnect: boolean;
   can_uninstall: boolean;
+  can_upgrade?: boolean;
+  upgrade_reason?: string | null;
+  current_version?: string | null;
+  target_version?: string | null;
+  current_build_id?: string | null;
+  target_build_id?: string | null;
+  latest_upgrade?: RemoteDeployment | null;
   reason: string;
   disconnect_reason?: string | null;
   uninstall_reason?: string | null;

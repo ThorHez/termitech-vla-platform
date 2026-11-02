@@ -1,6 +1,8 @@
 """An in-progress source write cannot race a newly delivered START."""
 
 from types import SimpleNamespace
+import fcntl
+from pathlib import Path
 import subprocess
 import pytest
 
@@ -46,6 +48,42 @@ def test_start_remains_retryable_until_writer_releases_checkout(agent_fixture, m
         assert agent.state.attempt(payload["attempt_id"])["state"] == "STARTING"
         agent.poll_commands()
         assert len(launches) == 1
+    finally:
+        agent.close()
+
+
+def test_upgrade_maintenance_defers_start_and_recovery_without_rejecting_command(agent_fixture, monkeypatch):
+    payload = agent_fixture["payload"]
+    command = {"id": "start-during-upgrade", "type": "START", "payload": payload}
+    acknowledgements, launches = [], []
+
+    class Client:
+        def request(self, method, path, token, body=None):
+            if method == "GET":
+                return [command]
+            acknowledgements.append(body)
+            return {"ok": True}
+
+    agent = Agent(agent_fixture["config"], client=Client())
+    agent.credentials = {"node_id": "node", "token": "token"}
+    monkeypatch.setattr(agent, "_launch_runner", lambda attempt: launches.append(attempt["id"]))
+    locks = Path(agent.config["state_dir"]) / "locks"
+    locks.mkdir(exist_ok=True)
+    try:
+        with (locks / "maintenance.lock").open("a") as maintenance:
+            fcntl.flock(maintenance, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            agent.poll_commands()
+            assert not launches and not acknowledgements
+            assert agent.state.attempt(payload["attempt_id"]) is None
+            assert agent.state.command(command["id"]) is None
+            # An already durable START must also wait for release switching.
+            agent.state.create_attempt(payload, str(Path(agent.config["output_root"]) / payload["attempt_id"]))
+            agent._recover_runners()
+            assert not launches
+        agent.poll_commands()
+        assert launches == [payload["attempt_id"]]
+        assert acknowledgements[0]["status"] == "APPLIED"
+        assert acknowledgements[0]["result"]["duplicate"]
     finally:
         agent.close()
 

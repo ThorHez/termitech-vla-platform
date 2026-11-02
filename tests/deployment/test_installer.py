@@ -1,4 +1,5 @@
 import hashlib
+import fcntl
 import importlib.util
 import json
 from pathlib import Path
@@ -417,25 +418,27 @@ def test_conda_creates_dedicated_environment_without_touching_base_or_training(t
     monkeypatch.setattr(installer, "run", lambda *argv, **kw: calls.append((argv, kw)))
     runtime = installer.prepare_runtime(tmp_path, "conda", "/opt/conda/bin/conda", installer.InstallEvents())
     argv, options = calls[0]
-    assert argv == ("/opt/conda/bin/conda", "create", "--prefix", str(tmp_path / ".venv"),
+    assert argv == ("/opt/conda/bin/conda", "create", "--prefix", str(runtime.path),
                     "python=3.11", "pip", "--yes")
     assert options["env"]["CONDA_PKGS_DIRS"] == str(tmp_path / "conda-pkgs")
     assert not {"PYTHONHOME", "PYTHONPATH", "CONDA_PREFIX"} & options["env"].keys()
-    assert runtime.python == tmp_path / ".venv/bin/python"
+    assert runtime.path.parent == tmp_path / "runtimes"
+    assert runtime.python == runtime.path / "bin/python"
     assert runtime.kind == "conda"
     assert installer.os.environ["CONDA_PREFIX"] == "/training/conda-env"
 
 
-@pytest.mark.parametrize("selected,existing,expected", [("conda", "conda", "conda"),
-                                                       ("venv", "conda", "conda"),
-                                                       ("venv", "venv", "venv")])
-def test_upgrade_reuses_existing_agent_runtime(tmp_path, monkeypatch, selected, existing, expected):
+@pytest.mark.parametrize("selected,existing", [("conda", "conda"), ("venv", "conda"), ("venv", "venv")])
+def test_upgrade_stages_fresh_runtime_without_modifying_existing_release(tmp_path, monkeypatch, selected, existing):
     path = tmp_path / ".venv"
     fake_runtime(path, existing)
     (path / "installed-package").write_text("keep")
-    monkeypatch.setattr(installer, "run", lambda *a, **kw: pytest.fail("Existing runtime must be reused"))
+    calls = []
+    monkeypatch.setattr(installer, "run", lambda *a, **kw: calls.append(a))
     runtime = installer.prepare_runtime(tmp_path, selected, "/opt/conda/bin/conda", installer.InstallEvents())
-    assert runtime.kind == expected
+    assert runtime.kind == selected
+    assert runtime.path.parent == tmp_path / "runtimes" and runtime.path != path
+    assert len(calls) == 1
     assert runtime.backup is None
     assert (path / "installed-package").read_text() == "keep"
 
@@ -444,11 +447,11 @@ def test_missing_conda_falls_back_to_isolated_default_python_venv(tmp_path, monk
     calls = []
     monkeypatch.setattr(installer, "run", lambda *argv, **kw: calls.append((argv, kw)))
     runtime = installer.prepare_runtime(tmp_path, "venv", None, installer.InstallEvents())
-    assert calls[0][0] == (sys.executable, "-I", "-m", "venv", str(tmp_path / ".venv"))
+    assert calls[0][0] == (sys.executable, "-I", "-m", "venv", str(runtime.path))
     assert runtime.kind == "venv"
 
 
-def test_venv_migration_keeps_backup_and_restores_it_on_creation_failure(tmp_path, monkeypatch):
+def test_runtime_creation_failure_leaves_existing_venv_untouched(tmp_path, monkeypatch):
     path = tmp_path / ".venv"
     fake_runtime(path)
     (path / "old-package").write_text("old installation")
@@ -456,9 +459,8 @@ def test_venv_migration_keeps_backup_and_restores_it_on_creation_failure(tmp_pat
 
     def fail_conda(*argv, **kwargs):
         calls.append(argv)
-        assert not path.exists()
-        assert len(list(tmp_path.glob(".venv.before-conda-*"))) == 1
-        fake_runtime(path, "conda")
+        assert (path / "old-package").read_text() == "old installation"
+        fake_runtime(Path(argv[argv.index("--prefix") + 1]), "conda")
         raise installer.InstallCommandError("Conda channel unavailable")
 
     monkeypatch.setattr(installer, "run", fail_conda)
@@ -476,7 +478,7 @@ def test_failed_fresh_conda_creation_removes_partial_environment_for_retry(tmp_p
 
     def fail_conda(*argv, **kwargs):
         calls.append(argv)
-        fake_runtime(tmp_path / ".venv", "conda")
+        fake_runtime(Path(argv[argv.index("--prefix") + 1]), "conda")
         raise installer.InstallCommandError("Conda channel unavailable")
 
     monkeypatch.setattr(installer, "run", fail_conda)
@@ -484,6 +486,7 @@ def test_failed_fresh_conda_creation_removes_partial_environment_for_retry(tmp_p
         installer.prepare_runtime(tmp_path, "conda", "/opt/conda/bin/conda", installer.InstallEvents())
     assert len(calls) == 1
     assert not (tmp_path / ".venv").exists()
+    assert not list((tmp_path / "runtimes").iterdir())
 
 
 def test_service_user_verifies_target_interpreter_and_pip_in_isolation(tmp_path, monkeypatch):
@@ -531,6 +534,60 @@ def test_runtime_guard_rejects_link_to_training_environment(tmp_path):
     assert (training / "conda-meta").is_dir()
 
 
+def test_release_activation_switches_link_and_rollback_preserves_both_environments(tmp_path):
+    old, new = tmp_path / "runtimes/old", tmp_path / "runtimes/new"
+    fake_runtime(old)
+    fake_runtime(new)
+    (old / "old-package").write_text("still running")
+    (tmp_path / ".venv").symlink_to(old, target_is_directory=True)
+    runtime = installer.AgentRuntime(new, "venv")
+    runtime.activate(tmp_path, "a" * 64)
+    assert (tmp_path / ".venv").resolve() == new
+    assert json.loads((new / "vla-training-runtime.json").read_text()) == {
+        "schema_version": 1, "runtime_path": str(new), "build_id": "a" * 64}
+    assert installer.runtime_request(SimpleNamespace(runtime_kind="venv"), tmp_path) == ("venv", None)
+    runtime.rollback(installer.InstallEvents())
+    assert (tmp_path / ".venv").resolve() == old
+    assert (old / "old-package").read_text() == "still running"
+    assert (new / "bin/python").is_file()
+
+
+def test_legacy_activation_restores_directory_on_failure(tmp_path):
+    old = tmp_path / ".venv"
+    new = tmp_path / "runtimes/new"
+    fake_runtime(old)
+    fake_runtime(new)
+    (old / "old-package").write_text("legacy")
+    runtime = installer.AgentRuntime(new, "venv")
+    runtime.activate(tmp_path)
+    assert old.is_symlink() and runtime.backup.is_dir()
+    runtime.rollback(installer.InstallEvents())
+    assert not old.is_symlink() and (old / "old-package").read_text() == "legacy"
+
+
+@pytest.mark.parametrize("proof", [
+    {"protocol_version": 1, "upgrade_safe": True, "active_attempts": 1},
+    {"protocol_version": 1, "upgrade_safe": False, "active_attempts": 1},
+    {"protocol_version": 0, "upgrade_safe": True, "active_attempts": 1},
+])
+def test_local_upgrade_guard_only_accepts_isolated_supervisor_evidence(tmp_path, monkeypatch, proof):
+    (tmp_path / "agent.sqlite3").touch()
+    interpreter = tmp_path / "bin/python"
+    interpreter.parent.mkdir()
+    interpreter.touch()
+    def legacy_guard(*args):
+        raise RuntimeError("活动或待对账任务")
+    monkeypatch.setattr(installer, "require_no_active_attempts", legacy_guard)
+    calls = []
+    monkeypatch.setattr(installer.subprocess, "check_output", lambda argv, **kw: calls.append(argv) or json.dumps(proof))
+    if proof["protocol_version"] == 1 and proof["upgrade_safe"]:
+        assert installer.require_upgrade_safe(str(tmp_path), interpreter) == proof
+    else:
+        with pytest.raises(RuntimeError, match="待对账"):
+            installer.require_upgrade_safe(str(tmp_path), interpreter)
+    assert "vla_agent.runner_runtime" in calls[0][3]
+
+
 def test_failed_dependency_upgrade_restores_venv_before_restarting_original_service(tmp_path, monkeypatch):
     prefix = tmp_path / "agent"
     fake_runtime(prefix / ".venv")
@@ -555,8 +612,8 @@ def test_failed_dependency_upgrade_restores_venv_before_restarting_original_serv
     def run(*argv, **kwargs):
         calls.append((argv, kwargs))
         if argv[0] == str(conda):
-            fake_runtime(prefix / ".venv", "conda")
-        if argv[:5] == (str(prefix / ".venv/bin/python"), "-I", "-m", "pip", "install"):
+            fake_runtime(Path(argv[argv.index("--prefix") + 1]), "conda")
+        if argv[1:5] == ("-I", "-m", "pip", "install"):
             assert kwargs["env"]["PIP_REQUIRE_VIRTUALENV"] == "false"
             raise installer.InstallCommandError("dependency download failed")
         if argv[:2] == ("systemctl", "start"):
@@ -624,6 +681,21 @@ def test_root_state_reader_prefers_existing_agent_interpreter(tmp_path, monkeypa
     monkeypatch.setattr(installer.subprocess, "check_output", lambda argv, **kw: calls.append(argv) or "0\n")
     installer.require_no_active_attempts(str(tmp_path), runtime_python)
     assert calls[0][4:7] == [str(runtime_python), "-I", "-c"]
+
+
+def test_installer_maintenance_lock_excludes_training_start_and_releases_after_failure(tmp_path):
+    (tmp_path / "agent.sqlite3").touch()
+    with installer.installation_lock(str(tmp_path)):
+        with (tmp_path / "locks/maintenance.lock").open("rb") as training:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(training.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+    with (tmp_path / "locks/maintenance.lock").open("rb") as training:
+        fcntl.flock(training.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="正在启动训练"):
+            with installer.installation_lock(str(tmp_path)):
+                pytest.fail("Must not install while START holds the shared lock")
+    with installer.installation_lock(str(tmp_path)):
+        pass
 
 
 def account(name="operator", uid=123, gid=456):
@@ -748,6 +820,55 @@ def upgrade_fixture(tmp_path, monkeypatch):
     return args, prefix, selected, previous, unit_directory / "test-agent.service"
 
 
+def test_live_upgrade_keeps_active_runtime_and_never_migrates_its_ownership(tmp_path, monkeypatch):
+    args, prefix, selected, _, _ = upgrade_fixture(tmp_path, monkeypatch)
+    old = prefix / "runtimes/old"
+    old.parent.mkdir()
+    (prefix / ".venv").replace(old)
+    (old / "still-running").write_text("unchanged")
+    (old / "vla-training-runtime.json").write_text(json.dumps({"schema_version": 1, "runtime_path": str(old)}))
+    (prefix / ".venv").symlink_to(old, target_is_directory=True)
+    monkeypatch.setattr(installer, "previous_service_account", lambda unit: selected)
+    proof = {"protocol_version": 1, "upgrade_safe": True, "active_attempts": 1}
+    checks = []
+    monkeypatch.setattr(installer, "require_upgrade_safe", lambda *args: checks.append(args) or proof)
+    monkeypatch.setattr(installer.subprocess, "check_output", lambda *a, **kw: "process\n")
+    monkeypatch.setattr(installer, "verify_training_interpreters", lambda *a: None)
+    monkeypatch.setattr(installer, "verify_runtime", lambda *a: None)
+    monkeypatch.setattr(installer, "own_directory", lambda *a: None)
+    monkeypatch.setattr(installer.os, "chown", lambda *a, **kw: None)
+    monkeypatch.setattr(installer, "ownership_migration", lambda *a: pytest.fail("Active training files must not be traversed"))
+    calls = []
+    def run(*argv, **kwargs):
+        calls.append(argv)
+        if argv[1:4] == ("-I", "-m", "venv"):
+            fake_runtime(Path(argv[4]))
+    monkeypatch.setattr(installer, "run", run)
+    installer._install(args, installer.InstallEvents())
+    assert len(checks) == 3
+    assert (prefix / ".venv").resolve() != old
+    assert (old / "still-running").read_text() == "unchanged"
+    installs = [argv for argv in calls if argv[1:5] == ("-I", "-m", "pip", "install")]
+    assert installs and all(str(old) not in argv[0] for argv in installs)
+
+
+@pytest.mark.parametrize("guard", ["legacy-runtime", "account", "kill-mode"])
+def test_live_upgrade_rejects_runtime_or_service_migration_before_stop(tmp_path, monkeypatch, guard):
+    args, prefix, selected, previous, _ = upgrade_fixture(tmp_path, monkeypatch)
+    if guard != "legacy-runtime":
+        old = prefix / "runtimes/old"
+        old.parent.mkdir()
+        (prefix / ".venv").replace(old)
+        (old / "vla-training-runtime.json").write_text(json.dumps({"schema_version": 1, "runtime_path": str(old)}))
+        (prefix / ".venv").symlink_to(old, target_is_directory=True)
+    monkeypatch.setattr(installer, "previous_service_account", lambda unit: previous if guard == "account" else selected)
+    monkeypatch.setattr(installer, "require_upgrade_safe", lambda *a: {"active_attempts": 1, "upgrade_safe": True})
+    monkeypatch.setattr(installer.subprocess, "check_output", lambda *a, **kw: "control-group\n")
+    monkeypatch.setattr(installer, "run", lambda *a, **kw: pytest.fail("Service stopped before live-upgrade safety check"))
+    with pytest.raises(RuntimeError, match="活动训练"):
+        installer._install(args, installer.InstallEvents())
+
+
 @pytest.mark.parametrize("failure", ["permission", "timeout"])
 def test_training_access_failure_precedes_service_stop_and_all_migrations(tmp_path, monkeypatch, failure):
     args, prefix, selected, previous, unit = upgrade_fixture(tmp_path, monkeypatch)
@@ -799,6 +920,8 @@ def test_ssh_account_upgrade_rolls_back_files_and_ownership_before_old_service_r
     monkeypatch.setattr(installer, "ownership_migration", migration_factory)
     def run(*argv, **kwargs):
         calls.append(argv)
+        if argv[1:4] == ("-I", "-m", "venv"):
+            fake_runtime(Path(argv[4]))
         if argv[:3] == ("systemctl", "enable", "--now"):
             assert "User=ssh-user\n" in unit.read_text()
             assert "Group=456\n" in unit.read_text()

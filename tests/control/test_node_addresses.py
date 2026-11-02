@@ -99,6 +99,19 @@ def test_latest_completed_success_wins_including_an_older_job_retried_later(plat
     assert listed(platform, node)["connection_address"]["host"] == "192.0.2.10"
 
 
+def test_successful_upgrade_retains_authoritative_address_and_ssh_transfer_binding(platform):
+    from vla_control.checkpoint_transfers import _connection
+
+    node = platform.register()
+    install(platform, node, "192.0.2.10")
+    upgrade_id = install(platform, node, "192.0.2.20", operation="upgrade",
+                         created="2026-10-02T00:00:00.000000+00:00")
+    assert detail(platform, node)["connection_address"]["host"] == "192.0.2.20"
+    with platform.app.state.db.read() as session:
+        selected = _connection(session, node["node_id"])
+        assert selected.id == session.get(RemoteDeployment, upgrade_id).connection_id
+
+
 def test_installations_are_scoped_to_the_exact_machine_and_ssh_overrides_hostname_fallback(platform):
     first = platform.register(name="first")
     second = platform.register(name="second")

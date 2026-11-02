@@ -38,6 +38,61 @@ _INSTALL_PHASES = frozenset({"CHECKING", "ENVIRONMENT", "DEPENDENCIES", "PACKAGE
 _OUTPUT_LIMIT = 256 * 1024
 _STREAM_LIMIT = 2 * 1024 * 1024
 _LINE_LIMIT = 16 * 1024
+
+# Only these public settings leave the target during maintenance. Unknown and
+# private settings are preserved by the merge on the target itself.
+_UPGRADE_CONFIG_FIELDS = ("name", "roots", "output_root", "cache_root", "state_dir",
+    "poll_interval_seconds", "heartbeat_interval_seconds", "http_timeout_seconds", "event_batch_size",
+    "cancel_grace_seconds")
+_UPGRADE_PROFILE_FIELDS = ("id", "name", "adapter", "code_dir", "python", "recipe", "execution_mode", "docker_image")
+
+
+def upgrade_public_config(config):
+    result = {key: config[key] for key in _UPGRADE_CONFIG_FIELDS if key in config}
+    result["profiles"] = [{key: profile[key] for key in _UPGRADE_PROFILE_FIELDS if key in profile}
+                          for profile in config.get("profiles", [])]
+    return result
+
+
+_UPGRADE_MERGE_SCRIPT = r'''
+import json, os, pathlib, pwd, subprocess, sys
+source, prefix = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+incoming = json.loads(source.read_text())
+old = json.loads((prefix / 'config/agent.json').read_text())
+config_fields = ''' + repr(_UPGRADE_CONFIG_FIELDS) + r'''
+profile_fields = ''' + repr(_UPGRADE_PROFILE_FIELDS) + r'''
+public = {key: old[key] for key in config_fields if key in old}
+public['profiles'] = [{key: p[key] for key in profile_fields if key in p} for p in old.get('profiles', [])]
+if public != incoming['_upgrade_expected']:
+    raise SystemExit('AGENT_UPGRADE_CONFIG_CHANGED')
+database = pathlib.Path(old['state_dir']) / 'agent.sqlite3'
+# Even a mode=ro WAL reader can create sidecars. Use the database owner so a
+# sudo installation cannot strand a non-root Agent with root-owned WAL/SHM.
+reader = ("import json,pathlib,sqlite3,sys; p=pathlib.Path(sys.argv[1]).resolve(); "
+    "d=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True); "
+    "r=d.execute('SELECT value FROM credentials WHERE id=1').fetchone(); "
+    "v=json.loads(r[0]) if r else {}; print(json.dumps({'node_id':v.get('node_id')})); d.close()")
+agent_python = prefix / '.venv/bin/python'
+reader_python = str(agent_python) if agent_python.is_file() else sys.executable
+args = [reader_python, '-I', '-c', reader, str(database)]
+owner = database.stat().st_uid
+if os.geteuid() == 0 and owner != 0:
+    args = ['runuser', '-u', pwd.getpwuid(owner).pw_name, '--'] + args
+result = subprocess.run(args, capture_output=True, text=True, timeout=10)
+if result.returncode:
+    raise SystemExit('AGENT_UPGRADE_IDENTITY_UNAVAILABLE')
+identity = json.loads(result.stdout)
+if identity.get('node_id') != incoming['_upgrade_node_id']:
+    raise SystemExit('AGENT_UPGRADE_IDENTITY_CHANGED')
+# Keep all unknown settings, local histories, profile fields and metadata here;
+# they never need to cross SSH or be stored/exposed by the control plane.
+old['control_plane_url'] = incoming['control_plane_url']
+old['enrollment_token'] = incoming['enrollment_token']
+provenance = {p['id']: p['metadata']['onboarding_id'] for p in incoming['profiles']}
+for profile in old['profiles']:
+    profile['metadata'] = {**profile.get('metadata', {}), 'onboarding_id': provenance[profile['id']]}
+source.write_text(json.dumps(old, ensure_ascii=False))
+'''
 _ANSI = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)|\x1b\[[0-?]*[ -/]*(?:[@-~]|$)|\x1b[@-_]")
 _SECRET_KEY = r"(?:[a-z0-9_-]*(?:password|passwd|token|secret|api[_-]?key|credential)[a-z0-9_-]*|(?:private|access|client)[_-]?key|key|(?:proxy[_-]?)?authorization)"
 
@@ -204,7 +259,7 @@ def installation_idle(prefix, proc_root=pathlib.Path('/proc')):
 
 _PROBE_SCRIPT = r'''
 import json, os, pathlib, platform, pwd, shutil, sqlite3, subprocess, sys
-''' + _INSTALLATION_IDLE_SCRIPT + r'''
+''' + _INSTALLATION_IDLE_SCRIPT + "\nupgrade_config_fields = " + repr(_UPGRADE_CONFIG_FIELDS) + "\nupgrade_profile_fields = " + repr(_UPGRADE_PROFILE_FIELDS) + r'''
 prefix = pathlib.Path(sys.argv[1])
 checks = []
 def check(name, ok, message):
@@ -248,20 +303,31 @@ old = prefix / "config/agent.json"
 if old.is_file():
     try:
         config = json.loads(old.read_text())
-        existing = {key: config[key] for key in ("name", "roots", "output_root", "state_dir") if key in config}
+        existing = {key: config[key] for key in upgrade_config_fields if key in config}
         existing["profiles"] = []
         for profile in config.get("profiles", []):
-            safe = {key: profile[key] for key in ("id", "name", "adapter", "code_dir", "python", "recipe") if key in profile}
+            safe = {key: profile[key] for key in upgrade_profile_fields if key in profile}
             safe["metadata"] = {key: profile.get("metadata", {})[key] for key in ("validated", "simulation", "onboarding_id") if key in profile.get("metadata", {})}
             existing["profiles"].append(safe)
         state = pathlib.Path(config["state_dir"]) / "agent.sqlite3"
         if state.is_file():
-            reader = ("import json,pathlib,sqlite3,sys; p=pathlib.Path(sys.argv[1]).resolve(); "
-                "d=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True); "
-                "r=d.execute('SELECT value FROM credentials WHERE id=1').fetchone(); "
-                "v=json.loads(r[0]) if r else {}; "
-                "n=d.execute(\"SELECT COUNT(*) FROM attempts WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')\").fetchone()[0]; "
-                "print(json.dumps({'node_id':v.get('node_id'),'active_attempts':n}));d.close()")
+            reader = """import json,pathlib,sqlite3,sys
+p=pathlib.Path(sys.argv[1]).resolve()
+d=sqlite3.connect(p.as_uri()+'?mode=ro',uri=True)
+r=d.execute('SELECT value FROM credentials WHERE id=1').fetchone()
+v=json.loads(r[0]) if r else {}
+n=d.execute("SELECT COUNT(*) FROM attempts WHERE state NOT IN ('SUCCEEDED','FAILED','CANCELLED')").fetchone()[0]
+d.close()
+safe = n == 0
+if n:
+    try:
+        from vla_agent.runner_runtime import upgrade_status
+        proof=upgrade_status(str(p.parent))
+        safe=(proof.get('protocol_version') == 1 and proof.get('upgrade_safe') is True and proof.get('active_attempts') == n)
+    except Exception:
+        safe=False
+print(json.dumps({'node_id':v.get('node_id'),'active_attempts':n,'upgrade_safe':safe}))
+"""
             agent_python = prefix / ".venv/bin/python"
             reader_python = str(agent_python) if agent_python.is_file() else sys.executable
             args = [reader_python, "-I", "-c", reader, str(state)]
@@ -272,7 +338,8 @@ if old.is_file():
             if identity.returncode:
                 raise ValueError("state_read_failed")
             existing.update(json.loads(identity.stdout))
-            check("idle", existing.get("active_attempts", 0) == 0, "升级前需要先结束已有训练任务")
+            check("idle", existing.get("active_attempts", 0) == 0, "卸载或重新接入前需要先结束已有训练任务")
+            check("upgrade_safe", existing.get("upgrade_safe") is True, "活动训练需要由独立监控进程接管才能升级 Agent")
         result["existing_agent"] = existing
         check("existing_config", True, "已发现 Agent 配置，将保留机器身份和状态目录")
     except Exception:
@@ -379,14 +446,28 @@ def uninstall_agent(value, unit_directory=pathlib.Path('/etc/systemd/system')):
         codes = [safe_path(p['code_dir']) for p in profiles]
     except (ValueError, TypeError, KeyError):
         fail('AGENT_UNINSTALL_UNVERIFIED')
-    components = [prefix / name for name in ('.venv', 'config', 'home', 'tmp')]
+    components = [prefix / name for name in ('.venv', 'runtimes', 'config', 'home', 'tmp')]
+    components.extend(path for path in prefix.iterdir() if re.fullmatch(r'\.venv\.before-release-[0-9a-f]{16}', path.name))
     if not any(overlap(state, path) for path in components):
         components.append(state)
     else:
         fail('AGENT_UNINSTALL_UNSAFE_PATH')
     protected = [output, *codes]
     for path in components:
-        safe_path(str(path))
+        if path == prefix / '.venv' and path.is_symlink():
+            target = path.resolve(strict=True)
+            releases = safe_path(str(prefix / 'runtimes'))
+            marker = target / 'vla-training-runtime.json'
+            if target.parent != releases or not marker.is_file() or marker.is_symlink():
+                fail('AGENT_UNINSTALL_UNSAFE_PATH')
+            try:
+                identity = json.loads(marker.read_text())
+                if identity.get('schema_version') != 1 or identity.get('runtime_path') != str(target):
+                    fail('AGENT_UNINSTALL_UNSAFE_PATH')
+            except (ValueError, OSError):
+                fail('AGENT_UNINSTALL_UNSAFE_PATH')
+        else:
+            safe_path(str(path))
         if any(overlap(path, protected_path) for protected_path in protected):
             fail('AGENT_UNINSTALL_PROTECTED_PATH')
     for profile in profiles:
@@ -398,7 +479,7 @@ def uninstall_agent(value, unit_directory=pathlib.Path('/etc/systemd/system')):
             fail('AGENT_UNINSTALL_TRAINING_ENV_SHARED')
     # Only an Agent-owned state directory can be moved, even outside the prefix.
     allowed_state = {'agent.sqlite3', 'agent.sqlite3-wal', 'agent.sqlite3-shm',
-                     'instance-id', 'agent.lock', 'locks', 'runner-logs'}
+                     'instance-id', 'agent.lock', 'locks', 'runner-logs', 'runner-configs', 'dataset-validation-cache'}
     if not state.is_dir() or any(p.name not in allowed_state or p.is_symlink() for p in state.iterdir()):
         fail('AGENT_UNINSTALL_STATE_INVALID')
     agent_python = prefix / '.venv/bin/python'
@@ -728,6 +809,7 @@ class SSHRemote:
             result["checks"].insert(1, selection_error)
             result["_maintenance_python"] = runtime["python"]
         result["can_install"] = all(check.get("ok") is True for check in result["checks"])
+        result["can_upgrade"] = all(check.get("ok") is True for check in result["checks"] if check.get("name") != "idle")
         return result
 
     def install(self, bundle_path: str | Path, config: dict, install_dir: str,
@@ -753,7 +835,9 @@ class SSHRemote:
             sftp.put(str(bundle), remote_bundle)
             sftp.chmod(remote_bundle, 0o600)
             # Do not stage private configuration on the control plane's disk.
-            payload = json.dumps(config, ensure_ascii=False).encode()
+            upload_config = config if config.get("_operation") == "upgrade" else {
+                key: value for key, value in config.items() if not key.startswith("_")}
+            payload = json.dumps(upload_config, ensure_ascii=False).encode()
             sftp.putfo(io.BytesIO(payload), remote_config)
             sftp.chmod(remote_config, 0o600)
             sftp.close()
@@ -763,6 +847,12 @@ class SSHRemote:
             remote_hash = self.run("sha256sum -- " + shlex.quote(remote_bundle)).split()[0]
             if remote_hash != local_hash:
                 raise RemoteError("AGENT_BUNDLE_CHECKSUM_FAILED", "Agent 安装包传输校验失败，已停止安装")
+            if config.get("_operation") == "upgrade":
+                merge_command = " ".join(shlex.quote(part) for part in (
+                    runtime["python"], "-I", "-c", _UPGRADE_MERGE_SCRIPT, remote_config, prefix))
+                status, _ = self._execute(merge_command, sudo=sudo)
+                if status:
+                    raise RemoteError("AGENT_UPGRADE_CONFIG_CHANGED", "远端 Agent 身份或配置已变化，升级已停止；请刷新机器状态后重试")
             emit("installing", "正在安装 Agent 独立环境和系统服务，首次安装可能需要数分钟")
             secrets = [self._password]
 

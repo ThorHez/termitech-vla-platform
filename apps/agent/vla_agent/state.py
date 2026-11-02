@@ -28,13 +28,18 @@ class State:
                 CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, status TEXT NOT NULL, result TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL,
                     runner_identity TEXT, child_identity TEXT, output_dir TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0,
-                    last_seq INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+                    last_seq INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, runner_runtime TEXT);
                 CREATE TABLE IF NOT EXISTS events (attempt_id TEXT NOT NULL, seq INTEGER NOT NULL, type TEXT NOT NULL,
                     timestamp TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(attempt_id,seq));
                 CREATE TABLE IF NOT EXISTS artifact_receipts (attempt_id TEXT NOT NULL, identity TEXT NOT NULL,
                     path TEXT NOT NULL, output TEXT NOT NULL, available INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY(attempt_id,identity));
             """)
+            # Additive protocol migration: old, still-running Runners continue to
+            # use their existing columns and outbox while a new Agent starts.
+            db.execute("BEGIN IMMEDIATE")
+            if "runner_runtime" not in {row[1] for row in db.execute("PRAGMA table_info(attempts)")}:
+                db.execute("ALTER TABLE attempts ADD COLUMN runner_runtime TEXT")
         self.path.chmod(0o600)
 
     @contextmanager
@@ -69,10 +74,11 @@ class State:
         with self.connect() as db:
             db.execute("INSERT OR IGNORE INTO commands VALUES(?,?,?)", (command_id, status, json.dumps(result)))
 
-    def create_attempt(self, payload: dict, output_dir: str) -> bool:
+    def create_attempt(self, payload: dict, output_dir: str, runner_runtime: dict | None = None) -> bool:
         with self.connect() as db:
-            cursor = db.execute("INSERT OR IGNORE INTO attempts(id,payload,state,output_dir,updated_at) VALUES(?,?,?,?,?)",
-                                (payload["attempt_id"], json.dumps(payload), "STARTING", output_dir, utc_now()))
+            cursor = db.execute("INSERT OR IGNORE INTO attempts(id,payload,state,output_dir,updated_at,runner_runtime) VALUES(?,?,?,?,?,?)",
+                                (payload["attempt_id"], json.dumps(payload), "STARTING", output_dir, utc_now(),
+                                 json.dumps(runner_runtime) if runner_runtime else None))
             if not cursor.rowcount:
                 existing = json.loads(db.execute("SELECT payload FROM attempts WHERE id=?", (payload["attempt_id"],)).fetchone()[0])
                 if existing != payload:
@@ -84,7 +90,7 @@ class State:
         if row is None:
             return None
         result = dict(row)
-        for key in ("payload", "runner_identity", "child_identity"):
+        for key in ("payload", "runner_identity", "child_identity", "runner_runtime"):
             result[key] = json.loads(result[key]) if result[key] else None
         return result
 

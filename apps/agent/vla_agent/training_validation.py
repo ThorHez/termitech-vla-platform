@@ -29,6 +29,9 @@ from .safety import AgentError, allowed_path
 VALIDATION_SCOPE = "configuration_and_local_assets"
 PROBE_PREFIX = "VLA_PREFLIGHT:"
 PROBE_TIMEOUT_SECONDS = 90
+TRAINING_PROBE_BASE_TIMEOUT_SECONDS = 300
+PROBE_ADDITIONAL_DATASET_SECONDS = 60
+PROBE_MAX_TIMEOUT_SECONDS = 720
 PROBE_OUTPUT_BYTES = 1024 * 1024
 CACHE_PATH_KEYS = {"HF_DATASETS_CACHE", "HF_HOME", "HUGGINGFACE_HUB_CACHE", "HF_HUB_CACHE",
                    "TRANSFORMERS_CACHE", "TMPDIR", "TEMP", "TMP", "XDG_CACHE_HOME",
@@ -131,6 +134,7 @@ def prepare_launch(launch: dict, config: dict, requested_inputs: dict, *, expect
     except (ValueError, IndexError, TypeError) as exc:
         raise AgentError("PREFLIGHT_UNSUPPORTED", "训练适配器没有提供可自动预检的执行配置") from exc
     spec["allowed_roots"] = list(config["roots"])
+    spec["validation_cache_dir"] = str(Path(config["state_dir"]) / "dataset-validation-cache")
     spec["requested_inputs"] = {role: asset["path"] for role, asset in requested_inputs.items()}
     if expected_plan_digest is not None:
         spec["expected_plan_digest"] = expected_plan_digest
@@ -149,14 +153,34 @@ def _probe_spec(launch: dict, config: dict) -> tuple[list[str], dict]:
     except (ValueError, IndexError, TypeError) as exc:
         raise AgentError("PREFLIGHT_UNSUPPORTED", "训练适配器没有提供可自动预检的执行配置") from exc
     spec["allowed_roots"] = list(config["roots"])
+    spec["validation_cache_dir"] = str(Path(config["state_dir"]) / "dataset-validation-cache")
     spec.pop("expected_plan_digest", None)
     argv[index + 1] = json.dumps(spec, ensure_ascii=False, allow_nan=False)
     argv.append("--validate-only")
     return argv, spec
 
 
+def _training_probe_limits(spec: dict) -> tuple[int, int]:
+    """Scale only the training probe, using its validated asset bindings.
+
+    The training base includes native loader/cache initialization and sampling;
+    the generic subprocess default remains independent of this larger budget.
+    Keep a hard ceiling below the controller's current 900-second preflight
+    lifetime; a caller-supplied timeout never changes the execution budget.
+    """
+    try:
+        bindings = validate_binding_assets(spec.get("dataset_bindings"), spec.get("inputs", {}))
+    except (ValueError, TypeError, KeyError) as exc:
+        raise AgentError("PREFLIGHT_UNSUPPORTED", "训练数据集绑定无效，无法确定自动预检时限") from exc
+    count = len(bindings) if bindings is not None else 1
+    timeout = min(PROBE_MAX_TIMEOUT_SECONDS,
+                  TRAINING_PROBE_BASE_TIMEOUT_SECONDS + (count - 1) * PROBE_ADDITIONAL_DATASET_SECONDS)
+    return count, timeout
+
+
 def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
     argv, spec = _probe_spec(launch, config)
+    dataset_count, timeout = _training_probe_limits(spec)
     environment = {key: value for key, value in os.environ.items() if key not in PLATFORM_CREDENTIALS}
     environment.update({key: value for key, value in launch.get("env", {}).items() if key not in PLATFORM_CREDENTIALS})
     from .storage_configuration import cache_environment
@@ -165,7 +189,13 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
     environment.update({"CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu", "PYTHONDONTWRITEBYTECODE": "1",
                         "WANDB_MODE": "disabled", "WANDB_DISABLED": "true", "HF_HUB_OFFLINE": "1",
                         "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "PYTHONUNBUFFERED": "1"})
-    returncode, stdout, stderr = _probe_process(argv, launch["cwd"], environment)
+    try:
+        returncode, stdout, stderr = _probe_process(argv, launch["cwd"], environment, timeout=timeout)
+    except AgentError as exc:
+        if exc.code == "PREFLIGHT_TIMEOUT":
+            raise AgentError("PREFLIGHT_TIMEOUT",
+                f"训练配方自动预检包含 {dataset_count} 组数据集，超过总时限 {timeout:g} 秒，请检查本机环境和数据读取") from exc
+        raise
     responses = [line[len(PROBE_PREFIX):] for line in stdout.splitlines() if line.startswith(PROBE_PREFIX)]
     try:
         if len(responses) != 1:

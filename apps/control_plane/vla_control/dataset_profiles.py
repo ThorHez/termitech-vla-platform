@@ -144,6 +144,8 @@ def normalize_dataset_profile(value) -> dict:
 def validate_asset_metadata(kind, metadata) -> dict:
     """Keep existing metadata intact; reserve one validated dataset namespace."""
     clean = deepcopy(metadata)
+    if "_dataset_validation" in clean:
+        raise ValueError("_dataset_validation 是服务端保留的校验状态，不能从客户端提交")
     if "dataset_profile" in clean:
         if kind != "DATASET":
             raise ValueError("只有数据集资产可以登记数据集描述")

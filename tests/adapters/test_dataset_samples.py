@@ -281,6 +281,48 @@ def test_budget_exhaustion_blocks_before_constructing_dataset(setup, monkeypatch
     assert setup.runtime.calls == []
 
 
+@pytest.mark.parametrize("load_seconds,passes", [(75, True), (check.LOAD_SECONDS + 1, False)])
+def test_cold_loader_has_separate_bounded_budget(setup, monkeypatch, load_seconds, passes):
+    clock = {"now": 0}
+    monkeypatch.setattr(check.time, "monotonic", lambda: clock["now"])
+
+    class LoadingCalls(list):
+        def append(self, value):
+            clock["now"] += load_seconds
+            super().append(value)
+
+    setup.runtime.calls = LoadingCalls()
+    if passes:
+        assert inspect_sample(setup)["checked_samples"] == 3
+    else:
+        with pytest.raises(ValueError, match="DATASET_SAMPLE_CHECK_LIMIT") as error:
+            inspect_sample(setup)
+        assert setup.evidence["path"] in str(error.value)
+        assert setup.runtime.dataset.indices == []
+
+
+def test_slow_decode_still_expires_after_successful_cold_initialization(setup, monkeypatch):
+    clock = {"now": 0}
+    monkeypatch.setattr(check.time, "monotonic", lambda: clock["now"])
+
+    class LoadingCalls(list):
+        def append(self, value):
+            clock["now"] += 75
+            super().append(value)
+
+    setup.runtime.calls = LoadingCalls()
+    original = type(setup.runtime.dataset).__getitem__
+
+    def read(self, index):
+        clock["now"] += check.SAMPLE_SECONDS + 1
+        return original(self, index)
+
+    monkeypatch.setattr(type(setup.runtime.dataset), "__getitem__", read)
+    with pytest.raises(ValueError, match="DATASET_SAMPLE_CHECK_LIMIT"):
+        inspect_sample(setup)
+    assert setup.runtime.dataset.indices == [0]
+
+
 def test_native_source_outside_bound_project_is_rejected(setup):
     setup.spec["code_dir"] = setup.evidence["path"]
     with pytest.raises(ValueError, match="DATASET_SAMPLE_CHECK_UNAVAILABLE"):
@@ -339,7 +381,7 @@ def test_isolated_probe_serializes_only_json_and_preserves_training_parent_envir
     assert options["start_new_session"] is True and options["cwd"] == setup.spec["code_dir"]
     assert options["env"]["CUDA_VISIBLE_DEVICES"] == "" and options["env"]["JAX_PLATFORMS"] == "cpu"
     assert options["env"]["HF_HUB_OFFLINE"] == "1" and options["env"]["WANDB_MODE"] == "disabled"
-    assert isolated_process.communicate_timeout == 70
+    assert isolated_process.communicate_timeout == check.CHILD_TIMEOUT_SECONDS
     payload = json.loads(isolated_process.input)
     assert payload == {"schema_version": 1, "spec": setup.spec, "dataset_evidence": setup.evidence, "factory_index": 0}
     assert isolated_process.stopped == [(123456, signal.SIGKILL)] and isolated_process.waits == [5]
@@ -354,6 +396,16 @@ def test_isolated_timeout_kills_entire_decoder_process_group(setup, isolated_pro
     isolated_process.timeout = True
     with pytest.raises(ValueError, match="DATASET_SAMPLE_CHECK_LIMIT"):
         check.inspect_composed_samples_isolated(setup.factory, setup.config, setup.spec, setup.evidence)
+    assert isolated_process.stopped == [(123456, signal.SIGKILL)]
+
+
+def test_child_hard_alarm_reports_dataset_timeout_instead_of_missing_interface(setup, isolated_process):
+    isolated_process.response = b""
+    isolated_process.returncode = -signal.SIGALRM
+    with pytest.raises(ValueError, match="DATASET_SAMPLE_CHECK_LIMIT") as error:
+        check.inspect_composed_samples_isolated(setup.factory, setup.config, setup.spec, setup.evidence)
+    assert setup.evidence["path"] in str(error.value)
+    assert f"{check.CHILD_TIMEOUT_SECONDS - 1} 秒" in str(error.value)
     assert isolated_process.stopped == [(123456, signal.SIGKILL)]
 
 
@@ -475,4 +527,4 @@ sys.exit(sample._child_main())
     result = subprocess.run([sys.executable, "-c", script], input=b"{}", stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, timeout=10)
     assert result.returncode == 0 and result.stderr == b""
-    assert json.loads(result.stdout)["result"]["guards"] == [[signal.SIGALRM, signal.SIG_DFL], 69]
+    assert json.loads(result.stdout)["result"]["guards"] == [[signal.SIGALRM, signal.SIG_DFL], check.CHILD_TIMEOUT_SECONDS - 1]

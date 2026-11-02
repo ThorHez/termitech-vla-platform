@@ -41,6 +41,32 @@ export function newDatasetBindings(slots: RecipeDatasetSlot[]): DatasetBinding[]
   }));
 }
 
+export function copyDatasetBinding(
+  first: DatasetBinding | undefined,
+  defaultRecipeIndex = 0,
+): DatasetBinding {
+  const settings = first ? structuredClone(first) : { recipe_index: defaultRecipeIndex, weight: 1 };
+  return { ...settings, dataset_asset_id: '', norm_asset_id: '' };
+}
+
+export function selectDatasetBinding(
+  binding: DatasetBinding,
+  selection: Pick<DatasetBinding, 'dataset_asset_id' | 'norm_asset_id'>,
+  defaultRecipeIndex: number,
+  preserveProcessing = false,
+): DatasetBinding {
+  const { processor, recipe_index: recipeIndex, ...rest } = binding;
+  const selected = { ...rest, ...selection };
+  // A copied row has no asset yet. Its first selection supplies the identity
+  // without replacing the processing settings that were just copied.
+  if (preserveProcessing || !binding.dataset_asset_id) {
+    return processor
+      ? { ...selected, processor }
+      : { ...selected, recipe_index: recipeIndex ?? defaultRecipeIndex };
+  }
+  return { ...selected, recipe_index: defaultRecipeIndex };
+}
+
 export function datasetInputLabel(role: string) {
   const match = /^(dataset|norm)_(\d+)$/u.exec(role);
   return match

@@ -1,7 +1,8 @@
 """Read-only discovery of committed OpenPI checkpoints during native training.
 
-The Agent owns this worker, so deploying it also observes detached Runners that
-were started with an older package. No training interpreter or tensor is loaded.
+Each training Runner owns its worker so checkpoint discovery survives Agent
+updates. The Agent also scans legacy attempts for compatibility. No training
+interpreter or tensor is loaded.
 """
 from __future__ import annotations
 
@@ -222,7 +223,7 @@ class ArtifactMonitor:
         """One bounded discovery, also used by Runners before their final event.
 
         Calling this directly starts no worker. The final pass closes the gap
-        between checkpoint retention and the next periodic Agent scan.
+        between checkpoint retention and the next periodic Runner scan.
         """
         if self._stopping.is_set():
             return 0

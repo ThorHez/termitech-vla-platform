@@ -24,6 +24,8 @@ import type {
   RecipeLiteral,
 } from './types';
 
+export type DatasetProcessingMode = 'recommended' | 'existing' | 'composed';
+
 export function DatasetProcessing(props: {
   binding: DatasetBinding;
   dataset?: Asset;
@@ -37,15 +39,18 @@ export function DatasetProcessing(props: {
   automatic?: boolean;
   readOnly?: boolean;
   validationToken?: string;
+  initialMode?: DatasetProcessingMode;
+  onModeChange?: (mode: DatasetProcessingMode) => void;
   onChange: (binding: DatasetBinding) => void;
   onValidityChange?: (valid: boolean) => void;
 }) {
-  const [mode, setMode] = useState<'recommended' | 'existing' | 'composed'>(() =>
+  const [mode, setMode] = useState<DatasetProcessingMode>(() =>
     props.binding.processor?.name === 'ComposableDataConfig'
       ? 'composed'
       : props.binding.processor
         ? 'existing'
-        : 'recommended',
+        : props.initialMode ||
+          (!props.automatic && props.binding.recipe_index !== undefined ? 'existing' : 'composed'),
   );
   const composed = props.readOnly
     ? props.binding.processor?.name === 'ComposableDataConfig'
@@ -63,6 +68,7 @@ export function DatasetProcessing(props: {
             onChange={(event) => {
               const next = event.target.value as typeof mode;
               setMode(next);
+              props.onModeChange?.(next);
               if (next === 'composed') {
                 if (props.binding.processor?.name !== 'ComposableDataConfig') {
                   const { recipe_index: _recipe, processor: _processor, ...assets } = props.binding;

@@ -13,14 +13,14 @@ Agent 的 systemd 服务使用 SSH 登录用户及其主组运行，训练环境
 Agent 环境选择遵循以下顺序，SSH 检查和安装使用同一套发现逻辑：
 
 1. 优先查找已有 Conda，包括 `CONDA_EXE`、`CONDA_PREFIX`、PATH、用户目录、`/opt`、`/usr/local`、`/data` 至 `/data3` 的常见 Miniconda/Anaconda/Miniforge 安装目录，以及用户的 Conda 环境登记文件。不执行 shell 启动文件，也不要求事先 `conda activate`。
-2. 发现 Conda 时，使用其 base Python 引导安装，在 `<Agent 安装目录>/.venv` 创建专用 Conda 环境，固定安装 Python 3.11 和 pip。base 只需 Python 3.9+，系统 Python 3.10 不会因此阻止接入。检测阶段只读，不创建或下载环境；页面会显示 Conda、引导解释器的路径和版本，环境创建在安装阶段执行。
+2. 发现 Conda 时，使用其 base Python 引导安装，在 `<Agent 安装目录>/runtimes/<版本目录>` 创建专用 Conda 环境，固定安装 Python 3.11 和 pip，验证完成后将 `.venv` 链接切换到该环境。base 只需 Python 3.9+，系统 Python 3.10 不会因此阻止接入。检测阶段只读，不创建或下载环境；页面会显示 Conda、引导解释器的路径和版本，环境创建在安装阶段执行。
 3. 没有 Conda 时，按 `python3`、`python` 和版本化 Python 命令查找可用的 Python 3.11+，在同一路径创建独立 venv。版本不足时显示实际路径和版本。
 
-发现的 Conda 不可用或创建环境失败时会报告错误，不回退到系统 Python。Conda 本身的包下载使用该机器已有的 channel 配置，需可访问其软件源；随后 Agent 的 pip 依赖仍使用清华镜像、锁定版本及 SHA-256 校验。专用环境通过绝对路径启动，不依赖交互式激活。已有 Conda 环境更新时复用；已有 Agent venv 在迁移时保留备份，迁移失败恢复原环境。
+发现的 Conda 不可用或创建环境失败时会报告错误，不回退到系统 Python。Conda 本身的包下载使用该机器已有的 channel 配置，需可访问其软件源；随后 Agent 的 pip 依赖仍使用清华镜像、锁定版本及 SHA-256 校验。专用环境通过绝对路径启动，不依赖交互式激活。升级始终创建新的版本环境，保留旧环境供运行中的训练 Runner 使用；已有 Agent venv 首次迁移时保留备份，失败后恢复原环境链接。
 
 如果指定安装目录中已有 Agent，探测返回原机器名称、状态目录、输出目录和训练 profiles，向导自动带入，避免重复登记或丢失已有任务记录。已有 systemd 服务使用其他安装目录时，检查会提示冲突；应填写原目录，例如当前 169 使用 `/data2/termitech-vla-platform`。
 
-修改 IP、端口、用户名或安装路径后，必须重新测试连接。已有活动或待对账任务的 Agent 不允许更新。
+修改 IP、端口、用户名或安装路径后，必须重新测试连接。重新接入仍要求已有任务结束；运行中的隔离训练可通过[升级 Agent](agent-upgrades.md)入口更新 Agent，旧版或待对账任务仍会阻止升级。
 
 ## 2. 训练环境
 
@@ -83,6 +83,10 @@ Agent 使用训练解释器检查版本、实际 executable、代码目录、Git
 `metadata.validated_recipes`、`metadata.validated_recipe_revisions` 和旧的 `metadata.validated` 可以保留历史记录，但不再拦截新配方。当前每次预检都会生成绑定配方、修订、输入和参数的自动证据；缺少自动证据的旧预检需更新中台与 Agent 后重新发起。自动预检通过不等于已完成梯度更新、checkpoint 保存或模型效果验证。
 
 训练预检、提交及 Agent 启动均使用本次任务的配方，任务详情保存该值。旧任务没有记录时显示“未记录”，不从当前环境推测。使用此功能前需更新 Agent；缺少配方回传的旧 Agent 会明确提示升级，避免预检与实际执行不一致。
+
+## 升级已连接 Agent
+
+在「管理机器连接」中选择「升级 Agent」，复用已保存的 SSH 凭据和原安装目录，保留机器身份及当前训练环境、存储设置。页面展示版本、阶段日志、后台进度与重试；存在活动任务时禁止升级。成功必须由目标构建的新心跳及训练环境检查确认。安装包准备、升级边界与 API 见[已连接 Agent 升级](agent-upgrades.md)。
 
 ## 删除连接与卸载 Agent
 

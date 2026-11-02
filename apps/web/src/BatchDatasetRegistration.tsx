@@ -9,6 +9,7 @@ import { DatasetProfileForm, emptyDatasetProfile } from './DatasetProfileForm';
 import { DatasetNormField } from './DatasetNormBinding';
 import { datasetNormInputError } from './datasetNormAssets';
 import { PathAutocomplete } from './PathAutocomplete';
+import { DatasetValidationBadge } from './DatasetValidation';
 import {
   applyBatchNorm,
   batchIdempotency,
@@ -285,13 +286,14 @@ function BatchDatasetRegistrationContent({
           <h3>
             已登记 {result.created.length} 个数据集，跳过 {result.skipped.length} 个已有登记
           </h3>
-          <p>资产已保存到所选机器的登记目录，数据文件保持原样。训练前仍需预检。</p>
+          <p>资产已登记，基础校验在后台执行，可在资产列表与详情查看结果。训练组合配置仍需在训练向导中校验。</p>
           <ul>
             {result.created.map((asset) => (
               <li key={asset.id}>
                 <Database size={14} />
                 <span>{asset.name}</span>
                 <code>{asset.path}</code>
+                <DatasetValidationBadge validation={(assets.data?.find((current) => current.id === asset.id) || asset).validation} />
               </li>
             ))}
           </ul>

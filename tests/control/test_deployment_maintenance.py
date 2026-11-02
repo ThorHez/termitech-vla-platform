@@ -56,3 +56,21 @@ def test_scheduler_retains_queue_until_deployment_finishes(platform):
         session.get(RemoteDeployment, deployment_id).state = "FAILED"
     assert platform.schedule() == 1
     assert platform.get_run(run)["state"] == "STARTING"
+
+
+def test_maintenance_rejects_new_gpu_reservations_and_allows_release(platform):
+    from .conftest import gpu
+    from .test_gpu_reservations import accounts, login, reserve
+
+    node = platform.register(gpus=[gpu("GPU-1"), gpu("GPU-2")])
+    accounts(platform)
+    login(platform.client, "alice")
+    original = reserve(platform, node, ["GPU-1"])
+    assert original.status_code == 200
+    maintenance(platform, node)
+    rejected = reserve(platform, node, ["GPU-1", "GPU-2"])
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "NODE_MAINTENANCE"
+    path = f"/api/v1/nodes/{node['node_id']}/gpu-reservations"
+    assert platform.client.get(path).json() == original.json()
+    assert reserve(platform, node, []).json() == []

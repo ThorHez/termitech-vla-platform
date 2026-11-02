@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import sqlite3
 
 import pytest
 
@@ -65,3 +66,23 @@ def test_cancel_token_is_bound_to_attempt(agent_fixture):
     with pytest.raises(ValueError, match="token mismatch"):
         state.request_cancel(payload["attempt_id"], "wrong-token")
     assert state.attempt(payload["attempt_id"])["cancel_requested"] == 0
+
+
+def test_runtime_migration_preserves_legacy_runner_outbox_and_insert_contract(agent_fixture):
+    config, payload = agent_fixture["config"], agent_fixture["payload"]
+    state = State(config["state_dir"])
+    state.create_attempt(payload, config["output_root"] + "/one")
+    state.emit(payload["attempt_id"], "STARTED", {"pid": 123})
+    state.emit(payload["attempt_id"], "METRIC", {"step": 1})
+    # Model a DB owned by a Runner installed before the additive migration.
+    with sqlite3.connect(state.path) as db:
+        db.execute("ALTER TABLE attempts DROP COLUMN runner_runtime")
+    migrated = State(config["state_dir"])
+    assert migrated.attempt(payload["attempt_id"])["runner_runtime"] is None
+    assert migrated.attempt(payload["attempt_id"])["state"] == "RUNNING"
+    # Old Runners use these same column-specific writes and can keep emitting.
+    state.emit(payload["attempt_id"], "METRIC", {"step": 2})
+    assert [(event["seq"], event["type"]) for event in migrated.pending_events()] == [
+        (1, "STARTED"), (2, "METRIC"), (3, "METRIC")]
+    migrated.acknowledge_events(migrated.pending_events()[:2])
+    assert migrated.pending_events()[0]["data"] == {"step": 2}

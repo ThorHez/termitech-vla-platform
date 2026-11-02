@@ -68,6 +68,33 @@
   font-size: 11px;
   line-height: 1.7;
 }
+.background-task-pagination,
+.background-task-page-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.background-task-pagination {
+  justify-content: space-between;
+  margin-top: 14px;
+  color: var(--text-muted, var(--muted));
+  font-size: 11px;
+}
+.background-task-page-controls > span {
+  min-width: 88px;
+  text-align: center;
+}
+.background-task-compatibility-note {
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-info, #edf5fc);
+  color: var(--text-muted, var(--muted));
+  font-size: 11px;
+  line-height: 1.7;
+}
 @media (prefers-reduced-motion: reduce) {
   .background-task-indeterminate > span {
     animation: none;

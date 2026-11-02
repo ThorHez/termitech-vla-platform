@@ -126,7 +126,7 @@ def _connection(session, node_id):
     # SSH credential. A client cannot submit a host or another connection id.
     for job in session.scalars(select(RemoteDeployment).where(RemoteDeployment.node_id == node_id,
             RemoteDeployment.state == "SUCCEEDED").order_by(RemoteDeployment.created_at.desc(), RemoteDeployment.id.desc())):
-        if (job.agent_config or {}).get("_operation") not in (None, "install"):
+        if (job.agent_config or {}).get("_operation") not in (None, "install", "upgrade"):
             continue
         connection = session.get(RemoteConnection, job.connection_id)
         if connection is not None and connection.fingerprint:

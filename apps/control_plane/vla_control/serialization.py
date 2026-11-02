@@ -20,7 +20,7 @@ def _connection_address(session, node):
         .order_by(func.coalesce(RemoteDeployment.finished_at, RemoteDeployment.created_at).desc(),
                   RemoteDeployment.created_at.desc(), RemoteDeployment.id.desc()))
     for host, port, operation in rows:
-        if operation not in (None, "install") or type(port) is not int or not 1 <= port <= 65535:
+        if operation not in (None, "install", "upgrade") or type(port) is not int or not 1 <= port <= 65535:
             continue
         try:
             host = SSHAuthenticationInput.plain_host(host)
@@ -57,9 +57,11 @@ def profile_dict(profile):
 
 
 def asset_dict(asset):
+    from .dataset_validations import INTERNAL_KEY, validation_dict
     return {"id": asset.id, "node_id": asset.node_id, "name": asset.name, "kind": asset.kind,
             "path": asset.path, "version": asset.version, "state": asset.state,
-            "metadata": asset.metadata_json, "created_at": asset.created_at,
+            "metadata": {key: value for key, value in (asset.metadata_json or {}).items() if key != INTERNAL_KEY},
+            **({"validation": validation_dict(asset)} if asset.kind == "DATASET" else {}), "created_at": asset.created_at,
             "norm_asset_id": asset.norm_asset_id if asset.kind == "DATASET" else None,
             "origin_attempt_id": asset.origin_attempt_id}
 

@@ -29,7 +29,19 @@ const stageLabels: Record<string, string> = {
   DISCONNECTED: '已断开连接',
 };
 
-export const deploymentStageLabel = (stage: string) => stageLabels[stage] || stage;
+export const deploymentStageLabel = (stage: string, operation?: RemoteDeployment['operation']) => {
+  if (operation === 'upgrade') {
+    const upgradeLabels: Record<string, string> = {
+      QUEUED: '等待升级',
+      CHECKING: '检查升级条件',
+      INSTALLING: '升级 Agent',
+      INSTALL_PACKAGE: '更新 Agent 程序',
+      ONLINE: '升级完成',
+    };
+    if (upgradeLabels[stage]) return upgradeLabels[stage];
+  }
+  return stageLabels[stage] || stage;
+};
 export const deploymentMainStage = (stage: string) =>
   stage.startsWith('INSTALL_')
     ? 'INSTALLING'
@@ -162,7 +174,7 @@ export function DeploymentLogs({ job, active }: { job: RemoteDeployment; active:
         </div>
         <div>
           <dt>{active ? '当前步骤' : '最后步骤'}</dt>
-          <dd>{deploymentStageLabel(job.stage)}</dd>
+          <dd>{deploymentStageLabel(job.stage, job.operation)}</dd>
         </div>
         <div>
           <dt>最近输出</dt>
@@ -200,7 +212,9 @@ export function DeploymentLogs({ job, active }: { job: RemoteDeployment; active:
           {job.logs.map((entry, index) => (
             <li key={`${entry.timestamp}-${index}`}>
               <time dateTime={entry.timestamp}>{timestamp(entry.timestamp)}</time>
-              <span className="onboard-log-stage">{deploymentStageLabel(entry.stage)}</span>
+              <span className="onboard-log-stage">
+                {deploymentStageLabel(entry.stage, job.operation)}
+              </span>
               <span className="onboard-log-message">{entry.message}</span>
             </li>
           ))}

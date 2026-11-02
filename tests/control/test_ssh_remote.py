@@ -202,6 +202,17 @@ def test_probe_keeps_discovered_conda_paths_when_using_sudo(tmp_path):
     assert ssh.run.call_args.kwargs == {"sudo": True}
 
 
+@pytest.mark.parametrize("safe", [True, False])
+def test_probe_distinguishes_live_upgrade_from_install_and_uninstall(tmp_path, safe):
+    ssh = remote(tmp_path)
+    ssh.run = Mock(side_effect=["0\n", "venv\n/usr/bin/python3.11\n\n",
+        json.dumps({"hostname": "gpu", "checks": [{"name": "python", "ok": True},
+            {"name": "idle", "ok": False}, {"name": "upgrade_safe", "ok": safe}]})])
+    result = ssh.probe("/data2/agent")
+    assert result["can_install"] is False
+    assert result["can_upgrade"] is safe
+
+
 def test_probe_surfaces_runtime_selection_failure_without_running_old_python(tmp_path):
     ssh = remote(tmp_path)
     ssh.run = Mock(side_effect=["0\n", "ERROR\nSSH 默认 Python：/usr/bin/python3（3.10.12）；需要 Python 3.11+\n", ""])
@@ -460,6 +471,57 @@ def test_uninstall_moves_identity_and_program_but_retains_training_files(tmp_pat
     assert not (unit_dir / "termitech-vla-agent.service").exists()
     assert not system["active"] and not system["enabled"]
     assert namespace["uninstall_agent"](str(prefix), unit_dir) == {"backup_dir": None, "removed_paths": [], "service_removed": True}
+
+
+def test_uninstall_archives_isolated_release_link_runtimes_and_config_snapshots(tmp_path, monkeypatch):
+    namespace, prefix, unit_dir, state, _, _ = uninstall_script_fixture(tmp_path, monkeypatch)
+    runtime = prefix / "runtimes/release"
+    runtime.parent.mkdir()
+    (prefix / ".venv").replace(runtime)
+    (runtime / "vla-training-runtime.json").write_text(json.dumps({"schema_version": 1, "runtime_path": str(runtime)}))
+    (prefix / ".venv").symlink_to(runtime, target_is_directory=True)
+    legacy = prefix / (".venv.before-release-" + "a" * 16)
+    legacy.mkdir()
+    (legacy / "old-package").write_text("legacy")
+    (state / "runner-configs").mkdir()
+    (state / "runner-configs/attempt.json").write_text("{}")
+    result = namespace["uninstall_agent"](str(prefix), unit_dir)
+    backup = module.Path(result["backup_dir"])
+    assert (backup / ".venv").is_symlink()
+    assert (backup / "runtimes/release/vla-training-runtime.json").is_file()
+    assert (backup / legacy.name / "old-package").read_text() == "legacy"
+    assert (backup / "state/runner-configs/attempt.json").is_file()
+    assert not (prefix / ".venv").is_symlink() and not runtime.exists()
+
+
+@pytest.mark.parametrize("state_outside", [False, True])
+def test_uninstall_archives_dataset_validation_cache_without_touching_training_files(tmp_path, monkeypatch, state_outside):
+    namespace, prefix, unit_dir, state, _, system = uninstall_script_fixture(tmp_path, monkeypatch, state_outside=state_outside)
+    cache = state / "dataset-validation-cache"
+    cache.mkdir(mode=0o700)
+    (cache / "timestamps-receipt.json").write_text('{"schema_version":1,"kind":"timestamps"}')
+    (cache / "timestamps-receipt.lock").touch(mode=0o600)
+    result = namespace["uninstall_agent"](str(prefix), unit_dir)
+    backup = module.Path(result["backup_dir"])
+    assert (backup / "state/dataset-validation-cache/timestamps-receipt.json").read_text() == '{"schema_version":1,"kind":"timestamps"}'
+    assert (backup / "state/dataset-validation-cache/timestamps-receipt.lock").is_file()
+    assert not state.exists() and not system["active"]
+    assert (prefix / "runs/result.txt").read_text() == "training-output"
+    assert (prefix / "smoke-code/train.py").read_text() == "training-code"
+
+
+@pytest.mark.parametrize("component", ["dataset-validation-cache", "unrecognized-cache"])
+def test_uninstall_still_rejects_linked_validation_cache_and_unknown_state_entries(tmp_path, monkeypatch, component):
+    namespace, prefix, unit_dir, state, config_path, system = uninstall_script_fixture(tmp_path, monkeypatch)
+    if component == "dataset-validation-cache":
+        (state / component).symlink_to(prefix / "runs", target_is_directory=True)
+    else:
+        (state / component).mkdir()
+    with pytest.raises(namespace["UninstallError"], match="AGENT_UNINSTALL_STATE_INVALID"):
+        namespace["uninstall_agent"](str(prefix), unit_dir)
+    assert state.exists() and config_path.exists() and system["active"]
+    assert not any(args[1] == "stop" for args in system["calls"])
+    assert (prefix / "runs/result.txt").read_text() == "training-output"
 
 
 @pytest.mark.parametrize("state_value,events", [("RUNNING", False), ("UNKNOWN", False), ("SUCCEEDED", True)])

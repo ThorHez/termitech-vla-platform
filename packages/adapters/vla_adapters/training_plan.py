@@ -26,6 +26,7 @@ if __package__:
     from .dataset_fps import resolve_registered_fps
     from .dataset_timestamps import inspect_dataset_timestamps
     from .dataset_samples import inspect_composed_samples_isolated
+    from .dataset_validation_cache import get_or_validate
     from .entrypoints import read_entrypoint, validate_entrypoint
     from .recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
 else:
@@ -39,6 +40,7 @@ else:
     from dataset_fps import resolve_registered_fps
     from dataset_timestamps import inspect_dataset_timestamps
     from dataset_samples import inspect_composed_samples_isolated
+    from dataset_validation_cache import get_or_validate
     from entrypoints import read_entrypoint, validate_entrypoint
     from recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
 
@@ -492,9 +494,23 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             data["recipe_index"] = binding["recipe_index"]
     passed("norm_contract", "所有数据集归一化统计可读，数值有限且维度一致")
     sampled = 0
-    for data, factory in zip(datasets, factories):
+    for index, (data, factory) in enumerate(zip(datasets, factories)):
         try:
-            evidence = inspect_composed_samples_isolated(factory, config, spec, data)
+            def context():
+                model = getattr(config, "model", None)
+                return {"composition": data.get("composition"),
+                        "factory_composition": getattr(factory, "composition", None),
+                        "binding": bindings[index] if bindings is not None else {"recipe_index": 0},
+                        "norm_path": data.get("norm_path"),
+                        "model_type": type(model).__module__ + "." + type(model).__qualname__,
+                        "model": {key: getattr(model, key, None) for key in (
+                            "action_horizon", "action_dim", "pi05", "image_keys", "depth_keys",
+                            "allow_all_masked_images", "discrete_state_input", "max_token_len")},
+                        "stage": spec.get("training_stage"), "stage_config": spec.get("stage_config"),
+                        "acp_dropout": getattr(factory, "acp_dropout", None)}
+            validate = lambda: inspect_composed_samples_isolated(factory, config, spec, data)
+            evidence = (get_or_validate("samples", data, spec, validate, context=context)
+                        if "composition" in data else validate())
             expected_status = "verified" if "composition" in data else "not_applicable"
             if not isinstance(evidence, dict) or evidence.get("status") != expected_status:
                 raise ValueError("DATASET_SAMPLE_CHECK_UNAVAILABLE: 真实样本检查未返回完整证据")
@@ -552,7 +568,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "parameters": spec["parameters"], "gpu_count": spec["gpu_count"], "entrypoint": str(entry),
             "entrypoint_sha256": hashlib.sha256(read_entrypoint(entry)).hexdigest(),
             "adapter_sha256": fingerprint({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py")}),
+                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py")}),
             "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),

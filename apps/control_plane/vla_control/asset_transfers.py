@@ -21,6 +21,7 @@ from .asset_transfer_models import (AssetTransfer, ASSET_TRANSFER_ACTIVE,
     ASSET_TRANSFER_RETRYABLE, ASSET_TRANSFER_TERMINAL, ASSET_TRANSFER_WORKING)
 from .checkpoint_transfers import _connection, _online, _verify_saved_ssh_credentials
 from .common import APIError, now, require_path, uid
+from .dataset_validations import INTERNAL_KEY as DATASET_VALIDATION_KEY, queue_validation
 from .models import Asset
 from .remote_models import RemoteConnection
 from .schemas import InputModel
@@ -182,7 +183,8 @@ def _bindings(session, body, settings):
     if same_machine and (source_tree == target_tree or source_tree in target_tree.parents or target_tree in source_tree.parents):
         raise APIError(422, 'ASSET_TRANSFER_PATH_OVERLAP', '同一台物理机器上的源目录与目标目录不能重叠')
     result = {'source_asset': {'id': asset.id, 'node_id': asset.node_id, 'name': asset.name, 'kind': asset.kind,
-                            'path': source_path, 'version': asset.version, 'metadata': deepcopy(asset.metadata_json)},
+                            'path': source_path, 'version': asset.version,
+                            'metadata': {key: deepcopy(value) for key, value in asset.metadata_json.items() if key != DATASET_VALIDATION_KEY}},
         'source_roots': deepcopy(source.roots), 'target_roots': deepcopy(target.roots),
         'source_connection_id': connections['source'].id, 'target_connection_id': connections['target'].id,
         'source_connection': _identity(connections['source']), 'target_connection': _identity(connections['target']),
@@ -542,6 +544,7 @@ class AssetTransferManager:
                         'progress_pct': 100}
                 session.add(asset)
                 session.flush()
+                queue_validation(session, asset, heartbeat_timeout_seconds=self.settings.heartbeat_timeout_seconds)
                 row.target_path, row.asset_path, row.target_asset_id = expected, asset_path, asset.id
                 row.manifest, row.manifest_sha256 = deepcopy(manifest), result['manifest_sha256']
                 row.bytes_total = row.bytes_transferred = manifest['bytes_total'] + (norm_manifest['bytes_total'] if norm_manifest else 0)

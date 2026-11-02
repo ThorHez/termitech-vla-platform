@@ -19,6 +19,8 @@ from pathlib import Path
 
 import psutil
 
+from vla_protocol.agent_release import installed_agent_release
+
 from .artifacts import ArtifactMonitor
 from .config import load_config
 from .metrics import gpu_inventory, process_metrics, system_metrics
@@ -27,12 +29,13 @@ from .preflight import run_preflight
 from .recipe_details import recipe_details
 from .recipe_suggestions import suggest_recipes
 from .runtime_checks import RuntimeMonitor
+from .runner_runtime import installed_runtime, snapshot_runner_config, training_start_lock, upgrade_status
 from .safety import AgentError, identity_matches, process_identity, safe_identifier, signal_owned_group
 from .state import State, TERMINAL_STATES, utc_now
 
 
 LOG = logging.getLogger("vla_agent")
-CAPABILITIES = ["PATH_SUGGEST", "RECIPE_SUGGEST", "RECIPE_DETAIL", "DATA_PROCESSORS", "DATASET_INSPECT",
+CAPABILITIES = ["PATH_SUGGEST", "RECIPE_SUGGEST", "RECIPE_DETAIL", "DATA_PROCESSORS", "DATASET_INSPECT", "DATASET_VALIDATE",
                 "DATASET_TIMESTAMP_PREFLIGHT_V1",
                 "DATASET_SAMPLE_PREFLIGHT_V1",
                 "RECIPE_WRITE", "PROFILE_REBIND", "STORAGE_CONFIGURE", "PREFLIGHT", "START", "CANCEL",
@@ -98,10 +101,16 @@ def _execute_preflight_command(config: dict, command: dict):
             elif command["type"] == "DATASET_INSPECT":
                 from .dataset_inspection import inspect_dataset
                 result = inspect_dataset(config, command["payload"])
+            elif command["type"] == "DATASET_VALIDATE":
+                from .dataset_validation import validate_dataset
+                result = validate_dataset(config, command["payload"])
             else:
                 result = run_preflight(config, command["payload"])
             status = "REJECTED" if result.get("error") else "APPLIED"
         except Exception as exc:
+            if (command["type"] == "DATASET_VALIDATE" and isinstance(exc, AgentError)
+                    and exc.code == "DATASET_VALIDATION_BUSY"):
+                return  # Remain pending until the detached training Runner finishes.
             if command["type"] == "RECIPE_WRITE" and (isinstance(exc, OSError)
                     or isinstance(exc, AgentError) and exc.code == "RECIPE_WRITE_RECOVERY_PENDING"):
                 LOG.warning("Recipe commit %s needs recovery; leaving its command unacknowledged", command["id"])
@@ -142,10 +151,12 @@ class Client:
 class Agent:
     def __init__(self, config: dict, client=None):
         self.config = config
+        self.release = installed_agent_release()
         self.state = State(config["state_dir"])
         self.client = client if client is not None else Client(config)
         self.credentials = self.state.credentials()
         self.runners: dict[str, subprocess.Popen] = {}
+        self.training_runtime = installed_runtime()
         self.last_profile_sync = None
         self.runtime_monitor = RuntimeMonitor(config["roots"])
         self.artifact_monitor = ArtifactMonitor(self.state, config["output_root"],
@@ -194,6 +205,10 @@ class Agent:
             elif command["type"] == "DATASET_INSPECT":
                 from .dataset_inspection import inspect_dataset
                 result, status = inspect_dataset(self.config, payload), "APPLIED"
+            elif command["type"] == "DATASET_VALIDATE":
+                from .dataset_validation import validate_dataset
+                result = validate_dataset(self.config, payload)
+                status = "REJECTED" if result.get("error") else "APPLIED"
             elif command["type"] == "RECIPE_WRITE":
                 from .recipe_writeback import write_recipe
                 result, status = write_recipe(self.config, payload, self.state), "APPLIED"
@@ -227,26 +242,21 @@ class Agent:
                 # Serialize the durable attempt registration with source writes.
                 # Bind lookup and registration together so a rebind cannot leave
                 # START holding a stale profile after its checkout lock releases.
-                with profile_configuration_lock(self.config, busy_code="RECIPE_WRITE_BUSY"):
-                    output = str(Path(self.config["output_root"]) / attempt_id)
-                    profile = next((item for item in self.config["profiles"] if item["id"] == payload.get("profile_id")), None)
-                    if profile is None:
-                        raise AgentError("PROFILE_UNAVAILABLE", "START requires a configured training environment")
-                    with checkout_lock(self.config, profile["code_dir"], require_git=profile.get("adapter") == "openpi-sft"):
-                        created = self.state.create_attempt(payload, output)
-                if created:
-                    logs = Path(self.config["state_dir"]) / "runner-logs"
-                    logs.mkdir(parents=True, exist_ok=True)
-                    try:
-                        with (logs / f"{attempt_id}.log").open("ab") as runner_log:
-                            process = subprocess.Popen([sys.executable, "-m", "vla_agent.runner", "--config", self.config["config_path"],
-                                                        "--attempt-id", attempt_id], stdin=subprocess.DEVNULL,
-                                                       stdout=runner_log, stderr=subprocess.STDOUT,
-                                                       start_new_session=True, close_fds=True)
-                        self.runners[attempt_id] = process
-                    except OSError as exc:
-                        self.state.emit(attempt_id, "FAILED", {"exit_code": None, "process_started": False,
-                                                                "error": {"code": "RUNNER_LAUNCH_FAILED", "message": str(exc)}})
+                with training_start_lock(self.config["state_dir"]):
+                    with profile_configuration_lock(self.config, busy_code="RECIPE_WRITE_BUSY"):
+                        output = str(Path(self.config["output_root"]) / attempt_id)
+                        profile = next((item for item in self.config["profiles"] if item["id"] == payload.get("profile_id")), None)
+                        if profile is None:
+                            raise AgentError("PROFILE_UNAVAILABLE", "START requires a configured training environment")
+                        with checkout_lock(self.config, profile["code_dir"], require_git=profile.get("adapter") == "openpi-sft"):
+                            runtime = None
+                            if self.training_runtime and self.state.attempt(attempt_id) is None:
+                                runner_config = load_config(self.config["config_path"])
+                                runner_config["profiles"] = [item for item in runner_config["profiles"]
+                                                             if item["id"] == payload.get("profile_id")]
+                                runtime = snapshot_runner_config(runner_config, attempt_id, self.training_runtime)
+                            created = self.state.create_attempt(payload, output, runner_runtime=runtime)
+                    self._launch_runner(self.state.attempt(attempt_id))
                 result, status = {"attempt_id": attempt_id, "accepted": True, "duplicate": not created}, "APPLIED"
             elif command["type"] == "CANCEL":
                 self.state.request_cancel(payload["attempt_id"], payload["execution_token"])
@@ -261,19 +271,62 @@ class Agent:
             if command["type"] == "RECIPE_WRITE" and (isinstance(exc, OSError)
                     or isinstance(exc, AgentError) and exc.code == "RECIPE_WRITE_RECOVERY_PENDING"):
                 raise
-            if command["type"] == "START" and isinstance(exc, AgentError) and exc.code == "RECIPE_WRITE_BUSY":
+            if command["type"] == "START" and isinstance(exc, AgentError) and exc.code in {"RECIPE_WRITE_BUSY", "AGENT_MAINTENANCE"}:
                 raise  # Keep START unacknowledged until its checkout is available.
             result = {"error": exc.as_dict() if isinstance(exc, AgentError) else {"code": "COMMAND_REJECTED", "message": str(exc)}}
             status = "REJECTED"
         self.state.save_command(command["id"], status, result)
         return {"status": status, "result": result}
 
+    def _launch_runner(self, attempt: dict):
+        """Recover only an accepted launch that has never acquired a Runner.
+
+        The Runner's attempt lock deduplicates the narrow fork/identity window.
+        Evidence of a prior process or output forbids replacement training.
+        """
+        attempt_id = safe_identifier(attempt["id"])
+        if (attempt["state"] != "STARTING" or attempt["runner_identity"] or attempt["child_identity"]
+                or Path(attempt["output_dir"]).exists()):
+            return
+        previous = self.runners.get(attempt_id)
+        if previous is not None and previous.poll() is None:
+            return
+        runtime = attempt.get("runner_runtime")
+        interpreter = str(Path(runtime["runtime_path"]) / "bin/python") if runtime else sys.executable
+        config_path = runtime["config_path"] if runtime else self.config["config_path"]
+        logs = Path(self.config["state_dir"]) / "runner-logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        try:
+            with (logs / f"{attempt_id}.log").open("ab") as runner_log:
+                # Isolated runtimes must not import a mutable checkout through
+                # PYTHONPATH, user site packages, or the current directory.
+                isolation = ["-I"] if runtime else []
+                process = subprocess.Popen([interpreter, *isolation, "-m", "vla_agent.runner", "--config", config_path,
+                                            "--attempt-id", attempt_id], stdin=subprocess.DEVNULL,
+                                           stdout=runner_log, stderr=subprocess.STDOUT,
+                                           start_new_session=True, close_fds=True)
+            self.runners[attempt_id] = process
+        except OSError as exc:
+            self.state.emit(attempt_id, "FAILED", {"exit_code": None, "process_started": False,
+                                                    "error": {"code": "RUNNER_LAUNCH_FAILED", "message": str(exc)}})
+
+    def _recover_runners(self):
+        try:
+            with training_start_lock(self.config["state_dir"]):
+                for attempt in self.state.active_attempts():
+                    self._launch_runner(attempt)
+        except AgentError as exc:
+            if exc.code != "AGENT_MAINTENANCE":
+                raise
+
     def poll_commands(self):
         self._collect_preflight_worker()
         commands = self.api("GET", "/agent/v1/commands?" + urllib.parse.urlencode({"node_id": self.credentials["node_id"]}))
         for command in commands:
             acknowledgement = self.state.command(command["id"])
-            if acknowledgement is None and command["type"] in {"PREFLIGHT", "RECIPE_WRITE", "DATA_PROCESSORS", "DATASET_INSPECT", "POLICY_DEPLOY_START", "POLICY_EXPORT"}:
+            if acknowledgement is None and command["type"] == "DATASET_VALIDATE" and self.state.active_attempts():
+                continue
+            if acknowledgement is None and command["type"] in {"PREFLIGHT", "RECIPE_WRITE", "DATA_PROCESSORS", "DATASET_INSPECT", "DATASET_VALIDATE", "POLICY_DEPLOY_START", "POLICY_EXPORT"}:
                 if self._preflight_worker is None and not self._closed:
                     worker = multiprocessing.get_context("spawn").Process(
                         target=_execute_preflight_command, args=(self.config, command),
@@ -289,7 +342,7 @@ class Agent:
                 try:
                     acknowledgement = self.handle_command(command)
                 except AgentError as exc:
-                    if ((command["type"] == "START" and exc.code == "RECIPE_WRITE_BUSY")
+                    if ((command["type"] == "START" and exc.code in {"RECIPE_WRITE_BUSY", "AGENT_MAINTENANCE"})
                             or command["type"] == "RECIPE_WRITE" and exc.code == "RECIPE_WRITE_RECOVERY_PENDING"
                             or command["type"] == "PROFILE_REBIND" and exc.code == "PROFILE_REBIND_RECOVERY_PENDING"
                             or command["type"] == "STORAGE_CONFIGURE" and exc.code == "STORAGE_CONFIGURE_RECOVERY_PENDING"):
@@ -376,6 +429,8 @@ class Agent:
                    "attempt_processes": process_samples, "sampled_at": utc_now(),
                    "runtime_checks": self.runtime_monitor.snapshot(self.config["profiles"]),
                    "capabilities": CAPABILITIES,
+                   "agent": self.release,
+                   "training_supervisor": upgrade_status(self.config["state_dir"]),
                    "storage_configuration": {"output_root": self.config["output_root"],
                                              "cache_root": self.config.get("cache_root")}}
         response = self.api("POST", "/agent/v1/heartbeat", {"node_id": self.credentials["node_id"], "gpus": gpus,
@@ -398,7 +453,11 @@ class Agent:
         last_heartbeat = 0.0
         try:
             while not stopping:
-                self.artifact_monitor.schedule(self.state.active_attempts())
+                self._recover_runners()
+                # Legacy Runners still need the Agent's compatibility scanner.
+                # Isolated Runners own their scanner for the entire run.
+                self.artifact_monitor.schedule([attempt for attempt in self.state.active_attempts()
+                                                if not attempt.get("runner_runtime")])
                 try:
                     self.register()
                 except (OSError, ValueError, urllib.error.URLError):

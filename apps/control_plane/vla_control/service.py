@@ -474,6 +474,25 @@ def sync_profiles(session, node: Node, entries: list[dict]) -> dict:
         elif not current.active or any(getattr(current, "metadata_json" if key == "metadata" else key) != value for key, value in proposed.items()):
             changed.add(profile_id)
     used = set(session.scalars(select(Run.profile_id).where(Run.node_id == node.id, Run.state.not_in(TERMINAL), Run.profile_id.in_(changed)))) if changed else set()
+    onboarding_refreshed = set()
+    for profile_id in (used & changed) - rebinding:
+        current, proposed = existing[profile_id], incoming.get(profile_id)
+        if proposed is None or not current.active:
+            continue
+        metadata = proposed.get("metadata", {})
+        onboarding_id = metadata.get("onboarding_id")
+        # Upgrades confirm that the replacement Agent loaded its new config.
+        # This receipt may refresh while the profile is in use, but every
+        # execution field and every other metadata value must remain identical.
+        fields = ("id", "name", "code_dir", "python", "adapter", "recipe", "execution_mode", "docker_image")
+        if (isinstance(onboarding_id, str) and 0 < len(onboarding_id) <= 200
+                and all(getattr(current, key) == proposed.get(key) for key in fields)
+                and {key: value for key, value in current.metadata_json.items() if key != "onboarding_id"}
+                    == {key: value for key, value in metadata.items() if key != "onboarding_id"}):
+            current.metadata_json = {**current.metadata_json, "onboarding_id": onboarding_id}
+            onboarding_refreshed.add(profile_id)
+    changed -= onboarding_refreshed
+    used -= onboarding_refreshed
     applied = changed - used - rebinding
     for profile_id in applied:
         current, proposed = existing.get(profile_id), incoming.get(profile_id)
@@ -494,11 +513,11 @@ def sync_profiles(session, node: Node, entries: list[dict]) -> dict:
                 preview.error = {"code": "PROFILE_CHANGED_SINCE_PREFLIGHT", "message": "Runtime configuration changed; run preflight again"}
     if rebinding & changed:
         return {"status": "BLOCKED", "code": "PROFILE_REBIND_PENDING", "message": "Runtime profile change awaits a persisted Agent acknowledgement",
-                "blocked_profile_ids": sorted(used | rebinding & changed), "updated_profile_ids": sorted(applied)}
+                "blocked_profile_ids": sorted(used | rebinding & changed), "updated_profile_ids": sorted(applied | onboarding_refreshed)}
     if used:
         return {"status": "BLOCKED", "code": "PROFILE_IN_USE", "message": "Active runs retain their registered runtime configuration",
-                "blocked_profile_ids": sorted(used), "updated_profile_ids": sorted(applied)}
-    return {"status": "APPLIED", "updated_profile_ids": sorted(applied)}
+                "blocked_profile_ids": sorted(used), "updated_profile_ids": sorted(applied | onboarding_refreshed)}
+    return {"status": "APPLIED", "updated_profile_ids": sorted(applied | onboarding_refreshed)}
 
 
 def apply_ack(session, command: Command, status: str, result: dict) -> None:

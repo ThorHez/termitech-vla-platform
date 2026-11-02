@@ -1,0 +1,23 @@
+.asset-catalog-pagination,
+.asset-catalog-page-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.asset-catalog-pagination {
+  justify-content: space-between;
+  margin: 15px 0 24px;
+  color: var(--text-muted, #8c9fac);
+  font-size: 11px;
+}
+.asset-catalog-page-controls > span {
+  min-width: 85px;
+  text-align: center;
+}
+.asset-catalog-pagination > p {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.7;
+}

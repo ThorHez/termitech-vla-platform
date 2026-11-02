@@ -1,0 +1,57 @@
+.asset-catalog-group-heading > tr {
+  background: var(--bg-subtle, #f5f9fa);
+}
+.asset-catalog-table > tbody:not(:last-child) > tr:last-child > td {
+  border-bottom: 1px solid var(--border-default, #eff3f5);
+}
+.asset-catalog-table .asset-catalog-group-toggle {
+  max-width: 400px;
+  gap: 9px;
+}
+.asset-catalog-group-toggle > svg {
+  flex-shrink: 0;
+}
+.asset-catalog-group-toggle > svg.collapsed {
+  transform: rotate(-90deg);
+}
+.asset-catalog-group-toggle > span:last-child {
+  min-width: 0;
+}
+.asset-catalog-group-toggle .subtext {
+  white-space: normal;
+}
+.asset-catalog-group-toggle strong {
+  display: block;
+  white-space: normal;
+}
+.asset-catalog-group-items[hidden] {
+  display: none;
+}
+.asset-catalog-group-items .asset-name-link {
+  margin-left: 24px;
+}
+.asset-catalog-group-availability {
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.asset-catalog-group-name {
+  gap: 9px;
+  max-width: 400px;
+}
+.asset-catalog-group-name-link > span:last-child {
+  min-width: 0;
+}
+.asset-catalog-group-name-link strong {
+  display: block;
+  white-space: normal;
+}
+.asset-catalog-group-name-link .subtext {
+  white-space: normal;
+}
+.asset-catalog-group-disclosure {
+  flex-shrink: 0;
+}
+.asset-catalog-group-disclosure > svg.collapsed {
+  transform: rotate(-90deg);
+}

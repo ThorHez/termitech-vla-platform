@@ -106,7 +106,7 @@ try {
     const before = JSON.stringify({ asset, binding, entry });
     const html = renderToStaticMarkup(React.createElement(DatasetProcessing, {
       binding, dataset: asset, entries: [entry], slots: [{ recipe_index: 0, processing: entry.name, weight: 1 }],
-      index: 0, stage: 'sft', managedParameters: {}, onChange() {},
+      index: 0, stage: 'sft', managedParameters: {}, initialMode: 'recommended', onChange() {},
     }));
     assert.match(html, /双臂/); assert.match(html, /ARX5/); assert.match(html, /处理器推荐/);
     assert.match(html, /高级：手动选择处理器与参数/);

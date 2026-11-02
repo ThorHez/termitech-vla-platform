@@ -7,6 +7,7 @@ import {
   Box,
   Check,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   Cpu,
   Database,
@@ -56,20 +57,25 @@ import { ProfileRebinding } from './ProfileRebinding';
 import { StorageConfiguration } from './StorageConfiguration';
 import { matchesNodeQuery, nodeAddressText } from './nodeAddress';
 import { PathAutocomplete } from './PathAutocomplete';
-import { AssetSyncDialog, AssetSyncBackgroundNotice, AssetTransfers } from './AssetTransfers';
+import { AssetSyncDialog, AssetSyncBackgroundNotice } from './AssetTransfers';
 import type { AssetTransfer } from './assetTransfer';
-import { assetTransferTaskPath } from './assetTransfer';
 import { BackgroundTasksPage } from './BackgroundTasks';
 import { RunDeleteAction } from './RunDeleteAction';
 import { DatasetInspection, useDatasetInspectionDraft } from './DatasetInspection';
 import { DatasetNormBindingDialog, DatasetNormField, DatasetNormSummary } from './DatasetNormBinding';
 import { AssetDetail } from './AssetDetail';
+import { catalogAssetGroups } from './modelAssetGroups';
+import { AssetGroupRows } from './AssetGroupRows';
+import { groupDatasetNormAssets } from './datasetAssetGroups';
+import { ASSET_CATALOG_PAGE_SIZE, paginateAssetCatalog } from './assetCatalogPagination';
+import { DatasetValidationBadge } from './DatasetValidation';
 import { BatchDatasetRegistration } from './BatchDatasetRegistration';
 import { BatchAssetSync } from './BatchAssetSync';
 import { BATCH_ASSET_SYNC_LIMIT, batchSyncSourceError, reconcileBatchSyncSelection, toggleBatchSyncVisible } from './batchAssetSyncData';
 import { DatasetFormatTemplates, DatasetFormatTemplateDialog } from './DatasetFormatTemplates';
 import { datasetNormBindingPayload, datasetNormInputError } from './datasetNormAssets';
 import './asset-registration.css';
+import './asset-catalog.css';
 import {
   DatasetProfileEditor,
   DatasetProfileForm,
@@ -465,9 +471,7 @@ export function NodesPage() {
   const [query, setQuery] = useState('');
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [managing, setManaging] = useState<Node>();
-  const [renaming, setRenaming] = useState<Node>();
   const [terminalNode, setTerminalNode] = useState<Node>();
-  const [reservationNode, setReservationNode] = useState<Node>();
   const filtered = nodes.data?.filter((node) => matchesNodeQuery(node, query)) || [];
   return (
     <>
@@ -564,27 +568,17 @@ export function NodesPage() {
                   <ChevronRight size={16} />
                 </div>
               </a>
-              <div className="machine-card-management">
-                <button className="text-link" onClick={() => setReservationNode(node)}>
-                  <LockKeyhole size={13} />GPU 预留
-                </button>
-                <a className="text-link machine-history-link" href={`#/nodes/${node.id}`}>
-                  <Activity size={13} />占用历史
-                </a>
-                {can('machines.manage') && <>
+              {can('machines.manage') && (
+                <div className="machine-card-management">
                   <button className="text-link" onClick={() => setTerminalNode(node)}>
                     <Terminal size={13} />终端
-                  </button>
-                  <button className="text-link" onClick={() => setRenaming(node)}>
-                    <Pencil size={13} />
-                    重命名
                   </button>
                   <button className="text-link" onClick={() => setManaging(node)}>
                     <Settings2 size={13} />
                     管理连接
                   </button>
-                </>}
-              </div>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -627,13 +621,9 @@ export function NodesPage() {
           }}
         />
       )}
-      {can('machines.manage') && renaming && (
-        <NodeRename node={renaming} close={() => setRenaming(undefined)} />
-      )}
       {can('machines.manage') && terminalNode && (
         <NodeTerminal node={terminalNode} close={() => setTerminalNode(undefined)} />
       )}
-      {reservationNode && <GpuReservations key={reservationNode.id} node={reservationNode} close={() => setReservationNode(undefined)} />}
     </>
   );
 }
@@ -966,7 +956,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
 
 export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const { user, can } = useAuth();
-  const { assets, nodes, enabled, refresh } = useData();
+  const { assets, nodes, profiles, runs, enabled, refresh } = useData();
   const [kind, setKind] = useState('ALL');
   const [nodeId, setNodeId] = useState(nodeFilter || '');
   const [query, setQuery] = useState('');
@@ -985,12 +975,19 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const detailAsset = assets.data?.find((asset) => asset.id === detailId);
   const [syncAsset, setSyncAsset] = useState<Asset>();
   const [backgroundSync, setBackgroundSync] = useState<AssetTransfer>();
-  const [syncRevision, setSyncRevision] = useState(0);
+  const [assetPage, setAssetPage] = useState({ filters: '', page: 1 });
+  const assetTableRef = useRef<HTMLDivElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [showArchived, setShowArchived] = useState(false);
   const canWriteAssets = can('assets.write');
   const selectionOwner = user?.id || '';
+  const filterKey = JSON.stringify([selectionOwner, kind, nodeId, query, showArchived]);
+  useEffect(() => {
+    setAssetPage((previous) =>
+      previous.filters === filterKey ? previous : { filters: filterKey, page: 1 },
+    );
+  }, [filterKey]);
   const selectedSyncIds =
     canWriteAssets && selectionOwner && syncSelection.owner === selectionOwner
       ? reconcileBatchSyncSelection(syncSelection.ids, assets.data || [], nodes.data || [])
@@ -1017,18 +1014,61 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
     setSyncAsset(undefined);
     setArchiving(undefined);
   }, [canWriteAssets]);
-  const filtered = (assets.data || []).filter(
+  const assetSearchText = (asset: Asset) =>
+    `${asset.name} ${asset.path} ${readDatasetProfile(asset.metadata?.dataset_profile)?.robot_type || ''} ${readDatasetProfile(asset.metadata?.dataset_profile)?.task_description || ''}`;
+  const scopedAssets = (assets.data || []).filter(
     (asset) =>
       (kind === 'ALL' || asset.kind === kind) &&
       (!nodeId || asset.node_id === nodeId) &&
-      (showArchived || (asset.status || asset.state) !== 'ARCHIVED') &&
-      `${asset.name} ${asset.path} ${readDatasetProfile(asset.metadata?.dataset_profile)?.robot_type || ''} ${readDatasetProfile(asset.metadata?.dataset_profile)?.task_description || ''}`
-        .toLowerCase()
-        .includes(query.toLowerCase()),
+      (showArchived || (asset.status || asset.state) !== 'ARCHIVED'),
   );
-  const visibleSyncIds = filtered
-    .filter((asset) => !batchSyncSourceError(asset, nodes.data || []))
-    .map((asset) => asset.id);
+  const scopedEntries = groupDatasetNormAssets(
+    catalogAssetGroups(scopedAssets, assets.data || [], runs.data),
+  );
+  const groupSearchText = new Map<string, string>();
+  for (const entry of scopedEntries) {
+    if (entry.kind === 'asset') continue;
+    const search =
+      entry.kind === 'dataset-group'
+        ? `${entry.name} ${entry.assets.map(assetSearchText).join(' ')}`
+        : entry.name;
+    for (const asset of entry.assets) groupSearchText.set(asset.id, search);
+  }
+  const filtered = scopedAssets.filter((asset) =>
+    `${assetSearchText(asset)} ${groupSearchText.get(asset.id) || ''}`
+      .toLowerCase()
+      .includes(query.toLowerCase()),
+  );
+  const catalogEntries = groupDatasetNormAssets(
+    catalogAssetGroups(filtered, assets.data || [], runs.data),
+  );
+  const catalogPage = paginateAssetCatalog(
+    catalogEntries,
+    assetPage.filters === filterKey ? assetPage.page : 1,
+  );
+  useEffect(() => {
+    setAssetPage((previous) =>
+      previous.filters === filterKey && previous.page !== catalogPage.page
+        ? { filters: filterKey, page: catalogPage.page }
+        : previous,
+    );
+  }, [filterKey, catalogPage.page]);
+  const changeAssetPage = (page: number) => {
+    setAssetPage({ filters: filterKey, page });
+    assetTableRef.current?.scrollIntoView({ block: 'start', behavior: 'instant' });
+    assetTableRef.current?.focus({ preventScroll: true });
+  };
+  const modelGroupCount = catalogEntries.filter((entry) => entry.kind === 'model-group').length;
+  const datasetGroupCount = catalogEntries.filter((entry) => entry.kind === 'dataset-group').length;
+  const groupSummary = [
+    modelGroupCount ? `${modelGroupCount} 个训练模型组` : '',
+    datasetGroupCount ? `${datasetGroupCount} 个数据集集合` : '',
+  ]
+    .filter(Boolean)
+    .join('，');
+  const visibleSyncIds = catalogPage.assetIds.filter((id) =>
+    !batchSyncSourceError(assets.data?.find((asset) => asset.id === id), nodes.data || []),
+  );
   const selectedVisibleSyncCount = visibleSyncIds.filter((id) =>
     selectedSyncIds.includes(id),
   ).length;
@@ -1045,6 +1085,90 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         checked,
       ),
     }));
+  const renderAsset = (asset: Asset, grouped = false) => (
+    <tr key={asset.id} className={grouped ? 'asset-group-member-row' : undefined}>
+      <td className="asset-selection-column">
+        <input
+          type="checkbox"
+          aria-label={`选择同步资产 ${asset.name}`}
+          checked={selectedSyncIds.includes(asset.id)}
+          disabled={
+            !canWriteAssets ||
+            !selectionOwner ||
+            Boolean(batchSyncSourceError(asset, nodes.data || []))
+          }
+          title={batchSyncSourceError(asset, nodes.data || []) || `选择 ${asset.name}`}
+          onChange={(event) => updateSyncSelection([asset.id], event.target.checked)}
+        />
+      </td>
+      <td>
+        <button
+          type="button"
+          className="row-link asset-name-link"
+          aria-label={`查看资产：${asset.name}`}
+          onClick={() => setDetailId(asset.id)}
+        >
+          <span className={`row-icon ${asset.kind === 'DATASET' ? 'blue' : 'teal'}`}>
+            {asset.kind === 'DATASET' ? (
+              <Database size={16} />
+            ) : asset.kind === 'MODEL' ? (
+              <Box size={16} />
+            ) : (
+              <FileSliders size={16} />
+            )}
+          </span>
+          <strong>{asset.name}</strong>
+        </button>
+        {asset.kind === 'DATASET' && (
+          <>
+            <DatasetAssetFeatures asset={asset} />
+            <DatasetNormSummary asset={asset} assets={assets.data || []} />
+          </>
+        )}
+      </td>
+      <td>
+        <span>{assetKinds[asset.kind] || asset.kind}</span>
+        <span className="subtext mono">{asset.version}</span>
+      </td>
+      <td>
+        <a className="node-link" href={`#/nodes/${asset.node_id}`}>
+          <Server size={13} />
+          {nodes.data?.find((node) => node.id === asset.node_id)?.name ||
+            asset.node_id.slice(0, 10)}
+        </a>
+      </td>
+      <td>
+        <code className="path-truncate" title={asset.path}>
+          {asset.path}
+        </code>
+      </td>
+      <td>
+        <div className="asset-catalog-validation">
+          <Badge
+            state={asset.status || asset.state || 'REGISTERED'}
+            label={asset.kind === 'DATASET' && (asset.status || asset.state || 'REGISTERED') === 'REGISTERED' ? '已登记' : undefined}
+          />
+          {asset.kind === 'DATASET' && <DatasetValidationBadge validation={asset.validation} />}
+        </div>
+      </td>
+      <td>
+        {can('assets.write') && (asset.status || asset.state) !== 'ARCHIVED' && (
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={`删除登记 ${asset.name}`}
+            title="删除登记"
+            onClick={() => {
+              setError(undefined);
+              setArchiving(asset);
+            }}
+          >
+            <Trash2 size={16} />
+          </button>
+        )}
+      </td>
+    </tr>
+  );
   return (
     <>
       <PageHeading
@@ -1126,9 +1250,9 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       {canWriteAssets && (
         <div className="batch-asset-selection" aria-label="资产批量选择">
           <span>
-            已选择 {selectedSyncIds.length} 项 · 当前筛选中 {selectedVisibleSyncCount} 项
+            已选择 {selectedSyncIds.length} 项 · 当前页 {selectedVisibleSyncCount} 项
             {selectedSyncIds.length > selectedVisibleSyncCount
-              ? ` · 另有 ${selectedSyncIds.length - selectedVisibleSyncCount} 项来自其他筛选`
+              ? ` · 另有 ${selectedSyncIds.length - selectedVisibleSyncCount} 项来自其他页或筛选`
               : ''}
           </span>
           <button
@@ -1160,7 +1284,11 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         </div>
       )}
       <div className="table-meta">
-        <span>{filtered.length} 项资产</span>
+        <span>
+          {groupSummary
+            ? `${catalogEntries.length} 项显示 · ${filtered.length} 个资产（${groupSummary}）`
+            : `${filtered.length} 项资产`}
+        </span>
         <label className="checkbox-label">
           <input
             type="checkbox"
@@ -1175,15 +1303,15 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         {assets.loading && enabled && !assets.data ? (
           <Loading />
         ) : filtered.length ? (
-          <div className="table-scroll">
+          <div className="table-scroll" ref={assetTableRef} tabIndex={-1}>
             <table className="asset-catalog-table" aria-label="资产目录">
               <thead>
                 <tr>
                   <th className="asset-selection-column">
                     <input
                       type="checkbox"
-                      aria-label="全选当前筛选结果"
-                      title="只选择或取消当前筛选结果中的可同步资产"
+                      aria-label="全选当前页资产"
+                      title="只选择或取消当前页中的可同步资产，其他页的选择会保留"
                       checked={allVisibleSyncSelected}
                       ref={(input) => {
                         if (input)
@@ -1204,88 +1332,25 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                   <th>操作</th>
                 </tr>
               </thead>
-              <tbody>
-                {filtered.map((asset) => (
-                  <tr key={asset.id}>
-                    <td className="asset-selection-column">
-                      <input
-                        type="checkbox"
-                        aria-label={`选择同步资产 ${asset.name}`}
-                        checked={selectedSyncIds.includes(asset.id)}
-                        disabled={
-                          !canWriteAssets ||
-                          !selectionOwner ||
-                          Boolean(batchSyncSourceError(asset, nodes.data || []))
-                        }
-                        title={
-                          batchSyncSourceError(asset, nodes.data || []) || `选择 ${asset.name}`
-                        }
-                        onChange={(event) => updateSyncSelection([asset.id], event.target.checked)}
-                      />
-                    </td>
-                    <td>
-                      <button
-                        type="button"
-                        className="row-link asset-name-link"
-                        aria-label={`查看资产：${asset.name}`}
-                        onClick={() => setDetailId(asset.id)}
-                      >
-                        <span className={`row-icon ${asset.kind === 'DATASET' ? 'blue' : 'teal'}`}>
-                          {asset.kind === 'DATASET' ? (
-                            <Database size={16} />
-                          ) : asset.kind === 'MODEL' ? (
-                            <Box size={16} />
-                          ) : (
-                            <FileSliders size={16} />
-                          )}
-                        </span>
-                        <strong>{asset.name}</strong>
-                      </button>
-                      {asset.kind === 'DATASET' && (
-                        <>
-                          <DatasetAssetFeatures asset={asset} />
-                          <DatasetNormSummary asset={asset} assets={assets.data || []} />
-                        </>
-                      )}
-                    </td>
-                    <td>
-                      <span>{assetKinds[asset.kind] || asset.kind}</span>
-                      <span className="subtext mono">{asset.version}</span>
-                    </td>
-                    <td>
-                      <a className="node-link" href={`#/nodes/${asset.node_id}`}>
-                        <Server size={13} />
-                        {nodes.data?.find((node) => node.id === asset.node_id)?.name ||
-                          asset.node_id.slice(0, 10)}
-                      </a>
-                    </td>
-                    <td>
-                      <code className="path-truncate" title={asset.path}>
-                        {asset.path}
-                      </code>
-                    </td>
-                    <td>
-                      <Badge state={asset.status || asset.state || 'REGISTERED'} />
-                    </td>
-                    <td>
-                      {can('assets.write') && (asset.status || asset.state) !== 'ARCHIVED' && (
-                        <button
-                          type="button"
-                          className="icon-button"
-                          aria-label={`删除登记 ${asset.name}`}
-                          title="删除登记"
-                          onClick={() => {
-                            setError(undefined);
-                            setArchiving(asset);
-                          }}
-                        >
-                          <Trash2 size={16} />
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
+              {catalogPage.items.map((entry) =>
+                entry.kind === 'asset' ? (
+                  <tbody key={`asset-${entry.asset.id}`}>{renderAsset(entry.asset)}</tbody>
+                ) : (
+                  <AssetGroupRows
+                    key={entry.key}
+                    group={entry}
+                    node={nodes.data?.find((node) => node.id === entry.nodeId)}
+                    selectedIds={selectedSyncIds}
+                    eligibleIds={entry.assets
+                      .filter((asset) => visibleSyncIds.includes(asset.id))
+                      .map((asset) => asset.id)}
+                    canSelect={canWriteAssets && Boolean(selectionOwner)}
+                    onSelectionChange={updateSyncSelection}
+                    renderAsset={renderAsset}
+                    viewDataset={(dataset) => setDetailId(dataset.id)}
+                  />
+                ),
+              )}
             </table>
           </div>
         ) : (
@@ -1314,18 +1379,36 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           />
         )}
       </div>
-      <AssetTransfers
-        revision={syncRevision}
-        viewProgress={(transfer) => navigate(assetTransferTaskPath(transfer.id))}
-        viewTarget={(targetNodeId) => {
-          setNodeId(targetNodeId);
-          setKind('ALL');
-          setQuery('');
-          setShowArchived(false);
-          refresh();
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        }}
-      />
+      {assets.data && (
+        <nav className="asset-catalog-pagination" aria-label="资产目录分页">
+          <span>
+            每页 {ASSET_CATALOG_PAGE_SIZE} 项 · 第 {catalogPage.start}–{catalogPage.end} 项 / 共{' '}
+            {catalogPage.total} 项
+          </span>
+          <div className="asset-catalog-page-controls">
+            <button
+              type="button"
+              className="button outline small"
+              disabled={catalogPage.page <= 1}
+              onClick={() => changeAssetPage(catalogPage.page - 1)}
+            >
+              <ChevronLeft size={14} />
+              上一页
+            </button>
+            <span aria-live="polite">第 {catalogPage.page} / {catalogPage.totalPages} 页</span>
+            <button
+              type="button"
+              className="button outline small"
+              disabled={catalogPage.page >= catalogPage.totalPages}
+              onClick={() => changeAssetPage(catalogPage.page + 1)}
+            >
+              下一页
+              <ChevronRight size={14} />
+            </button>
+          </div>
+          <p>集合按一项计数，展开后可查看组内资产。</p>
+        </nav>
+      )}
       {detailAsset &&
         !(batchSyncOwner && batchSyncOwner === selectionOwner) &&
         !batchRegister &&
@@ -1336,8 +1419,17 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         !templateAsset && (
           <AssetDetail
             asset={detailAsset}
+            datasetChoices={detailAsset.kind === 'DATASET' && detailAsset.norm_asset_id
+              ? (assets.data || []).filter((asset) =>
+                asset.kind === 'DATASET' && asset.node_id === detailAsset.node_id &&
+                asset.norm_asset_id === detailAsset.norm_asset_id &&
+                (showArchived || (asset.status || asset.state) !== 'ARCHIVED'))
+              : undefined}
+            selectDataset={setDetailId}
             node={nodes.data?.find((node) => node.id === detailAsset.node_id)}
             assets={assets.data || []}
+            profiles={profiles.data}
+            validationChanged={assets.refresh}
             close={() => setDetailId(undefined)}
             bindNorm={() => setBindingDataset(detailAsset)}
             editProfile={() => setEditingProfile(detailAsset)}
@@ -1357,7 +1449,6 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           created={(transfer) => {
             setSyncAsset(undefined);
             setBackgroundSync(transfer);
-            setSyncRevision((value) => value + 1);
             refresh();
           }}
         />
@@ -1368,7 +1459,6 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           close={() => setBatchSyncOwner('')}
           created={() => {
             setSyncSelection({ owner: selectionOwner, ids: [] });
-            setSyncRevision((value) => value + 1);
             refresh();
           }}
         />
@@ -1523,7 +1613,9 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
       title="登记本地资产"
       wide
       className={`asset-register-modal ${showDatasetConfig ? '' : 'asset-register-simple'}`}
-      subtitle="建立资产元数据与裸金属本地路径的关联。"
+      subtitle={form.kind === 'DATASET'
+        ? '登记后自动在后台执行基础校验，可在资产列表与详情查看结果。'
+        : '建立资产元数据与裸金属本地路径的关联。'}
       close={() => {
         if (!pending.current) close();
       }}

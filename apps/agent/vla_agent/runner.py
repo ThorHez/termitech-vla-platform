@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -109,6 +110,7 @@ def execute(config: dict, attempt_id: str) -> int:
     descendants: list[dict] = []
     gpu_locks = []
     selector = None
+    artifact_monitor = None
     output = None
     profile = None
     start_snapshot = None
@@ -121,6 +123,18 @@ def execute(config: dict, attempt_id: str) -> int:
 
     old_signals = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
+        runtime = attempt.get("runner_runtime")
+        if runtime:
+            from .runner_runtime import installed_runtime
+            installed = installed_runtime()
+            if (not installed or installed["runtime_path"] != runtime["runtime_path"]
+                    or installed.get("build_id") != runtime.get("build_id")
+                    or config["config_path"] != runtime["config_path"]
+                    or hashlib.sha256(Path(config["config_path"]).read_bytes()).hexdigest() != runtime["config_sha256"]):
+                raise AgentError("RUNNER_RUNTIME_CHANGED", "训练监控环境或配置已变化，拒绝启动训练")
+        if attempt["cancel_requested"]:
+            state.emit(attempt_id, "CANCELLED", {"exit_code": None, "process_started": False})
+            return 0
         output = allowed_path(attempt["output_dir"], [config["output_root"]], must_exist=False)
         profile, inputs = validate_local_inputs(config, payload)
         if profile.get("adapter") != "smoke":
@@ -182,6 +196,9 @@ def execute(config: dict, attempt_id: str) -> int:
             identity = {"pid": child.pid, "created_at": psutil.Process(child.pid).create_time()}
         state.set_identity(attempt_id, "child", identity)
         state.emit(attempt_id, "STARTED", {"pid": child.pid, "code_snapshot": start_snapshot, "output_dir": str(output)})
+        if profile.get("adapter") == "openpi-sft":
+            artifact_monitor = ArtifactMonitor(state, config["output_root"],
+                                               output_roots=config.get("_output_root_history", []))
         selector = selectors.DefaultSelector()
         os.set_blocking(child.stdout.fileno(), False)
         selector.register(child.stdout, selectors.EVENT_READ)
@@ -212,6 +229,8 @@ def execute(config: dict, attempt_id: str) -> int:
                     by_identity = {(p["pid"], p["created_at"]): p for p in descendants + new_descendants}
                     descendants = list(by_identity.values())
                 current = state.attempt(attempt_id)
+                if artifact_monitor:
+                    artifact_monitor.schedule([current])
                 if (current["cancel_requested"] or interrupted) and not cancelling:
                     cancelling, cancel_started = True, now
                     _kill_owned(identity, descendants, signal.SIGTERM)
@@ -249,6 +268,8 @@ def execute(config: dict, attempt_id: str) -> int:
                         break
             if buffer:
                 record_line(buffer)
+        if artifact_monitor:
+            artifact_monitor.close()
         code_changed = False
         try:
             end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}))
@@ -296,6 +317,8 @@ def execute(config: dict, attempt_id: str) -> int:
                                            "checks": launch_checks})
         return 1
     finally:
+        if artifact_monitor:
+            artifact_monitor.close()
         for sig, handler in old_signals.items():
             signal.signal(sig, handler)
         if selector:

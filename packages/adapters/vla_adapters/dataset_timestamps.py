@@ -199,6 +199,23 @@ def _parquet_file(path, parquet):
 
 
 def inspect_dataset_timestamps(data, spec):
+    """Reuse a source-bound receipt, retaining the complete check on a miss."""
+    if not spec.get("validation_cache_dir"):
+        return _inspect_dataset_timestamps(data, spec)
+    if __package__:
+        from .dataset_validation_cache import get_or_validate
+    else:
+        from dataset_validation_cache import get_or_validate
+
+    def context():
+        runtime, tolerance = _runtime()
+        return {"runtime": runtime, "tolerance_s": tolerance}
+
+    return get_or_validate("timestamps", data, spec,
+                           lambda: _inspect_dataset_timestamps(data, spec), context=context)
+
+
+def _inspect_dataset_timestamps(data, spec):
     """Verify every timestamp pair under the exact effective FPS declaration."""
     deadline = time.monotonic() + SCAN_SECONDS
     try:

@@ -421,6 +421,91 @@ def test_probe_has_bounded_output_and_kills_process_group(tmp_path):
     assert time.monotonic() - started < 5
 
 
+def bound_probe_spec(count):
+    bindings, inputs = [], {"model": {"id": "model"}}
+    for index in range(count):
+        dataset_id, norm_id = f"data-{index}", f"norm-{index}"
+        bindings.append({"dataset_asset_id": dataset_id, "norm_asset_id": norm_id,
+                         "recipe_index": 0, "weight": 1})
+        inputs[f"dataset_{index}"] = {"id": dataset_id}
+        inputs[f"norm_{index}"] = {"id": norm_id}
+    return {"dataset_bindings": bindings, "inputs": inputs}
+
+
+@pytest.mark.parametrize("count,expected", [(1, 300), (2, 360), (3, 420), (7, 660), (8, 720), (12, 720), (64, 720)])
+def test_training_probe_budget_is_bounded_by_validated_dataset_count(count, expected):
+    spec = bound_probe_spec(count)
+    # These untrusted declarations cannot alter an Agent-owned execution limit.
+    spec.update(timeout=86400, probe_timeout_seconds=86400, preflight_timeout_seconds=86400)
+    assert training_validation._training_probe_limits(spec) == (count, expected)
+
+
+def test_legacy_single_dataset_gets_training_probe_initialization_budget():
+    assert training_validation._training_probe_limits({"inputs": {}}) == (1, 300)
+    assert training_validation._training_probe_limits({"inputs": {}, "dataset_bindings": None}) == (1, 300)
+
+
+@pytest.mark.parametrize("mutation", ["empty", "too_many", "missing_asset", "mismatched_input", "invalid_weight"])
+def test_invalid_bindings_cannot_expand_the_probe_budget(probe_fixture, monkeypatch, mutation):
+    spec = bound_probe_spec(65 if mutation == "too_many" else 2)
+    if mutation == "empty":
+        spec["dataset_bindings"] = []
+    elif mutation == "missing_asset":
+        spec["dataset_bindings"][0]["dataset_asset_id"] = ""
+    elif mutation == "mismatched_input":
+        spec["inputs"]["dataset_0"]["id"] = "another-dataset"
+    elif mutation == "invalid_weight":
+        spec["dataset_bindings"][0]["weight"] = 0
+    argv = list(probe_fixture["launch"]["argv"])
+    position = argv.index("--spec-json") + 1
+    argv[position] = json.dumps({**json.loads(argv[position]), **spec})
+    monkeypatch.setattr(training_validation, "_probe_process",
+                        lambda *args, **kwargs: pytest.fail("invalid bindings launched a probe"))
+    with pytest.raises(AgentError) as failure:
+        training_validation._wrapper_validation(probe_fixture["config"], {**probe_fixture["launch"], "argv": argv}, [])
+    assert failure.value.code == "PREFLIGHT_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("count,expected", [(1, 300), (2, 360), (12, 720)])
+def test_training_wrapper_forwards_budget_and_preserves_failed_checks(probe_fixture, monkeypatch, count, expected):
+    argv = list(probe_fixture["launch"]["argv"])
+    position = argv.index("--spec-json") + 1
+    argv[position] = json.dumps({**json.loads(argv[position]), **bound_probe_spec(count)})
+    response = {"schema_version": 1, "scope": "configuration_and_local_assets",
+                "checks": [{"name": "norm_contract", "ok": False, "message": "invalid norm"}],
+                "error": {"code": "NORM_CONTRACT", "message": "invalid norm"}}
+    observed = []
+
+    def failed_probe(command, cwd, environment, *, timeout):
+        observed.append(timeout)
+        assert environment["CUDA_VISIBLE_DEVICES"] == "" and environment["JAX_PLATFORMS"] == "cpu"
+        return 2, "VLA_PREFLIGHT:" + json.dumps(response), ""
+
+    monkeypatch.setattr(training_validation, "_probe_process", failed_probe)
+    checks = []
+    with pytest.raises(AgentError) as failure:
+        training_validation._wrapper_validation(probe_fixture["config"], {**probe_fixture["launch"], "argv": argv}, checks)
+    assert observed == [expected]
+    assert failure.value.code == "NORM_CONTRACT" and checks == response["checks"]
+
+
+@pytest.mark.parametrize("count,expected", [(1, 300), (12, 720)])
+def test_wrapper_timeout_identifies_dataset_count_and_total_limit(probe_fixture, monkeypatch, count, expected):
+    argv = list(probe_fixture["launch"]["argv"])
+    position = argv.index("--spec-json") + 1
+    argv[position] = json.dumps({**json.loads(argv[position]), **bound_probe_spec(count)})
+
+    def timeout_probe(command, cwd, environment, *, timeout):
+        assert timeout == expected
+        raise AgentError("PREFLIGHT_TIMEOUT", "child did not finish")
+
+    monkeypatch.setattr(training_validation, "_probe_process", timeout_probe)
+    with pytest.raises(AgentError) as failure:
+        training_validation._wrapper_validation(probe_fixture["config"], {**probe_fixture["launch"], "argv": argv}, [])
+    assert failure.value.code == "PREFLIGHT_TIMEOUT"
+    assert f"{count} 组数据集" in str(failure.value) and f"总时限 {expected} 秒" in str(failure.value)
+
+
 def test_probe_timeout_kills_descendant_even_if_parent_exits(tmp_path):
     pid_file = tmp_path / "child-pid"
     script = tmp_path / "hang.py"

@@ -8,6 +8,10 @@ from pydantic import Field, SecretStr, field_validator
 from .schemas import AgentConfigInput, InputModel
 
 
+class AgentUpgradeInput(InputModel):
+    expected_build_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
 class SSHAuthenticationInput(InputModel):
     host: str = Field(min_length=1, max_length=255)
     port: int = Field(default=22, ge=1, le=65535, strict=True)

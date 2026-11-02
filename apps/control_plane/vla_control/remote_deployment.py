@@ -12,7 +12,9 @@ import logging
 import os
 from pathlib import Path
 import queue
+import shutil
 import stat
+import tempfile
 import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -24,10 +26,10 @@ from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 
 from .common import APIError, TERMINAL, digest, now, offset_time, uid
-from .models import Allocation, Command, Node, Profile, Run
+from .models import Allocation, Attempt, Command, GPUReservation, Node, Profile, Run
 from .onboarding import _path, generate_agent_config, resolve_agent_config_defaults
 from .remote_models import RemoteConnection, RemoteDeployment
-from .remote_schemas import RemoteDeploymentInput, SSHAuthenticationInput, SSHConnectionInput, SSHInstallCheckInput, SSHPathSuggestInput
+from .remote_schemas import AgentUpgradeInput, RemoteDeploymentInput, SSHAuthenticationInput, SSHConnectionInput, SSHInstallCheckInput, SSHPathSuggestInput
 
 
 JOB_TERMINAL = {"SUCCEEDED", "FAILED", "INTERRUPTED", "DISCONNECTED", "UNINSTALLED"}
@@ -403,13 +405,53 @@ class DeploymentManager:
         run = session.scalar(select(Run.id).where(Run.node_id == node_id, Run.state.not_in(TERMINAL)).limit(1))
         command = session.scalar(select(Command.id).where(Command.node_id == node_id, Command.status == "PENDING").limit(1))
         allocation = session.scalar(select(Allocation.node_id).where(Allocation.node_id == node_id).limit(1))
+        attempt = session.scalar(select(Attempt.id).where(Attempt.node_id == node_id, Attempt.state.not_in(TERMINAL)).limit(1))
+        reservation = session.scalar(select(GPUReservation.node_id).where(GPUReservation.node_id == node_id).limit(1))
         from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
         deployment = session.scalar(select(PolicyDeployment.id).where(
             PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES)).limit(1))
         from .checkpoint_transfers import active_transfers
         from .asset_transfers import active_asset_transfers
-        if run or command or allocation or deployment or active_transfers(session, node_id) or active_asset_transfers(session, node_id=node_id):
+        if run or command or allocation or attempt or reservation or deployment or active_transfers(session, node_id) or active_asset_transfers(session, node_id=node_id):
             raise APIError(409, "NODE_BUSY", "该机器仍有训练、资产同步、真机部署、资源预约或待执行命令，暂不能管理 Agent")
+
+    def _assert_upgrade_safe(self, session, node_id: str | None):
+        """Only a fresh proof for every running attempt permits a live upgrade.
+
+        Disconnect and uninstall still require complete idleness. A capability
+        flag alone is insufficient: old and isolated runners can coexist after
+        the first upgrade, and UNKNOWN work must retain its recovery guard.
+        """
+        if not node_id:
+            return
+        node = session.scalar(select(Node).where(Node.id == node_id).with_for_update().execution_options(populate_existing=True))
+        command = session.scalar(select(Command.id).where(Command.node_id == node_id, Command.status == "PENDING").limit(1))
+        from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
+        deployment = session.scalar(select(PolicyDeployment.id).where(
+            PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES)).limit(1))
+        from .checkpoint_transfers import active_transfers
+        from .asset_transfers import active_asset_transfers
+        if command or deployment or active_transfers(session, node_id) or active_asset_transfers(session, node_id=node_id):
+            raise APIError(409, "NODE_BUSY", "该机器仍有资产同步、真机部署或待执行命令，暂不能升级 Agent")
+        runs = list(session.scalars(select(Run).where(Run.node_id == node_id, Run.state.not_in(TERMINAL))))
+        attempts = list(session.scalars(select(Attempt).where(Attempt.node_id == node_id, Attempt.state.not_in(TERMINAL))))
+        allocations = list(session.scalars(select(Allocation).where(Allocation.node_id == node_id)))
+        if not runs and not attempts and not allocations:
+            return
+        proof = node.metrics.get("training_supervisor", {}) if node and isinstance(node.metrics, dict) else {}
+        ids = {attempt.id for attempt in attempts}
+        proven_ids = proof.get("active_attempt_ids") if isinstance(proof, dict) else None
+        safe = (node is not None and node.status == "ONLINE"
+                and node.last_seen >= offset_time(-self.settings.heartbeat_timeout_seconds)
+                and isinstance(proof, dict) and proof.get("protocol_version") == 1 and proof.get("upgrade_safe") is True
+                and isinstance(proven_ids, list) and all(isinstance(value, str) for value in proven_ids)
+                and ids and set(proven_ids) == ids
+                and all(attempt.state in {"RUNNING", "CANCELLING"} for attempt in attempts)
+                and {run.id for run in runs} == {attempt.run_id for attempt in attempts}
+                and all(run.state in {"RUNNING", "CANCELLING"} for run in runs)
+                and all(allocation.attempt_id in ids for allocation in allocations))
+        if not safe:
+            raise APIError(409, "NODE_BUSY", "训练尚未由独立监控进程接管，或运行状态待确认；请等待当前任务结束后升级 Agent")
 
     @staticmethod
     def _assert_no_other_job(session, node_id: str | None, exclude_id: str | None = None):
@@ -537,7 +579,7 @@ class DeploymentManager:
     def _node_management(self, session, node_id):
         node = self._required_node(session, node_id)
         jobs = list(session.scalars(select(RemoteDeployment).where(RemoteDeployment.node_id == node_id).order_by(RemoteDeployment.created_at.desc())))
-        installations = [job for job in jobs if self._operation(job) == "install"]
+        installations = [job for job in jobs if self._operation(job) in {"install", "upgrade"}]
         latest = installations[0] if installations else None
         connection = session.get(RemoteConnection, latest.connection_id) if latest else None
         busy = None
@@ -545,7 +587,8 @@ class DeploymentManager:
             busy = "机器已断开或卸载；如需再次使用，请重新通过 SSH 接入"
         elif any(job.state not in JOB_TERMINAL for job in jobs):
             busy = "机器仍有未完成的管理操作，请等待完成后再操作"
-        else:
+        management_busy = busy
+        if busy is None:
             try:
                 self._assert_idle(session, node_id)
             except APIError as exc:
@@ -553,16 +596,93 @@ class DeploymentManager:
         uninstall_reason = busy
         if not uninstall_reason and (not latest or not connection or not connection.encrypted_password):
             uninstall_reason = "没有可用的 SSH 管理凭据；请先通过 SSH 重新接入机器"
+        upgrade_reason = management_busy
+        if upgrade_reason is None:
+            try:
+                self._assert_upgrade_safe(session, node_id)
+            except APIError as exc:
+                upgrade_reason = exc.message
+        if not upgrade_reason and (not latest or not connection or not connection.encrypted_password):
+            upgrade_reason = "没有可用的 SSH 管理凭据；请先通过 SSH 重新接入机器"
+        release = None
+        try:
+            release = self._upgrade_release()
+        except APIError as exc:
+            upgrade_reason = upgrade_reason or exc.message
+        upgrades = [job for job in jobs if self._operation(job) == "upgrade"]
+        agent = node.metrics.get("agent", {})
         return {"node_id": node.id, "node_status": node.status, "managed": latest is not None,
                 "host": connection.host if connection else None, "port": connection.port if connection else None,
                 "username": connection.username if connection else None, "install_dir": latest.install_dir if latest else None,
                 "deployment_id": latest.id if latest else None, "can_disconnect": busy is None,
                 "can_uninstall": uninstall_reason is None, "reason": busy or uninstall_reason,
-                "disconnect_reason": busy, "uninstall_reason": uninstall_reason}, latest, connection
+                "disconnect_reason": busy, "uninstall_reason": uninstall_reason,
+                "can_upgrade": upgrade_reason is None, "upgrade_reason": upgrade_reason,
+                "current_version": agent.get("version") if isinstance(agent, dict) else None,
+                "target_version": release["version"] if release else None,
+                "current_build_id": agent.get("build_id") if isinstance(agent, dict) else None,
+                "target_build_id": release["build_id"] if release else None,
+                "latest_upgrade": self._view(session, upgrades[0]) if upgrades else None}, latest, connection
 
     def management(self, node_id):
         with self.db.read() as session:
             return self._node_management(session, node_id)[0]
+
+    @staticmethod
+    def _upgrade_release():
+        from vla_protocol.agent_release import read_agent_bundle
+
+        bundle = Path(os.getenv("VLA_AGENT_BUNDLE", ".local/agent-dist/vla-agent-bundle.tar.gz"))
+        try:
+            return read_agent_bundle(bundle)
+        except (OSError, ValueError):
+            raise APIError(503, "AGENT_PACKAGE_UNAVAILABLE", "中台尚未准备可验证版本的 Agent 安装包，请先重新构建安装包") from None
+
+    def upgrade(self, node_id: str, key: str | None, expected_build_id: str | None = None):
+        if not key or not key.strip() or len(key) > 200:
+            raise APIError(422, "IDEMPOTENCY_KEY_REQUIRED", "Provide an Idempotency-Key of 1 to 200 characters")
+        request = {"node_id": node_id, "operation": "upgrade"}
+        if expected_build_id is not None:
+            request["expected_build_id"] = expected_build_id
+        request_digest = digest(request)
+        with self.db.write() as session:
+            node = self._required_node(session, node_id)
+            session.scalar(select(Node).where(Node.id == node_id).with_for_update().execution_options(populate_existing=True))
+            existing = session.scalar(select(RemoteDeployment).where(RemoteDeployment.idempotency_key == key))
+            if existing:
+                if existing.request_digest != request_digest:
+                    raise APIError(409, "IDEMPOTENCY_CONFLICT", "该幂等键已用于不同的管理操作")
+                return self._view(session, existing)
+            self._assert_upgrade_safe(session, node_id)
+            info, source, connection = self._node_management(session, node_id)
+            if not info["can_upgrade"]:
+                raise APIError(409, "NODE_UPGRADE_UNAVAILABLE", info["upgrade_reason"])
+            release = self._upgrade_release()
+            if expected_build_id is not None and expected_build_id != release["build_id"]:
+                raise APIError(409, "AGENT_PACKAGE_CHANGED", "Agent 安装包已更换，请刷新并确认新的目标版本后升级")
+            self._assert_no_other_job(session, node_id)
+            onboarding_id, timestamp = uid(), now()
+            profiles = [{"id": p.id, "name": p.name, "code_dir": p.code_dir, "python": p.python,
+                "adapter": p.adapter, "recipe": p.recipe, "execution_mode": p.execution_mode,
+                "docker_image": p.docker_image, "metadata": {"onboarding_id": onboarding_id}}
+                for p in session.scalars(select(Profile).where(Profile.node_id == node_id, Profile.active.is_(True)))]
+            if not profiles:
+                raise APIError(409, "NODE_UPGRADE_UNAVAILABLE", "机器没有可用的运行环境，请先检查 Agent 配置")
+            config = {key: value for key, value in source.agent_config.items() if not key.startswith("_")}
+            config.update(name=node.name, roots=node.roots, output_root=node.output_root, cache_root=node.cache_root,
+                profiles=profiles, _operation="upgrade", _target_release=release)
+            job = RemoteDeployment(id=uid(), connection_id=connection.id, idempotency_key=key,
+                request_digest=request_digest, target_key=source.target_key, onboarding_id=onboarding_id, node_id=node_id,
+                state="QUEUED", stage="QUEUED", logs=[], history=[], agent_config=config,
+                install_dir=source.install_dir, control_plane_url=source.control_plane_url,
+                connection_mode=source.connection_mode, tunnel_state="STARTING" if source.connection_mode == "ssh-tunnel" else "NOT_REQUIRED",
+                tunnel_remote_port=None, created_at=timestamp, updated_at=timestamp, started_at=None, finished_at=None, error=None)
+            self._change(job, "QUEUED", "QUEUED", "Agent 升级已排队；将保留机器身份、当前环境和存储配置")
+            session.add(job)
+            session.flush()
+            view = self._view(session, job)
+        self._launch(job.id)
+        return view
 
     def _retire_node(self, session, node_id: str, state: str):
         node = self._required_node(session, node_id)
@@ -602,7 +722,7 @@ class DeploymentManager:
                 job = session.get(RemoteDeployment, job_id)
                 node = session.get(Node, job.node_id) if job and job.node_id else None
                 allowed = (job is not None and job.tunnel_state not in DISABLED_TUNNELS
-                           and self._operation(job) == "install"
+                           and self._operation(job) in {"install", "upgrade"}
                            and (node is None or node.status not in {"DISCONNECTED", "REMOVED"})
                            and not self._stop.is_set())
             if allowed:
@@ -717,13 +837,14 @@ class DeploymentManager:
             self._execute_uninstall(job_id)
             return
         remote = None
+        bundle_snapshot = None
         try:
             with self.db.write() as session:
                 job = session.get(RemoteDeployment, job_id)
                 if job is None or job.state != "QUEUED":
                     return
                 connection = session.get(RemoteConnection, job.connection_id)
-                self._assert_idle(session, job.node_id)
+                (self._assert_upgrade_safe if self._operation(job) == "upgrade" else self._assert_idle)(session, job.node_id)
                 self._change(job, "RUNNING", "CONNECTING", "正在通过已验证的 SSH 主机密钥连接目标机器")
                 job.started_at = now()
                 config = dict(job.agent_config)
@@ -734,13 +855,31 @@ class DeploymentManager:
                 return
             self._log(job_id, "CHECKING", "正在重新检查系统、目录和现有 Agent 状态")
             probe = remote.probe(prefix)
-            if not probe.get("can_install"):
+            if not (probe.get("can_upgrade", probe.get("can_install")) if self._operation(job) == "upgrade" else probe.get("can_install")):
                 raise APIError(409, "SSH_PREREQUISITES_FAILED", "目标机器未通过安装条件检查，请修复目录权限或系统依赖后重试")
             existing = probe.get("existing_agent") or {}
             with self.db.write() as session:
                 job = session.get(RemoteDeployment, job_id)
+                if self._operation(job) == "upgrade":
+                    from .ssh_remote import upgrade_public_config
+
+                    if existing.get("node_id") != job.node_id:
+                        raise APIError(409, "REMOTE_NODE_CHANGED", "远端 Agent 身份与待升级机器不一致，升级已停止；请检查 SSH 接入")
+                    if existing.get("state_dir") != config.get("state_dir"):
+                        raise APIError(409, "AGENT_STATE_DIR_CONFLICT", "远端 Agent 状态目录已变化，升级已停止；请检查当前配置")
+                    public = upgrade_public_config(existing)
+                    if not public.get("profiles") or not all(key in public for key in ("name", "roots", "output_root", "state_dir")):
+                        raise APIError(409, "AGENT_CONFIG_UNAVAILABLE", "远端 Agent 配置不完整，升级已停止；请检查当前配置")
+                    config = {**public, "cache_root": public.get("cache_root"),
+                        "control_plane_url": config["control_plane_url"], "_operation": "upgrade",
+                        "_target_release": config["_target_release"]}
+                    config["profiles"] = [{**profile, "execution_mode": profile.get("execution_mode", "native"),
+                        "metadata": {"onboarding_id": job.onboarding_id}} for profile in public["profiles"]]
+                    config["_upgrade_expected"] = public
+                    config["_upgrade_node_id"] = job.node_id
+                    job.agent_config = dict(config)
                 actual_node_id = existing.get("node_id") or job.node_id
-                self._assert_idle(session, actual_node_id)
+                (self._assert_upgrade_safe if self._operation(job) == "upgrade" else self._assert_idle)(session, actual_node_id)
                 self._assert_no_other_job(session, actual_node_id, job.id)
                 actual_node = session.get(Node, actual_node_id) if actual_node_id else None
                 if actual_node and actual_node.status in {"DISCONNECTED", "REMOVED"}:
@@ -769,6 +908,19 @@ class DeploymentManager:
             bundle = Path(os.getenv("VLA_AGENT_BUNDLE", ".local/agent-dist/vla-agent-bundle.tar.gz"))
             if not bundle.is_file():
                 raise APIError(503, "AGENT_PACKAGE_UNAVAILABLE", "中台尚未准备 Agent 安装包，请管理员先构建安装包")
+            if self._operation(job) == "upgrade":
+                from vla_protocol.agent_release import read_agent_bundle
+
+                bundle_snapshot = tempfile.TemporaryDirectory(prefix="vla-agent-upgrade-")
+                snapshot = Path(bundle_snapshot.name) / "vla-agent-bundle.tar.gz"
+                shutil.copyfile(bundle, snapshot)
+                try:
+                    release = read_agent_bundle(snapshot)
+                except (OSError, ValueError):
+                    raise APIError(409, "AGENT_PACKAGE_CHANGED", "Agent 安装包已更换或失效，请重新构建并提交升级") from None
+                if release != config["_target_release"]:
+                    raise APIError(409, "AGENT_PACKAGE_CHANGED", "Agent 安装包已更换，请重新提交升级以确认目标版本")
+                bundle = snapshot
             remote.install(bundle, config, prefix, lambda stage, message: self._log(job_id, stage, message))
             config.pop("enrollment_token", None)
             remote.close()
@@ -799,6 +951,8 @@ class DeploymentManager:
         finally:
             if remote is not None:
                 remote.close()
+            if bundle_snapshot is not None:
+                bundle_snapshot.cleanup()
             with self._lock:
                 self._workers.pop(job_id, None)
 
@@ -816,6 +970,10 @@ class DeploymentManager:
                 if (not node or node.status != "ONLINE" or node.last_seen <= job.started_at
                         or (job.node_id and job.node_id != node.id)):
                     continue
+                if self._operation(job) == "upgrade":
+                    release = node.metrics.get("agent", {})
+                    if not isinstance(release, dict) or any(release.get(key) != value for key, value in job.agent_config["_target_release"].items()):
+                        continue
                 if any(p["id"] not in profiles or any(getattr(profiles[p["id"]], field) != p.get(field)
                        for field in ("code_dir", "python", "adapter", "recipe", "execution_mode")) for p in expected):
                     continue
@@ -827,6 +985,8 @@ class DeploymentManager:
                 node.name = job.agent_config["name"]
                 node.roots = job.agent_config["roots"]
                 node.output_root = job.agent_config["output_root"]
+                if self._operation(job) == "upgrade":
+                    node.cache_root = job.agent_config.get("cache_root")
                 checks = {check.get("profile_id"): check for check in node.metrics.get("runtime_checks", [])}
                 if any(checks.get(p["id"], {}).get("status") == "FAILED" for p in expected):
                     message = "Agent 已上线，但训练 Python 环境检查失败；请在机器详情查看检查结果，修正路径后重新接入"
@@ -835,7 +995,8 @@ class DeploymentManager:
                     return True
                 if not all(checks.get(p["id"], {}).get("status") == "READY" for p in expected):
                     continue
-                self._change(job, "SUCCEEDED", "ONLINE", "Agent 已上线，训练 Python 环境检查通过")
+                self._change(job, "SUCCEEDED", "ONLINE", "Agent 升级完成，目标构建已上线且训练 Python 环境检查通过"
+                    if self._operation(job) == "upgrade" else "Agent 已上线，训练 Python 环境检查通过")
                 job.error = None
                 return True
         return False
@@ -880,7 +1041,7 @@ class DeploymentManager:
                 continue
             with self._lock:
                 tunnel = self._tunnels.get(job.id)
-            if self._operation(job) != "install":
+            if self._operation(job) not in {"install", "upgrade"}:
                 continue
             if tunnel is not None and tunnel.healthy:
                 self._tunnel_retries.pop(job.id, None)
@@ -1007,6 +1168,8 @@ class DeploymentManager:
             raise APIError(409, "DEPLOYMENT_NOT_RETRYABLE", "只有失败或中断的部署可以重试")
         if old["operation"] == "uninstall":
             return self.remove(old["node_id"], "uninstall", key or f"retry-{job_id}-{uid()}")
+        if old["operation"] == "upgrade":
+            return self.upgrade(old["node_id"], key or f"retry-{job_id}-{uid()}")
         config = dict(old["agent"])
         config["profiles"] = [{field: profile[field] for field in ("id", "name", "code_dir", "python", "adapter", "recipe", "execution_mode")
                                if field in profile} for profile in config["profiles"]]
@@ -1046,6 +1209,10 @@ def register_remote_routes(app: FastAPI, admin, manager: DeploymentManager):
     @app.post("/api/v1/nodes/{node_id}/uninstall", dependencies=admin, status_code=202)
     def node_uninstall(node_id: str, idempotency_key: str | None = Header(default=None)):
         return response(manager.remove(node_id, "uninstall", idempotency_key), 202)
+
+    @app.post("/api/v1/nodes/{node_id}/upgrade", dependencies=admin, status_code=202)
+    def node_upgrade(node_id: str, body: AgentUpgradeInput | None = None, idempotency_key: str | None = Header(default=None)):
+        return response(manager.upgrade(node_id, idempotency_key, body.expected_build_id if body else None), 202)
 
     @app.get("/api/v1/remote-deployments", dependencies=admin)
     def list_deployments():

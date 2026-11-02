@@ -250,7 +250,8 @@ try {
     assert.match(html, /新建训练/);
     assert.match(html, /后台执行/);
     assert.match(html, /筛选任务类型/);
-    assert.match(html, /最近 200 条/);
+    assert.match(html, /每页固定显示 20 条/);
+    assert.match(html, /aria-label="任务分页"/);
     assert.doesNotMatch(html, /开始同步|取消同步|重试同步/);
   });
 } finally {

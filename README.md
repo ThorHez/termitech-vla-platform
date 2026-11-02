@@ -112,7 +112,7 @@ Compose 包含 PostgreSQL、API/Web 和独立 Scheduler，默认仅将端口发�
 
 如果先使用本机中台连接远端 Agent，参见 [SSH 隧道联调说明](docs/remote-agent-dev.md)。该模式保持管理端口在 loopback 上，不需要开放公网管理端口。
 
-远端需要 Linux/systemd、Git、SSH 密码认证，以及 root 或 sudo 安装权限。安装优先发现 Conda，并在 Agent 安装目录下创建专用 Python 3.11 Conda 环境；只有没有 Conda 时，才使用默认 Python 3.11+ 创建 venv。SSH 无需预先激活 Conda，检测会显示实际解释器路径和版本。训练环境、代码、数据和模型需已在目标机器准备好。中台不向 base 或训练环境安装 Agent 依赖。已有 Agent 更新会保留状态目录及节点身份，并拒绝更新仍有活动任务的机器。
+远端需要 Linux/systemd、Git、SSH 密码认证，以及 root 或 sudo 安装权限。安装优先发现 Conda，并在 Agent 安装目录下创建专用 Python 3.11 Conda 环境；只有没有 Conda 时，才使用默认 Python 3.11+ 创建 venv。SSH 无需预先激活 Conda，检测会显示实际解释器路径和版本。训练环境、代码、数据和模型需已在目标机器准备好。中台不向 base 或训练环境安装 Agent 依赖。升级为 Agent 创建新版本环境并保留节点身份和状态；已隔离的训练 Runner 保留原环境和配置，训练及本地监控持续运行。旧版或状态未知的任务仍会阻止升级，首次迁移需等待旧任务结束，详见[Agent 升级说明](docs/agent-upgrades.md)。
 
 Agent 服务及训练进程使用 SSH 登录用户运行，普通用户的 sudo 仅用于安装和服务管理；使用 root 接入时，Agent 使用 root。安装前会使用该账户验证训练 Python 和代码目录的实际访问能力。
 

@@ -1,0 +1,64 @@
+.dataset-validation-badge {
+  display: inline-block;
+}
+.asset-catalog-validation {
+  display: grid;
+  justify-items: start;
+  gap: 6px;
+}
+.dataset-validation-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.dataset-validation-heading h4 {
+  margin: 0;
+}
+.dataset-validation > p,
+.dataset-validation-checks {
+  color: var(--text-secondary, #63828d);
+  font-size: 11px;
+  line-height: 1.7;
+}
+.dataset-validation-scope {
+  margin-bottom: 14px;
+}
+.dataset-validation > .dataset-validation-warning,
+.dataset-validation-checks .failed {
+  color: var(--text-warning, #a16636);
+}
+.dataset-validation-checks summary {
+  cursor: pointer;
+}
+.dataset-validation-checks ul {
+  list-style: none;
+  padding: 0;
+}
+.dataset-validation-checks li {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-top: 8px;
+}
+.dataset-validation-checks svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.dataset-validation-actions {
+  display: flex;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+.dataset-validation-actions .field {
+  flex: 1;
+  min-width: 210px;
+  margin: 0;
+}
+.dataset-validation-actions > .field-hint,
+.dataset-validation-actions > .error-notice {
+  flex-basis: 100%;
+}

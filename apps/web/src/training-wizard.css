@@ -239,7 +239,7 @@
   margin: 0;
 }
 
-.training-data-datasets .dataset-binding > .form-grid {
+.training-data-datasets .dataset-binding-content > .form-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(100px, 0.6fr);
   gap: 0 12px;
 }
@@ -271,7 +271,7 @@
     gap: 6px;
   }
 
-  .training-data-datasets .dataset-binding > .form-grid {
+  .training-data-datasets .dataset-binding-content > .form-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -407,7 +407,7 @@
     gap: 6px;
   }
 
-  .training-data-datasets .dataset-binding > .form-grid {
+  .training-data-datasets .dataset-binding-content > .form-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }

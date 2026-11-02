@@ -21,6 +21,7 @@ import { useAuth } from './auth';
 import { Badge, Field, Modal, ViewLink } from './components';
 import { useData } from './data';
 import { DeploymentLogs, deploymentMainStage, deploymentStageLabel } from './DeploymentLogs';
+import { nodeOperationLabel } from './agentUpgradeState';
 import { SSHPathAutocomplete, type SshPathConnection } from './SSHPathAutocomplete';
 import type {
   AgentConfigDefaults,
@@ -74,6 +75,7 @@ const deploymentLabel = (job: RemoteDeployment): string => {
   if (job.state === 'DISCONNECTED' || job.tunnel_state === 'DISCONNECTED') return '已断开连接';
   if (job.operation === 'uninstall')
     return ['FAILED', 'INTERRUPTED'].includes(job.state) ? '卸载未完成' : '正在卸载 Agent';
+  if (job.operation === 'upgrade') return nodeOperationLabel(job);
   return job.state === 'SUCCEEDED'
     ? '接入完成'
     : job.state === 'FAILED'
@@ -600,7 +602,11 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
                 job.operation !== 'disconnect' && (
                   <button className="button outline" disabled={busy} onClick={() => void retry()}>
                     {busy ? <LoaderCircle className="spin" size={15} /> : <RefreshCw size={15} />}
-                    {job.operation === 'uninstall' ? '重试卸载' : '重试部署'}
+                    {job.operation === 'uninstall'
+                      ? '重试卸载'
+                      : job.operation === 'upgrade'
+                        ? '重试升级'
+                        : '重试部署'}
                   </button>
                 )}
               {retired(job) && (
@@ -625,11 +631,15 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
                 {completed(job)
                   ? retired(job)
                     ? '完成'
-                    : '完成接入'
+                    : job.operation === 'upgrade'
+                      ? '完成升级'
+                      : '完成接入'
                   : isActive
                     ? job.operation === 'uninstall'
                       ? '后台继续卸载'
-                      : '后台继续部署'
+                      : job.operation === 'upgrade'
+                        ? '后台继续升级'
+                        : '后台继续部署'
                     : '关闭'}
               </button>
             </>
@@ -1114,7 +1124,7 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
           <p className="onboard-caption">
             {job.install_dir ? `安装目录：${job.install_dir} · ` : ''}创建于 {date(job.created_at)}
           </p>
-          {(!job.operation || job.operation === 'install') && !retired(job) && (
+          {(!job.operation || ['install', 'upgrade'].includes(job.operation)) && !retired(job) && (
             <ol className="onboard-deploy-stages">
               {deploymentStages.map(([stage, label], index) => {
                 const current = deploymentStages.findIndex(
@@ -1125,7 +1135,7 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
                 return (
                   <li key={stage} className={passed ? 'done' : active ? 'current' : ''}>
                     <span>{passed ? <Check size={13} /> : index + 1}</span>
-                    {label}
+                    {stage === 'INSTALLING' && job.operation === 'upgrade' ? '升级 Agent' : label}
                   </li>
                 );
               })}
@@ -1159,7 +1169,9 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
                   错误代码：{job.error.code}。
                   {job.operation === 'uninstall'
                     ? '可重试卸载，或查看日志排查原因。'
-                    : '可重试部署，或修改连接与环境配置。'}
+                    : job.operation === 'upgrade'
+                      ? '可重试升级，或查看日志排查原因。'
+                      : '可重试部署，或修改连接与环境配置。'}
                 </p>
               </div>
             </div>
@@ -1204,35 +1216,39 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
               关闭窗口后中台会继续执行。可从「接入机器 → 最近部署」重新查看进度。
             </p>
           )}
-          {job.node_id && !retired(job) && (!job.operation || job.operation === 'install') && (
-            <section className="onboard-runtime-results">
-              <div className="onboard-connected">
-                <strong>{matchedNode?.name || job.agent.name}</strong>
-                {matchedNode && <Badge state={matchedNode.status} />}
-                <ViewLink to={`/nodes/${job.node_id}`}>查看机器详情</ViewLink>
-              </div>
-              <p className="onboard-caption">
-                {matchedNode?.last_seen && `最近心跳：${date(matchedNode.last_seen)}。`}
-                {job.state === 'SUCCEEDED'
-                  ? '本次部署已确认上线并通过环境检查。'
-                  : '机器当前在线状态不代表本次部署已完成，部署确认以上方进度为准。'}
-              </p>
-              {checkError && (
-                <div className="inline-note amber" role="alert">
-                  训练环境状态读取失败：{checkError}
+          {job.node_id &&
+            !retired(job) &&
+            (!job.operation || ['install', 'upgrade'].includes(job.operation)) && (
+              <section className="onboard-runtime-results">
+                <div className="onboard-connected">
+                  <strong>{matchedNode?.name || job.agent.name}</strong>
+                  {matchedNode && <Badge state={matchedNode.status} />}
+                  <ViewLink to={`/nodes/${job.node_id}`}>查看机器详情</ViewLink>
                 </div>
-              )}
-              {!matchedProfiles.length && (
-                <p className="onboard-caption">等待本次部署的环境检查。</p>
-              )}
-              {matchedProfiles.map((profile) => (
-                <div className="onboard-profile-check" key={profile.id}>
-                  <strong>{profile.name}</strong>
-                  <RuntimeCheckView check={runtimeCheckFor(matchedNode, profile.id)} />
-                </div>
-              ))}
-            </section>
-          )}
+                <p className="onboard-caption">
+                  {matchedNode?.last_seen && `最近心跳：${date(matchedNode.last_seen)}。`}
+                  {job.state === 'SUCCEEDED'
+                    ? job.operation === 'upgrade'
+                      ? '本次升级已确认上线并通过环境检查。'
+                      : '本次部署已确认上线并通过环境检查。'
+                    : '机器当前在线状态不代表本次部署已完成，部署确认以上方进度为准。'}
+                </p>
+                {checkError && (
+                  <div className="inline-note amber" role="alert">
+                    训练环境状态读取失败：{checkError}
+                  </div>
+                )}
+                {!matchedProfiles.length && (
+                  <p className="onboard-caption">等待本次部署的环境检查。</p>
+                )}
+                {matchedProfiles.map((profile) => (
+                  <div className="onboard-profile-check" key={profile.id}>
+                    <strong>{profile.name}</strong>
+                    <RuntimeCheckView check={runtimeCheckFor(matchedNode, profile.id)} />
+                  </div>
+                ))}
+              </section>
+            )}
         </div>
       )}
     </Modal>

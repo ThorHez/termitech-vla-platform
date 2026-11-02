@@ -64,6 +64,10 @@ def _node(session, node_id, *, lock=False):
 def _validate_additions(session, node, user_id, additions, settings):
     if not additions:
         return
+    from .remote_models import RemoteDeployment
+    if session.scalar(select(RemoteDeployment.id).where(RemoteDeployment.node_id == node.id,
+            RemoteDeployment.state.in_({"QUEUED", "RUNNING", "WAITING_AGENT"})).limit(1)):
+        raise APIError(409, "NODE_MAINTENANCE", "机器正在管理或升级 Agent，请等待完成后新增 GPU 预留")
     if node.status != "ONLINE" or node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
         raise APIError(409, "NODE_OFFLINE", "机器离线或心跳已过期，暂时不能新增 GPU 预留")
     inventory = {gpu["uuid"]: gpu for gpu in node.gpus}

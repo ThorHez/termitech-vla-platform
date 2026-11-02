@@ -9,15 +9,73 @@ import {
   Trash2,
   Unplug,
 } from 'lucide-react';
-import { api, date, useApi } from './api';
+import { api, useApi } from './api';
 import { useAuth } from './auth';
 import { Badge, ErrorNotice, Loading, Modal } from './components';
 import { activeStates, useData } from './data';
+import { DeploymentLogs } from './DeploymentLogs';
+import {
+  agentReleaseLabel,
+  latestNodeUpgrade,
+  nodeOperationComplete as complete,
+  nodeOperationFailed as failed,
+  nodeOperationLabel,
+  nodeOperationSucceeded as succeeded,
+} from './agentUpgradeState';
 import type { Node, NodeManagementInfo, RemoteDeployment } from './types';
 
-const complete = (job: RemoteDeployment) =>
-  ['UNINSTALLED', 'DISCONNECTED', 'FAILED', 'INTERRUPTED'].includes(job.state);
-const failed = (job: RemoteDeployment) => ['FAILED', 'INTERRUPTED'].includes(job.state);
+export function nodeManagementAvailability(
+  info: NodeManagementInfo | undefined,
+  activeRunCount: number,
+  trainingUnknown: boolean,
+) {
+  const idle = !activeRunCount && !trainingUnknown;
+  return {
+    canUpgrade: !!info?.can_upgrade,
+    canDisconnect: !!info?.can_disconnect && idle,
+    canUninstall: !!info?.can_uninstall && idle,
+  };
+}
+
+export function AgentUpgradeAction({
+  info,
+  allowed,
+  reason,
+  select,
+  view,
+}: {
+  info: NodeManagementInfo;
+  allowed: boolean;
+  reason: string;
+  select: () => void;
+  view?: () => void;
+}) {
+  return (
+    <section>
+      <RefreshCw size={21} />
+      <div>
+        <h3>升级 Agent</h3>
+        <p>
+          通过已保存的 SSH 连接更新
+          Agent。独立监控的训练可继续运行；短暂离线期间，日志和指标在本地保存，恢复后补传。
+        </p>
+        <p>
+          当前版本：{agentReleaseLabel(info.current_version, info.current_build_id)} · 目标版本：
+          {agentReleaseLabel(info.target_version, info.target_build_id, '中台当前安装包')}
+        </p>
+        {!allowed && <small>{reason || info.upgrade_reason || '当前状态不支持升级。'}</small>}
+        {view && (
+          <button className="text-link" onClick={view}>
+            查看最近升级
+          </button>
+        )}
+      </div>
+      <button className="button outline small" disabled={!allowed} onClick={select}>
+        升级 Agent
+      </button>
+    </section>
+  );
+}
 
 export function NodeManagement(props: Parameters<typeof NodeManagementContent>[0]) {
   const { can } = useAuth();
@@ -43,7 +101,7 @@ function NodeManagementContent({
 }) {
   const { runs, refresh } = useData();
   const management = useApi<NodeManagementInfo>(`/nodes/${node.id}/management`, 0);
-  const [action, setAction] = useState<'disconnect' | 'uninstall'>();
+  const [action, setAction] = useState<'disconnect' | 'uninstall' | 'upgrade'>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [pollError, setPollError] = useState<Error>();
@@ -57,11 +115,19 @@ function NodeManagementContent({
   );
   const trainingUnknown = runs.loading && !runs.data;
   const info = management.data;
-  const canDisconnect = info?.can_disconnect && !activeRuns.length && !trainingUnknown;
-  const canUninstall = info?.can_uninstall && !activeRuns.length && !trainingUnknown;
+  const { canDisconnect, canUninstall, canUpgrade } = nodeManagementAvailability(
+    info,
+    activeRuns.length,
+    trainingUnknown,
+  );
+  const upgradeReason = info?.upgrade_reason || info?.reason || '正在确认训练监控隔离状态。';
+  const allowed =
+    action === 'upgrade' ? canUpgrade : action === 'uninstall' ? canUninstall : canDisconnect;
+  const latestUpgrade = latestNodeUpgrade(info?.latest_upgrade, node.id);
+  const resumed = useRef(false);
   const active = job && !complete(job);
   const reason = activeRuns.length
-    ? `此机器有 ${activeRuns.length} 个活动训练，请结束训练后再操作。`
+    ? `此机器有 ${activeRuns.length} 个活动训练，暂不能断开连接或卸载；Agent 升级资格由训练监控隔离检查决定。`
     : trainingUnknown
       ? '正在确认训练状态。'
       : '';
@@ -69,7 +135,13 @@ function NodeManagementContent({
   const updated = () => {
     changedRef.current.refresh();
     changedRef.current.changed?.();
+    management.refresh();
   };
+  useEffect(() => {
+    if (!info || resumed.current) return;
+    resumed.current = true;
+    if (latestUpgrade && !complete(latestUpgrade)) setJob(latestUpgrade);
+  }, [info, latestUpgrade]);
   useEffect(() => {
     if (!job || complete(job)) return;
     const controller = new AbortController();
@@ -99,7 +171,7 @@ function NodeManagementContent({
   }, [job?.id, job?.state]);
 
   const execute = async () => {
-    if (!action || busy || (action === 'uninstall' ? !canUninstall : !canDisconnect)) return;
+    if (!action || busy || !allowed) return;
     if (request.current?.action !== action) request.current = { action, key: crypto.randomUUID() };
     setBusy(true);
     setError(undefined);
@@ -107,6 +179,9 @@ function NodeManagementContent({
       const result = await api<RemoteDeployment>(`/nodes/${node.id}/${action}`, {
         method: 'POST',
         headers: { 'Idempotency-Key': request.current.key },
+        ...(action === 'upgrade'
+          ? { body: JSON.stringify({ expected_build_id: info?.target_build_id }) }
+          : {}),
       });
       setJob(result);
       if (complete(result)) updated();
@@ -129,6 +204,7 @@ function NodeManagementContent({
       });
       setJob(result);
       setPollError(undefined);
+      if (complete(result)) updated();
     } catch (cause) {
       setError(cause as Error);
     } finally {
@@ -146,11 +222,15 @@ function NodeManagementContent({
         job
           ? job.operation === 'disconnect'
             ? '连接已断开'
-            : 'Agent 卸载状态'
+            : job.operation === 'upgrade'
+              ? 'Agent 升级状态'
+              : 'Agent 卸载状态'
           : action
             ? action === 'disconnect'
               ? '确认断开连接'
-              : '确认卸载 Agent'
+              : action === 'upgrade'
+                ? '确认升级 Agent'
+                : '确认卸载 Agent'
             : '管理机器连接'
       }
       subtitle={node.name}
@@ -177,17 +257,22 @@ function NodeManagementContent({
           )}
           {!job && action && (
             <button
-              className="button danger"
-              disabled={busy || (action === 'uninstall' ? !canUninstall : !canDisconnect)}
+              className={`button ${action === 'upgrade' ? 'primary' : 'danger'}`}
+              disabled={busy || !allowed}
               onClick={() => void execute()}
             >
               {busy && <LoaderCircle size={15} className="spin" />}
-              {action === 'disconnect' ? '确认断开连接' : '确认卸载 Agent'}
+              {action === 'disconnect'
+                ? '确认断开连接'
+                : action === 'upgrade'
+                  ? '确认升级 Agent'
+                  : '确认卸载 Agent'}
             </button>
           )}
-          {job && failed(job) && job.operation === 'uninstall' && (
+          {job && failed(job) && ['uninstall', 'upgrade'].includes(job.operation || '') && (
             <button className="button outline" disabled={busy} onClick={() => void retry()}>
-              {busy ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}重试卸载
+              {busy ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}
+              {job.operation === 'upgrade' ? '重试升级' : '重试卸载'}
             </button>
           )}
           {job && ['DISCONNECTED', 'UNINSTALLED'].includes(job.state) && (
@@ -196,8 +281,23 @@ function NodeManagementContent({
             </button>
           )}
           {job && (
+            <button
+              className="button outline"
+              disabled={busy || Boolean(active)}
+              onClick={() => {
+                setJob(undefined);
+                setAction(undefined);
+                setError(undefined);
+                request.current = undefined;
+                management.refresh();
+              }}
+            >
+              返回管理
+            </button>
+          )}
+          {job && (
             <button className="button primary" disabled={busy} onClick={safeClose}>
-              {active ? '后台继续卸载' : '完成'}
+              {active ? (job.operation === 'upgrade' ? '后台继续升级' : '后台继续卸载') : '完成'}
             </button>
           )}
         </>
@@ -234,7 +334,7 @@ function NodeManagementContent({
                     }
                   />
                 </div>
-                {reason && (
+                {reason && action !== 'upgrade' && (
                   <div className="inline-note amber" role="status">
                     <AlertTriangle size={16} />
                     {reason}
@@ -242,6 +342,13 @@ function NodeManagementContent({
                 )}
                 {!action ? (
                   <div className="node-management-actions">
+                    <AgentUpgradeAction
+                      info={info}
+                      allowed={canUpgrade}
+                      reason={upgradeReason}
+                      select={() => setAction('upgrade')}
+                      view={latestUpgrade ? () => setJob(latestUpgrade) : undefined}
+                    />
                     <section>
                       <Unplug size={21} />
                       <div>
@@ -297,14 +404,29 @@ function NodeManagementContent({
                       <AlertTriangle size={18} />
                       {action === 'disconnect'
                         ? '断开后，此机器将从可用机器列表移除，不能再创建训练。远端 Agent 仍安装在机器上。'
-                        : '中台将远程停止并卸载此机器的 Agent 服务，重置本次接入的机器身份。此机器随后从可用机器列表移除。'}
+                        : action === 'upgrade'
+                          ? '中台将更新 Agent 并重启服务，期间机器会短暂离线。已通过隔离检查的训练及其独立监控继续运行，日志和指标将在恢复后补传。'
+                          : '中台将远程停止并卸载此机器的 Agent 服务，重置本次接入的机器身份。此机器随后从可用机器列表移除。'}
                     </div>
                     <p>
                       {action === 'disconnect'
                         ? '已保存的 SSH 凭据将被清除。断开后如需远程卸载，必须重新填写 SSH 信息接入。'
-                        : '训练代码、数据、模型和训练输出会保留；历史训练记录及关联关系可继续查看。'}
+                        : action === 'upgrade'
+                          ? '沿用原机器身份、运行环境绑定、存储目录与历史记录。训练代码、数据、模型和已有训练输出保留。'
+                          : '训练代码、数据、模型和训练输出会保留；历史训练记录及关联关系可继续查看。'}
                     </p>
-                    {action === 'uninstall' && info.install_dir && (
+                    {action === 'upgrade' && (
+                      <p>
+                        当前版本：{agentReleaseLabel(info.current_version, info.current_build_id)} →
+                        目标版本：
+                        {agentReleaseLabel(
+                          info.target_version,
+                          info.target_build_id,
+                          '中台当前安装包',
+                        )}
+                      </p>
+                    )}
+                    {action !== 'disconnect' && info.install_dir && (
                       <p>
                         Agent 安装目录：<code>{info.install_dir}</code>
                       </p>
@@ -319,6 +441,9 @@ function NodeManagementContent({
                         {reason || info.uninstall_reason || info.reason}
                       </p>
                     )}
+                    {!canUpgrade && action === 'upgrade' && (
+                      <p className="danger-text">{upgradeReason}</p>
+                    )}
                   </div>
                 )}
               </>
@@ -329,9 +454,9 @@ function NodeManagementContent({
       {job && (
         <>
           <div
-            className={`onboard-deploy-heading ${['DISCONNECTED', 'UNINSTALLED'].includes(job.state) ? 'success' : failed(job) ? 'failed' : ''}`}
+            className={`onboard-deploy-heading ${succeeded(job) ? 'success' : failed(job) ? 'failed' : ''}`}
           >
-            {['DISCONNECTED', 'UNINSTALLED'].includes(job.state) ? (
+            {succeeded(job) ? (
               <CheckCircle2 size={25} />
             ) : failed(job) ? (
               <AlertTriangle size={25} />
@@ -339,15 +464,7 @@ function NodeManagementContent({
               <LoaderCircle size={25} className="spin" />
             )}
             <div>
-              <h3>
-                {job.state === 'DISCONNECTED'
-                  ? '连接已断开'
-                  : job.state === 'UNINSTALLED'
-                    ? 'Agent 已卸载'
-                    : failed(job)
-                      ? '卸载未完成'
-                      : '正在远程卸载 Agent'}
-              </h3>
+              <h3>{nodeOperationLabel(job)}</h3>
               <p>
                 {job.host || node.hostname} · {job.install_dir}
               </p>
@@ -386,31 +503,20 @@ function NodeManagementContent({
               )}
             </>
           )}
+          {job.operation === 'upgrade' && job.state === 'SUCCEEDED' && (
+            <p className="node-management-result">
+              Agent 已重新上线并通过本次升级的环境检查。机器身份、运行环境绑定与历史记录保留。
+            </p>
+          )}
           {['DISCONNECTED', 'UNINSTALLED'].includes(job.state) && (
             <a className="text-link" href={`#/nodes/${node.id}`} onClick={safeClose}>
               查看机器历史详情
             </a>
           )}
-          <section className="onboard-deploy-log" aria-label="机器管理日志">
-            <div className="onboard-section-heading">
-              <h3>操作日志</h3>
-            </div>
-            {job.logs.length ? (
-              <ol>
-                {job.logs.map((entry, index) => (
-                  <li key={`${entry.timestamp}-${index}`}>
-                    <time>{date(entry.timestamp)}</time>
-                    <span>{entry.message}</span>
-                  </li>
-                ))}
-              </ol>
-            ) : (
-              <p>操作已提交。</p>
-            )}
-          </section>
+          <DeploymentLogs key={job.id} job={job} active={Boolean(active)} />
           {active && (
             <p className="onboard-caption">
-              关闭窗口后中台继续执行，可在「接入机器 → 最近部署」查看结果。
+              关闭窗口后中台继续执行，可重新打开「管理连接」或在「接入机器 → 最近部署」查看结果。
             </p>
           )}
         </>

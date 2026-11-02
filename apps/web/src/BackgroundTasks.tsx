@@ -1,5 +1,14 @@
-import { useMemo, useState } from 'react';
-import { ArrowRight, ChevronRight, FolderSync, Plus, Search, Server, Workflow } from 'lucide-react';
+import { useCallback, useEffect, useReducer, useState } from 'react';
+import {
+  ArrowRight,
+  ChevronLeft,
+  ChevronRight,
+  FolderSync,
+  Plus,
+  Search,
+  Server,
+  Workflow,
+} from 'lucide-react';
 import { date } from './api';
 import { useAuth } from './auth';
 import { Badge, Empty, ErrorNotice, Loading, PageHeading, ProgressBar } from './components';
@@ -12,10 +21,17 @@ import {
   backgroundTaskActive,
   backgroundTaskPath,
   backgroundTaskProgress,
-  buildBackgroundTasks,
-  filterBackgroundTasks,
 } from './backgroundTaskEntries';
-import type { BackgroundTask, BackgroundTaskStatus, BackgroundTaskType } from './backgroundTaskEntries';
+import type { BackgroundTask, BackgroundTaskType } from './backgroundTaskEntries';
+import {
+  BACKGROUND_TASK_PAGE_SIZE,
+  backgroundTaskPagePath,
+  backgroundTaskPageRange,
+  backgroundTaskQueryReducer,
+  initialBackgroundTaskQuery,
+} from './backgroundTaskPagination';
+import type { BackgroundTaskPage, BackgroundTaskQuery } from './backgroundTaskPagination';
+import { useBackgroundTaskPage } from './useBackgroundTaskPage';
 import './background-tasks.css';
 
 export function BackgroundTaskTable({
@@ -182,22 +198,13 @@ export function BackgroundTaskErrors({
 
 export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
   const { can } = useAuth();
-  const { runs, nodes, templates, enabled, assetTransfers: transfers, refresh } = useData();
-  const [filter, setFilter] = useState<BackgroundTaskStatus>('ALL');
-  const [type, setType] = useState<BackgroundTaskType>('ALL');
-  const [query, setQuery] = useState('');
-  const tasks = useMemo(
-    () => buildBackgroundTasks(runs.data || [], transfers.data || []),
-    [runs.data, transfers.data],
-  );
-  const filtered = useMemo(
-    () => filterBackgroundTasks(tasks, { type, status: filter, query, nodes: nodes.data || [] }),
-    [tasks, type, filter, query, nodes.data],
-  );
-  const loadingEmpty =
-    enabled &&
-    !tasks.length &&
-    ((runs.loading && !runs.data) || (transfers.loading && !transfers.data));
+  const { enabled } = useData();
+  const [request, dispatch] = useReducer(backgroundTaskQueryReducer, initialBackgroundTaskQuery);
+  const [totalAll, setTotalAll] = useState<number>();
+  const receivePage = useCallback((query: BackgroundTaskQuery, response: BackgroundTaskPage) => {
+    setTotalAll(response.total_all);
+    dispatch({ kind: 'receipt', request: query, page: response.page });
+  }, []);
   return (
     <>
       <PageHeading
@@ -225,12 +232,12 @@ export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
             ] as const
           ).map(([key, label]) => (
             <button
-              className={filter === key ? 'selected' : ''}
+              className={request.status === key ? 'selected' : ''}
               key={key}
-              onClick={() => setFilter(key)}
+              onClick={() => dispatch({ kind: 'status', value: key })}
             >
               {label}
-              {key === 'ALL' && <b>{tasks.length}</b>}
+              {key === 'ALL' && totalAll !== undefined && <b>{totalAll}</b>}
             </button>
           ))}
         </div>
@@ -239,8 +246,10 @@ export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
             任务类型
             <select
               aria-label="筛选任务类型"
-              value={type}
-              onChange={(event) => setType(event.target.value as BackgroundTaskType)}
+              value={request.type}
+              onChange={(event) =>
+                dispatch({ kind: 'type', value: event.target.value as BackgroundTaskType })
+              }
             >
               <option value="ALL">全部类型</option>
               <option value="training">模型训练</option>
@@ -252,44 +261,127 @@ export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
             <input
               aria-label="搜索任务"
               placeholder="搜索任务名称或机器"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              maxLength={200}
+              value={request.query}
+              onChange={(event) => dispatch({ kind: 'query', value: event.target.value })}
             />
           </div>
         </div>
       </div>
-      <BackgroundTaskErrors
-        trainingError={runs.error}
-        transferError={transfers.error}
-        refreshTraining={runs.refresh}
-        refreshTransfers={transfers.refresh}
+      <BackgroundTaskResults
+        key={backgroundTaskPagePath(request)}
+        request={request}
+        receivePage={receivePage}
+        changePage={(page) => dispatch({ kind: 'page', page })}
       />
+      <p className="background-task-history-note">
+        每页固定显示 {BACKGROUND_TASK_PAGE_SIZE} 条，按创建时间从新到旧排列；每 3
+        秒更新当前页，可翻页查看历史任务。
+      </p>
+    </>
+  );
+}
+
+function BackgroundTaskResults({
+  request,
+  receivePage,
+  changePage,
+}: {
+  request: BackgroundTaskQuery;
+  receivePage: (query: BackgroundTaskQuery, response: BackgroundTaskPage) => void;
+  changePage: (page: number) => void;
+}) {
+  const { nodes, templates, enabled, refresh } = useData();
+  const result = useBackgroundTaskPage(request, enabled, nodes.data || []);
+  useEffect(() => {
+    if (result.data) receivePage(request, result.data);
+  }, [result.data, request, receivePage]);
+  const filtered = Boolean(request.query || request.type !== 'ALL' || request.status !== 'ALL');
+  const deleted = () => {
+    result.refresh();
+    refresh();
+  };
+  return (
+    <>
+      <ErrorNotice error={result.error} retry={result.refresh} title="后台任务读取失败" />
+      {result.data?.history_limited && (
+        <p className="background-task-compatibility-note" role="status">
+          当前服务暂未支持全量历史分页，显示已加载的 {result.data.total_all} 条记录（训练最多 500
+          条，同步最多 200 条）。
+        </p>
+      )}
       <div className="panel">
-        {loadingEmpty ? (
+        {enabled && result.loading && !result.data ? (
           <Loading label="正在读取后台任务…" />
-        ) : filtered.length ? (
+        ) : result.data?.items.length ? (
           <BackgroundTaskTable
-            tasks={filtered}
+            tasks={result.data.items}
             nodes={nodes.data || []}
             templates={templates.data || []}
-            onRunDeleted={refresh}
-            onTransferDeleted={refresh}
+            onRunDeleted={deleted}
+            onTransferDeleted={deleted}
           />
-        ) : (
+        ) : !result.error ? (
           <Empty
             icon={Workflow}
-            title={query || type !== 'ALL' || filter !== 'ALL' ? '没有匹配的任务' : '暂无任务'}
+            title={filtered ? '没有匹配的任务' : '暂无任务'}
             description={
-              query || type !== 'ALL' || filter !== 'ALL'
+              filtered
                 ? '调整任务类型、状态或搜索条件，查看其他任务。'
                 : '创建模型训练，或从“数据与模型”将资产同步到其他机器。'
             }
           />
-        )}
+        ) : null}
       </div>
-      <p className="background-task-history-note">
-        同步记录每 3 秒更新，显示最近 200 条；点击任务查看进度、日志与操作。
-      </p>
+      <BackgroundTaskPagination
+        result={result.data}
+        loading={result.loading}
+        changePage={changePage}
+      />
     </>
+  );
+}
+
+export function BackgroundTaskPagination({
+  result,
+  loading = false,
+  changePage,
+}: {
+  result?: BackgroundTaskPage;
+  loading?: boolean;
+  changePage: (page: number) => void;
+}) {
+  const range = result ? backgroundTaskPageRange(result) : undefined;
+  return (
+    <nav className="background-task-pagination" aria-label="任务分页">
+      <span aria-live="polite">
+        {range && result
+          ? `显示 ${range.start}–${range.end} 条，共 ${result.total} 条${result.history_limited ? '（已加载）' : ''}`
+          : `每页 ${BACKGROUND_TASK_PAGE_SIZE} 条`}
+      </span>
+      <div className="background-task-page-controls">
+        <button
+          type="button"
+          className="button outline small"
+          disabled={!result || loading || result.page <= 1}
+          onClick={() => result && changePage(result.page - 1)}
+        >
+          <ChevronLeft size={14} />
+          上一页
+        </button>
+        <span>
+          第 {result?.page || 1} / {result?.total_pages || 1} 页
+        </span>
+        <button
+          type="button"
+          className="button outline small"
+          disabled={!result || loading || result.page >= result.total_pages}
+          onClick={() => result && changePage(result.page + 1)}
+        >
+          下一页
+          <ChevronRight size={14} />
+        </button>
+      </div>
+    </nav>
   );
 }

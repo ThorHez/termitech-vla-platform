@@ -31,6 +31,9 @@ from .recipe_suggestions import acknowledge as acknowledge_recipe_query, create_
 from .recipe_details import acknowledge as acknowledge_recipe_detail
 from .data_processors import acknowledge as acknowledge_data_processors, register_routes as register_data_processor_routes
 from .dataset_inspections import acknowledge as acknowledge_dataset_inspection, expire_pending as expire_dataset_inspections, register_routes as register_dataset_inspection_routes
+from .dataset_validations import (COMMAND as DATASET_VALIDATION_COMMAND, acknowledge as acknowledge_dataset_validation,
+                                 invalidate_validation, queue_validation, register_routes as register_dataset_validation_routes)
+from .dataset_statistics import DatasetStatisticsManager, register_routes as register_dataset_statistics_routes
 from .dataset_norm_bindings import (_lock_norm_path, canonical_norm_path, resolve_norm_path,
                                     update_norm_binding, validate_norm_binding)
 from .recipe_library import register_recipe_routes
@@ -56,6 +59,7 @@ from .training_templates import register_routes as register_training_template_ro
 from .dataset_templates import register_routes as register_dataset_template_routes
 from .dataset_batches import DatasetBatchManager, register_routes as register_dataset_batch_routes
 from .asset_transfer_batches import register_routes as register_asset_transfer_batch_routes
+from .background_tasks import register_routes as register_background_task_routes
 from .resource_history import capture_sample, register_routes as register_resource_history_routes
 from .run_records import delete_run_record, require_replayable_run, require_visible_run
 from .training_metrics import register_routes as register_training_metric_routes
@@ -77,6 +81,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     asset_transfer_manager = AssetTransferManager(db, settings, remote_manager)
     node_terminal_manager = NodeTerminalManager(db, settings, remote_manager, auth)
     dataset_batch_manager = DatasetBatchManager(db, settings, remote_manager, auth)
+    dataset_statistics_manager = DatasetStatisticsManager(db, settings, remote_manager)
     stop = threading.Event()
 
     def scheduler_loop():
@@ -132,6 +137,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.asset_transfer_manager = asset_transfer_manager
     app.state.node_terminal_manager = node_terminal_manager
     app.state.dataset_batch_manager = dataset_batch_manager
+    app.state.dataset_statistics_manager = dataset_statistics_manager
     app.state.auth = auth
 
     @app.middleware("http")
@@ -214,6 +220,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_gpu_reservation_routes(app, admin, db, auth, settings)
     register_resource_history_routes(app, admin, db)
     register_training_metric_routes(app, admin, db)
+    register_background_task_routes(app, admin, db)
+    register_dataset_validation_routes(app, admin, db, settings)
+    register_dataset_statistics_routes(app, admin, dataset_statistics_manager)
     register_remote_routes(app, admin, remote_manager)
 
     def require_available_node(session, node_id):
@@ -430,6 +439,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                           norm_asset_id=norm_asset_id)
             session.add(asset)
             session.flush()
+            queue_validation(session, asset, heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds)
             return asset_dict(asset)
 
     @app.put("/api/v1/assets/{asset_id}/norm-binding", dependencies=admin)
@@ -449,6 +459,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise APIError(409, "ASSET_IN_USE", "An active training run still references this asset")
             if active_asset_transfers(session, asset_id=asset_id):
                 raise APIError(409, "ASSET_IN_USE", "资产正在同步，请等待完成或先取消同步")
+            invalidate_validation(session, asset)
             asset.state = "ARCHIVED"
             return asset_dict(asset)
 
@@ -466,6 +477,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise APIError(409, "ASSET_IN_USE", "资产正在同步，请等待完成或先取消同步")
             asset.metadata_json = {**asset.metadata_json,
                                    "dataset_profile": body.dataset_profile.model_dump(mode="json", exclude_none=True)}
+            invalidate_validation(session, asset)
             session.flush()
             return asset_dict(asset)
 
@@ -763,8 +775,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # priority, including START before its later CANCEL, so retries
             # return the same unacknowledged commands.
             priority = case((Command.type.in_(["START", "CANCEL", "POLICY_DEPLOY_START", "POLICY_DEPLOY_STOP", "POLICY_EXPORT_CANCEL"]), 0),
-                            (Command.type == "PREFLIGHT", 2), else_=1)
-            rows = session.scalars(select(Command).where(Command.node_id == node_id, Command.status == "PENDING")
+                            (Command.type == "PREFLIGHT", 2), (Command.type == DATASET_VALIDATION_COMMAND, 3), else_=1)
+            training_busy = (select(Run.id).where(Run.node_id == node_id, Run.state.not_in(TERMINAL)).exists()
+                             | select(Attempt.id).where(Attempt.node_id == node_id, Attempt.state.not_in(TERMINAL)).exists())
+            rows = session.scalars(select(Command).where(Command.node_id == node_id, Command.status == "PENDING",
+                                   (Command.type != DATASET_VALIDATION_COMMAND) | ~training_busy)
                                    .order_by(priority, Command.created_at, Command.id).limit(100))
             return [{"id": row.id, "type": row.type, "payload": row.payload} for row in rows]
 
@@ -772,6 +787,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def command_ack(command_id: str, body: schemas.AckInput, node_id: str = Depends(require_agent)):
         check_owner(node_id, body.node_id)
         with db.write() as session:
+            baseline = session.get(Command, command_id)
+            if baseline is not None and baseline.type == DATASET_VALIDATION_COMMAND:
+                if baseline.node_id != node_id:
+                    raise APIError(403, "NODE_OWNERSHIP_MISMATCH", "Command is not assigned to this node")
+                node = get_required(session, Node, node_id, "Node")
+                assert_agent_connected(node)
+                acknowledge_dataset_validation(session, baseline, node, body.status, body.result)
+                return {"ok": True}
             node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
             assert_agent_connected(node)
             command = session.scalar(select(Command).where(Command.id == command_id).with_for_update())
