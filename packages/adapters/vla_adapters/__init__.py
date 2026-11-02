@@ -9,7 +9,7 @@ from .entrypoints import validate_entrypoint
 from .dataset_bindings import validate_binding_assets
 from .recap import recap_stages, runtime_adapter_for, validate_training_stage
 from .automatic_config import automatic_recipe_name, normalize_auto_config
-from .runtime_options import RUNTIME_PARAMETER_RULES, validate_runtime_parameter_relations
+from .runtime_options import RUNTIME_PARAMETER_RULES, normalize_normalization_method, validate_runtime_parameter_relations
 
 
 def get_templates() -> list[dict]:
@@ -101,10 +101,11 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
                  recipe_definition: dict | None = None, entrypoint: str | None = None,
                  dataset_bindings: list[dict] | None = None,
                  training_stage: str | None = None, stage_config: dict | None = None,
-                 auto_config: dict | None = None) -> dict:
+                 auto_config: dict | None = None, normalization_method: str | None = None) -> dict:
     """Build argv; Agent preflight and launch recheck validate the selected recipe."""
     from .recipe_definitions import recipe_parameters, resolve_definition
     parameters = validate_parameters(template_id, {**recipe_parameters(recipe_definition), **parameters})
+    normalization_method = normalize_normalization_method(normalization_method, template_id=template_id)
     training_stage, stage_config = validate_training_stage(template_id, training_stage, stage_config)
     auto_config = normalize_auto_config(auto_config)
     if auto_config is not None:
@@ -162,6 +163,8 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
             spec["recipe_definition"] = recipe_definition
         if auto_config is not None:
             spec["auto_config"] = auto_config
+        if normalization_method is not None:
+            spec["normalization_method"] = normalization_method
         argv = [python, "-u", str(wrapper), "--spec-json", json.dumps(spec, ensure_ascii=False)]
     return {"argv": argv, "cwd": str(code_dir), "env": {
         "CUDA_VISIBLE_DEVICES": ",".join(gpu_uuids), "PYTHONUNBUFFERED": "1",

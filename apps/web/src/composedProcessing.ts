@@ -454,10 +454,13 @@ export function draftComposedProcessing(profile: ProcessingProfileSeed): Compose
   };
 }
 
-export function composedProcessingSummary(spec: ComposedProcessingSpec): string {
+export function composedProcessingSummary(
+  spec: ComposedProcessingSpec,
+  normalizationLabel?: string,
+): string {
   const state = spec.state_fields.reduce((sum, field) => sum + field.width, 0),
     action = spec.action_layout.reduce((sum, block) => sum + block.width, 0);
-  return `${spec.robot_model} · ${spec.arm_mode === 'single' ? '单臂' : '双臂'} · 状态 ${spec.state_representation.toUpperCase()} ${state} 维 × ${spec.state_history} · 动作 ${spec.action_representation.toUpperCase()} ${action} 维 · ${spec.cameras.length} 路视觉 · ${spec.normalization === 'quantile' ? '分位数' : 'Z-score'}归一化`;
+  return `${spec.robot_model} · ${spec.arm_mode === 'single' ? '单臂' : '双臂'} · 状态 ${spec.state_representation.toUpperCase()} ${state} 维 × ${spec.state_history} · 动作 ${spec.action_representation.toUpperCase()} ${action} 维 · ${spec.cameras.length} 路视觉 · ${normalizationLabel ?? (spec.normalization === 'quantile' ? '分位数' : 'Z-score')}归一化`;
 }
 
 export interface SourceActionLayout {

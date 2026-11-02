@@ -2,8 +2,15 @@ import { useEffect, useRef, useState } from 'react';
 import { LoaderCircle, RefreshCw, XCircle } from 'lucide-react';
 import { emptyDatasetProfile, readDatasetProfile } from './DatasetProfileForm';
 import { ComposedProcessingEditor } from './ComposedProcessingEditor';
-import { imageLayoutErrors, imageLayoutManualMarker, inferImageLayout, type ImageFeature, type ImageLayoutEdits } from './imageLayout';
+import {
+  imageLayoutErrors,
+  imageLayoutManualMarker,
+  inferImageLayout,
+  type ImageFeature,
+  type ImageLayoutEdits,
+} from './imageLayout';
 import { useDatasetImageMetadata } from './useDatasetImageMetadata';
+import { trainingNormalizationLabel } from './trainingNormalization';
 import {
   composedProcessingErrors,
   composedProcessingSummary,
@@ -20,6 +27,7 @@ import type {
   Node,
   RecipeDatasetSlot,
   RecipeLiteral,
+  TrainingNormalizationMethod,
 } from './types';
 
 export function compositionToken(value: unknown): string {
@@ -96,7 +104,8 @@ export function compositionBindingState({
   const spec = editableDraft(raw) ? normalizeComposedProcessing(raw) : undefined;
   if (spec && registered && !errors.length)
     errors.push(...trainingCompositionProfileErrors(registered, spec));
-  if (spec) errors.push(...spec.cameras.flatMap((camera) => imageLayoutErrors(camera, imageFeatures)));
+  if (spec)
+    errors.push(...spec.cameras.flatMap((camera) => imageLayoutErrors(camera, imageFeatures)));
   if (!dataset) errors.push('请先选择本组训练数据集。');
   const slot =
     slots.find((entry) => entry.recipe_index === binding.recipe_index) || slots[index] || slots[0];
@@ -119,8 +128,7 @@ export function compositionBindingState({
     !!expected &&
     binding.processor?.name === expected.name &&
     Object.keys(binding.processor.parameters).length === 1 &&
-    compositionToken(spec) ===
-      compositionToken(expected.parameters.composition);
+    compositionToken(spec) === compositionToken(expected.parameters.composition);
   if (expected && !matches)
     errors.push('处理器参数与当前组合方案不一致，请返回数据配置重新保存处理方案。');
   return {
@@ -143,6 +151,7 @@ export function ComposedDatasetProcessing(props: {
   index: number;
   stage: 'sft' | 'value' | 'offline_rl';
   readOnly?: boolean;
+  normalizationOverride?: TrainingNormalizationMethod;
   validationToken?: string;
   onChange: (binding: DatasetBinding) => void;
   onValidityChange?: (valid: boolean) => void;
@@ -153,7 +162,8 @@ export function ComposedDatasetProcessing(props: {
   const profile = { ...trainingProfileSeed(props.dataset), image_features: features };
   const manualLayouts = useRef(new Set<string>());
   const [layoutNotice, setLayoutNotice] = useState<string[]>([]);
-  const layoutKey = (key: string, kind: string) => imageLayoutManualMarker([images.scope, props.index, key.trim(), kind]);
+  const layoutKey = (key: string, kind: string) =>
+    imageLayoutManualMarker([images.scope, props.index, key.trim(), kind]);
   const validity = useRef(props.onValidityChange);
   validity.current = props.onValidityChange;
   useEffect(() => {
@@ -174,7 +184,9 @@ export function ComposedDatasetProcessing(props: {
       const evidence = inferImageLayout(features, camera.key, camera.kind);
       if (props.imageLayoutEdits?.has(key) || manualLayouts.current.has(key)) return camera;
       if (!evidence.layout || evidence.layout === camera.layout) return camera;
-      changes.push(`${camera.key} [${evidence.shape?.join(' × ')}] → ${evidence.layout.toUpperCase()}`);
+      changes.push(
+        `${camera.key} [${evidence.shape?.join(' × ')}] → ${evidence.layout.toUpperCase()}`,
+      );
       return { ...camera, layout: evidence.layout };
     });
     if (changes.length) {
@@ -187,6 +199,11 @@ export function ComposedDatasetProcessing(props: {
   const canImport = !composedProcessingErrors(legacy).length;
   return (
     <div className="dataset-processing composed-training-selection">
+      {props.normalizationOverride && (
+        <p className="field-hint">
+          本次训练统一使用：{trainingNormalizationLabel(props.normalizationOverride)}
+        </p>
+      )}
       <div className="inline-note" role="status">
         <div>
           <strong>
@@ -198,22 +215,28 @@ export function ComposedDatasetProcessing(props: {
           )}
           {images.error && <p>{images.error} 可重新读取，或手动核对图像布局。</p>}
           {images.inspection && (
-            <p>来源：meta/info.json · {images.inspection.source.info_sha256.slice(0, 12)}；仅填写布局，不自动选择历史帧。</p>
+            <p>
+              来源：meta/info.json · {images.inspection.source.info_sha256.slice(0, 12)}
+              ；仅填写布局，不自动选择历史帧。
+            </p>
           )}
-          {!props.readOnly && <button
-            type="button"
-            className="button outline small"
-            disabled={images.loading || props.node?.status !== 'ONLINE'}
-            onClick={() => {
-              manualLayouts.current.clear();
-              for (const camera of state.spec?.cameras || [])
-                props.imageLayoutEdits?.set(layoutKey(camera.key, camera.kind), false);
-              setLayoutNotice([]);
-              images.refresh();
-            }}
-          >
-            <RefreshCw size={13} />重新识别图像布局
-          </button>}
+          {!props.readOnly && (
+            <button
+              type="button"
+              className="button outline small"
+              disabled={images.loading || props.node?.status !== 'ONLINE'}
+              onClick={() => {
+                manualLayouts.current.clear();
+                for (const camera of state.spec?.cameras || [])
+                  props.imageLayoutEdits?.set(layoutKey(camera.key, camera.kind), false);
+                setLayoutNotice([]);
+                images.refresh();
+              }}
+            >
+              <RefreshCw size={13} />
+              重新识别图像布局
+            </button>
+          )}
         </div>
       </div>
       <div
@@ -222,14 +245,25 @@ export function ComposedDatasetProcessing(props: {
       >
         {!state.valid && <XCircle size={16} aria-hidden="true" />}
         <div>
-          <strong>{state.valid ? '本次训练组合方案已配置' : '数据处理配置错误，修正后才能预检'}</strong>
+          <strong>
+            {state.valid ? '本次训练组合方案已配置' : '数据处理配置错误，修正后才能预检'}
+          </strong>
           <p>方案随本次训练保存；数据资产的字段标签保持原样。</p>
           {state.spec && !composedProcessingErrors(state.spec).length && (
-            <p>{composedProcessingSummary(state.spec)}</p>
+            <p>
+              {composedProcessingSummary(
+                state.spec,
+                props.normalizationOverride
+                  ? trainingNormalizationLabel(props.normalizationOverride)
+                  : undefined,
+              )}
+            </p>
           )}
           {state.errors.length > 0 && (
             <ul className="training-validation-errors">
-              {state.errors.map((error) => <li key={error}>{error}</li>)}
+              {state.errors.map((error) => (
+                <li key={error}>{error}</li>
+              ))}
             </ul>
           )}
         </div>
@@ -258,6 +292,7 @@ export function ComposedDatasetProcessing(props: {
             <ComposedProcessingEditor
               value={state.spec}
               profile={profile}
+              normalizationOverride={props.normalizationOverride}
               onChange={update}
               onImageLayoutEdit={(key, kind) => {
                 const marker = layoutKey(key, kind);

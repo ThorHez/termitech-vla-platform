@@ -23,6 +23,7 @@ import {
   datasetBindingDisclosureReducer,
 } from './datasetBindingDisclosure';
 import type { ImageLayoutEdits } from './imageLayout';
+import { trainingNormalizationLabel } from './trainingNormalization';
 import { datasetProfileSummary, type DatasetProfile } from './DatasetProfileForm';
 import type {
   Asset,
@@ -31,6 +32,7 @@ import type {
   Profile,
   RecipeDatasetSlot,
   RecipeLiteral,
+  TrainingNormalizationMethod,
 } from './types';
 
 export function DatasetBindings({
@@ -42,6 +44,7 @@ export function DatasetBindings({
   onValidityChange,
   managedParameters = {},
   trainingStage = 'sft',
+  normalizationOverride,
   automatic = false,
   showProcessing = true,
   readOnly = false,
@@ -58,6 +61,7 @@ export function DatasetBindings({
   onValidityChange?: (valid: boolean) => void;
   managedParameters?: Record<string, RecipeLiteral>;
   trainingStage?: 'sft' | 'value' | 'offline_rl';
+  normalizationOverride?: TrainingNormalizationMethod;
   automatic?: boolean;
   showProcessing?: boolean;
   readOnly?: boolean;
@@ -163,6 +167,7 @@ export function DatasetBindings({
       trainingStage,
       managedParameters,
       automatic,
+      normalizationOverride,
       datasets.find((asset) => asset.id === binding.dataset_asset_id)?.metadata?.dataset_profile,
       entries.find((entry) => entry.name === binding.processor?.name),
       slots.find((slot) => slot.recipe_index === binding.recipe_index) || slots[index] || slots[0],
@@ -489,6 +494,7 @@ export function DatasetBindings({
                 <DatasetProcessing
                   key={bindingKey(binding, index)}
                   binding={binding}
+                  normalizationOverride={normalizationOverride}
                   initialMode={processingModes[bindingKey(binding, index)]}
                   onModeChange={(mode) =>
                     setProcessingModes((previous) => ({
@@ -557,13 +563,21 @@ export function DatasetBindingSummary({
   bindings,
   assets,
   profiles,
+  normalizationOverride,
 }: {
   bindings: DatasetBinding[];
   assets: Asset[];
   profiles?: Record<string, DatasetProfile> | null;
+  normalizationOverride?: TrainingNormalizationMethod;
 }) {
   return (
     <div className="dataset-binding-summary">
+      {normalizationOverride && (
+        <p className="field-hint">
+          本次训练统一使用：{trainingNormalizationLabel(normalizationOverride)}。
+          下方处理器参数保留原有声明，实际公式以本次训练选择为准。
+        </p>
+      )}
       {bindings.map((binding, index) => {
         const dataset = assets.find((asset) => asset.id === binding.dataset_asset_id);
         const norm = assets.find((asset) => asset.id === binding.norm_asset_id);

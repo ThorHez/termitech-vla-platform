@@ -173,6 +173,7 @@ class PreviewInput(InputModel):
     training_stage: Literal["value", "offline_rl"] | None = None
     stage_config: dict | None = None
     auto_config: dict | None = None
+    normalization_method: Literal["minmax", "quantile", "zscore"] | None = None
     recipe: str | None = Field(default=None, max_length=255, pattern=r"^[A-Za-z0-9_-]+$")
     recipe_revision_id: str | None = Field(default=None, min_length=1, max_length=36)
     entrypoint: str | None = Field(default=None, min_length=1, max_length=4096)

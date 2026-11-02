@@ -3,6 +3,7 @@
 from copy import deepcopy
 from contextlib import nullcontext
 import dataclasses
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -13,6 +14,42 @@ import pytest
 from vla_agent.policy_deployment_worker import configuration_receipt, probe, resolve_inference_config
 from vla_adapters.portable_policy import export_portable_policy, portable_digest
 from vla_adapters.policy_inference import ComposedInferenceInputs
+
+
+@pytest.mark.parametrize("method", ["minmax", "quantile", "zscore", None])
+def test_frozen_export_recaptures_explicit_normalization_without_false_code_drift(tmp_path, monkeypatch, method):
+    from vla_agent.policy_deployment import _frozen
+    from vla_protocol import canonical_digest
+
+    code = tmp_path / "code"
+    code.mkdir()
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    frozen = {"recipe": "fixture", "code_dir": str(code)}
+    if method is not None:
+        frozen["normalization_method"] = method
+    source = "FROZEN_REQUEST = " + repr(frozen) + "\n"
+    generated = {"source": source, "sha256": hashlib.sha256(source.encode()).hexdigest()}
+    plan = {"datasets": [{}], "generated_config": generated}
+    expected = {"complete": True, "automatic_preflight": {"plan": plan, "plan_digest": canonical_digest(plan)}}
+    if method is not None:
+        expected["normalization_method"] = method
+    captured = []
+
+    def capture(*_, **kwargs):
+        captured.append(kwargs)
+        return {"complete": True, **({"normalization_method": kwargs["normalization_method"]}
+            if "normalization_method" in kwargs else {})}
+
+    monkeypatch.setattr("vla_agent.snapshots.capture_code", capture)
+    result = _frozen({"roots": [str(tmp_path)]}, {"code_dir": str(code)}, {
+        "checkpoint_path": str(checkpoint), "source_training": {
+            "code_expectation": expected, "checkpoint_roots": [str(tmp_path)],
+        },
+    })
+    assert result["frozen_request"] == frozen
+    assert ("normalization_method" in captured[0]) == (method is not None)
+    assert captured[0].get("normalization_method") == method
 
 
 @dataclasses.dataclass(frozen=True)

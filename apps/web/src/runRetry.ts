@@ -5,6 +5,7 @@ import {
 } from './trainingDraft';
 import { TRAINING_TEMPLATE_PROCESSING_MARKER } from './trainingTemplate';
 import { validRequestedGpuList } from './trainingGpuSelection';
+import { isTrainingNormalizationMethod } from './trainingNormalization';
 import type { AutoTrainingConfig, DatasetBinding, RecipeLiteral, Run, RunRequest } from './types';
 
 const terminalStates = new Set(['FAILED', 'CANCELLED', 'SUCCEEDED']);
@@ -91,6 +92,12 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
   )
     throw new Error('原训练 GPU 数量无效。');
   const requestedGpus = setting('requested_gpu_uuids');
+  const normalizationMethod = setting('normalization_method');
+  if (normalizationMethod != null) {
+    if (!isTrainingNormalizationMethod(normalizationMethod))
+      throw new Error('原训练归一化方式无效，请手动重新选择。');
+    request.normalization_method = normalizationMethod;
+  }
   if (requestedGpus != null) {
     if (
       !validRequestedGpuList(requestedGpus) ||

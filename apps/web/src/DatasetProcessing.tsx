@@ -14,6 +14,7 @@ import {
 import { trainingCompositionDraft } from './composedProcessing';
 import type { ImageLayoutEdits } from './imageLayout';
 import { Field } from './components';
+import { trainingNormalizationLabel } from './trainingNormalization';
 import './training-data-processing.css';
 import type {
   Asset,
@@ -22,6 +23,7 @@ import type {
   Node,
   RecipeDatasetSlot,
   RecipeLiteral,
+  TrainingNormalizationMethod,
 } from './types';
 
 export type DatasetProcessingMode = 'recommended' | 'existing' | 'composed';
@@ -38,6 +40,7 @@ export function DatasetProcessing(props: {
   managedParameters: Record<string, RecipeLiteral>;
   automatic?: boolean;
   readOnly?: boolean;
+  normalizationOverride?: TrainingNormalizationMethod;
   validationToken?: string;
   initialMode?: DatasetProcessingMode;
   onModeChange?: (mode: DatasetProcessingMode) => void;
@@ -58,6 +61,11 @@ export function DatasetProcessing(props: {
   const annotations = trainingProfileSeed(props.dataset).field_annotations;
   return (
     <section className="training-dataset-processing" aria-label={`数据处理方式 ${props.index + 1}`}>
+      {props.normalizationOverride && !composed && (
+        <p className="field-hint">
+          本次训练统一使用：{trainingNormalizationLabel(props.normalizationOverride)}
+        </p>
+      )}
       {!props.readOnly && (
         <Field
           label={`数据处理方式 ${props.index + 1}`}

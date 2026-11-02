@@ -129,6 +129,8 @@ def generated_training_config(config, spec, *, entrypoint=None):
                      "decay_steps": "lr_schedule", "decay_lr": "lr_schedule", "clip_gradient_norm": "optimizer"}
     explicit_fields = {root_explicit.get(key, key) for key in parameters}
     explicit_fields.update(spec.get("stage_config") or {})
+    if spec.get("normalization_method") is not None:
+        explicit_fields.add("normalization_method")
 
     def review_fields(value, path):
         """Show active overrides and required constructors, without task noise."""
@@ -180,6 +182,8 @@ def generated_training_config(config, spec, *, entrypoint=None):
     keys = ("code_dir", "recipe", "inputs", "parameters", "gpu_count", "dataset_bindings", "auto_config",
             "recipe_definition", "entrypoint", "template_id", "training_stage", "stage_config", "allowed_roots")
     frozen = {key: spec[key] for key in keys if key in spec}
+    if spec.get("normalization_method") is not None:
+        frozen["normalization_method"] = spec["normalization_method"]
     automatic = normalize_auto_config(spec.get("auto_config"))
     if automatic is not None:
         frozen["auto_config"] = automatic

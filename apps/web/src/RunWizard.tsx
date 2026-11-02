@@ -29,6 +29,12 @@ import type { ImageLayoutEdits } from './imageLayout';
 import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
 import { retryTrainingSnapshot, sameTrainingConfiguration } from './runRetry';
 import { TrainingGpuSelector } from './TrainingGpuSelector';
+import { TrainingNormalizationField } from './TrainingNormalizationField';
+import {
+  DEFAULT_TRAINING_NORMALIZATION_METHOD,
+  trainingNormalizationLabel,
+  withTrainingNormalizationMethod,
+} from './trainingNormalization';
 import { requestedGpuError, requestedGpuSummary } from './trainingGpuSelection';
 import {
   applyTrainingTemplate,
@@ -376,6 +382,9 @@ function RunWizardContent({
         parameters: {},
         gpu_count: 1,
         auto_config: initialTemplate === 'smoke' ? undefined : { ...DEFAULT_AUTO_CONFIG },
+        ...(initialTemplate === 'smoke'
+          ? {}
+          : { normalization_method: DEFAULT_TRAINING_NORMALIZATION_METHOD }),
       },
   );
   const [previewId, setPreviewId] = useState('');
@@ -863,13 +872,18 @@ function RunWizardContent({
     setConfirmedConfigSha256(undefined);
     setPreviewId('');
     setCreatedPreview(undefined);
-    setRequest((previous) => ({
-      ...previous,
-      [key]: value,
-      ...(key === 'node_id' && value !== previous.node_id
-        ? { requested_gpu_uuids: undefined, gpu_count: Math.max(minGpus, previous.gpu_count) }
-        : {}),
-    }));
+    setRequest((previous) => {
+      const next = {
+        ...previous,
+        [key]: value,
+        ...(key === 'node_id' && value !== previous.node_id
+          ? { requested_gpu_uuids: undefined, gpu_count: Math.max(minGpus, previous.gpu_count) }
+          : {}),
+      };
+      return key === 'normalization_method'
+        ? withTrainingNormalizationMethod(next, value as RunRequest['normalization_method'])
+        : next;
+    });
   };
   const updateGpuSelection = (selection: Pick<RunRequest, 'gpu_count' | 'requested_gpu_uuids'>) => {
     draftSession.markEdited();
@@ -1073,6 +1087,9 @@ function RunWizardContent({
         gpu_count: request.gpu_count,
         requested_gpu_uuids: request.requested_gpu_uuids,
         auto_config: automaticMode ? request.auto_config : undefined,
+        ...(hasLocalTraining && request.normalization_method
+          ? { normalization_method: request.normalization_method }
+          : {}),
         recipe_revision_id: advancedRecipe ? request.recipe_revision_id : undefined,
         recipe: automaticMode ? undefined : request.recipe?.trim(),
         entrypoint: hasLocalTraining && advancedRecipe ? request.entrypoint?.trim() : undefined,
@@ -1659,6 +1676,7 @@ function RunWizardContent({
               {hasLocalTraining && (
                 <section className="training-data-datasets" aria-label="训练数据与处理方式">
                   <DatasetBindings
+                    normalizationOverride={request.normalization_method}
                     imageLayoutEdits={imageLayoutEdits}
                     showProcessing
                     preserveProcessingOnDatasetChange={editedParameters.current.has(
@@ -2012,6 +2030,7 @@ function RunWizardContent({
                     核对数据与处理配置（{request.dataset_bindings?.length || 0} 个数据集）
                   </summary>
                   <DatasetBindings
+                    normalizationOverride={request.normalization_method}
                     imageLayoutEdits={imageLayoutEdits}
                     preserveProcessingOnDatasetChange={editedParameters.current.has(
                       TRAINING_TEMPLATE_PROCESSING_MARKER,
@@ -2124,6 +2143,16 @@ function RunWizardContent({
                 <span>参数已填入初始值，可直接修改后生成 config</span>
               </div>
               <div className="training-parameter-sections">
+                {hasLocalTraining && (
+                  <section className="training-parameter-section" aria-label="训练归一化方式">
+                    <div className="form-grid">
+                      <TrainingNormalizationField
+                        value={request.normalization_method}
+                        onChange={(method) => update('normalization_method', method)}
+                      />
+                    </div>
+                  </section>
+                )}
                 {parameterGroups.map((group) => (
                   <section
                     className="training-parameter-section"
@@ -2492,6 +2521,14 @@ function RunWizardContent({
                 </code>
               </dd>
             </div>
+            {hasLocalTraining && (
+              <div>
+                <dt>训练归一化方式</dt>
+                <dd>
+                  {trainingNormalizationLabel((preview?.request || request).normalization_method)}
+                </dd>
+              </div>
+            )}
             {frozenRecipe && (
               <div>
                 <dt>配方版本摘要</dt>
@@ -2532,6 +2569,7 @@ function RunWizardContent({
             <div className="preflight-dataset-bindings">
               <h3>本次数据集绑定</h3>
               <DatasetBindingSummary
+                normalizationOverride={(preview?.request || request).normalization_method}
                 bindings={preview?.request?.dataset_bindings || request.dataset_bindings}
                 assets={assets.data || []}
                 profiles={preview?.request?.dataset_profiles}

@@ -150,6 +150,7 @@ def tick(db: Database, settings: Settings) -> int:
                     "gpu_uuids": chosen, "code_expectation": run.code_expectation,
                     "entrypoint": run.code_expectation.get("requested_entrypoint"),
                     **({"auto_config": run.code_expectation["auto_config"]} if run.code_expectation.get("auto_config") is not None else {}),
+                    **({"normalization_method": run.code_expectation["normalization_method"]} if run.code_expectation.get("normalization_method") is not None else {}),
                     **({"confirmed_config_sha256": run.code_expectation["confirmed_config_sha256"]} if run.code_expectation.get("confirmed_config_sha256") else {}),
                     **({"training_stage": run.code_expectation["training_stage"], "stage_config": run.code_expectation.get("stage_config", {})} if run.code_expectation.get("training_stage") is not None else {}),
                     **({"dataset_bindings": run.code_expectation["dataset_bindings"]} if run.code_expectation.get("dataset_bindings") is not None else {}),

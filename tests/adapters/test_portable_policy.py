@@ -1,13 +1,16 @@
 """Portable policy JSON restores observations without source training paths."""
 
 from copy import deepcopy
+import ast
 import dataclasses
 import enum
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -56,6 +59,7 @@ class Data:
     use_quantile_norm: bool = True
     normalize_masks: object = None
     robot_type: str = "ARM=1,G=0,H=0"
+    normalization_method: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,6 +78,7 @@ class Train:
     data: object
     policy_metadata: dict
     assets_dirs: tuple = ()
+    normalization_method: str | None = None
 
 
 def configuration(runtime):
@@ -94,6 +99,58 @@ def test_roundtrip_has_no_training_path_and_keeps_model_contract(runtime):
     assert dataclasses.asdict(restored.data.create(None, None)) == dataclasses.asdict(original.data.value)
     assert restored.assets_dirs == ()
     assert restored.policy_metadata == {"task": "折叠衣服"}
+    assert "normalization_method" not in exported["data"]
+
+
+@pytest.mark.parametrize("method", ["minmax", "quantile", "zscore"])
+def test_portable_normalization_method_survives_with_global_request_priority(runtime, method):
+    root, *_ = runtime
+    original = configuration(runtime)
+    original = dataclasses.replace(original, normalization_method=method,
+        data=dataclasses.replace(original.data, value=dataclasses.replace(original.data.value, normalization_method="zscore")))
+    exported = export_portable_policy(original, root)
+    assert exported["data"]["normalization_method"] == method
+    restored = load_portable_policy(exported, portable_digest(exported), root)
+    assert restored.data.create(None, None).normalization_method == method
+
+
+def test_portable_respects_dataset_method_when_global_request_is_absent(runtime):
+    root, *_ = runtime
+    original = configuration(runtime)
+    original = dataclasses.replace(original,
+        data=dataclasses.replace(original.data, value=dataclasses.replace(original.data.value, normalization_method="minmax")))
+    exported = export_portable_policy(original, root)
+    assert exported["data"]["normalization_method"] == "minmax"
+
+
+@pytest.mark.parametrize("method", ["auto", True, [], {}])
+def test_portable_rejects_invalid_method_in_config_and_serialized_package(runtime, method):
+    root, *_ = runtime
+    original = configuration(runtime)
+    with pytest.raises(ValueError, match="normalization method"):
+        export_portable_policy(dataclasses.replace(original, normalization_method=method), root)
+    exported = export_portable_policy(original, root)
+    exported["data"]["normalization_method"] = method
+    with pytest.raises(ValueError, match="normalization method"):
+        load_portable_policy(exported, portable_digest(exported), root)
+
+
+@pytest.mark.parametrize("method", ["minmax", "quantile", "zscore", None])
+def test_local_inference_projection_records_effective_explicit_method(runtime, method):
+    root, *_ = runtime
+    source = Path(__file__).resolve().parents[2] / "apps/agent/vla_agent/policy_deployment_worker.py"
+    node = next(node for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "local_inference_description")
+    namespace = {"Path": Path, "PurePosixPath": PurePosixPath, "dataclasses": dataclasses,
+        "importlib": importlib, "json": json, "math": math}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    config = dataclasses.replace(configuration(runtime), normalization_method=method)
+    projection = namespace["local_inference_description"](config, config.data.value,
+        {"code_dir": str(root), "frozen_request": {}}, "local-only fixture")
+    if method is None:
+        assert "normalization_method" not in projection["data"]
+    else:
+        assert projection["data"]["normalization_method"] == method
 
 
 def test_changed_source_target_adapter_runtime_and_payload_are_rejected(runtime, monkeypatch):

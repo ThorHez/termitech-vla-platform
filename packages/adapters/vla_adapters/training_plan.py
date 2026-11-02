@@ -30,6 +30,7 @@ if __package__:
     from .dataset_validation_cache import get_or_validate
     from .entrypoints import read_entrypoint, validate_entrypoint
     from .recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
+    from .runtime_options import normalize_normalization_method
 else:
     from automatic_config import normalize_auto_config
     from generated_config import generated_training_config
@@ -44,6 +45,7 @@ else:
     from dataset_validation_cache import get_or_validate
     from entrypoints import read_entrypoint, validate_entrypoint
     from recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
+    from runtime_options import normalize_normalization_method
 
 
 def fingerprint(value):
@@ -348,7 +350,9 @@ def check_composed_mixture(data_factory, datasets, *, shared_validated=False):
             raise ValueError(f"COMPOSITION_STATE_PADDING_INVALID: 配方 data.state_pad_dim={target} 与组合输出状态宽度 {actual} 不兼容；Pi05 至少需要 {actual}，Pi0 必须等于模型 action_dim")
 
 
-def norm_contract(factory, spec):
+def norm_contract(factory, spec, *, normalization_method=None):
+    method = normalize_normalization_method(normalization_method if normalization_method is not None
+                                            else spec.get("normalization_method"))
     assets = factory.assets
     asset_dir = assets.get("assets_dir") if isinstance(assets, dict) else getattr(assets, "assets_dir", None)
     asset_id = assets.get("asset_id") if isinstance(assets, dict) else getattr(assets, "asset_id", None)
@@ -382,8 +386,15 @@ def norm_contract(factory, spec):
             if lengths[0] != expected:
                 raise ValueError(f"COMPOSITION_NORM_MISMATCH: {key} 归一化统计宽度与组合拼接顺序的总宽度不一致")
         base = getattr(factory, "base_config", None)
-        if (getattr(base, "use_quantile_norm", False) or composition is not None and composition["normalization"] == "quantile") and not all(values.get(k) is not None for k in ("q01", "q99")):
+        needs_quantiles = method == "quantile" or method is None and (
+            getattr(base, "use_quantile_norm", False) or composition is not None and composition["normalization"] == "quantile")
+        if needs_quantiles and not all(values.get(k) is not None for k in ("q01", "q99")):
             raise ValueError(f"NORM_FORMAT: {norm_path} 缺少分位数归一化统计")
+        if method == "minmax" and not all(values.get(k) is not None for k in ("min", "max")):
+            raise ValueError(f"NORM_FORMAT: {norm_path} 缺少 Min-Max 归一化统计 min/max")
+        bounds = ("min", "max") if method == "minmax" else ("q01", "q99") if method == "quantile" else None
+        if bounds is not None and any(low > high for low, high in zip(values[bounds[0]], values[bounds[1]])):
+            raise ValueError(f"NORM_FORMAT: {norm_path} 的 {key} 归一化下界不能大于上界")
     return {"norm_path": str(norm_path), "norm_sha256": sha}
 
 
@@ -477,6 +488,10 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
         checks.append({"name": name, "ok": True, "message": message})
 
     bindings = validate_binding_assets(spec.get("dataset_bindings"), spec["inputs"])
+    requested_method = normalize_normalization_method(spec.get("normalization_method"))
+    effective_method = normalize_normalization_method(getattr(config, "normalization_method", None))
+    if requested_method is not None and effective_method != requested_method:
+        raise ValueError("NORMALIZATION_METHOD_MISMATCH: 实际训练配置未应用所选归一化方法，请升级训练代码后重新预检")
     children = getattr(config.data, "datasets", None)
     multi = children is not None
     if multi and bindings is None:
@@ -515,7 +530,10 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             raise
     passed("dataset_timestamps", "已按本次生效 FPS 和训练加载器容差，逐帧核对所有数据集的真实时间戳")
     for data, factory in zip(datasets, factories):
-        data.update(norm_contract(factory, spec))
+        data.update(norm_contract(factory, spec, **({"normalization_method": effective_method}
+                                                  if effective_method is not None else {})))
+        if effective_method is not None:
+            data["normalization_method"] = effective_method
     normalization = shared_norm_contract(config.data, factories, datasets, spec) if multi else {"mode": "per_dataset"}
     check_composed_mixture(config.data, datasets, shared_validated=normalization["mode"] == "shared")
     for i, (data, (dataset_role, norm_role)) in enumerate(zip(datasets, roles)):
@@ -599,6 +617,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "dataset_fps_runtime": fps_runtime if fps_runtime and fps_runtime.get("installed") is True else None,
             "generated_config": generated_training_config(config, spec, entrypoint=entry),
             **({"auto_config": normalize_auto_config(spec["auto_config"])} if spec.get("auto_config") is not None else {}),
+            **({"normalization_method": requested_method} if requested_method is not None else {}),
             **({"training_stage": stage, "stage_config": stage_config, "recap_stage_contract": stage_contract}
                if stage is not None else {}),
             **({"dataset_bindings": bindings} if bindings is not None else {}),

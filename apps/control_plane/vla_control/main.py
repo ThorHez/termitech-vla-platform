@@ -523,6 +523,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "template_id": body.template_id, "recipe": data["recipe"], "inputs": resolve_inputs(session, data),
                 "parameters": parameters, "gpu_count": body.gpu_count, "entrypoint": data.get("entrypoint"),
                 **({"auto_config": data["auto_config"]} if data.get("auto_config") is not None else {}),
+                **({"normalization_method": data["normalization_method"]} if data.get("normalization_method") is not None else {}),
                 **({"training_stage": data["training_stage"], "stage_config": data["stage_config"]} if data.get("training_stage") is not None else {}),
                 **({"dataset_bindings": data["dataset_bindings"]} if data.get("dataset_bindings") is not None else {}),
                 **({"recipe_definition": data["recipe_definition"], "node_id": node.id} if data.get("recipe_definition") else {})})
@@ -591,7 +592,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             created = now()
-            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "training_stage", "stage_config", "dataset_profiles", "auto_config"}}
+            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "training_stage", "stage_config", "dataset_profiles", "auto_config", "normalization_method"}}
             expectation = {key: deepcopy(value) for key, value in preview.code_snapshot.items() if key != "dataset_profiles"}
             if data["template_id"] in {"openpi-sft", "recap"}:
                 expectation["confirmed_config_sha256"] = body.confirmed_config_sha256

@@ -308,7 +308,9 @@ def _frozen(config, profile, payload):
         current = capture_code(profile, config["roots"], recipe=frozen.get("recipe"),
                                recipe_definition=frozen.get("recipe_definition"), entrypoint=frozen.get("entrypoint"),
                                dataset_bindings=frozen.get("dataset_bindings"), training_stage=frozen.get("training_stage"),
-                               stage_config=frozen.get("stage_config"), auto_config=frozen.get("auto_config"))
+                               stage_config=frozen.get("stage_config"), auto_config=frozen.get("auto_config"),
+                               **({"normalization_method": expected["normalization_method"]}
+                                  if expected.get("normalization_method") is not None else {}))
         compare_code(expected, current, compare_automatic=False)
         if str(allowed_path(frozen["code_dir"], config["roots"])) != profile["code_dir"]:
             raise ValueError("Training configuration belongs to another checkout")

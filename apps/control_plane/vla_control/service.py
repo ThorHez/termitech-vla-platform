@@ -10,6 +10,7 @@ from vla_adapters.entrypoints import validate_entrypoint
 from vla_adapters.recipe_definitions import recipe_parameters, resolve_definition
 from vla_adapters.recap import runtime_adapter_for, validate_training_stage
 from vla_adapters.sample_evidence import validate_sample_evidence
+from vla_adapters.runtime_options import normalize_normalization_method, validate_generated_normalization_method
 from vla_protocol import canonical_digest
 from vla_protocol.config_preview import validate_generated_config
 
@@ -40,6 +41,14 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
     template = next((t for t in get_templates() if t["id"] == data["template_id"]), None)
     if not template or template["status"] != "AVAILABLE":
         raise APIError(422, "TEMPLATE_UNAVAILABLE", "Template has not been made available")
+    try:
+        method = normalize_normalization_method(data.get("normalization_method"), template_id=template["id"])
+    except ValueError as exc:
+        raise APIError(422, str(exc).split(":", 1)[0], str(exc)) from exc
+    if method is None:
+        data.pop("normalization_method", None)
+    else:
+        data["normalization_method"] = method
     try:
         stage, stage_config = validate_training_stage(template["id"], data.get("training_stage"), data.get("stage_config"))
     except ValueError as exc:
@@ -239,6 +248,22 @@ def training_stage_snapshot_error(requested_stage, requested_config, snapshot) -
     return None
 
 
+def normalization_method_snapshot_error(requested, snapshot) -> dict | None:
+    evidence = snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None
+    plan = evidence.get("plan") if isinstance(evidence, dict) else None
+    if requested is not None and any(not isinstance(value, dict) or "normalization_method" not in value
+                                     for value in (snapshot, plan)):
+        return {"code": "AGENT_NORMALIZATION_UNSUPPORTED", "message": "Agent 未确认所选归一化方法，请升级 Agent 和训练代码后重新预检"}
+    if any(isinstance(value, dict) and value.get("normalization_method") != requested for value in (snapshot, plan)):
+        return {"code": "NORMALIZATION_METHOD_MISMATCH", "message": "实际归一化方法与本次选择不一致，请重新预检"}
+    if requested is not None:
+        try:
+            validate_generated_normalization_method(plan.get("generated_config"), requested)
+        except ValueError:
+            return {"code": "NORMALIZATION_METHOD_MISMATCH", "message": "生成的训练配置未冻结所选归一化方法，请升级 Agent 后重新预检"}
+    return None
+
+
 def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict | None:
     """Require Agent evidence for this exact task; discovery is not execution proof."""
     if request["template_id"] not in {"openpi-sft", "recap"}:
@@ -248,6 +273,8 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
         snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None)
     if storage_error:
         return storage_error
+    if error := normalization_method_snapshot_error(request.get("normalization_method"), snapshot):
+        return error
     requested_auto = request.get("auto_config")
     if requested_auto is not None and (not isinstance(snapshot, dict) or snapshot.get("auto_config") is None):
         return {"code": "AGENT_AUTO_CONFIG_UNSUPPORTED", "message": "Agent 未确认自动组装配置，请更新 Agent 后重新预检"}
@@ -282,6 +309,8 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
         expected["dataset_bindings"] = request.get("dataset_bindings")
     if requested_auto is not None or "auto_config" in plan:
         expected["auto_config"] = requested_auto
+    if request.get("normalization_method") is not None:
+        expected["normalization_method"] = request["normalization_method"]
     if request.get("training_stage") is not None:
         expected.update(training_stage=request["training_stage"], stage_config=request["stage_config"])
     if any(key not in plan or canonical_digest(plan[key]) != canonical_digest(value) for key, value in expected.items()):
@@ -704,6 +733,8 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
         elif error := entrypoint_snapshot_error(run.code_expectation.get("requested_entrypoint"), snapshot):
             event_failure(session, attempt, run, error["code"], error["message"])
         elif error := dataset_bindings_snapshot_error(run.code_expectation.get("dataset_bindings"), snapshot):
+            event_failure(session, attempt, run, error["code"], error["message"])
+        elif error := normalization_method_snapshot_error(run.code_expectation.get("normalization_method"), snapshot):
             event_failure(session, attempt, run, error["code"], error["message"])
         elif error := training_stage_snapshot_error(run.code_expectation.get("training_stage"), run.code_expectation.get("stage_config"), snapshot):
             event_failure(session, attempt, run, error["code"], error["message"])

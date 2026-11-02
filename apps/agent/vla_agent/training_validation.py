@@ -17,6 +17,7 @@ from pathlib import Path
 
 from vla_adapters.dataset_bindings import validate_binding_assets
 from vla_adapters.sample_evidence import validate_sample_evidence
+from vla_adapters.runtime_options import validate_generated_normalization_method
 from vla_protocol import canonical_digest
 from vla_protocol.config_preview import validate_generated_config
 
@@ -155,6 +156,11 @@ def _probe_spec(launch: dict, config: dict) -> tuple[list[str], dict]:
     spec["allowed_roots"] = list(config["roots"])
     spec["validation_cache_dir"] = str(Path(config["state_dir"]) / "dataset-validation-cache")
     spec.pop("expected_plan_digest", None)
+    from vla_adapters.runtime_options import normalize_normalization_method
+    try:
+        normalize_normalization_method(spec.get("normalization_method"))
+    except ValueError as exc:
+        raise AgentError(str(exc).split(":", 1)[0], str(exc)) from exc
     argv[index + 1] = json.dumps(spec, ensure_ascii=False, allow_nan=False)
     argv.append("--validate-only")
     return argv, spec
@@ -230,6 +236,9 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
         validate_generated_config(plan.get("generated_config"))
         if canonical_digest(plan.get("auto_config")) != canonical_digest(spec.get("auto_config")):
             raise ValueError("resolved execution plan does not match automatic configuration")
+        if plan.get("normalization_method") != spec.get("normalization_method"):
+            raise ValueError("resolved execution plan does not match normalization_method")
+        validate_generated_normalization_method(plan.get("generated_config"), spec.get("normalization_method"))
         _validate_training_cache(plan, config["roots"])
         if configured_cache and any(plan["training_cache"]["paths"].get(key) != value
                                     for key, value in configured_cache.items()):

@@ -231,6 +231,7 @@ class PortableData:
     use_quantile_norm: bool
     normalize_masks: object
     robot_type: str | None
+    normalization_method: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -239,6 +240,15 @@ class ResolvedDataFactory:
 
     def create(self, *_args):
         return self.value
+
+
+def _normalization_method(train_config, data):
+    method = getattr(train_config, "normalization_method", None)
+    if method is None:
+        method = getattr(data, "normalization_method", None)
+    if method is not None and (not isinstance(method, str) or method not in {"minmax", "quantile", "zscore"}):
+        _fail("Invalid explicit normalization method")
+    return method
 
 
 def export_portable_policy(train_config, code_dir, *, resolved_data=None):
@@ -272,6 +282,8 @@ def export_portable_policy(train_config, code_dir, *, resolved_data=None):
         "code_files": _code_files(code_dir), "adapter_files": _adapter_files(), "runtime_versions": _versions(),
         "model_family": type(train_config.model).__name__,
     }
+    if (method := _normalization_method(train_config, data)) is not None:
+        result["data"]["normalization_method"] = method
     if len(canonical(result)) > MAX_BYTES:
         _fail("Portable policy exceeds 512 KiB")
     return result
@@ -299,14 +311,16 @@ def load_portable_policy(config, digest, code_dir):
     if type(model).__module__ not in MODEL_MODULES or type(model).__name__ != config["model_family"]:
         _fail("Model family does not match exported evidence")
     data = config["data"]
-    if not isinstance(data, dict) or set(data) != {"asset_id", "data_transforms", "model_transforms", "use_quantile_norm", "normalize_masks", "robot_type"}:
+    required_data = {"asset_id", "data_transforms", "model_transforms", "use_quantile_norm", "normalize_masks", "robot_type"}
+    if not isinstance(data, dict) or set(data) not in (required_data, required_data | {"normalization_method"}):
         _fail("Invalid resolved inference data")
+    method = _normalization_method(SimpleNamespace(), SimpleNamespace(normalization_method=data.get("normalization_method")))
     asset_id = data["asset_id"]
     if (not isinstance(asset_id, str) or not asset_id or PurePosixPath(asset_id).is_absolute()
             or ".." in PurePosixPath(asset_id).parts or type(data["use_quantile_norm"]) is not bool
             or data["robot_type"] is not None and not isinstance(data["robot_type"], str)):
         _fail("Invalid checkpoint normalization or robot contract")
     resolved = PortableData(asset_id, codec.decode(data["data_transforms"]), codec.decode(data["model_transforms"]),
-        data["use_quantile_norm"], codec.decode(data["normalize_masks"]), data["robot_type"])
+        data["use_quantile_norm"], codec.decode(data["normalize_masks"]), data["robot_type"], method)
     return SimpleNamespace(model=model, data=ResolvedDataFactory(resolved), assets_dirs=(),
                            policy_metadata=codec.decode(config["policy_metadata"]))

@@ -418,6 +418,7 @@ export interface Template {
   stages?: TrainingStageSpec[];
 }
 export type TrainingStage = 'value' | 'offline_rl';
+export type TrainingNormalizationMethod = 'minmax' | 'quantile' | 'zscore';
 export interface TrainingStageSpec {
   id: TrainingStage;
   name: string;
@@ -461,6 +462,7 @@ export interface GeneratedTrainingConfig {
   sha256: string;
 }
 export interface CodeSnapshot {
+  normalization_method?: TrainingNormalizationMethod | null;
   auto_config?: AutoTrainingConfig | null;
   confirmed_config_sha256?: string | null;
   config_confirmed_at?: string | null;
@@ -501,6 +503,7 @@ export interface Attempt {
   code_changed_during_run?: boolean;
 }
 export interface Run {
+  normalization_method?: TrainingNormalizationMethod | null;
   owner_user_id?: string | null;
   auto_config?: AutoTrainingConfig | null;
   confirmed_config_sha256?: string | null;
@@ -549,6 +552,7 @@ export interface Alert {
   created_at?: string;
 }
 export interface RunRequest {
+  normalization_method?: TrainingNormalizationMethod;
   auto_config?: AutoTrainingConfig;
   training_stage?: TrainingStage;
   stage_config?: Record<string, number>;

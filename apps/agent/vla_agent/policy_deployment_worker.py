@@ -39,7 +39,7 @@ def configuration_receipt(directory):
 
 def local_inference_description(train_config, data, manifest, reason):
     """Describe a local trusted resolver without pretending it is portable code."""
-    from vla_adapters.portable_policy import _adapter_files, _code_files, _versions
+    from vla_adapters.portable_policy import _adapter_files, _code_files, _normalization_method, _versions
 
     if (not isinstance(data.asset_id, str) or not data.asset_id or PurePosixPath(data.asset_id).is_absolute()
             or ".." in PurePosixPath(data.asset_id).parts):
@@ -91,6 +91,8 @@ def local_inference_description(train_config, data, manifest, reason):
                        ("asset_id", "data_transforms", "model_transforms", "use_quantile_norm", "normalize_masks", "robot_type")},
               "assets_dirs": project(train_config.assets_dirs), "policy_metadata": project(train_config.policy_metadata),
               "code_files": _code_files(manifest["code_dir"]), "adapter_files": _adapter_files(), "runtime_versions": _versions()}
+    if (method := _normalization_method(train_config, data)) is not None:
+        result["data"]["normalization_method"] = method
     if len(json.dumps(result, ensure_ascii=False, allow_nan=False).encode()) > 768 * 1024:
         raise ValueError("POLICY_CONFIG_INVALID: local inference configuration exceeds artifact size limit")
     return result

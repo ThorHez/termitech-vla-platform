@@ -28,7 +28,7 @@ if __package__:
     from .entrypoints import read_entrypoint
     from .recipe_definitions import apply_overrides, validate_definition
     from .recap_runtime import apply_stage, stage_request
-    from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, runtime_parameter_overrides,
+    from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                   validate_runtime_parameter_relations)
     from .training_plan import fingerprint, inspect_training_config, local_path, require_lerobot_source, training_entrypoint
 else:
@@ -40,13 +40,14 @@ else:
     from entrypoints import read_entrypoint
     from recipe_definitions import apply_overrides, validate_definition
     from recap_runtime import apply_stage, stage_request
-    from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, runtime_parameter_overrides,
+    from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                  validate_runtime_parameter_relations)
     from training_plan import fingerprint, inspect_training_config, local_path, require_lerobot_source, training_entrypoint
 
 
 def resolve_config(base, spec, config_module, weight_loaders):
     """Explicit asset bindings override recipe defaults; never modify the recipe."""
+    normalization_method = normalize_normalization_method(spec.get("normalization_method"), template_id=spec.get("template_id"))
     if spec.get("recipe_definition") is not None:
         definition = validate_definition(spec["recipe_definition"])
         if definition["base_recipe"] != spec["recipe"]:
@@ -190,6 +191,10 @@ def resolve_config(base, spec, config_module, weight_loaders):
         raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方需要 CheckpointWeightLoaderWithValueHead 初始化价值头")
     root_overrides = {name: value for name, value in runtime_overrides.items()
                       if name not in SCHEDULE_PARAMETERS | OPTIMIZER_PARAMETERS}
+    if normalization_method is not None:
+        if "normalization_method" not in {field.name for field in dataclasses.fields(base)}:
+            raise ValueError("NORMALIZATION_METHOD_UNSUPPORTED: 当前训练代码不支持显式归一化方法，请升级 openpi-umi 后重新预检")
+        root_overrides["normalization_method"] = normalization_method
     root_overrides.setdefault("fsdp_devices", spec["gpu_count"])
     if set(root_overrides) - {field.name for field in dataclasses.fields(base)}:
         raise ValueError("TRAINING_PARAMETER_UNSUPPORTED: 当前训练环境缺少所选检查点或数据加载参数")

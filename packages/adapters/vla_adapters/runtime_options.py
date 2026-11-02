@@ -1,5 +1,6 @@
 """Optional per-run controls, independent of data/model recipe selection."""
 
+import ast
 import math
 
 
@@ -58,6 +59,37 @@ RUNTIME_PARAMETER_RULES = {
 
 SCHEDULE_PARAMETERS = frozenset({"warmup_steps", "decay_steps", "decay_lr"})
 OPTIMIZER_PARAMETERS = frozenset({"clip_gradient_norm"})
+
+
+def normalize_normalization_method(value, *, template_id=None):
+    """Absent choices retain the registered recipe/checkpoint's legacy behavior."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value not in {"minmax", "quantile", "zscore"}:
+        raise ValueError("NORMALIZATION_METHOD_INVALID: 归一化方法只支持 minmax、quantile 或 zscore")
+    if template_id is not None and template_id not in {"openpi-sft", "recap"}:
+        raise ValueError("NORMALIZATION_METHOD_UNSUPPORTED: 该训练模板不支持选择归一化方法")
+    return value
+
+
+def validate_generated_normalization_method(generated, method):
+    """Confirm the reviewed Python freezes an explicit choice without executing it."""
+    method = normalize_normalization_method(method)
+    if method is None:
+        return
+    source = generated.get("source") if isinstance(generated, dict) else None
+    try:
+        if not isinstance(source, str) or len(source.encode("utf-8")) > 384 * 1024:
+            raise ValueError("missing bounded configuration source")
+        assignments = [node for node in ast.parse(source).body if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "FROZEN_REQUEST" for target in node.targets)]
+        if len(assignments) != 1:
+            raise ValueError("missing frozen request")
+        frozen = ast.literal_eval(assignments[0].value)
+        if not isinstance(frozen, dict) or frozen.get("normalization_method") != method:
+            raise ValueError("different normalization method")
+    except (SyntaxError, ValueError, TypeError, RecursionError, UnicodeError) as exc:
+        raise ValueError("NORMALIZATION_METHOD_MISMATCH: generated FROZEN_REQUEST does not freeze normalization_method") from exc
 
 
 def runtime_parameter_overrides(parameters):

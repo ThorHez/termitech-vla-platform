@@ -3,6 +3,8 @@ import { useState } from 'react';
 import { Field } from './components';
 import { RobotTypeField } from './RobotTypeField';
 import { inferImageLayout } from './imageLayout';
+import { trainingNormalizationLabel } from './trainingNormalization';
+import type { TrainingNormalizationMethod } from './types';
 import {
   composedProcessingErrors,
   composedProcessingSummary,
@@ -58,6 +60,7 @@ export function ComposedProcessingEditor({
   onChange,
   onFieldEdit,
   onImageLayoutEdit,
+  normalizationOverride,
   disabled = false,
 }: {
   value: ComposedProcessingSpec;
@@ -65,6 +68,7 @@ export function ComposedProcessingEditor({
   onChange: (value: ComposedProcessingSpec) => void;
   onFieldEdit?: (path: string) => void;
   onImageLayoutEdit?: (key: string, kind: ComposedCamera['kind']) => void;
+  normalizationOverride?: TrainingNormalizationMethod;
   disabled?: boolean;
 }) {
   const set = <K extends keyof ComposedProcessingSpec>(key: K, next: ComposedProcessingSpec[K]) => {
@@ -577,11 +581,11 @@ export function ComposedProcessingEditor({
                 required
                 maxLength={256}
                 value={item.key}
-              onChange={(event) => {
-                const key = event.target.value;
-                const inferred = inferImageLayout(profile.image_features, key, item.kind);
-                camera(index, { key, layout: inferred.layout || '' });
-              }}
+                onChange={(event) => {
+                  const key = event.target.value;
+                  const inferred = inferImageLayout(profile.image_features, key, item.kind);
+                  camera(index, { key, layout: inferred.layout || '' });
+                }}
               />
             </Field>
             <div className="form-grid">
@@ -628,7 +632,9 @@ export function ComposedProcessingEditor({
                     camera(index, { layout: event.target.value as ComposedCamera['layout'] });
                   }}
                 >
-                  <option value="" disabled>待读取或手动选择布局</option>
+                  <option value="" disabled>
+                    待读取或手动选择布局
+                  </option>
                   <option value="chw">CHW · 通道/高/宽</option>
                   <option value="hwc">HWC · 高/宽/通道</option>
                 </select>
@@ -700,15 +706,22 @@ export function ComposedProcessingEditor({
             />
           </Field>
           <Field label="组合归一化方式">
-            <select
-              value={value.normalization}
-              onChange={(event) =>
-                set('normalization', event.target.value as ComposedProcessingSpec['normalization'])
-              }
-            >
-              <option value="quantile">分位数（Quantile）</option>
-              <option value="zscore">均值方差（Z-score）</option>
-            </select>
+            {normalizationOverride ? (
+              <span>本次训练统一使用：{trainingNormalizationLabel(normalizationOverride)}</span>
+            ) : (
+              <select
+                value={value.normalization}
+                onChange={(event) =>
+                  set(
+                    'normalization',
+                    event.target.value as ComposedProcessingSpec['normalization'],
+                  )
+                }
+              >
+                <option value="quantile">沿用统计文件方式（旧配置）</option>
+                <option value="zscore">均值方差（Z-score）</option>
+              </select>
+            )}
           </Field>
           <Field label="组合动作模式（可选）">
             <select
@@ -788,9 +801,7 @@ export function ComposedProcessingEditor({
           <input
             type="checkbox"
             checked={value.gripper_range != null}
-            onChange={(event) =>
-              set('gripper_range', event.target.checked ? [NaN, NaN] : null)
-            }
+            onChange={(event) => set('gripper_range', event.target.checked ? [NaN, NaN] : null)}
           />
           启用夹爪范围校验（可选）
         </label>
@@ -860,7 +871,13 @@ export function ComposedProcessingEditor({
           </div>
         </div>
       ) : (
-        <p className="field-hint">组合摘要：{composedProcessingSummary(value)}</p>
+        <p className="field-hint">
+          组合摘要：
+          {composedProcessingSummary(
+            value,
+            normalizationOverride ? trainingNormalizationLabel(normalizationOverride) : undefined,
+          )}
+        </p>
       )}
     </fieldset>
   );
