@@ -93,6 +93,61 @@ def test_registration_queues_one_dataset_scoped_command_and_safe_ack_updates_onl
     assert create(platform, asset).json()["id"] != report["id"]
 
 
+@pytest.mark.parametrize("registered_path,returned_path", [
+    ("/machine/data/", "/machine/data"),
+    ("/machine//data/./", "/machine/data"),
+    ("///machine/data///", "/machine/data"),
+    ("/machine/data", "/machine//data/./"),
+    ("/machine/data set/", "/machine/data set"),
+    ("/machine/data /", "/machine/data "),
+])
+def test_equivalent_remote_path_spellings_accept_agent_evidence_without_changing_registration(
+        platform, registered_path, returned_path):
+    node = worker(platform)
+    asset = register(platform, node, path=registered_path)
+    value = {**result(asset), "path": returned_path}
+    assert ack(platform, node, asset["validation"], value).status_code == 200
+    report = get(platform, asset)
+    assert report["status"] == "SUCCEEDED" and report["error"] is None
+    assert report["input_digest"] == asset["validation"]["input_digest"]
+    with platform.app.state.db.read() as session:
+        assert session.get(Asset, asset["id"]).path == registered_path
+        command = session.get(Command, report["id"])
+        assert command.payload["path"] == registered_path
+        assert command.result == value
+
+
+@pytest.mark.parametrize("returned_path", [
+    "/machine/data-other", "/another/data", "/machine/data ",
+    "/machine/link/../data", "machine/data", "/machine/data\x00", "/machine/data\n",
+    "/machine/data\x7f", "/machine/data\x85", "", None, [], {}, True,
+])
+def test_different_or_unsafe_remote_paths_cannot_validate_a_dataset(platform, returned_path):
+    node = worker(platform)
+    asset = register(platform, node, path="/machine/data/")
+    value = {**result(asset), "path": returned_path}
+    assert ack(platform, node, asset["validation"], value).status_code == 200
+    report = get(platform, asset)
+    assert report["status"] == "FAILED" and report["error"]["code"] == "DATASET_VALIDATION_INVALID_RESULT"
+    assert report["source_fingerprint"] is None and report["raw_samples"] is None
+
+
+@pytest.mark.parametrize("corruption", ["profile", "fps", "sample"])
+def test_equivalent_paths_do_not_bypass_other_evidence_checks(platform, corruption):
+    node = worker(platform)
+    asset = register(platform, node, path="/machine/data/", metadata={"dataset_profile": dataset_profile(fps=20)})
+    value = {**result(asset), "path": "/machine/data"}
+    if corruption == "profile":
+        value["profile_id"] = "foreign"
+    elif corruption == "fps":
+        value["timestamp_contract"].update(effective_fps=30, expected_interval_seconds=1 / 30)
+    else:
+        value["raw_samples"]["sample_indices"] = [0, 2, 5]
+    assert ack(platform, node, asset["validation"], value).status_code == 200
+    report = get(platform, asset)
+    assert report["status"] == "FAILED" and report["error"]["code"] == "DATASET_VALIDATION_INVALID_RESULT"
+
+
 @pytest.mark.parametrize("condition,code", [("offline", "DATASET_VALIDATION_NODE_OFFLINE"),
     ("unsupported", "DATASET_VALIDATION_AGENT_UNSUPPORTED"), ("no-profile", "DATASET_VALIDATION_PROFILE_UNAVAILABLE"),
     ("many-profiles", "DATASET_VALIDATION_PROFILE_REQUIRED")])

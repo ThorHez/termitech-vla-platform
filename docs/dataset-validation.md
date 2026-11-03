@@ -22,6 +22,11 @@ queued or executing; the protocol does not claim a separate start acknowledgemen
 The server owns the internal report namespace and rejects browser attempts to
 submit it. Old acknowledgements cannot replace reports for changed registrations.
 
+The controller compares dataset paths as remote POSIX paths, accepting equivalent
+spellings with trailing or repeated slashes and `.` components. It preserves the
+registered path and raw evidence, rejects parent traversal and different paths,
+and never resolves remote symlinks using the controller's filesystem.
+
 ## Reuse during training
 
 The first training preview still verifies the selected composition and model

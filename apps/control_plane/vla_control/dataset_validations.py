@@ -3,6 +3,7 @@
 from copy import deepcopy
 import json
 import math
+from pathlib import PurePosixPath
 import re
 
 from pydantic import Field
@@ -178,6 +179,17 @@ def _checks(value):
     return deepcopy(value)
 
 
+def _canonical_path(value):
+    _text(value, 4096)
+    path = PurePosixPath(value)
+    if (not path.is_absolute() or ".." in path.parts
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value)):
+        raise ValueError("invalid dataset path")
+    # Compare remote POSIX spellings without resolving them on the controller.
+    # Parent traversal and different symlink targets cannot prove equivalence.
+    return "/" + str(path).lstrip("/")
+
+
 def validated_result(command, value):
     try:
         if len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode()) > MAX_RESULT_BYTES:
@@ -194,7 +206,8 @@ def validated_result(command, value):
             return {"error": _error(code, message), "checks": _checks(value["checks"]) if value.get("checks") else []}
         _keys(value, allowed - {"error"})
         if (type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["scope"] != SCOPE
-                or value["path"] != command.payload["path"] or value["profile_id"] != command.payload["profile_id"]):
+                or _canonical_path(value["path"]) != _canonical_path(command.payload["path"])
+                or value["profile_id"] != command.payload["profile_id"]):
             raise ValueError("result does not match command")
         _hash(value["source_fingerprint"])
         checks = _checks(value["checks"])
