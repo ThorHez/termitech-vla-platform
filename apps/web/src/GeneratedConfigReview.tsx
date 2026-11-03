@@ -9,17 +9,20 @@ export function GeneratedConfigReview({
   confirmedSha256,
   onConfirm,
   readOnly = false,
+  purpose = 'training',
 }: {
   config?: GeneratedTrainingConfig;
   confirmedSha256?: string;
   onConfirm?: (sha256: string | undefined) => void;
   readOnly?: boolean;
+  purpose?: 'training' | 'norm';
 }) {
+  const norm = purpose === 'norm';
   const [copyState, setCopyState] = useState('复制代码');
   if (!generatedConfigAvailable(config))
     return (
       <div className="inline-note amber" role="alert">
-        预检尚未提供本次训练的 Python config，暂时无法确认启动。请更新中台、Agent
+        预检尚未提供本次任务的 Python config，暂时无法确认启动。请更新中台、Agent
         和训练适配器后重新预检。
       </div>
     );
@@ -36,15 +39,19 @@ export function GeneratedConfigReview({
   return (
     <section
       className={`generated-config-review${readOnly ? ' generated-config-readonly' : ''}`}
-      aria-label={readOnly ? '本次训练 config' : '检查本次训练 config'}
+      aria-label={norm ? '检查统计 config' : readOnly ? '本次训练 config' : '检查本次训练 config'}
     >
       <div className="generated-config-heading">
         <div>
-          <h3>{readOnly ? '本次训练 config' : '检查本次训练 config'}</h3>
+          <h3>{norm ? '检查统计 config' : readOnly ? '本次训练 config' : '检查本次训练 config'}</h3>
           <p>
-            {readOnly
-              ? '由 Agent 根据本次实际解析结果生成，保留模型、数据处理、资产路径和训练参数。'
-              : '请核对 Agent 生成的模型、数据处理、资产路径和训练参数。'}
+            {norm
+              ? readOnly
+                ? '本次统计配置保留每个数据集的处理方式与参数；各数据集独立完整统计，分别生成 norm_stats。'
+                : '请核对每个数据集、处理方式和统计参数。确认后将逐个完整统计，各自生成 norm_stats。'
+              : readOnly
+                ? '由 Agent 根据本次实际解析结果生成，保留模型、数据处理、资产路径和训练参数。'
+                : '请核对 Agent 生成的模型、数据处理、资产路径和训练参数。'}
           </p>
         </div>
         <div className="generated-config-actions">
@@ -91,7 +98,9 @@ export function GeneratedConfigReview({
               checked={configurationConfirmed(config, confirmedSha256)}
               onChange={(event) => onConfirm?.(event.target.checked ? config.sha256 : undefined)}
             />
-            <span>已核对本次 config，确认启动训练</span>
+            <span>
+              {norm ? '已核对本次 config，确认计算 norm_stats' : '已核对本次 config，确认启动训练'}
+            </span>
           </label>
         )}
         {!readOnly && (

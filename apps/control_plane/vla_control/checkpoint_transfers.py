@@ -11,6 +11,7 @@ import threading
 import time
 from types import SimpleNamespace
 
+from fastapi import Request
 from pydantic import Field, field_validator
 from sqlalchemy import or_, select
 from vla_protocol import canonical_digest
@@ -22,11 +23,14 @@ from .profile_rebindings import require_not_pending
 from .recipe_writeback import require_no_pending_writeback
 from .remote_models import RemoteConnection, RemoteDeployment
 from .schemas import InputModel
+from .account_lifecycle import lock_execution_guard, task_execution_authorized
+from .resource_authorization import (request_user_id, require_active_actor, require_expected_user,
+    require_resource_owner)
 
 
 LOG = logging.getLogger(__name__)
 EXPORT_COMMANDS = {"POLICY_EXPORT", "POLICY_EXPORT_STATUS", "POLICY_EXPORT_CANCEL"}
-PUBLIC_FIELDS = ("id", "name", "source_node_id", "source_run_id", "source_checkpoint_path", "target_node_id",
+PUBLIC_FIELDS = ("id", "owner_user_id", "execution_user_id", "name", "source_node_id", "source_run_id", "source_checkpoint_path", "target_node_id",
     "target_profile_id", "target_directory", "target_path", "state", "bytes_total", "bytes_transferred", "files_total",
     "files_transferred", "speed_bytes_per_second", "progress_pct", "attempt", "logs", "error", "manifest_sha256",
     "portable_digest", "created_at", "updated_at", "finished_at")
@@ -377,6 +381,27 @@ class CheckpointTransferManager:
             row = session.get(CheckpointTransfer, transfer_id)
             return row is None or row.state not in TRANSFER_ACTIVE or row.attempt != attempt
 
+    def _interrupt_revoked_undelivered_export(self, session, row):
+        """Release a waiting slot only when no export could have started.
+
+        The caller holds AuthGuard and source Node/task locks, serializing
+        account revocation, first delivery and Agent export acknowledgements.
+        Delivered or acknowledged exports retain their existing lifecycle.
+        """
+        if task_execution_authorized(session, row.owner_user_id, row.execution_user_id,
+                allow_legacy=self.settings.legacy_admin_enabled):
+            return False
+        starts = list(session.scalars(select(Command).where(Command.node_id == row.source_node_id,
+            Command.type == "POLICY_EXPORT", Command.payload["export_id"].as_string() == _export_id(row))
+            .with_for_update()))
+        if not starts or any(command.status != "PENDING" or command.delivered_at is not None for command in starts):
+            return False
+        row.state, row.finished_at = "INTERRUPTED", now()
+        row.error = {"code": "ACCOUNT_EXECUTION_REVOKED", "message": "本次执行发起账户当前无执行权限；导出尚未下发，已暂停同步，恢复权限后可重试"}
+        _log(row, row.error["message"])
+        self._retire_exports(session, row)
+        return True
+
     def _progress(self, transfer_id, attempt, event):
         with self.db.write() as session:
             row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id).with_for_update())
@@ -418,14 +443,31 @@ class CheckpointTransferManager:
             if not acquired:
                 return
             with self.db.write() as session:
+                lock_execution_guard(session)
                 row = session.get(CheckpointTransfer, transfer_id)
                 if row is None or row.state not in TRANSFER_ACTIVE:
                     return
+                session.scalar(select(Node).where(Node.id == row.source_node_id).with_for_update())
+                row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id)
+                    .with_for_update().execution_options(populate_existing=True))
+                if row is None or row.state not in TRANSFER_ACTIVE:
+                    return
+                if self._interrupt_revoked_undelivered_export(session, row):
+                    return
                 attempt = row.attempt
+            # Release the source-only check before acquiring source and target
+            # in the snapshot's stable Node ordering.
+            with self.db.write() as session:
+                lock_execution_guard(session)
+                row = session.get(CheckpointTransfer, transfer_id)
+                if row is None or row.state not in TRANSFER_ACTIVE or row.attempt != attempt:
+                    return
                 _check_snapshot(session, row, self.settings)
                 row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id)
                     .with_for_update().execution_options(populate_existing=True))
                 if row.state not in TRANSFER_ACTIVE or row.attempt != attempt:
+                    return
+                if self._interrupt_revoked_undelivered_export(session, row):
                     return
                 row.state = "EXPORTING"
                 _log(row, "等待源 Agent 导出可移植推理配置")
@@ -433,7 +475,17 @@ class CheckpointTransferManager:
             last_poll = 0
             while not self._cancelled(transfer_id, attempt):
                 with self.db.write() as session:
+                    lock_execution_guard(session)
                     row = session.get(CheckpointTransfer, transfer_id)
+                    if row is None:
+                        return
+                    session.scalar(select(Node).where(Node.id == row.source_node_id).with_for_update())
+                    row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id)
+                        .with_for_update().execution_options(populate_existing=True))
+                    if row is None or row.state not in TRANSFER_ACTIVE or row.attempt != attempt:
+                        return
+                    if self._interrupt_revoked_undelivered_export(session, row):
+                        return
                     if row.portable_config is not None:
                         break
                     if not _pending_exports(session, _export_id(row)) and time.monotonic() - last_poll >= 2:
@@ -445,11 +497,14 @@ class CheckpointTransferManager:
             if self._cancelled(transfer_id, attempt):
                 return
             with self.db.write() as session:
+                lock_execution_guard(session)
                 row = session.get(CheckpointTransfer, transfer_id)
                 bindings = _check_snapshot(session, row, self.settings)
                 row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id)
                     .with_for_update().execution_options(populate_existing=True))
                 if row.state not in TRANSFER_ACTIVE or row.attempt != attempt:
+                    return
+                if self._interrupt_revoked_undelivered_export(session, row):
                     return
                 source_connection = session.get(RemoteConnection, bindings["source_connection_id"])
                 target_connection = session.get(RemoteConnection, bindings["target_connection_id"])
@@ -575,17 +630,22 @@ def register_routes(app, admin, manager):
             return transfer_dict(row, session)
 
     @app.post("/api/v1/checkpoint-transfers", dependencies=admin, status_code=202)
-    def create_transfer(body: TransferInput):
+    def create_transfer(body: TransferInput, request: Request):
+        require_expected_user(request)
         with db.write() as session:
-            bindings = _bindings(session, body, settings)
+            require_active_actor(session, request)
             from .deployment_record_models import DeploymentRecordTransfer
             from .deployment_records import create_record, require_preparation_record
-            record = require_preparation_record(session, body.record_id) if body.record_id is not None else None
+            record = require_preparation_record(session, body.record_id, request=request) if body.record_id is not None else None
+            owner_user_id = record.owner_user_id if record is not None else request_user_id(request)
+            bindings = _bindings(session, body, settings)
             active = list(session.scalars(select(CheckpointTransfer).where(CheckpointTransfer.state.in_(TRANSFER_ACTIVE))))
             if len(active) >= 20:
                 raise APIError(429, "TRANSFER_BUSY", "当前同步任务较多，请等待已有任务完成")
             legacy_deduplication = body.record_id is None and body.record_name is None
             for existing in active:
+                if existing.owner_user_id != owner_user_id:
+                    continue
                 ownership = session.get(DeploymentRecordTransfer, existing.id)
                 same_record = record is not None and ownership is not None and ownership.record_id == record.id
                 if ((same_record or legacy_deduplication)
@@ -599,7 +659,8 @@ def register_routes(app, admin, manager):
             _verify_saved_ssh_credentials(session, bindings, manager)
             run = session.get(Run, body.source_run_id)
             stamp = now()
-            row = CheckpointTransfer(id=uid(), name=body.name or (run.name + " · 权重同步")[:200],
+            row = CheckpointTransfer(id=uid(), owner_user_id=owner_user_id, execution_user_id=request_user_id(request),
+                name=body.name or (run.name + " · 权重同步")[:200],
                 source_node_id=bindings["source_node_id"], source_run_id=run.id,
                 source_checkpoint_path=_path(body.source_checkpoint_path, bindings["source_roots"]),
                 target_node_id=body.target_node_id, target_profile_id=body.target_profile_id,
@@ -609,7 +670,7 @@ def register_routes(app, admin, manager):
             session.add(row)
             session.flush()
             if record is None:
-                record = create_record(session, row.id, body.record_name or row.name, row.created_at)
+                record = create_record(session, row.id, body.record_name or row.name, row.created_at, owner_user_id=row.owner_user_id)
             session.add(DeploymentRecordTransfer(transfer_id=row.id, record_id=record.id,
                 provenance={"origin": "created_transfer", "linked_at": stamp}))
             session.flush()
@@ -619,27 +680,31 @@ def register_routes(app, admin, manager):
         return result
 
     @app.post("/api/v1/checkpoint-transfers/{transfer_id}/retry", dependencies=admin, status_code=202)
-    def retry_transfer(transfer_id: str):
+    def retry_transfer(transfer_id: str, request: Request):
+        require_expected_user(request)
         with manager._lock:
             worker = manager._workers.get(transfer_id)
             if worker is not None and worker.is_alive():
                 raise APIError(409, "TRANSFER_CANCELLING", "上一次同步仍在结束，请稍后重试")
         with db.write() as session:
+            require_active_actor(session, request)
             row = session.get(CheckpointTransfer, transfer_id)
             if row is None:
                 raise APIError(404, "NOT_FOUND", "同步任务不存在")
-            require_transfer_record(session, transfer_id)
+            require_resource_owner(request, row.owner_user_id)
+            require_transfer_record(session, transfer_id, request=request)
             if row.state not in TRANSFER_RETRYABLE:
                 raise APIError(409, "TRANSFER_NOT_RETRYABLE", "只有失败、取消或中断的同步可以重试")
             bindings = _check_snapshot(session, row, settings)
             _verify_saved_ssh_credentials(session, bindings, manager)
-            require_transfer_record(session, transfer_id, lock=True)
+            require_transfer_record(session, transfer_id, lock=True, request=request)
             row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id)
                 .with_for_update().execution_options(populate_existing=True))
             if row.state not in TRANSFER_RETRYABLE:
                 raise APIError(409, "TRANSFER_NOT_RETRYABLE", "同步状态已变化，请刷新后重试")
             manager._retire_exports(session, row)
             row.attempt += 1
+            row.execution_user_id = request_user_id(request)
             row.state, row.error, row.finished_at = "QUEUED", None, None
             row.target_path, row.speed_bytes_per_second = None, 0
             # A new inventory may exclude training-only state or reflect a
@@ -657,9 +722,15 @@ def register_routes(app, admin, manager):
         return result
 
     @app.post("/api/v1/checkpoint-transfers/{transfer_id}/cancel", dependencies=admin, status_code=202)
-    def cancel_transfer(transfer_id: str):
+    def cancel_transfer(transfer_id: str, request: Request):
+        require_expected_user(request)
         with db.write() as session:
-            require_transfer_record(session, transfer_id, lock=True)
+            require_active_actor(session, request)
+            row = session.get(CheckpointTransfer, transfer_id)
+            if row is None:
+                raise APIError(404, "NOT_FOUND", "同步任务不存在")
+            require_resource_owner(request, row.owner_user_id)
+            require_transfer_record(session, transfer_id, lock=True, request=request)
             row = session.scalar(select(CheckpointTransfer).where(CheckpointTransfer.id == transfer_id).with_for_update())
             if row is None:
                 raise APIError(404, "NOT_FOUND", "同步任务不存在")

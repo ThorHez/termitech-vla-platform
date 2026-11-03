@@ -74,6 +74,12 @@ class Database:
                 connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN display_name VARCHAR(200)")
             if "cache_root" not in node_columns:
                 connection.exec_driver_sql("ALTER TABLE nodes ADD COLUMN cache_root TEXT")
+            remote_columns = {column["name"] for column in inspect(connection).get_columns("remote_connections")}
+            if "service_name" not in remote_columns:
+                # Existing connections retain their canonical service. Historical
+                # deployment keys/digests and Agent identities do not change.
+                connection.exec_driver_sql("ALTER TABLE remote_connections ADD COLUMN service_name "
+                                           "VARCHAR(100) NOT NULL DEFAULT 'termitech-vla-agent'")
             asset_columns = {column["name"] for column in inspect(connection).get_columns("assets")}
             if "norm_asset_id" not in asset_columns:
                 connection.exec_driver_sql("ALTER TABLE assets ADD COLUMN norm_asset_id VARCHAR(36) REFERENCES assets(id) ON DELETE RESTRICT")
@@ -86,6 +92,37 @@ class Database:
                 connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN exclude_train_state BOOLEAN NOT NULL DEFAULT false")
             if "norm_sync" not in transfer_columns:
                 connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN norm_sync JSON")
+            # Task ownership is additive. Unknown historical owners stay NULL;
+            # they remain shared-readable and administrator-managed.
+            for table_name in ("asset_transfers", "checkpoint_transfers", "deployment_records", "previews"):
+                task_columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+                if "owner_user_id" not in task_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN owner_user_id "
+                                               "VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
+            for table_name in ("asset_transfers", "checkpoint_transfers", "policy_deployments"):
+                task_columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+                if "execution_user_id" not in task_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN execution_user_id "
+                                               "VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
+            reservation_columns = {column["name"] for column in inspect(connection).get_columns("gpu_reservations")}
+            if "expires_at" not in reservation_columns:
+                connection.exec_driver_sql("ALTER TABLE gpu_reservations ADD COLUMN expires_at VARCHAR(40)")
+            command_columns = {column["name"] for column in inspect(connection).get_columns("commands")}
+            if "delivered_at" not in command_columns:
+                connection.exec_driver_sql("ALTER TABLE commands ADD COLUMN delivered_at VARCHAR(40)")
+                # Old PENDING commands may already have reached an Agent. Keep
+                # their retry/late-ack semantics; only newly queued commands can
+                # be proven never delivered under the new admission policy.
+                connection.exec_driver_sql("UPDATE commands SET delivered_at = created_at")
+            if "actor_user_id" not in command_columns:
+                connection.exec_driver_sql("ALTER TABLE commands ADD COLUMN actor_user_id "
+                                           "VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
+            if "required_permission" not in command_columns:
+                connection.exec_driver_sql("ALTER TABLE commands ADD COLUMN required_permission VARCHAR(80)")
+            deployment_columns = {column["name"] for column in inspect(connection).get_columns("remote_deployments")}
+            if "actor_user_id" not in deployment_columns:
+                connection.exec_driver_sql("ALTER TABLE remote_deployments ADD COLUMN actor_user_id "
+                                           "VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
             run_columns = {column["name"] for column in inspect(connection).get_columns("runs")}
             if "deleted_at" not in run_columns:
                 connection.exec_driver_sql("ALTER TABLE runs ADD COLUMN deleted_at VARCHAR(40)")
@@ -131,6 +168,8 @@ class Database:
                                        "ON training_templates (user_id, name)")
             from .deployment_records import backfill_deployment_records
             backfill_deployment_records(connection)
+            from .model_names import backfill_model_names
+            backfill_model_names(connection)
 
     @contextmanager
     def read(self):

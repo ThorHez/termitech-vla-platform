@@ -8,6 +8,10 @@ from pydantic import Field, SecretStr, field_validator
 from .schemas import AgentConfigInput, InputModel
 
 
+DEFAULT_AGENT_SERVICE_NAME = "termitech-vla-agent"
+AGENT_SERVICE_NAME_PATTERN = r"^[A-Za-z0-9_-]{1,100}$"
+
+
 class AgentUpgradeInput(InputModel):
     expected_build_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
@@ -17,6 +21,7 @@ class SSHAuthenticationInput(InputModel):
     port: int = Field(default=22, ge=1, le=65535, strict=True)
     username: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$")
     password: SecretStr = Field(min_length=1, max_length=4096)
+    service_name: str = Field(default=DEFAULT_AGENT_SERVICE_NAME, pattern=AGENT_SERVICE_NAME_PATTERN)
 
     @field_validator("host")
     @classmethod
@@ -45,6 +50,7 @@ class SSHPathSuggestInput(InputModel):
 
 class SSHInstallCheckInput(InputModel):
     install_dir: str = Field(min_length=2, max_length=4096)
+    service_name: str = Field(default=DEFAULT_AGENT_SERVICE_NAME, pattern=AGENT_SERVICE_NAME_PATTERN)
 
 
 class RemoteDeploymentInput(InputModel):

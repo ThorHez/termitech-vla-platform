@@ -37,7 +37,7 @@ def _allow(permission, method, *paths):
 
 
 _allow("platform.read", "GET",
-       "/templates", "/overview", "/nodes", "/nodes/{node_id}", "/profiles", "/assets",
+       "/templates", "/overview", "/nodes", "/nodes/{node_id}", "/profiles", "/assets", "/members",
        "/nodes/{node_id}/resource-history",
        "/nodes/{node_id}/path-suggestions/{query_id}",
        "/nodes/{node_id}/recipe-suggestions/{query_id}",
@@ -48,31 +48,32 @@ _allow("platform.read", "GET",
        "/recipe-writebacks/{operation_id}",
        "/run-previews/{preview_id}", "/runs", "/runs/{run_id}",
        "/runs/{run_id}/events", "/runs/{run_id}/logs", "/runs/{run_id}/metrics", "/alerts")
-_allow("assets.write", "POST", "/assets", "/assets/{asset_id}/archive",
-       "/nodes/{node_id}/path-suggestions")
+_allow("assets.write", "POST", "/assets", "/assets/{asset_id}/archive")
+_allow("assets.query", "POST", "/nodes/{node_id}/path-suggestions")
 _allow("assets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
 _allow("assets.write", "POST", "/assets/{asset_id}/validations")
 _allow("platform.read", "GET", "/assets/{asset_id}/validation")
 _allow("platform.read", "GET", "/assets/{asset_id}/statistics")
-_allow("assets.write", "GET", "/dataset-format-templates", "/dataset-format-templates/{template_id}")
-_allow("assets.write", "POST", "/dataset-format-templates")
-_allow("assets.write", "PUT", "/dataset-format-templates/{template_id}")
-_allow("assets.write", "DELETE", "/dataset-format-templates/{template_id}")
+_allow("dataset-templates.write", "GET", "/dataset-format-templates", "/dataset-format-templates/{template_id}")
+_allow("dataset-templates.write", "POST", "/dataset-format-templates")
+_allow("dataset-templates.write", "PUT", "/dataset-format-templates/{template_id}")
+_allow("dataset-templates.write", "DELETE", "/dataset-format-templates/{template_id}")
 _allow("assets.write", "POST", "/nodes/{node_id}/dataset-scans",
        "/nodes/{node_id}/dataset-scans/{scan_id}/register")
 _allow("assets.write", "GET", "/nodes/{node_id}/dataset-scans/{scan_id}")
 _allow("assets.write", "PUT", "/assets/{asset_id}/norm-binding")
-_allow("assets.write", "POST", "/nodes/{node_id}/dataset-inspections")
-_allow("assets.write", "GET", "/nodes/{node_id}/dataset-inspections/{query_id}")
+_allow("assets.query", "POST", "/nodes/{node_id}/dataset-inspections")
+_allow("assets.query", "GET", "/nodes/{node_id}/dataset-inspections/{query_id}")
 _allow("platform.read", "GET", "/asset-transfers", "/asset-transfers/{transfer_id}")
 _allow("platform.read", "GET", "/background-tasks")
-_allow("assets.write", "POST", "/asset-transfers", "/asset-transfers/{transfer_id}/retry",
+_allow("assets.transfer", "POST", "/asset-transfers", "/asset-transfers/{transfer_id}/retry",
        "/asset-transfers/{transfer_id}/cancel")
-_allow("assets.write", "POST", "/asset-transfer-batches")
-_allow("assets.write", "DELETE", "/asset-transfers/{transfer_id}")
+_allow("assets.transfer", "POST", "/asset-transfer-batches")
+_allow("assets.transfer", "DELETE", "/asset-transfers/{transfer_id}")
 _allow("training.write", "POST", "/run-previews", "/runs", "/runs/{run_id}/cancel")
 _allow("training.write", "DELETE", "/runs/{run_id}")
 _allow("platform.read", "GET", "/nodes/{node_id}/gpu-reservations")
+_allow("platform.read", "GET", "/gpu-reservation-policy")
 _allow("training.write", "PUT", "/nodes/{node_id}/gpu-reservations")
 _allow("training.write", "DELETE", "/nodes/{node_id}/gpu-reservations/{gpu_uuid}")
 _allow("platform.read", "GET", "/policy-deployments", "/policy-deployments/{deployment_id}")
@@ -92,8 +93,8 @@ _allow("training.write", "GET", "/training-templates", "/training-templates/{tem
 _allow("training.write", "POST", "/training-templates")
 _allow("training.write", "PUT", "/training-templates/{template_id}")
 _allow("training.write", "DELETE", "/training-templates/{template_id}")
-_allow("recipes.write", "POST", "/recipes", "/recipes/{recipe_id}/revisions",
-       "/nodes/{node_id}/recipe-suggestions", "/nodes/{node_id}/recipe-details",
+_allow("recipes.write", "POST", "/recipes", "/recipes/{recipe_id}/revisions")
+_allow("recipes.query", "POST", "/nodes/{node_id}/recipe-suggestions", "/nodes/{node_id}/recipe-details",
        "/nodes/{node_id}/data-processors")
 _allow("recipes.writeback", "POST", "/recipe-revisions/{revision_id}/writeback")
 _allow("machines.manage", "GET", "/agent-config-defaults", "/agent-package",
@@ -105,6 +106,7 @@ _allow("machines.manage", "POST", "/agent-configs", "/ssh-connections/test", "/s
        "/nodes/{node_id}/terminal-sessions",
        "/nodes/{node_id}/storage-configurations",
        "/nodes/{node_id}/profile-rebindings",
+       "/nodes/{node_id}/profiles",
        "/ssh-connections/{connection_id}/path-suggestions", "/ssh-connections/{connection_id}/test",
        "/nodes/{node_id}/disconnect", "/nodes/{node_id}/uninstall", "/nodes/{node_id}/upgrade",
        "/remote-deployments", "/remote-deployments/{job_id}/retry")

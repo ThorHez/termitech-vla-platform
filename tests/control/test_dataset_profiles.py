@@ -159,7 +159,7 @@ def test_patch_rejects_archived_missing_and_extra_mutation_fields(platform):
     assert asset_row(platform, asset["id"]) == before
 
 
-@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 200), ("viewer", 403)])
+@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 403), ("viewer", 403)])
 def test_dataset_profile_patch_respects_asset_write_permission_and_csrf(platform, role, status):
     node = platform.register()
     asset = register_asset(platform, node)

@@ -14,6 +14,8 @@ from .auth_models import User
 from .common import APIError, now, uid
 from .dataset_profiles import DatasetProfile
 from .dataset_template_models import DatasetFormatTemplate
+from .account_lifecycle import lock_execution_guard
+from .resource_authorization import require_active_actor
 
 
 MAX_REQUEST_BYTES = 64 * 1024
@@ -115,19 +117,25 @@ def _owned(session, user_id, template_id):
     return row
 
 
-def _lock_owner(session, user_id):
+def _lock_owner(session, user_id, request=None):
     # Serialize this owner's upserts/capacity checks across PostgreSQL workers;
     # SQLite writes already hold BEGIN IMMEDIATE. A unique index is the final guard.
+    if request is not None:
+        require_active_actor(session, request, "dataset-templates.write")
+    else:
+        lock_execution_guard(session)
     user = session.scalar(select(User).where(User.id == user_id).with_for_update())
     if user is None or not user.enabled:
         raise APIError(401, "UNAUTHORIZED", "登录账户已不可用")
-    if "assets.write" not in ROLE_PERMISSIONS.get(user.role, frozenset()):
+    if user.must_change_password:
+        raise APIError(403, "PASSWORD_CHANGE_REQUIRED", "请先修改初始密码")
+    if "dataset-templates.write" not in ROLE_PERMISSIONS.get(user.role, frozenset()):
         raise APIError(403, "FORBIDDEN", "当前账户没有资产编辑权限")
 
 
-def create_template(db, user_id, value):
+def create_template(db, user_id, value, request=None):
     with db.write() as session:
-        _lock_owner(session, user_id)
+        _lock_owner(session, user_id, request)
         row = session.scalar(select(DatasetFormatTemplate).where(
             DatasetFormatTemplate.user_id == user_id, DatasetFormatTemplate.name == value["name"]))
         created = row is None
@@ -151,9 +159,9 @@ def create_template(db, user_id, value):
     return result, 201 if created else 200
 
 
-def update_template(db, user_id, template_id, value):
+def update_template(db, user_id, template_id, value, request=None):
     with db.write() as session:
-        _lock_owner(session, user_id)
+        _lock_owner(session, user_id, request)
         row = _owned(session, user_id, template_id)
         revision = value["expected_revision"]
         if row.revision != revision or row.revision >= MAX_EXPECTED_REVISION:
@@ -175,9 +183,9 @@ def update_template(db, user_id, template_id, value):
                 "revision": revision + 1, "created_at": row.created_at, "updated_at": stamp}
 
 
-def delete_template(db, user_id, template_id, revision):
+def delete_template(db, user_id, template_id, revision, request=None):
     with db.write() as session:
-        _lock_owner(session, user_id)
+        _lock_owner(session, user_id, request)
         _owned(session, user_id, template_id)
         changed = session.execute(delete(DatasetFormatTemplate).where(
             DatasetFormatTemplate.id == template_id, DatasetFormatTemplate.user_id == user_id,
@@ -189,7 +197,7 @@ def delete_template(db, user_id, template_id, revision):
 
 def register_routes(app, dependencies, db, auth):
     def owner(request):
-        principal = auth.require(request, "assets.write")
+        principal = auth.require(request, "dataset-templates.write")
         if principal.legacy or not principal.session_id:
             raise APIError(403, "DATASET_TEMPLATE_ACCOUNT_REQUIRED", "请使用个人账户登录后使用数据集格式模板")
         expected = request.headers.get("x-dataset-template-user")
@@ -220,7 +228,7 @@ def register_routes(app, dependencies, db, auth):
         user_id = owner(request)
         value = await _body(request, "create")
         owner(request)
-        result, status = await run_in_threadpool(create_template, db, user_id, value)
+        result, status = await run_in_threadpool(create_template, db, user_id, value, request)
         return response(result, status)
 
     @app.put("/api/v1/dataset-format-templates/{template_id}", dependencies=dependencies)
@@ -228,11 +236,11 @@ def register_routes(app, dependencies, db, auth):
         user_id = owner(request)
         value = await _body(request, "update")
         owner(request)
-        return response(await run_in_threadpool(update_template, db, user_id, template_id, value))
+        return response(await run_in_threadpool(update_template, db, user_id, template_id, value, request))
 
     @app.delete("/api/v1/dataset-format-templates/{template_id}", dependencies=dependencies)
     async def remove(template_id: str, request: Request):
         user_id = owner(request)
         value = await _body(request, "delete")
         owner(request)
-        return response(await run_in_threadpool(delete_template, db, user_id, template_id, value["expected_revision"]))
+        return response(await run_in_threadpool(delete_template, db, user_id, template_id, value["expected_revision"], request))

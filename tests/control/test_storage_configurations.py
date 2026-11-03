@@ -299,6 +299,96 @@ def test_openpi_storage_configuration_is_preserved_and_matches_effective_cache(p
     assert checked['code_snapshot']['automatic_preflight']['storage_configuration'] == evidence['storage_configuration']
 
 
+def pending_numeric_norm_with_configured_cache(platform):
+    from vla_agent.storage_configuration import cache_environment
+    from vla_protocol import canonical_digest
+    from .test_norm_tasks import pending_batch_norm
+    node, request, _, _, code, checks = pending_batch_norm(platform, auto_config={}, composed=True)
+    cache_root = '/machine/current-cache'
+    with platform.app.state.db.write() as session:
+        session.get(Node, node['node_id']).cache_root = cache_root
+    # Create this preflight after the machine already has an explicit cache root.
+    response = platform.client.post('/api/v1/run-previews', headers=ADMIN, json=request)
+    assert response.status_code == 202, response.text
+    preview = response.json()
+    command = next(item for item in platform.commands(node) if item['type'] == 'PREFLIGHT'
+                   and item['payload']['preview_id'] == preview['id'])
+    evidence = code['automatic_preflight']
+    evidence['storage_configuration'] = {'output_root': '/machine/output', 'cache_root': cache_root}
+    evidence['plan']['training_cache']['paths'] = cache_environment({'cache_root': cache_root, 'roots': ['/machine']})
+    evidence['plan_digest'] = canonical_digest(evidence['plan'])
+    return node, preview, command, code, checks
+
+
+def test_norm_numeric_projection_with_configured_cache_survives_preview_confirmation_and_start(platform):
+    from .conftest import confirmed_run_request
+    from .test_norm_tasks import acknowledge
+    node, preview, command, code, checks = pending_numeric_norm_with_configured_cache(platform)
+    evidence = code['automatic_preflight']
+    cache = evidence['plan']['training_cache']
+    assert cache['mode'] == 'numeric_projection' and cache['persistent_cache'] is False
+    assert 'datasets_cache' not in cache and 'builders' not in cache
+    checked = acknowledge(platform, node, preview, command, code, checks)
+    assert checked['status'] == 'READY', checked
+    response = platform.client.post('/api/v1/runs', headers={**ADMIN, 'Idempotency-Key': preview['id']},
+                                   json=confirmed_run_request(checked))
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert platform.schedule() == 1
+    start = next(item for item in platform.commands(node) if item['type'] == 'START')
+    assert start['payload']['code_expectation']['automatic_preflight'] == evidence
+    assert platform.get_run(run)['state'] == 'STARTING'
+    platform.start(node, run)
+    assert platform.get_run(run)['state'] == 'RUNNING'
+
+
+@pytest.mark.parametrize('change', ['missing_environment', 'wrong_cache_root', 'wrong_cache_subdirectory',
+    'missing_storage', 'old_hf_cache', 'wrong_projection', 'missing_plan'])
+def test_norm_cannot_ignore_configured_cache_root_or_forge_numeric_projection_storage(platform, change):
+    from vla_protocol import canonical_digest
+    from .test_norm_tasks import acknowledge
+    node, preview, command, code, checks = pending_numeric_norm_with_configured_cache(platform)
+    evidence = code['automatic_preflight']
+    cache = evidence['plan']['training_cache']
+    if change == 'missing_environment':
+        cache['paths'].pop('TMPDIR')
+    elif change == 'wrong_cache_root':
+        cache['paths']['TMPDIR'] = '/machine/old-cache/tmp'
+    elif change == 'wrong_cache_subdirectory':
+        cache['paths']['HF_DATASETS_CACHE'] = '/machine/current-cache/incorrect-datasets'
+    elif change == 'missing_storage':
+        evidence.pop('storage_configuration')
+    elif change == 'old_hf_cache':
+        evidence['plan']['training_cache'] = {'datasets_cache': cache['paths']['HF_DATASETS_CACHE'],
+            'paths': cache['paths'], 'builders': []}
+    elif change == 'wrong_projection':
+        cache['datasets'][0]['columns'] = ['unselected.state', 'actions']
+    else:
+        evidence['plan'] = None
+    evidence['plan_digest'] = canonical_digest(evidence['plan'])
+    checked = acknowledge(platform, node, preview, command, code, checks)
+    assert checked['status'] == 'FAILED', checked
+    expected = 'AGENT_STORAGE_CONFIGURATION_UNSUPPORTED' if change == 'missing_storage' else 'STORAGE_CHANGED_SINCE_PREFLIGHT'
+    assert checked['error']['code'] == expected
+
+
+def test_sft_cannot_use_numeric_cache_shape_to_bypass_its_existing_storage_checks(platform):
+    from vla_agent.storage_configuration import cache_environment
+    from vla_protocol import canonical_digest
+    from .test_automatic_preflight import acknowledge, pending
+    node, identifier, command, code = pending(platform)
+    cache_root = '/machine/current-cache'
+    with platform.app.state.db.write() as session:
+        session.get(Node, node['node_id']).cache_root = cache_root
+    evidence = code['automatic_preflight']
+    evidence['storage_configuration'] = {'output_root': '/machine/output', 'cache_root': cache_root}
+    evidence['plan']['training_cache'] = {'mode': 'numeric_projection', 'persistent_cache': False,
+        'paths': cache_environment({'cache_root': cache_root, 'roots': ['/machine']}), 'datasets': []}
+    evidence['plan_digest'] = canonical_digest(evidence['plan'])
+    checked = acknowledge(platform, node, identifier, command, code)
+    assert checked['status'] == 'FAILED' and checked['error']['code'] == 'STORAGE_CHANGED_SINCE_PREFLIGHT'
+
+
 def test_additive_database_upgrade_preserves_old_machine_and_business_data(platform):
     from sqlalchemy import inspect
     node = platform.register()

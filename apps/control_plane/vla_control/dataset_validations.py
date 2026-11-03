@@ -6,6 +6,7 @@ import math
 from pathlib import PurePosixPath
 import re
 
+from fastapi import Request
 from pydantic import Field
 from sqlalchemy import select
 from sqlalchemy.orm import object_session
@@ -13,6 +14,8 @@ from sqlalchemy.orm import object_session
 from .common import APIError, digest, now, offset_time, require_path, uid
 from .models import Asset, Command, Node, Profile
 from .schemas import InputModel
+from .resource_authorization import bind_command_actor, execution_permission_authorized, require_active_actor
+from .account_lifecycle import task_execution_authorized
 
 
 COMMAND = "DATASET_VALIDATE"
@@ -98,7 +101,85 @@ def invalidate_validation(session, asset, reason="DATASET_VALIDATION_INPUT_CHANG
         command.status, command.result, command.acknowledged_at = "REJECTED", {"error": _error(reason)}, now()
 
 
-def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_seconds=90):
+def reject_undelivered_validation(session, command, error):
+    """Reject local-only work and its matching report, locking Asset first.
+
+    Delivered commands keep their retry/late-ack semantics. The report ID and
+    digest prevent an old command from overwriting a newer validation report.
+    No other registered metadata or actor attribution changes here.
+    """
+    if command.type != COMMAND:
+        return False
+    asset = session.scalar(select(Asset).where(Asset.id == command.payload.get("asset_id"))
+        .with_for_update().execution_options(populate_existing=True))
+    command = session.scalar(select(Command).where(Command.id == command.id)
+        .with_for_update().execution_options(populate_existing=True))
+    if command is None or command.type != COMMAND or command.status != "PENDING" or command.delivered_at is not None:
+        return False
+    stamp = now()
+    clean = _error(str(error.get("code") or "COMMAND_AUTHORIZATION_REVOKED")[:128],
+                   str(error.get("message") or "校验发起账户或权限已失效，请由管理员重新提交")[:2000])
+    stored = (asset.metadata_json or {}).get(INTERNAL_KEY) if asset is not None else None
+    if (isinstance(stored, dict) and stored.get("status") == "PENDING" and stored.get("id") == command.id
+            and asset.node_id == command.node_id and stored.get("input_digest") == command.payload.get("input_digest")):
+        _write(asset, {**stored, "status": "FAILED", "error": deepcopy(clean), "completed_at": stamp})
+    command.status, command.result, command.acknowledged_at = "REJECTED", {"error": clean, "checks": []}, stamp
+    session.flush()
+    return True
+
+
+def validation_execution_authorized(session, command, *, allow_legacy=False):
+    """Authorize explicit admin work or a proven successful copy's own output.
+
+    A transfer cannot grant explicit validation rights to an operator. Derived
+    validation is constrained to that transfer's exact target asset, node and
+    execution actor, including the current admin capability for intervention.
+    """
+    if command.type != COMMAND:
+        return False
+    source_id = command.payload.get("source_transfer_id")
+    permission = "assets.transfer" if source_id is not None else "assets.write"
+    legacy = command.actor_user_id is None and command.required_permission is None
+    if (command.required_permission != permission and not legacy
+            or not execution_permission_authorized(session, command.actor_user_id, permission, allow_legacy=allow_legacy)):
+        return False
+    if source_id is None:
+        return True
+    if not isinstance(source_id, str) or not source_id:
+        return False
+    from .asset_transfer_models import AssetTransfer
+    transfer = session.get(AssetTransfer, source_id)
+    asset = session.get(Asset, command.payload.get("asset_id"))
+    if transfer is None or asset is None:
+        return False
+    actor = transfer.execution_user_id if transfer.execution_user_id is not None else transfer.owner_user_id
+    provenance = (asset.metadata_json or {}).get("asset_sync")
+    return bool(transfer.state == "SUCCEEDED" and transfer.target_asset_id == asset.id
+                and transfer.target_node_id == command.node_id == asset.node_id
+                and asset.kind == "DATASET" and command.actor_user_id == actor
+                and isinstance(provenance, dict) and provenance.get("transfer_id") == transfer.id
+                and task_execution_authorized(session, transfer.owner_user_id, actor, allow_legacy=allow_legacy))
+
+
+def _reuse_pending_validation(session, asset, previous):
+    session.scalar(select(Asset).where(Asset.id == asset.id).with_for_update()
+        .execution_options(populate_existing=True))
+    command = session.scalar(select(Command).where(Command.id == previous.get("id"))
+        .with_for_update().execution_options(populate_existing=True)) if previous.get("id") else None
+    if command is None or command.type != COMMAND or command.status != "PENDING":
+        return False
+    if command.delivered_at is not None:
+        return True
+    if validation_execution_authorized(session, command, allow_legacy=True):
+        return True
+    code = "COMMAND_ACTOR_REQUIRED" if command.actor_user_id is None else "COMMAND_AUTHORIZATION_REVOKED"
+    reject_undelivered_validation(session, command,
+        {"code": code, "message": "校验发起账户或权限已失效，旧校验未下发；请由管理员重新提交"})
+    return False
+
+
+def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_seconds=90, actor_request=None,
+                     actor_user_id=None, source_transfer_id=None):
     if asset.kind != "DATASET":
         return None
     node = session.get(Node, asset.node_id)
@@ -114,7 +195,8 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
         raise APIError(422, "DATASET_VALIDATION_PROFILE_UNAVAILABLE", "请选择本机有效的原生 OpenPI 校验环境")
     previous = validation_dict(asset, session)
     if (previous and previous.get("status") == "PENDING" and chosen is not None
-            and previous.get("profile_id") == chosen.id and previous.get("input_digest") == input_digest(asset, chosen, node)):
+            and previous.get("profile_id") == chosen.id and previous.get("input_digest") == input_digest(asset, chosen, node)
+            and _reuse_pending_validation(session, asset, previous)):
         return previous
     reason = None
     if chosen is None:
@@ -136,6 +218,11 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
             payload={"asset_id": asset.id, "path": asset.path, "profile_id": chosen.id,
                      "registered_profile": deepcopy(_metadata(asset).get("dataset_profile")),
                      "input_digest": report["input_digest"], "expires_at": report["expires_at"]})
+        if source_transfer_id is not None:
+            command.payload = {**command.payload, "source_transfer_id": source_transfer_id}
+            command.actor_user_id, command.required_permission = actor_user_id, "assets.transfer"
+        else:
+            bind_command_actor(command, actor_request, "assets.write")
         session.add(command)
         report["id"] = command.id
     _write(asset, report)
@@ -312,10 +399,11 @@ def register_routes(app, admin, db, settings):
         return asset
 
     @app.post("/api/v1/assets/{asset_id}/validations", dependencies=admin, status_code=202)
-    def create(asset_id: str, body: ValidationInput):
+    def create(asset_id: str, body: ValidationInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "assets.write")
             return queue_validation(session, required(session, asset_id, lock=True), body.profile_id,
-                                    heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds)
+                                    heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds, actor_request=request)
 
     @app.get("/api/v1/assets/{asset_id}/validation", dependencies=admin)
     def get(asset_id: str):

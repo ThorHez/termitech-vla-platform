@@ -38,7 +38,7 @@ LOG = logging.getLogger("vla_agent")
 CAPABILITIES = ["PATH_SUGGEST", "RECIPE_SUGGEST", "RECIPE_DETAIL", "DATA_PROCESSORS", "DATASET_INSPECT", "DATASET_VALIDATE",
                 "DATASET_TIMESTAMP_PREFLIGHT_V1",
                 "DATASET_SAMPLE_PREFLIGHT_V1",
-                "RECIPE_WRITE", "PROFILE_REBIND", "STORAGE_CONFIGURE", "PREFLIGHT", "START", "CANCEL",
+                "RECIPE_WRITE", "PROFILE_REBIND", "PROFILE_ADD", "STORAGE_CONFIGURE", "PREFLIGHT", "START", "CANCEL",
                 "POLICY_DEPLOY_START", "POLICY_DEPLOY_STATUS", "POLICY_DEPLOY_STOP", "POLICY_DEPLOY_TEST",
                 "POLICY_DEPLOY_PORTABLE_V1", "POLICY_DEPLOY_SHARED_GPU_V1", "POLICY_CHECKPOINT_SOURCE_WARNING_V1",
                 "POLICY_CHECKPOINT_INFERENCE_CONTENTS_V1",
@@ -234,6 +234,8 @@ class Agent:
                 result = execute_export_command(self.config, command["type"], payload)
                 status = "APPLIED" if command["type"] == "POLICY_EXPORT_CANCEL" and (result.get("error") or {}).get("code") == "POLICY_EXPORT_CANCELLED" else "REJECTED" if result.get("error") else "APPLIED"
             elif command["type"] == "START":
+                from .resource_guard import require_gpu_access
+                require_gpu_access(self.config, payload.get("gpu_uuids", []))
                 attempt_id = safe_identifier(payload["attempt_id"])
                 if not payload.get("execution_token"):
                     raise AgentError("INVALID_COMMAND", "START requires an execution token")
@@ -420,6 +422,8 @@ class Agent:
                 process_samples.append({"attempt_id": attempt["id"], **sampled})
                 owned_pids.update({pid: attempt["id"] for pid in sampled["process_ids"]})
         gpus, availability = gpu_inventory()
+        from .resource_guard import filter_inventory
+        gpus, resource_guard = filter_inventory(self.config, gpus)
         for gpu in gpus:
             if gpu["processes"] is not None:
                 for process in gpu["processes"]:
@@ -433,6 +437,8 @@ class Agent:
                    "training_supervisor": upgrade_status(self.config["state_dir"]),
                    "storage_configuration": {"output_root": self.config["output_root"],
                                              "cache_root": self.config.get("cache_root")}}
+        if resource_guard is not None:
+            metrics["resource_guard"] = resource_guard
         response = self.api("POST", "/agent/v1/heartbeat", {"node_id": self.credentials["node_id"], "gpus": gpus,
                                                             "metrics": metrics, "active_attempts": active,
                                                             "profiles": self.config["profiles"]})

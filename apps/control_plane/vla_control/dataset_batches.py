@@ -25,6 +25,8 @@ from .models import Asset, Node
 from .remote_models import RemoteConnection, RemoteDeployment
 from .schemas import InputModel
 from .serialization import asset_dict
+from .account_lifecycle import lock_execution_guard
+from .resource_authorization import require_active_actor
 
 
 WORKING = {"QUEUED", "SCANNING"}
@@ -287,9 +289,13 @@ class DatasetBatchManager:
                 row.state, row.updated_at = "FAILED", now()
                 row.error = {"code": "DATASET_SCAN_INTERRUPTED", "message": "扫描已中断，请重新扫描目录"}
 
-    def create(self, user_id, node_id, body):
+    def create(self, user_id, node_id, body, request=None):
         path = _path(body.path)
         with self.db.write() as session:
+            if request is not None:
+                require_active_actor(session, request, "assets.write")
+            else:
+                lock_execution_guard(session)
             _owner_exists(session, user_id, lock=True)
             _admission_lock(session)
             _expire_result_bodies(session)
@@ -336,6 +342,7 @@ class DatasetBatchManager:
             if not acquired:
                 return
             with self.db.write() as session:
+                lock_execution_guard(session)
                 row = session.get(DatasetScan, scan_id)
                 if row is None or row.state != "QUEUED":
                     return
@@ -394,7 +401,7 @@ class DatasetBatchManager:
             row = _owned(session, scan_id, node_id, user_id)
             return scan_dict(row, session)
 
-    def register(self, user_id, node_id, scan_id, body):
+    def register(self, user_id, node_id, scan_id, body, request=None):
         data = body.model_dump(exclude_unset=True)
         canonical = []
         for entry in body.entries:
@@ -403,6 +410,10 @@ class DatasetBatchManager:
             raise APIError(422, "DATASET_BATCH_DUPLICATE_PATH", "同一批次不能重复登记相同目录")
         request_digest = digest({"node_id": node_id, "scan_id": scan_id, "request": data})
         with self.db.write() as session:
+            if request is not None:
+                require_active_actor(session, request, "assets.write")
+            else:
+                lock_execution_guard(session)
             _owner_exists(session, user_id, lock=True)
             previous = session.scalar(select(DatasetBatchRegistration).where(
                 DatasetBatchRegistration.user_id == user_id,
@@ -466,7 +477,8 @@ class DatasetBatchManager:
                               norm_asset_id=norm_id, created_at=now())
                 session.add(asset)
                 session.flush()
-                queue_validation(session, asset, heartbeat_timeout_seconds=self.settings.heartbeat_timeout_seconds)
+                queue_validation(session, asset, heartbeat_timeout_seconds=self.settings.heartbeat_timeout_seconds,
+                                 actor_request=request)
                 created.append(asset_dict(asset))
             result = {"scan_id": scan.id, "idempotency_key": body.idempotency_key, "created": created,
                       "skipped": skipped, "created_count": len(created), "skipped_count": len(skipped)}
@@ -515,7 +527,7 @@ def register_routes(app, dependencies, manager):
         user_id = owner(request)
         body = await _body(request, ScanInput)
         owner(request)
-        result = await run_in_threadpool(manager.create, user_id, node_id, body)
+        result = await run_in_threadpool(manager.create, user_id, node_id, body, request)
         return JSONResponse(result, status_code=202, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/nodes/{node_id}/dataset-scans/{scan_id}", dependencies=dependencies)
@@ -527,5 +539,5 @@ def register_routes(app, dependencies, manager):
         user_id = owner(request)
         body = await _body(request, BatchInput)
         owner(request)
-        return JSONResponse(await run_in_threadpool(manager.register, user_id, node_id, scan_id, body),
+        return JSONResponse(await run_in_threadpool(manager.register, user_id, node_id, scan_id, body, request),
                             headers={"Cache-Control": "no-store"})

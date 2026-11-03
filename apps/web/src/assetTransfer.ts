@@ -18,6 +18,8 @@ export interface AssetNormTransfer {
 }
 
 export interface AssetTransfer {
+  owner_user_id?: string | null;
+  execution_user_id?: string | null;
   id: string;
   name: string;
   source_asset_id: string;

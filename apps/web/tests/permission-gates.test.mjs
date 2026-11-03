@@ -26,10 +26,19 @@ try {
       'machines.manage',
       'training.write',
       'assets.write',
+      'assets.transfer',
+      'dataset-templates.write',
+      'recipes.query',
       'recipes.write',
       'recipes.writeback',
     ],
-    operator: ['training.write', 'assets.write', 'recipes.write'],
+    operator: [
+      'training.write',
+      'assets.query',
+      'assets.transfer',
+      'dataset-templates.write',
+      'recipes.query',
+    ],
     viewer: [],
   };
   const auth = (role) => ({
@@ -64,9 +73,13 @@ try {
     }
   });
 
-  await test('operators retain asset and training actions while viewers retain the pages', () => {
+  await test('only administrators register public assets while operators can create personal training', () => {
+    for (const role of ['admin', 'operator'])
+      assert.match(render(role, AssetsPage), />我的格式模板</);
+    assert.doesNotMatch(render('viewer', AssetsPage), />我的格式模板</);
+    assert.match(render('admin', AssetsPage), />登记资产</);
+    assert.doesNotMatch(render('operator', AssetsPage), />登记资产</);
     for (const role of ['admin', 'operator']) {
-      assert.match(render(role, AssetsPage), />登记资产</);
       assert.match(render(role, RunsPage, { createRun() {} }), />新建训练</);
       assert.match(render(role, OverviewPage, { createRun() {} }), />新建训练</);
     }

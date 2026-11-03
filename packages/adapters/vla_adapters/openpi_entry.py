@@ -273,12 +273,17 @@ def prepare_config(spec):
 
 
 @contextmanager
-def training_module(entry, code, source_sha256):
-    """Execute exactly the verified source, without accepting stale bytecode."""
+def training_module(entry, code, source_sha256, *, module_name="vla_registered_openpi_train"):
+    """Execute verified source, optionally retaining its importable worker name.
+
+    A statistics loader's spawn workers import their dataset and collate
+    functions by module name. Its filename is importable from ``entry.parent``;
+    ordinary training keeps the existing private module name.
+    """
     contents = read_entrypoint(entry)
     if hashlib.sha256(contents).hexdigest() != source_sha256:
         raise ValueError("ASSETS_CHANGED_SINCE_PREFLIGHT: 训练入口源码在最终检查后发生变化，请重新预检")
-    name = "vla_registered_openpi_train"
+    name = module_name
     module_spec = importlib.util.spec_from_file_location(name, entry)
     module = importlib.util.module_from_spec(module_spec)
     previous = sys.modules.get(name)

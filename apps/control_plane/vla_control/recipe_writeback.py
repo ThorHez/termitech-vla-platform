@@ -8,6 +8,7 @@ import copy
 from pathlib import PurePosixPath
 from types import SimpleNamespace
 
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import Field
 from sqlalchemy import select
@@ -19,6 +20,7 @@ from . import recipe_details
 from .recipe_models import RecipeRevision, SavedRecipe
 from .recipe_suggestions import matching_profile, profile_digest, require_profile
 from .schemas import InputModel
+from .resource_authorization import bind_command_actor, require_active_actor
 
 
 WRITE_TTL_SECONDS = 300
@@ -213,7 +215,7 @@ def acknowledge(session, command, node, status, result):
     session.flush()
 
 
-def create_query(session, node, revision_id, config_name):
+def create_query(session, node, revision_id, config_name, request=None):
     from .recipe_library import _get, _verified_revision, require_asset_managed_overrides_absent
 
     revision = _get(session, RecipeRevision, revision_id, "Recipe revision")
@@ -226,6 +228,15 @@ def create_query(session, node, revision_id, config_name):
             Command.node_id == node.id, Command.type == "RECIPE_WRITE").order_by(Command.created_at, Command.id)):
         if (command.payload.get("definition", {}).get("id") == revision.id
                 and command.payload.get("config_name") == config_name):
+            receipt = command.result if isinstance(command.result, dict) else {}
+            if (command.status == "REJECTED" and command.delivered_at is None
+                    and set(receipt) == {"error"}
+                    and isinstance(receipt["error"], dict)
+                    and receipt["error"].get("code") in {"COMMAND_AUTHORIZATION_REVOKED", "COMMAND_ACTOR_REQUIRED"}):
+                # A first-delivery denial proves no Agent could have committed
+                # this operation. Keep its actor/receipt intact and accept a
+                # separately authorized command, rather than adopting the old one.
+                continue
             return query_dict(command)
     recipe = session.scalar(select(SavedRecipe).where(SavedRecipe.id == recipe.id).with_for_update()
                             .execution_options(populate_existing=True))
@@ -243,6 +254,8 @@ def create_query(session, node, revision_id, config_name):
                       payload={"operation_id": command_id, "profile_id": profile.id,
                                "profile_digest": profile_digest(profile, node.roots), "definition": copy.deepcopy(definition),
                                "config_name": config_name, "expires_at": offset_time(WRITE_TTL_SECONDS)})
+    if request is not None:
+        bind_command_actor(command, request, "recipes.writeback")
     session.add(command)
     session.flush()
     return query_dict(command)
@@ -253,8 +266,9 @@ def register_routes(app, admin, db, require_available_node, settings):
         return JSONResponse(status_code=status, content=value, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/v1/recipe-revisions/{revision_id}/writeback", dependencies=admin, status_code=202)
-    def create(revision_id: str, body: WritebackInput):
+    def create(revision_id: str, body: WritebackInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "recipes.writeback")
             revision = session.get(RecipeRevision, revision_id)
             if revision is None:
                 raise APIError(404, "NOT_FOUND", "Recipe revision not found")
@@ -262,7 +276,7 @@ def register_routes(app, admin, db, require_available_node, settings):
             node = require_available_node(session, recipe.node_id)
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法回写配方")
-            return response(create_query(session, node, revision_id, body.config_name), 202)
+            return response(create_query(session, node, revision_id, body.config_name, request), 202)
 
     @app.get("/api/v1/recipe-writebacks/{operation_id}", dependencies=admin)
     def get(operation_id: str):

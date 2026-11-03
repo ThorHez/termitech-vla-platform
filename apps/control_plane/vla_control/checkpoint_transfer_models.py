@@ -17,6 +17,8 @@ class CheckpointTransfer(Base):
         ["profiles.node_id", "profiles.id"], ondelete="RESTRICT"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
+    execution_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
     source_node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="RESTRICT"), index=True)
     source_run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="RESTRICT"), index=True)

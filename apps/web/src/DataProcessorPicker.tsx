@@ -108,6 +108,7 @@ export function processorParameterErrors(
   choice: DataProcessorChoice,
   entry?: DataProcessorEntry,
   managedParameters: Record<string, RecipeLiteral> = {},
+  purpose: 'training' | 'norm' = 'training',
 ): string[] {
   if (!entry) return ['处理器未出现在当前环境目录中，请重新读取并选择。'];
   if (!entry.available) return [entry.reason || '此处理器有无法从页面提供的必填配置。'];
@@ -119,7 +120,7 @@ export function processorParameterErrors(
       !Object.hasOwn(choice.parameters, 'composition')
     )
       return ['组件组合只接受本次训练保存的 composition，训练阶段由任务注入。'];
-    return composedProcessingErrors(choice.parameters.composition);
+    return composedProcessingErrors(choice.parameters.composition, purpose);
   }
   const errors: string[] = [];
   const managed = assetManagedOverridePaths(
@@ -306,6 +307,7 @@ export function DataProcessorPicker({
   index,
   managedParameters = {},
   allowRecipeDefault = true,
+  purpose = 'training',
   onChange,
 }: {
   binding: DatasetBinding;
@@ -314,13 +316,16 @@ export function DataProcessorPicker({
   index: number;
   managedParameters?: Record<string, RecipeLiteral>;
   allowRecipeDefault?: boolean;
+  purpose?: 'training' | 'norm';
   onChange: (binding: DatasetBinding) => void;
 }) {
   const id = useId();
   const [search, setSearch] = useState('');
   const choice = binding.processor;
   const selected = choice ? entries.find((entry) => entry.name === choice.name) : undefined;
-  const errors = choice ? processorParameterErrors(choice, selected, managedParameters) : [];
+  const errors = choice
+    ? processorParameterErrors(choice, selected, managedParameters, purpose)
+    : [];
   const legacy = allowRecipeDefault
     ? slots.length
       ? slots
@@ -569,7 +574,9 @@ export function DataProcessorPicker({
           <div>
             <strong>处理器配置错误</strong>
             <ul className="training-validation-errors">
-              {errors.map((error) => <li key={error}>{error}</li>)}
+              {errors.map((error) => (
+                <li key={error}>{error}</li>
+              ))}
             </ul>
           </div>
         </div>

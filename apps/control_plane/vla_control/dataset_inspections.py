@@ -2,6 +2,7 @@
 
 import posixpath
 
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import Field
 from sqlalchemy import select
@@ -9,6 +10,8 @@ from vla_protocol.dataset_inspection import normalize_dataset_inspection
 
 from .common import APIError, now, offset_time, require_path, uid
 from .models import Command
+from .resource_authorization import (COMMAND_AUTHORIZATION_ERRORS, bind_command_actor,
+                                     query_reusable, require_active_actor)
 from .schemas import InputModel
 
 
@@ -17,6 +20,7 @@ CACHE_SECONDS = 10
 MAX_PENDING = 10
 COMMAND = "DATASET_INSPECT"
 ERRORS = {
+    **COMMAND_AUTHORIZATION_ERRORS,
     "DATASET_INSPECT_TIMEOUT": "读取数据集元信息超时，可重试或继续手动填写",
     "DATASET_INSPECT_AGENT_UNSUPPORTED": "当前 Agent 尚不支持读取数据集字段，请更新 Agent 后重试",
     "DATASET_INSPECT_NOT_FOUND": "目录中未找到 LeRobot meta/info.json，请核对所选数据集目录",
@@ -95,13 +99,15 @@ def query_dict(command, roots):
     return result
 
 
-def create_query(session, node, path):
+def create_query(session, node, path, *, actor_request=None):
     path = validated_path(path, node.roots)
     expire_pending(session, node.id)
     recent = select(Command).where(Command.node_id == node.id, Command.type == COMMAND,
                                    Command.created_at >= offset_time(-CACHE_SECONDS)).order_by(Command.created_at.desc())
     for candidate in session.scalars(recent):
         if candidate.payload.get("path") == path:
+            if not query_reusable(session, candidate, actor_request, "assets.query"):
+                continue
             existing = query_dict(candidate, node.roots)
             if existing["status"] in {"PENDING", "READY"}:
                 return existing
@@ -111,6 +117,7 @@ def create_query(session, node, path):
         raise APIError(429, "DATASET_INSPECT_BUSY", "当前读取请求较多，请稍后重试")
     command = Command(id=uid(), node_id=node.id, type=COMMAND, status="PENDING", created_at=now(),
                       payload={"path": path, "expires_at": offset_time(QUERY_TTL_SECONDS)})
+    bind_command_actor(command, actor_request, "assets.query")
     session.add(command)
     return query_dict(command, node.roots)
 
@@ -140,10 +147,11 @@ def register_routes(app, admin, db, require_available_node, settings):
         return node
 
     @app.post("/api/v1/nodes/{node_id}/dataset-inspections", dependencies=admin, status_code=202)
-    def create(node_id: str, body: InspectInput):
+    def create(node_id: str, body: InspectInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "assets.query")
             node = available(session, node_id)
-            return response(create_query(session, node, body.path), 202)
+            return response(create_query(session, node, body.path, actor_request=request), 202)
 
     @app.get("/api/v1/nodes/{node_id}/dataset-inspections/{query_id}", dependencies=admin)
     def get(node_id: str, query_id: str):

@@ -42,12 +42,15 @@ try {
     created_at: '2026-11-01T00:00:00Z',
     updated_at: '2026-11-01T00:00:00Z',
   });
-  const render = (element, permissions = ['assets.write']) =>
+  const render = (element, permissions = ['assets.transfer']) =>
     renderToStaticMarkup(
       React.createElement(
         AuthContext.Provider,
         {
-          value: { can: (permission) => permissions.includes(permission) },
+          value: {
+            user: { id: 'test-admin', role: 'admin' },
+            can: (permission) => permissions.includes(permission),
+          },
         },
         React.createElement(DataProvider, { enabled: false }, element),
       ),
@@ -87,7 +90,7 @@ try {
       ),
     );
     const element = React.createElement(BackgroundTaskTable, { tasks });
-    const writable = render(element, ['assets.write', 'training.write']);
+    const writable = render(element, ['assets.transfer', 'training.write']);
     assert.equal((writable.match(/aria-label="删除同步记录 /g) || []).length, 4);
     assert.match(writable, /aria-label="删除同步记录 FAILED 同步"/);
     assert.doesNotMatch(writable, /aria-label="删除同步记录 (TRANSFERRING|CANCELLING) 同步"/);

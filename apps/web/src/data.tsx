@@ -3,8 +3,10 @@ import type { ReactNode } from 'react';
 import { useApi } from './api';
 import type { Alert, Asset, Gpu, Node, Overview, Profile, Run, Template } from './types';
 import type { AssetTransfer } from './assetTransfer';
+import type { MemberSummary } from './resourcePermissions';
 
 function useResources(enabled: boolean) {
+  const members = useApi<MemberSummary[]>(enabled ? '/members' : null, 30000);
   const overview = useApi<Overview>(enabled ? '/overview' : null);
   const nodes = useApi<Node[]>(enabled ? '/nodes' : null);
   const assets = useApi<Asset[]>(enabled ? '/assets' : null);
@@ -17,6 +19,7 @@ function useResources(enabled: boolean) {
   );
   const alerts = useApi<Alert[]>(enabled ? '/alerts' : null);
   const refresh = () => {
+    members.refresh();
     overview.refresh();
     nodes.refresh();
     assets.refresh();
@@ -28,6 +31,7 @@ function useResources(enabled: boolean) {
   };
   return {
     enabled,
+    members,
     overview,
     nodes,
     assets,
@@ -48,6 +52,9 @@ export function useData() {
   const context = useContext(DataContext);
   if (!context) throw new Error('DataProvider missing');
   return context;
+}
+export function useMembers() {
+  return useContext(DataContext)?.members;
 }
 export const assetKinds: Record<string, string> = {
   DATASET: '数据集',

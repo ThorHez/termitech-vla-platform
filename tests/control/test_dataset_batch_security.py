@@ -25,7 +25,7 @@ def secured(platform):
     node = platform.register()
     connection = bind_ssh(platform, node, "192.0.2.41")
     platform.app.state.dataset_batch_manager._launch = lambda _id: None
-    for name, role in (("batch-owner", "operator"), ("batch-admin", "admin"), ("batch-reader", "viewer")):
+    for name, role in (("batch-owner", "admin"), ("batch-admin", "admin"), ("batch-reader", "viewer")):
         platform.app.state.auth.create_user(name, PASSWORD, role)
     client = TestClient(platform.app, base_url="https://testserver")
     yield platform, client, node, connection

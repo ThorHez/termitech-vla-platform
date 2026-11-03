@@ -251,19 +251,25 @@ def check_gpu_before_load(manifest):
     if not manifest.get("gpu_uuid") or "gpu_policy" not in manifest:
         return  # Legacy manifests retain their previous process contract.
     policy = manifest["gpu_policy"]
+    guarded = manifest.get("resource_guard") is not None
+    guard_import = "from vla_agent.resource_guard import require_gpu_access;" if guarded else ""
+    guard_check = "\n require_gpu_access(json.loads(sys.argv[4]),[sys.argv[2]])" if guarded else ""
     source = (
         "import json,sys;sys.path[:0]=json.loads(sys.argv[1]);"
+        + guard_import +
         "from vla_agent.metrics import check_deployment_gpu;"
         "from vla_agent.safety import AgentError;"
         "policy=json.loads(sys.argv[3]);"
-        "\ntry:\n actual=check_deployment_gpu(sys.argv[2],policy['mode'],policy['memory_mb'])"
+        "\ntry:" + guard_check + "\n actual=check_deployment_gpu(sys.argv[2],policy['mode'],policy['memory_mb'])"
         "\nexcept AgentError as exc:\n print(json.dumps({'error':exc.as_dict()}));sys.exit(1)"
         "\nprint(json.dumps({'ok':True,'gpu_policy':actual}))"
     )
     result = subprocess.run(
         [manifest["agent_python"], "-I", "-c", source,
          json.dumps([manifest["agent_root"], manifest["protocol_root"]]),
-         manifest["gpu_uuid"], json.dumps(policy)],
+         manifest["gpu_uuid"], json.dumps(policy),
+         json.dumps({"resource_guard": manifest["resource_guard"], "state_dir": manifest.get("state_dir", "")}
+                    if manifest.get("resource_guard") is not None else {})],
         stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
     )
     try:

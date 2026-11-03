@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { date, displayNumber, navigate, post, useApi, useRunFeed, useRunMetrics } from './api';
 import { useAuth } from './auth';
+import { canManageResource, ResourceOwner } from './resourcePermissions';
 import {
   Back,
   Badge,
@@ -32,6 +33,7 @@ import {
 } from './components';
 import { activeStates, assetKinds, inputRoles, useData } from './data';
 import { DatasetBindingSummary } from './DatasetBindings';
+import { NormDatasetEditor } from './NormDatasetEditor';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { datasetInputLabel } from './datasetBindingHelpers';
 import { stageParameterLabels, trainingStageLabels } from './recap';
@@ -42,8 +44,12 @@ import { retryableRun } from './runRetry';
 import { requestedGpuSummary } from './trainingGpuSelection';
 import { RunDeleteAction } from './RunDeleteAction';
 import { RunGpuReservationNotice } from './GpuReservations';
+import { TrainingEnvironmentDetails } from './TrainingEnvironment';
 
 const queueReasonLabels: Record<string, string> = {
+  ACCOUNT_EXECUTION_REVOKED: '执行账号已停用或不再具备训练权限，暂停启动；请联系管理员处理',
+  ACCOUNT_DISABLED: '执行账号已停用，暂停启动；请联系管理员处理',
+  ACCOUNT_PERMISSION_REVOKED: '执行账号的训练权限已撤销，暂停启动；请联系管理员处理',
   GPU_RESERVED: '空闲 GPU 已由其他用户预留，等待公共资源或本人的预留 GPU 可用',
   REQUESTED_GPU_RESERVED: '指定 GPU 已由其他用户预留，等待预留释放或重新选择 GPU',
   GPU_UNAVAILABLE: '可用 GPU 数量不足，等待资源释放',
@@ -51,6 +57,16 @@ const queueReasonLabels: Record<string, string> = {
   REQUESTED_GPU_MISSING: '部分指定 GPU 尚未上报，等待设备恢复；不会自动替换其他卡',
   REQUESTED_GPU_INVALID: '指定 GPU 配置无效，请重新配置并预检',
 };
+
+export function RunQueueReason({ reason }: { reason?: string | null }) {
+  if (!reason) return null;
+  return (
+    <div className="info-strip">
+      <Clock3 size={17} />
+      <span>排队原因：{queueReasonLabels[reason] || reason}</span>
+    </div>
+  );
+}
 
 function outputRemoved(output: Asset) {
   return output.state === 'UNAVAILABLE' || output.metadata?.availability === 'removed';
@@ -62,10 +78,11 @@ function outputStep(output: Asset) {
 }
 
 export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run: Run) => void }) {
-  const { can } = useAuth();
-  const { nodes, templates, assets, profiles, refresh } = useData();
+  const { can, user } = useAuth();
+  const { nodes, templates, assets, refresh } = useData();
   const detail = useApi<Run>(`/runs/${id}`, 3000);
   const run = detail.data?.id === id ? detail.data : undefined;
+  const canManage = can('training.write') && canManageResource(user, run?.owner_user_id);
   const live = !run || !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(run.state);
   const events = useRunFeed<RunEvent>(`/runs/${id}/events`, 'events', live);
   const logs = useRunFeed<Logs['items'][number]>(`/runs/${id}/logs`, 'logs', live);
@@ -95,7 +112,6 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
   );
   const node = nodes.data?.find((item) => item.id === run?.node_id);
   const template = templates.data?.find((item) => item.id === run?.template_id);
-  const profile = profiles.data?.find((item) => item.id === run?.profile_id);
   const trainingStage =
     run?.training_stage ||
     attempt?.code_snapshot?.training_stage ||
@@ -161,7 +177,7 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                     部署模型
                   </a>
                 )}
-              {can('training.write') && activeStates.has(run.state) && (
+              {canManage && activeStates.has(run.state) && (
                 <button
                   className="button outline danger-text"
                   disabled={run.state === 'CANCELLING'}
@@ -182,18 +198,14 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
           )
         }
       />
+      {run && <ResourceOwner ownerUserId={run.owner_user_id} />}
       <ErrorNotice error={detail.error || error} retry={detail.refresh} />
       {detail.loading && !run ? (
         <Loading />
       ) : (
         run && (
           <>
-            {run.queue_reason && (
-              <div className="info-strip">
-                <Clock3 size={17} />
-                <span>排队原因：{queueReasonLabels[run.queue_reason] || run.queue_reason}</span>
-              </div>
-            )}
+            <RunQueueReason reason={run.queue_reason} />
             {run.state === 'UNKNOWN' && (
               <div className="inline-note amber">
                 <AlertCircle size={18} />
@@ -243,7 +255,10 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                     实际：{requestedGpuSummary(attempt.gpu_uuids, node)}
                   </small>
                 )}
-                <RunGpuReservationNotice node={node} gpuUuids={attempt?.gpu_uuids || run.requested_gpu_uuids || undefined} />
+                <RunGpuReservationNotice
+                  node={node}
+                  gpuUuids={attempt?.gpu_uuids || run.requested_gpu_uuids || undefined}
+                />
               </div>
               <div>
                 <span>
@@ -310,10 +325,7 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                 <div>
                   <Panel title="执行信息">
                     <dl className="detail-list padded">
-                      <div>
-                        <dt>运行环境</dt>
-                        <dd>{profile?.name || run.profile_id}</dd>
-                      </div>
+                      <TrainingEnvironmentDetails run={run} />
                       {trainingStage && (
                         <div>
                           <dt>训练阶段</dt>
@@ -613,18 +625,14 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                         <code>{run.template_id}</code>
                       </dd>
                     </div>
-                    <div>
-                      <dt>环境标识</dt>
-                      <dd>
-                        <code>{run.profile_id}</code>
-                      </dd>
-                    </div>
+                    <TrainingEnvironmentDetails run={run} />
                   </dl>
                 </Panel>
               </div>
             )}
             {tab === 'code' && reviewedConfig && (
               <GeneratedConfigReview
+                purpose={run.template_id === 'openpi-norm' ? 'norm' : 'training'}
                 config={reviewedConfig}
                 confirmedSha256={
                   run.confirmed_config_sha256 ||
@@ -636,6 +644,22 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
             )}
             {tab === 'assets' && (
               <>
+                {run.template_id === 'openpi-norm' && !!run.norm_datasets?.length && (
+                  <Panel
+                    title="统计数据与处理方式"
+                    subtitle="每个数据集独立计算，分别生成归一化参数资产"
+                  >
+                    <NormDatasetEditor
+                      rows={run.norm_datasets}
+                      assets={assets.data || []}
+                      node={node}
+                      recipe={run.recipe || undefined}
+                      automatic={!!autoConfig}
+                      readOnly
+                      onChange={() => {}}
+                    />
+                  </Panel>
+                )}
                 {!!run.dataset_bindings?.length && (
                   <Panel
                     title="数据集与归一化参数"
@@ -784,7 +808,7 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
           </>
         )
       )}
-      {can('training.write') && confirmCancel && (
+      {canManage && confirmCancel && (
         <Modal
           title="取消这项训练？"
           close={() => {
@@ -803,7 +827,7 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                 className="button danger"
                 disabled={busy}
                 onClick={async () => {
-                  if (!can('training.write')) return;
+                  if (!canManage) return;
                   setBusy(true);
                   setError(undefined);
                   try {

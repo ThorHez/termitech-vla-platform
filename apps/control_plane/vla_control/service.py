@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 from sqlalchemy import delete, select
 from vla_adapters import get_templates, resolve_recipe, validate_parameters
 from vla_adapters.dataset_bindings import binding_inputs, normalize_dataset_bindings
+from vla_adapters.norm_datasets import normalize_norm_datasets, norm_inputs, validate_norm_configuration
 from vla_adapters.entrypoints import validate_entrypoint
 from vla_adapters.recipe_definitions import recipe_parameters, resolve_definition
 from vla_adapters.recap import runtime_adapter_for, validate_training_stage
@@ -16,6 +17,7 @@ from vla_protocol.config_preview import validate_generated_config
 
 from .common import APIError, INPUT_KINDS, TERMINAL, absolute_path, digest, now, require_path, snapshot_identity, uid, under_root, valid_snapshot
 from .models import Allocation, Asset, Attempt, Command, Event, Node, Preview, Profile, Run
+from .norm_outputs import norm_outputs_error, reconcile_norm_outputs
 from .scheduler import enqueue, resolve_inputs
 
 
@@ -41,6 +43,28 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
     template = next((t for t in get_templates() if t["id"] == data["template_id"]), None)
     if not template or template["status"] != "AVAILABLE":
         raise APIError(422, "TEMPLATE_UNAVAILABLE", "Template has not been made available")
+    try:
+        norm_datasets = normalize_norm_datasets(data.get("norm_datasets"))
+    except ValueError as exc:
+        raise APIError(422, "NORM_DATASETS_INVALID", str(exc)) from exc
+    if norm_datasets is not None and template["id"] != "openpi-norm":
+        raise APIError(422, "NORM_DATASETS_UNSUPPORTED", "只有 norm_stats 模板支持独立统计数据集列表")
+    if template["id"] == "openpi-norm":
+        if data["gpu_count"] != 0 or data.get("requested_gpu_uuids"):
+            raise APIError(422, "NORM_GPU_UNSUPPORTED", "统计任务使用 CPU，请申请 0 张 GPU")
+        if data.get("dataset_bindings") is not None:
+            raise APIError(422, "NORM_DATASETS_INVALID", "统计模板不接受归一化参数或混采权重，请使用统计数据集列表")
+        if norm_datasets is None and set(data["inputs"]) != {"dataset"}:
+            raise APIError(422, "NORM_DATASET_REQUIRED", "请选择统计数据集；统计任务只接受数据集资产")
+        if data.get("auto_config") is None and (data.get("recipe_revision_id") or data.get("recipe_definition") is not None):
+            raise APIError(422, "NORM_CONFIG_UNSUPPORTED", "统计模板不支持保存的高级配方，请选择自动配置或代码配方")
+        if norm_datasets is not None:
+            bound_norm_inputs = norm_inputs(norm_datasets)
+            provided = data["inputs"]
+            if (frozen or provided) and provided != bound_norm_inputs:
+                raise APIError(422, "NORM_DATASETS_MISMATCH", "统计数据集列表与资产输入不一致；不能同时选择模型、已有统计或单数据集输入")
+            data["norm_datasets"] = norm_datasets
+            data["inputs"] = bound_norm_inputs
     try:
         method = normalize_normalization_method(data.get("normalization_method"), template_id=template["id"])
     except ValueError as exc:
@@ -68,11 +92,13 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
     try:
         if data.get("auto_config") is not None:
             from vla_adapters.automatic_config import automatic_recipe_name, normalize_auto_config
-            if template["id"] not in {"openpi-sft", "recap"}:
+            if template["id"] not in {"openpi-sft", "recap", "openpi-norm"}:
                 raise APIError(422, "AUTO_CONFIG_UNSUPPORTED", "该训练模板不支持自动组装配置")
             if data.get("recipe_revision_id") or data.get("recipe_definition") is not None:
                 raise APIError(422, "AUTO_CONFIG_CONFLICT", "自动组装与高级代码配方不能同时使用")
             data["auto_config"] = normalize_auto_config(data["auto_config"])
+            if template["id"] == "openpi-norm":
+                data["auto_config"] = validate_norm_configuration(data["auto_config"], norm_datasets)
             recipe = automatic_recipe_name(data["auto_config"], data.get("training_stage"))
             if data.get("recipe") not in {None, recipe}:
                 raise APIError(422, "AUTO_CONFIG_CONFLICT", "自动组装不能同时指定其他代码配方")
@@ -98,6 +124,8 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
                     "RECIPE_DEFINITION_INVALID": "保存的配方版本无效，请重新选择",
                     "RECIPE_DEFINITION_MISMATCH": "保存的配方不属于所选训练环境",
                     "AUTO_CONFIG_INVALID": "自动组装的模型、微调方式或模型维度配置无效",
+                    "AUTO_CONFIG_UNSUPPORTED": "统计任务仅支持 full 模型结构配置",
+                    "AUTO_CONFIG_PROCESSOR_REQUIRED": "自动统计需要为每个数据集明确选择处理器或字段组合",
                     "PROFILE_TEMPLATE_MISMATCH": "所选训练环境不支持该训练模板"}
         if code not in messages:
             raise
@@ -131,9 +159,12 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
         raise APIError(422, "DATASET_BINDINGS_INVALID", "数据集、归一化参数、配方位置和混采权重配置无效") from exc
     input_kinds = INPUT_KINDS
     required_inputs = set(template["required_inputs"])
+    if norm_datasets is not None:
+        input_kinds = {role: "DATASET" for role in norm_inputs(norm_datasets)}
+        required_inputs = set(input_kinds)
     if template["id"] == "recap" and bindings is None:
         raise APIError(422, "DATASET_BINDINGS_REQUIRED", "ReCap 训练需要逐组配置数据集与归一化参数")
-    if data.get("auto_config") is not None and (not bindings or any(row.get("processor") is None for row in bindings)):
+    if template["id"] != "openpi-norm" and data.get("auto_config") is not None and (not bindings or any(row.get("processor") is None for row in bindings)):
         raise APIError(422, "AUTO_CONFIG_PROCESSOR_REQUIRED", "自动组装需要每组数据明确绑定已登记处理配置或独立数据处理器")
     if bindings is not None:
         if template["id"] not in {"openpi-sft", "recap"}:
@@ -194,6 +225,16 @@ def training_cache_evidence_valid(cache, datasets, roots: list[str]) -> bool:
                for dataset, builder in zip(datasets, builders))
 
 
+def norm_cache_evidence_valid(cache, datasets, roots: list[str]) -> bool:
+    """Statistics project numeric columns directly and never build an HF cache."""
+    from vla_protocol.norm_plan import validate_norm_cache
+    try:
+        validate_norm_cache(cache, datasets, roots)
+    except (ValueError, TypeError, KeyError):
+        return False
+    return True
+
+
 def entrypoint_snapshot_error(requested_entrypoint: str | None, snapshot) -> dict | None:
     """Explicit scripts need evidence from a current Agent at each boundary."""
     evidence = snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None
@@ -227,6 +268,30 @@ def dataset_bindings_snapshot_error(requested_bindings, snapshot) -> dict | None
     if (canonical_digest(snapshot["dataset_bindings"]) != canonical_digest(requested_bindings)
             or canonical_digest(plan["dataset_bindings"]) != canonical_digest(requested_bindings)):
         return {"code": "DATASET_BINDINGS_MISMATCH", "message": "Agent 数据集绑定与预检冻结的配置不一致，请重新预检"}
+    return None
+
+
+def norm_datasets_snapshot_error(requested, snapshot) -> dict | None:
+    evidence = snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None
+    plan = evidence.get("plan") if isinstance(evidence, dict) else None
+    if requested is not None and any(not isinstance(owner, dict) or "norm_datasets" not in owner
+                                     for owner in (snapshot, plan)):
+        return {"code": "AGENT_NORM_DATASETS_UNSUPPORTED", "message": "Agent 未确认逐项统计数据集，请更新 Agent 后重新预检"}
+    if any(isinstance(owner, dict) and canonical_digest(owner.get("norm_datasets")) != canonical_digest(requested)
+           for owner in (snapshot, plan)):
+        return {"code": "NORM_DATASETS_MISMATCH", "message": "实际统计数据集或处理配置与预检冻结配置不一致"}
+    return None
+
+
+def auto_config_snapshot_error(requested, snapshot) -> dict | None:
+    evidence = snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None
+    plan = evidence.get("plan") if isinstance(evidence, dict) else None
+    if requested is not None and any(not isinstance(owner, dict) or "auto_config" not in owner
+                                     for owner in (snapshot, plan)):
+        return {"code": "AGENT_AUTO_CONFIG_UNSUPPORTED", "message": "Agent 未确认本次自动统计配置，请更新 Agent 后重新预检"}
+    if any(isinstance(owner, dict) and canonical_digest(owner.get("auto_config")) != canonical_digest(requested)
+           for owner in (snapshot, plan)):
+        return {"code": "AUTO_CONFIG_MISMATCH", "message": "实际自动统计配置与本次冻结配置不一致，请重新预检"}
     return None
 
 
@@ -266,6 +331,8 @@ def normalization_method_snapshot_error(requested, snapshot) -> dict | None:
 
 def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict | None:
     """Require Agent evidence for this exact task; discovery is not execution proof."""
+    if request["template_id"] == "openpi-norm":
+        return norm_preflight_error(session, request, snapshot, checks)
     if request["template_id"] not in {"openpi-sft", "recap"}:
         return None
     from .storage_configurations import snapshot_error as storage_snapshot_error
@@ -466,9 +533,38 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
     return None
 
 
+def norm_preflight_error(session, request, snapshot, checks):
+    from vla_protocol.norm_plan import NORM_CHECKS, validate_norm_plan
+    from .storage_configurations import snapshot_error
+    evidence = snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None
+    if (not isinstance(evidence, dict) or type(evidence.get("schema_version")) is not int or evidence["schema_version"] != 1
+            or evidence.get("scope") != "configuration_and_local_assets"):
+        return {"code": "AGENT_PREFLIGHT_UNSUPPORTED", "message": "Agent 未返回统计预检证据，请更新 Agent 后重新预检"}
+    if error := snapshot_error(session, request["node_id"], evidence, norm_stats=True):
+        return error
+    if error := norm_datasets_snapshot_error(request.get("norm_datasets"), snapshot):
+        return error
+    if error := auto_config_snapshot_error(request.get("auto_config"), snapshot):
+        return error
+    if (not isinstance(checks, list) or any(not isinstance(check, dict) or check.get("ok") is not True for check in checks)
+            or not NORM_CHECKS <= {check.get("name") for check in checks if isinstance(check.get("name"), str)}):
+        return {"code": "AGENT_PREFLIGHT_INCOMPLETE", "message": "统计任务预检未完成全部检查"}
+    try:
+        plan = validate_norm_plan(evidence.get("plan"), request, resolve_inputs(session, request))
+        node = get_required(session, Node, request["node_id"], "Node")
+        if (evidence.get("plan_digest") != canonical_digest(plan)
+                or not under_root(plan["entrypoint"], [snapshot["code_dir"]])
+                or any(not under_root(path, node.roots) for path in plan["inputs"].values())
+                or not norm_cache_evidence_valid(plan.get("training_cache"), plan["datasets"], node.roots)):
+            raise ValueError("Statistics evidence has invalid paths, cache or digest")
+    except (ValueError, TypeError, KeyError):
+        return {"code": "AGENT_PREFLIGHT_INVALID", "message": "统计预检的配方、数据、参数或执行证据无效，请重新预检"}
+    return None
+
+
 def config_confirmation_error(request: dict, snapshot: dict, confirmed_sha256: str | None) -> dict | None:
     """Submission must acknowledge the exact code the successful preflight produced."""
-    if request["template_id"] not in {"openpi-sft", "recap"}:
+    if request["template_id"] not in {"openpi-sft", "recap", "openpi-norm"}:
         return None
     generated = snapshot.get("automatic_preflight", {}).get("plan", {}).get("generated_config")
     if confirmed_sha256 is None:
@@ -642,19 +738,25 @@ def validated_output(node: Node, attempt: Attempt, run: Run, output) -> dict | N
 
 def register_outputs(session, node: Node, attempt: Attempt, outputs: list[dict]) -> None:
     """Reuse an execution's checkpoint asset across scans, restarts and completion."""
+    from .model_names import model_output_name
+    run = session.get(Run, attempt.run_id)
     existing = {(asset.kind, str(PurePosixPath(asset.path)), asset.version): asset
                 for asset in session.scalars(select(Asset).where(Asset.origin_attempt_id == attempt.id))}
     for output in outputs:
+        name = model_output_name(run, attempt, output)
         identity = (output["kind"], output["path"], output["version"])
         asset = existing.get(identity)
         if asset is None:
-            asset = Asset(id=uid(), node_id=node.id, name=output["name"], kind=output["kind"],
+            asset = Asset(id=uid(), node_id=node.id, name=name, kind=output["kind"],
                           path=output["path"], version=output["version"], state="READY",
                           metadata_json=output["metadata"], created_at=now(), origin_attempt_id=attempt.id)
             session.add(asset)
             existing[identity] = asset
         else:
-            asset.name = output["name"]
+            # A periodic legacy scanner must not erase a model's explicit
+            # label while it refreshes availability or completion metadata.
+            if name == output["name"] or asset.name in {output["name"], name}:
+                asset.name = name
             asset.metadata_json = {**asset.metadata_json, **output["metadata"]}
             if asset.state == "UNAVAILABLE":
                 asset.state = "READY"
@@ -696,6 +798,9 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
             raise APIError(409, "TERMINAL_STATE_CONFLICT", "Attempt already has a different terminal state")
         return
     if event.type == "ARTIFACT":
+        # A statistics batch publishes only after every source completes.
+        if run.template_id == "openpi-norm":
+            return
         # Discovery reports are informational. Bad entries must not reject the
         # event batch, finish an execution or release its device reservations.
         latest = session.scalar(select(Attempt.id).where(Attempt.run_id == run.id)
@@ -734,6 +839,10 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
             event_failure(session, attempt, run, error["code"], error["message"])
         elif error := dataset_bindings_snapshot_error(run.code_expectation.get("dataset_bindings"), snapshot):
             event_failure(session, attempt, run, error["code"], error["message"])
+        elif error := norm_datasets_snapshot_error(run.code_expectation.get("norm_datasets"), snapshot):
+            event_failure(session, attempt, run, error["code"], error["message"])
+        elif run.template_id == "openpi-norm" and (error := auto_config_snapshot_error(run.code_expectation.get("auto_config"), snapshot)):
+            event_failure(session, attempt, run, error["code"], error["message"])
         elif error := normalization_method_snapshot_error(run.code_expectation.get("normalization_method"), snapshot):
             event_failure(session, attempt, run, error["code"], error["message"])
         elif error := training_stage_snapshot_error(run.code_expectation.get("training_stage"), run.code_expectation.get("stage_config"), snapshot):
@@ -763,8 +872,11 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
         outputs = data.get("outputs", [])
         if exit_code != 0 or not isinstance(outputs, list):
             failure = {"code": "OUTPUT_INCOMPLETE", "message": "Successful execution needs exit code zero and an output manifest"}
-        elif run.template_id != "smoke" and not any(isinstance(o, dict) and o.get("kind") == "MODEL" for o in outputs):
-            failure = {"code": "OUTPUT_INCOMPLETE", "message": "Training completed without a model artifact"}
+        elif run.template_id != "smoke" and not any(isinstance(o, dict) and o.get("kind") ==
+                ("NORM" if run.template_id == "openpi-norm" else "MODEL") for o in outputs):
+            failure = {"code": "OUTPUT_INCOMPLETE", "message": "Task completed without its required artifact"}
+        elif output_error := norm_outputs_error(session, node, run, outputs):
+            failure = output_error
         else:
             for output in outputs:
                 row = validated_output(node, attempt, run, output)
@@ -786,6 +898,8 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
     attempt.exit_code = exit_code
     attempt.error = run.error = failure
     attempt.finished_at = run.finished_at = event.timestamp
+    if final_state == "SUCCEEDED" and run.template_id == "openpi-norm":
+        reconcile_norm_outputs(session, run, attempt_id=attempt.id)
     run.queue_reason = None
     run.previous_state = attempt.previous_state = None
     session.execute(delete(Allocation).where(Allocation.attempt_id == attempt.id))

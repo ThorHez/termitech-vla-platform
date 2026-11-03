@@ -115,15 +115,17 @@ def test_merge_filters_keyword_and_caps_output(platform):
     assert ready["truncated"] is True
 
 
-def test_inference_config_suggestions_share_cache_and_only_return_existing_code(platform):
+def test_inference_config_suggestions_keep_own_execution_cache_and_only_return_existing_code(platform):
     node = register(platform)
     edit_profile(platform, node, recipe="pi0_alpha", metadata_json={"validated_recipes": ["pi0_aaa"]})
     query = create(platform, node, limit=2).json()
     path = f"/api/v1/nodes/{node['node_id']}/inference-config-suggestions"
     payload = {"profile_id": "default", "prefix": "pi0", "limit": 2}
-    assert platform.client.post(path, headers=ADMIN, json=payload).json()["id"] == query["id"]
+    inference = platform.client.post(path, headers=ADMIN, json=payload).json()
+    assert inference["id"] != query["id"]
     assert ack(platform, node, query["id"]).status_code == 200
-    ready = platform.client.get(path + "/" + query["id"], headers=ADMIN).json()
+    assert ack(platform, node, inference["id"]).status_code == 200
+    ready = platform.client.get(path + "/" + inference["id"], headers=ADMIN).json()
     assert ready["status"] == "READY"
     assert ready["entries"] == [{"name": "pi0_alpha", "validated": False, "source": "both"},
                                 {"name": "pi0_beta", "validated": False, "source": "code"}]
@@ -153,7 +155,7 @@ def test_inference_discovery_uses_deployment_permission_without_changing_recipe_
     response = platform.client.post(path, headers=headers, json=payload)
     assert response.status_code == expected, response.text
     assert platform.client.post(path.replace("inference-config", "recipe"), headers=headers, json=payload).status_code == 403
-    assert PERMISSIONS[("POST", "/api/v1/nodes/{node_id}/recipe-suggestions")] == "recipes.write"
+    assert PERMISSIONS[("POST", "/api/v1/nodes/{node_id}/recipe-suggestions")] == "recipes.query"
     if expected == 202:
         assert platform.client.get(path + "/" + response.json()["id"]).status_code == 200
 

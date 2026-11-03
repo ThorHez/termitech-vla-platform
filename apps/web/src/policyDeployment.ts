@@ -26,6 +26,8 @@ export function resolvedInferenceBackendLabel(backend?: ResolvedInferenceBackend
 }
 
 export interface PolicyDeployment {
+  owner_user_id?: string | null;
+  execution_user_id?: string | null;
   id: string;
   record_id?: string | null;
   name: string;
@@ -58,6 +60,7 @@ export interface PolicyDeployment {
 }
 
 export interface DeploymentRecordSummary {
+  owner_user_id?: string | null;
   id: string;
   name: string;
   node_id: string | null;

@@ -30,12 +30,15 @@ export function AssetGroupRows({
   const contentId = useId();
   const datasetGroup = group.kind === 'dataset-group';
   const groupType = datasetGroup ? 'dataset' : 'model';
-  const groupLabel = datasetGroup ? '数据集集合' : '训练模型组';
+  const groupLabel = datasetGroup ? '数据集' : '训练模型组';
   const memberLabel = datasetGroup
     ? `${group.assets.length} 项资产`
     : `${group.assets.length} 个检查点`;
-  const selectedCount = eligibleIds.filter((id) => selectedIds.includes(id)).length;
-  const checked = eligibleIds.length > 0 && selectedCount === eligibleIds.length;
+  const selectionIds = datasetGroup
+    ? eligibleIds.filter((id) => id === group.datasets[0].id)
+    : eligibleIds;
+  const selectedCount = selectionIds.filter((id) => selectedIds.includes(id)).length;
+  const checked = selectionIds.length > 0 && selectedCount === selectionIds.length;
   const states = new Set(group.assets.map((asset) => asset.status || asset.state || 'REGISTERED'));
   const availableCount = group.assets.filter((asset) =>
     ['READY', 'AVAILABLE', 'REGISTERED'].includes(asset.status || asset.state || 'REGISTERED'),
@@ -47,7 +50,7 @@ export function AssetGroupRows({
     while (length < common.length && common[length] === directory[length]) length += 1;
     common.length = length;
   }
-  const directory = common.join('/');
+  const directory = datasetGroup ? group.datasets[0].path : common.join('/');
   return (
     <>
       <tbody className={`asset-catalog-group-heading asset-${groupType}-group-heading`}>
@@ -56,13 +59,17 @@ export function AssetGroupRows({
             <input
               type="checkbox"
               aria-label={`选择同步${groupLabel} ${group.name}`}
-              title="选择或取消本组当前筛选中的全部可同步资产"
+              title={
+                datasetGroup
+                  ? '选择或取消此数据集，归一化参数可展开单独选择'
+                  : '选择或取消本组当前筛选中的全部可同步资产'
+              }
               checked={checked}
               ref={(input) => {
                 if (input) input.indeterminate = selectedCount > 0 && !checked;
               }}
-              disabled={!canSelect || !eligibleIds.length}
-              onChange={(event) => onSelectionChange(eligibleIds, event.target.checked)}
+              disabled={!canSelect || !selectionIds.length}
+              onChange={(event) => onSelectionChange(selectionIds, event.target.checked)}
             />
           </td>
           <td>
@@ -89,9 +96,7 @@ export function AssetGroupRows({
                   </span>
                   <span>
                     <strong>{group.name}</strong>
-                    <span className="subtext">
-                      {group.datasets.length} 个数据集 · 已绑定 norm_stats
-                    </span>
+                    <span className="subtext">已绑定 norm_stats · 展开查看两项资产</span>
                   </span>
                 </button>
               </div>
@@ -111,9 +116,7 @@ export function AssetGroupRows({
                 <span>
                   <strong>{group.name}</strong>
                   <span className="subtext">
-                    {datasetGroup
-                      ? `${group.datasets.length} 个数据集 · 已绑定 norm_stats`
-                      : memberLabel}
+                    {datasetGroup ? '已绑定 norm_stats · 展开查看两项资产' : memberLabel}
                     {!datasetGroup && group.latestStep !== undefined
                       ? ` · 最新 ${group.latestStep.toLocaleString('zh-CN')} 步`
                       : ''}
@@ -123,8 +126,10 @@ export function AssetGroupRows({
             )}
           </td>
           <td>
-            <span>{datasetGroup ? '数据集 + norm_stats' : '模型集合'}</span>
-            <span className="subtext">{datasetGroup ? memberLabel : '按训练任务归组'}</span>
+            <span>{datasetGroup ? '数据集' : '模型集合'}</span>
+            <span className={`subtext${datasetGroup ? ' mono' : ''}`}>
+              {datasetGroup ? group.datasets[0].version : '按训练任务归组'}
+            </span>
           </td>
           <td>
             <a className="node-link" href={`#/nodes/${group.nodeId}`}>
@@ -143,11 +148,18 @@ export function AssetGroupRows({
           </td>
           <td>
             <div className="asset-catalog-validation">
-              {states.size === 1 ? (
+              {datasetGroup ? (
                 <Badge
-                  state={[...states][0]}
-                  label={datasetGroup && states.has('REGISTERED') ? '已登记' : undefined}
+                  state={group.datasets[0].status || group.datasets[0].state || 'REGISTERED'}
+                  label={
+                    (group.datasets[0].status || group.datasets[0].state || 'REGISTERED') ===
+                    'REGISTERED'
+                      ? '已登记'
+                      : undefined
+                  }
                 />
+              ) : states.size === 1 ? (
+                <Badge state={[...states][0]} />
               ) : (
                 <span className="asset-catalog-group-availability">
                   可用 {availableCount} / {group.assets.length}

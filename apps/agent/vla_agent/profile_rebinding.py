@@ -1,4 +1,4 @@
-"""Rebind one idle training profile without restarting or deploying the Agent."""
+"""Add or rebind a training profile without restarting or deploying the Agent."""
 from __future__ import annotations
 
 import copy
@@ -21,6 +21,7 @@ MAX_CONFIG_BYTES = 4 * 1024 * 1024
 MAX_OPERATIONS = 32
 OPERATIONS_KEY = "_profile_rebind_operations"
 PAYLOAD_KEYS = {"profile_id", "expected_code_dir", "expected_python", "code_dir", "python", "expires_at"}
+ADD_PAYLOAD_KEYS = {"action", "profile_id", "name", "code_dir", "python", "expires_at"}
 
 
 class ProfileRebindError(AgentError):
@@ -237,7 +238,8 @@ def rebind_profile(config, state, payload, *, operation_id):
     """Probe, CAS and persist one profile; only then expose it in live memory."""
     persisted = False
     try:
-        if not isinstance(payload, dict) or set(payload) != PAYLOAD_KEYS:
+        adding = isinstance(payload, dict) and payload.get("action") == "add"
+        if not isinstance(payload, dict) or set(payload) != (ADD_PAYLOAD_KEYS if adding else PAYLOAD_KEYS):
             _fail("INVALID", "运行环境切换参数不完整或包含未知字段")
         try:
             operation_id = safe_identifier(operation_id)
@@ -247,7 +249,19 @@ def rebind_profile(config, state, payload, *, operation_id):
         if (not isinstance(profile_id, str) or not 1 <= len(profile_id) <= 200
                 or not profile_id.strip() or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in profile_id)):
             _fail("INVALID", "运行环境标识必须是长度不超过 200 的无控制字符文本")
-        request = {key: _path(payload[key], key) for key in ("expected_code_dir", "expected_python", "code_dir", "python")}
+        if adding:
+            try:
+                safe_identifier(profile_id)
+            except AgentError as exc:
+                _fail("INVALID", str(exc))
+            name = payload["name"]
+            if (not isinstance(name, str) or not 1 <= len(name) <= 200 or not name.strip()
+                    or name != name.strip() or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in name)):
+                _fail("INVALID", "运行环境名称必须是长度不超过 200 的无控制字符文本")
+        path_fields = ("code_dir", "python") if adding else ("expected_code_dir", "expected_python", "code_dir", "python")
+        request = {key: _path(payload[key], key) for key in path_fields}
+        if adding:
+            request.update(action="add", name=name)
         expires = payload["expires_at"]
         if not isinstance(expires, str) or len(expires) > 128:
             _fail("INVALID", "切换请求必须包含 UTC 过期时间")
@@ -274,34 +288,49 @@ def rebind_profile(config, state, payload, *, operation_id):
                 result = prior.get("result")
                 try:
                     disk_profile = _profile(disk, profile_id)
-                    _profile(config, profile_id)
+                    if not adding:
+                        _profile(config, profile_id)
                 except AgentError:
                     _fail("RECOVERY_PENDING", "已保存的运行环境发生变化，等待确认本次切换结果", persisted=None)
                 if (prior.get("fingerprint") != fingerprint or not isinstance(result, dict)
                         or result.get("profile_id") != profile_id or result.get("code_dir") != request["code_dir"]
                         or result.get("python") != request["python"] or result.get("persisted") is not True
+                        or adding and (result.get("action") != "add" or result.get("name") != name or disk_profile.get("name") != name)
                         or any(_path(disk_profile.get(key), key) != request[key] for key in ("code_dir", "python"))):
                     _fail("RECOVERY_PENDING", "同一切换操作的参数或已保存目标发生变化，等待确认", persisted=None)
                 persisted = True
                 config["profiles"] = copy.deepcopy(disk["profiles"])
                 return copy.deepcopy(result)
-            disk_profile = _profile(disk, profile_id)
-            memory_profile = _profile(config, profile_id)
+            if adding:
+                if any(item.get("id") == profile_id for source in (disk, config) for item in source["profiles"]):
+                    _fail("CONFLICT", "运行环境标识已存在，请选择其他标识")
+                if any(len(source["profiles"]) >= 100 for source in (disk, config)):
+                    _fail("INVALID", "同一机器最多登记 100 个训练环境")
+                disk_profile = None
+                candidate = {"id": profile_id, "name": name, "adapter": "openpi-sft", "execution_mode": "native",
+                             "code_dir": request["code_dir"], "python": request["python"], "recipe": None, "metadata": {}}
+            else:
+                disk_profile = _profile(disk, profile_id)
+                memory_profile = _profile(config, profile_id)
             if deadline <= datetime.now(timezone.utc):
                 _fail("EXPIRED", "运行环境切换请求已过期")
-            if any(_path(profile.get(key), key) != request["expected_" + key]
+            if not adding and any(_path(profile.get(key), key) != request["expected_" + key]
                    for profile in (disk_profile, memory_profile) for key in ("code_dir", "python")):
                 _fail("CONFLICT", "运行环境已变更，请刷新后重试")
-            candidate = {**copy.deepcopy(disk_profile), "code_dir": request["code_dir"], "python": request["python"]}
+            if not adding:
+                candidate = {**copy.deepcopy(disk_profile), "code_dir": request["code_dir"], "python": request["python"]}
             try:
                 checkout = allowed_path(candidate["code_dir"], config["roots"])
                 if not checkout.is_dir():
                     _fail("INVALID", "新代码目录必须是已存在的目录")
                 new_checkout = _repository_root(config, checkout, strict=True)
-                try:
-                    old_checkout = _repository_root(config, Path(request["expected_code_dir"]), strict=True)
-                except AgentError:
-                    old_checkout = None
+                if adding:
+                    old_checkout = new_checkout
+                else:
+                    try:
+                        old_checkout = _repository_root(config, Path(request["expected_code_dir"]), strict=True)
+                    except AgentError:
+                        old_checkout = None
                 interpreter = Path(candidate["python"])
                 if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
                     _fail("INVALID", "训练 Python 必须是 Agent 用户可执行的现有文件")
@@ -317,11 +346,16 @@ def rebind_profile(config, state, payload, *, operation_id):
                     if deadline <= datetime.now(timezone.utc):
                         _fail("EXPIRED", "环境检查完成时切换请求已过期")
                     _active(config, state, profile_id, old_checkout, new_checkout)
-                    if any(_path(_profile(config, profile_id).get(key), key) != request["expected_" + key] for key in ("code_dir", "python")):
+                    if (adding and any(item.get("id") == profile_id for item in config["profiles"])
+                            or not adding and any(_path(_profile(config, profile_id).get(key), key) != request["expected_" + key] for key in ("code_dir", "python"))):
                         _fail("CONFLICT", "运行中的环境配置已变更，请刷新后重试")
                     result = {"profile_id": profile_id, "code_dir": candidate["code_dir"], "python": candidate["python"],
                               "runtime_check": runtime, "persisted": True}
-                    disk_profile.update(code_dir=candidate["code_dir"], python=candidate["python"])
+                    if adding:
+                        result.update(action="add", name=name)
+                        disk["profiles"].append(candidate)
+                    else:
+                        disk_profile.update(code_dir=candidate["code_dir"], python=candidate["python"])
                     disk[OPERATIONS_KEY] = [*operations, {"operation_id": operation_id, "fingerprint": fingerprint,
                                                           "result": result}][-MAX_OPERATIONS:]
                     content = (json.dumps(disk, ensure_ascii=True, indent=2) + "\n").encode()

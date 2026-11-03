@@ -211,14 +211,14 @@ def registered_task_features(path, info, spec, registered_profile, *, selected_c
         raise ValueError("DATASET_PROFILE_UNVERIFIABLE: 登记了派生 task 字段，但无法从真实 meta/tasks.jsonl 核实 task_index 到任务文本的映射；首版暂不支持 tasks.parquet") from exc
 
 
-def dataset_contract(factory, spec, registered_profile=None, *, model_config=None, binding=None, checks=None):
+def dataset_contract(factory, spec, registered_profile=None, *, model_config=None, binding=None, checks=None, norm_stats=False):
     path = local_path(factory.repo_id, spec)
     info, metadata_sha = read_json(path / "meta" / "info.json", spec)
     for key in ("total_frames", "total_episodes"):
         if type(info.get(key)) is not int or info[key] <= 0:
             raise ValueError(f"DATASET_FORMAT: {path} 的 {key} 必须大于零")
     features = info.get("features")
-    composition = normalize_composition(factory.composition) if type(factory).__name__ == COMPOSABLE_PROCESSOR else None
+    composition = normalize_composition(factory.composition, norm_stats=norm_stats) if type(factory).__name__ == COMPOSABLE_PROCESSOR else None
     action_key = composition["action_key"] if composition else "actions"
     if not isinstance(features, dict) or not isinstance(features.get(action_key), dict):
         raise ValueError(f"DATASET_FORMAT: {path} 缺少 actions 特征元数据")
@@ -226,11 +226,11 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
     if not isinstance(actions, list) or not actions or any(type(v) is not int or v <= 0 for v in actions):
         raise ValueError(f"DATASET_FORMAT: {path} 的动作形状无效")
     derived = (registered_task_features(path, info, spec, registered_profile, selected_composition=composition)
-               if registered_profile is not None or composition is not None else {})
+               if not norm_stats and (registered_profile is not None or composition is not None) else {})
     warnings = []
     declared = ({"registered_profile": verify_registered_dataset_profile(registered_profile, info,
                   derived_features=derived.get("derived_features", ()), selected_composition=composition,
-                  warnings=warnings)} if registered_profile is not None else {})
+                  warnings=warnings, norm_stats=norm_stats)} if registered_profile is not None else {})
     warnings = [{**warning, "dataset_path": str(path),
                  "message": f"数据集 {path}：{warning['message']}"} for warning in warnings]
     if checks is not None:
@@ -247,16 +247,16 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
             # Compatibility for callers holding only a historical frozen asset.
             # Normal run planning always supplies the explicit dataset binding.
             expected = registered_profile.get("processing")
-        if expected is None or composition_digest(expected) != composition_digest(composition):
+        if expected is None or composition_digest(expected, norm_stats=norm_stats) != composition_digest(composition, norm_stats=norm_stats):
             raise ValueError("COMPOSITION_BINDING_MISMATCH: 实际组合处理配置与本次冻结的训练数据绑定不一致")
-        validate_composition_profile_input(registered_profile, composition)
+        validate_composition_profile_input(registered_profile, composition, norm_stats=norm_stats)
         model_type = type(model_config).__name__
         if model_type not in {"Pi0Config", "Pi0GripperConfig", "Pi0ValueConfig"}:
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 组合处理首版支持标准 Pi0/Pi05、Value 和 Gripper 模型，MEM/Hybrid 使用原处理器")
         horizon, action_dim = getattr(model_config, "action_horizon", None), getattr(model_config, "action_dim", None)
         if type(horizon) is not int or horizon <= 0 or type(action_dim) is not int or action_dim <= 0:
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 模型动作维度和预测长度无效")
-        verify_composition_metadata(composition, info, derived_features=derived.get("derived_features", ()), action_horizon=horizon)
+        verify_composition_metadata(composition, info, derived_features=derived.get("derived_features", ()), action_horizon=horizon, norm_stats=norm_stats)
         if sum(field["width"] for field in composition["action_layout"]) > action_dim:
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 数据动作宽度超过模型 action_dim")
         if (getattr(model_config, "pi05", False) is not True and
@@ -272,10 +272,10 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
         describe = getattr(factory, "processing_contract", None)
         if not callable(describe):
             raise ValueError("COMPOSITION_SOURCE_UNAVAILABLE: 训练处理器缺少轻量预检接口，请更新训练代码")
-        runtime = describe(model_config)
-        depth_keys = list(getattr(model_config, "depth_keys", None) or ())
+        runtime = describe(model_config, norm_stats=True) if norm_stats else describe(model_config)
+        depth_keys = [] if norm_stats else list(getattr(model_config, "depth_keys", None) or ())
         image_keys = getattr(model_config, "image_keys", None)
-        image_keys = list(image_keys) if image_keys is not None else [key for key in SLOTS if key not in depth_keys]
+        image_keys = [] if norm_stats else list(image_keys) if image_keys is not None else [key for key in SLOTS if key not in depth_keys]
         expected_runtime = {"training_stage": stage, "model_type": model_type,
             "pi05": getattr(model_config, "pi05", False) is True, "action_dim": action_dim, "action_horizon": horizon,
             "raw_state_dim": sum(field["width"] for field in composition["state_fields"]),
@@ -301,12 +301,12 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
         if len(contents) > 1024 * 1024:
             raise ValueError("COMPOSITION_SOURCE_UNAVAILABLE: 组合处理实现超过读取上限")
         composed = {"composition": {"schema_version": 1, "spec": composition,
-                    "digest": composition_digest(composition), **runtime,
+                    "digest": composition_digest(composition, norm_stats=norm_stats), **runtime,
                     "source": {"path": source.relative_to(root).as_posix(), "sha256": hashlib.sha256(contents).hexdigest()}}}
     rows, data_bytes, manifest = file_manifest(path / "data", spec)
     if not any(row[0].endswith(".parquet") and row[1] > 0 for row in rows):
         raise ValueError(f"DATASET_FORMAT: {path} 缺少非空 parquet 数据文件")
-    video_keys = [key for key, value in features.items() if isinstance(value, dict) and value.get("dtype") == "video"]
+    video_keys = [] if norm_stats else [key for key, value in features.items() if isinstance(value, dict) and value.get("dtype") == "video"]
     video_evidence = {}
     if video_keys:
         video_rows, video_bytes, video_manifest = file_manifest(path / "videos", spec)

@@ -28,7 +28,8 @@ from .state import State, TERMINAL_STATES
 from .training_validation import prepare_launch, validate_training
 
 
-def verified_outputs(output_dir: Path, smoke: bool) -> list[dict]:
+def verified_outputs(output_dir: Path, smoke: bool, *, template_id: str | None = None,
+                     norm_datasets: list[dict] | None = None) -> list[dict]:
     manifest = output_dir / "artifacts.json"
     if not manifest.exists():
         if not smoke:
@@ -53,10 +54,23 @@ def verified_outputs(output_dir: Path, smoke: bool) -> list[dict]:
             if smoke:
                 metadata["simulation"] = True
             result.append({**output, "path": str(path), "metadata": metadata})
-        if not smoke and not any(artifact["kind"] == "MODEL" for artifact in result):
-            raise ValueError("Training exited without a model artifact")
+        required_kind = "NORM" if template_id == "openpi-norm" else "MODEL"
+        if not smoke and not any(artifact["kind"] == required_kind for artifact in result):
+            raise ValueError(f"Task exited without a {required_kind} artifact")
+        if template_id == "openpi-norm":
+            from vla_adapters.norm_entry import verify_statistics
+            from vla_adapters.norm_datasets import normalize_norm_datasets
+            rows = normalize_norm_datasets(norm_datasets)
+            if rows is not None and (len(result) != len(rows) or any(
+                artifact["kind"] != "NORM" or artifact.get("metadata", {}).get("source_dataset_asset_id") != row["dataset_asset_id"]
+                for artifact, row in zip(result, rows)
+            ) or len({artifact["path"] for artifact in result}) != len(rows)):
+                raise ValueError("Statistics batch output does not match every independent input dataset")
+            for artifact in result:
+                if artifact["kind"] == "NORM":
+                    verify_statistics(Path(artifact["path"]))
         return result
-    except (OSError, ValueError, TypeError, AgentError) as exc:
+    except (OSError, ValueError, TypeError, KeyError, AgentError) as exc:
         raise AgentError("ARTIFACT_INVALID", f"Cannot verify output manifest: {exc}") from exc
 
 
@@ -151,7 +165,7 @@ def execute(config: dict, attempt_id: str) -> int:
                 raise AgentError("CONFIG_CONFIRMATION_MISMATCH", "启动命令与用户确认的 config 不一致，请重新预检并确认")
         validate_output_isolation(config, profile["code_dir"], inputs, str(output))
         output.mkdir(parents=True, exist_ok=False)
-        start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}))
+        start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
         compare_code(payload["code_expectation"], start_snapshot, compare_automatic=False)
         for uuid in sorted(payload.get("gpu_uuids", [])):
             # GPU UUIDs never become path components directly.
@@ -163,15 +177,17 @@ def execute(config: dict, attempt_id: str) -> int:
                 gpu_lock.close()
                 raise AgentError("GPU_BUSY", f"GPU reserved by another local Runner: {uuid}") from exc
             gpu_locks.append(gpu_lock)
+        from .resource_guard import require_gpu_access
+        require_gpu_access(config, payload.get("gpu_uuids", []))
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), str(output),
-                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}))
+                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
         allowed_path(launch["cwd"], config["roots"])
         if profile.get("adapter") != "smoke":
             if not isinstance(payload["code_expectation"].get("automatic_preflight"), dict):
                 raise AgentError("AUTOMATIC_PREFLIGHT_REQUIRED", "正式训练缺少 Agent 自动预检记录，请重新执行预检")
             launch = prepare_launch(launch, config, payload.get("inputs", {}))
             automatic = validate_training(config, launch, launch_checks, assigned=payload.get("gpu_uuids", []))
-            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}))
+            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
             compare_code(start_snapshot, current, compare_automatic=False)
             start_snapshot["automatic_preflight"] = automatic
             compare_code(payload["code_expectation"], start_snapshot)
@@ -179,6 +195,7 @@ def execute(config: dict, attempt_id: str) -> int:
             (output / "provenance" / "code-snapshot.json").write_text(json.dumps(start_snapshot, indent=2))
         # Recheck assigned devices after the CPU probe, just before spawning.
         check_gpus(payload.get("gpu_uuids", []))
+        require_gpu_access(config, payload.get("gpu_uuids", []))
         if state.attempt(attempt_id)["cancel_requested"] or interrupted:
             state.emit(attempt_id, "CANCELLED", {"exit_code": None, "process_started": False})
             return 0
@@ -272,7 +289,7 @@ def execute(config: dict, attempt_id: str) -> int:
             artifact_monitor.close()
         code_changed = False
         try:
-            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}))
+            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
             if "automatic_preflight" in start_snapshot:
                 end_snapshot["automatic_preflight"] = start_snapshot["automatic_preflight"]
                 (output / "provenance" / "end" / "code-snapshot.json").write_text(json.dumps(end_snapshot, indent=2))
@@ -295,7 +312,7 @@ def execute(config: dict, attempt_id: str) -> int:
         if cancelling:
             state.emit(attempt_id, "CANCELLED", common)
         elif child.returncode == 0:
-            state.emit(attempt_id, "SUCCEEDED", {**common, "outputs": verified_outputs(output, profile.get("adapter") == "smoke")})
+            state.emit(attempt_id, "SUCCEEDED", {**common, "outputs": verified_outputs(output, profile.get("adapter") == "smoke", template_id=payload["template_id"], norm_datasets=payload.get("norm_datasets"))})
         else:
             state.emit(attempt_id, "FAILED", {**common, "error": {"code": "PROCESS_EXITED", "message": f"Training process exited with code {child.returncode}"}})
         return 0

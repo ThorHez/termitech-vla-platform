@@ -30,7 +30,7 @@ export function BatchAssetSync({
   created: (transfers: AssetTransfer[]) => void;
 }) {
   const { user, can } = useAuth();
-  if (!user?.id || !can('assets.write'))
+  if (!user?.id || !can('assets.transfer'))
     return (
       <Modal title="无法批量同步" close={close}>
         请使用具有资产编辑权限的个人账户登录后操作。
@@ -79,7 +79,7 @@ function BatchAssetSyncContent({
   const pending = useRef(false);
   const assetKey = JSON.stringify(assetIds);
   const current = useRef({ owner, allowed: true, assetKey });
-  current.current = { owner: user?.id || '', allowed: can('assets.write'), assetKey };
+  current.current = { owner: user?.id || '', allowed: can('assets.transfer'), assetKey };
   const targetNode = nodes.data?.find((node) => node.id === targetId);
   const sourceNodeIds = new Set(
     assetIds.map((id) => assets.data?.find((asset) => asset.id === id)?.node_id),

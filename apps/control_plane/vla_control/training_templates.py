@@ -11,6 +11,8 @@ from .common import APIError, now, uid
 from .auth_models import User
 from .models import TrainingTemplate
 from .training_drafts import MAX_CONTENT_BYTES, MAX_EXPECTED_REVISION, bounded_content
+from .account_lifecycle import lock_execution_guard, training_execution_authorized
+from .resource_authorization import require_active_actor
 
 
 MAX_REQUEST_BYTES = MAX_CONTENT_BYTES + 32 * 1024
@@ -98,16 +100,21 @@ def _owned(session, user_id, template_id):
     return row
 
 
-def _lock_owner(session, user_id):
+def _lock_owner(session, user_id, request=None):
     # Serialize mutations for one account on PostgreSQL. SQLite writers already
     # hold BEGIN IMMEDIATE; the unique owner/name index supplies a final guard.
-    if session.scalar(select(User.id).where(User.id == user_id).with_for_update()) is None:
+    if request is not None:
+        require_active_actor(session, request)
+    else:
+        lock_execution_guard(session)
+    if (not training_execution_authorized(session, user_id)
+            or session.scalar(select(User.id).where(User.id == user_id).with_for_update()) is None):
         raise APIError(401, "UNAUTHORIZED", "登录账户已不可用")
 
 
-def create_template(db, user_id, value):
+def create_template(db, user_id, value, request=None):
     with db.write() as session:
-        _lock_owner(session, user_id)
+        _lock_owner(session, user_id, request)
         stamp = now()
         row = session.scalar(select(TrainingTemplate).where(
             TrainingTemplate.user_id == user_id, TrainingTemplate.name == value["name"]))
@@ -125,10 +132,10 @@ def create_template(db, user_id, value):
     return result, 201 if created else 200
 
 
-def update_template(db, user_id, template_id, value):
+def update_template(db, user_id, template_id, value, request=None):
     revision = value["expected_revision"]
     with db.write() as session:
-        _lock_owner(session, user_id)
+        _lock_owner(session, user_id, request)
         row = _owned(session, user_id, template_id)
         if row.revision != revision:
             raise _conflict()
@@ -150,9 +157,9 @@ def update_template(db, user_id, template_id, value):
     return result
 
 
-def delete_template(db, user_id, template_id, revision):
+def delete_template(db, user_id, template_id, revision, request=None):
     with db.write() as session:
-        _lock_owner(session, user_id)
+        _lock_owner(session, user_id, request)
         _owned(session, user_id, template_id)
         changed = session.execute(delete(TrainingTemplate).where(
             TrainingTemplate.id == template_id, TrainingTemplate.user_id == user_id,
@@ -187,7 +194,7 @@ def register_routes(app, dependencies, db, auth):
     async def create(request: Request):
         user_id = owner(request)
         value = await _body(request, operation="create")
-        result, status = await run_in_threadpool(create_template, db, user_id, value)
+        result, status = await run_in_threadpool(create_template, db, user_id, value, request)
         return response(result, status)
 
     @app.get("/api/v1/training-templates/{template_id}", dependencies=dependencies)
@@ -200,10 +207,10 @@ def register_routes(app, dependencies, db, auth):
     async def save(template_id: str, request: Request):
         user_id = owner(request)
         value = await _body(request, operation="update")
-        return response(await run_in_threadpool(update_template, db, user_id, template_id, value))
+        return response(await run_in_threadpool(update_template, db, user_id, template_id, value, request))
 
     @app.delete("/api/v1/training-templates/{template_id}", dependencies=dependencies)
     async def remove(template_id: str, request: Request):
         user_id = owner(request)
         value = await _body(request, operation="delete")
-        return response(await run_in_threadpool(delete_template, db, user_id, template_id, value["expected_revision"]))
+        return response(await run_in_threadpool(delete_template, db, user_id, template_id, value["expected_revision"], request))

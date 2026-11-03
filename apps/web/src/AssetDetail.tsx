@@ -45,6 +45,8 @@ export function AssetDetail({
   const archived = state === 'ARCHIVED';
   const unavailable = state === 'UNAVAILABLE';
   const writable = can('assets.write') && !archived;
+  const transferable = can('assets.transfer') && !archived;
+  const canSaveTemplate = can('dataset-templates.write') && !archived;
   const dataset = asset.kind === 'DATASET';
   const profile = dataset ? readDatasetProfile(asset.metadata?.dataset_profile) : undefined;
   const templateProfile = dataset
@@ -85,9 +87,9 @@ export function AssetDetail({
       </div>
       {dataset && selectDataset && (datasetChoices?.length || 0) > 1 && (
         <label className="asset-detail-dataset-picker">
-          <span>集合中的数据集</span>
+          <span>使用此归一化参数的数据集</span>
           <select
-            aria-label="集合中的数据集"
+            aria-label="使用此归一化参数的数据集"
             value={asset.id}
             onChange={(event) => selectDataset(event.target.value)}
           >
@@ -99,29 +101,29 @@ export function AssetDetail({
           </select>
         </label>
       )}
-      {writable && (
+      {(writable || transferable || canSaveTemplate) && (
         <section className="asset-detail-section asset-detail-action-section">
           <h4>资产操作</h4>
           <div className="asset-detail-actions">
-            {dataset && !unavailable && (
+            {writable && dataset && !unavailable && (
               <button type="button" className="button outline" onClick={bindNorm}>
                 <Link2 size={15} />
                 {asset.norm_asset_id ? '修改 norm_stats' : '绑定 norm_stats'}
               </button>
             )}
-            {dataset && (
+            {writable && dataset && (
               <button type="button" className="button outline" onClick={editProfile}>
                 <Pencil size={15} />
                 {profile ? '编辑数据特征' : '补录数据特征'}
               </button>
             )}
-            {templateProfile && saveTemplate && (
+            {canSaveTemplate && templateProfile && saveTemplate && (
               <button type="button" className="button outline" onClick={saveTemplate}>
                 <Save size={15} />
                 保存为格式模板
               </button>
             )}
-            {['DATASET', 'MODEL', 'NORM'].includes(asset.kind) && (
+            {transferable && ['DATASET', 'MODEL', 'NORM'].includes(asset.kind) && (
               <button
                 type="button"
                 className="button outline"
@@ -229,6 +231,11 @@ export function AssetDetail({
               <p>
                 {norm?.name || asset.norm_asset_id}
                 {norm && ` · ${norm.version}`}
+                {norm && (
+                  <span aria-label="norm_stats 状态">
+                    <Badge state={norm.status || norm.state || 'REGISTERED'} />
+                  </span>
+                )}
               </p>
               {norm && <code className="asset-detail-norm-path">{norm.path}</code>}
               {normError && (

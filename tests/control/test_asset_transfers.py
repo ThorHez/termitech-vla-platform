@@ -1,6 +1,7 @@
 """Registered data copies keep ownership, SSH identity, and asset semantics."""
 
 import hashlib
+from copy import deepcopy
 from pathlib import PurePosixPath
 import re
 import socket
@@ -14,8 +15,8 @@ from vla_protocol import canonical_digest
 from vla_control.asset_transfer_models import AssetTransfer
 from vla_control.asset_transfers import active_asset_transfers
 from vla_control.checkpoint_transfer_transport import TransferError
-from vla_control.common import APIError, offset_time, uid
-from vla_control.models import Asset, Command, Node, Run
+from vla_control.common import APIError, now, offset_time, uid
+from vla_control.models import Asset, Attempt, Command, Node, Run
 from vla_control.remote_deployment import DeploymentManager
 from vla_control.remote_models import RemoteConnection
 from vla_control.ssh_remote import RemoteError
@@ -253,6 +254,46 @@ def test_frozen_binding_drift_blocks_worker_and_retry(fixture, monkeypatch, drif
     final = receipt(fixture, task['id'])
     assert final['state'] == 'FAILED' and called == []
     assert platform.client.post(BASE + '/' + task['id'] + '/retry', headers=ADMIN).status_code == 409
+
+
+@pytest.mark.parametrize('drift', [None, 'custom-name', 'metadata', 'path', 'fingerprint'])
+def test_generated_model_label_upgrade_preserves_copy_snapshot_and_rejects_other_drift(fixture, monkeypatch, drift):
+    platform, _, source, _, asset, connections = fixture
+    recipe = 'auto_pi05_full_h16_d32_sft'
+    with platform.app.state.db.write() as session:
+        run = add_run(session, source, name='折叠衣服训练')
+        attempt = Attempt(id=uid(), run_id=run.id, node_id=source['node_id'], number=1,
+            execution_token=uid(), state='SUCCEEDED', created_at=now(), code_snapshot=run.code_expectation)
+        session.add(attempt)
+        session.flush()
+        model = session.get(Asset, asset['id'])
+        model.kind = 'MODEL'
+        model.name = recipe + ' / 59999'
+        model.version = '59999'
+        model.metadata_json = {'format': 'openpi-orbax', 'recipe': recipe, 'step': 59999}
+        model.origin_attempt_id = attempt.id
+        expected = f'{run.name} · {run.id[:8]} / 59999'
+    task = create(fixture).json()
+    with platform.app.state.db.read() as session:
+        frozen = deepcopy(session.get(AssetTransfer, task['id']).binding_snapshot)
+    platform.app.state.db.initialize()
+    with platform.app.state.db.write() as session:
+        model = session.get(Asset, asset['id'])
+        assert model.name == expected
+        assert session.get(AssetTransfer, task['id']).name == expected + ' · 资产同步'
+        if drift == 'custom-name': model.name = '另一个手动名称'
+        elif drift == 'metadata': model.metadata_json = {**model.metadata_json, 'changed': True}
+        elif drift == 'path': model.path += '-changed'
+        elif drift == 'fingerprint': session.get(RemoteConnection, connections[0].id).fingerprint = 'SHA256:changed'
+    final = run_copy(fixture, task['id'], monkeypatch)
+    with platform.app.state.db.read() as session:
+        assert session.get(AssetTransfer, task['id']).binding_snapshot == frozen
+        if drift is None:
+            assert final['state'] == 'SUCCEEDED'
+            assert session.get(Asset, final['target_asset_id']).name == expected
+        else:
+            assert final['state'] == 'FAILED'
+            assert final['error']['code'] == 'ASSET_TRANSFER_BINDING_CHANGED'
 
 
 def test_retry_uses_same_owned_target_and_a_new_attempt(fixture, monkeypatch):

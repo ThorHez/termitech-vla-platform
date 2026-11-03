@@ -16,6 +16,8 @@ class AssetTransfer(Base):
     __tablename__ = 'asset_transfers'
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), nullable=True)
+    execution_user_id: Mapped[str | None] = mapped_column(ForeignKey('users.id', ondelete='RESTRICT'), nullable=True)
     request_key: Mapped[str] = mapped_column(String(200), unique=True)
     request_digest: Mapped[str] = mapped_column(String(64))
     name: Mapped[str] = mapped_column(String(200))

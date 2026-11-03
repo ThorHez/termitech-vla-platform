@@ -12,6 +12,11 @@ import {
 import { useDatasetImageMetadata } from './useDatasetImageMetadata';
 import { trainingNormalizationLabel } from './trainingNormalization';
 import {
+  fillMissingCompositionRepresentations,
+  representationManualMarker,
+  type RepresentationField,
+} from './compositionRepresentationDefaults';
+import {
   composedProcessingErrors,
   composedProcessingSummary,
   normalizeComposedProcessing,
@@ -28,6 +33,8 @@ import type {
   RecipeDatasetSlot,
   RecipeLiteral,
   TrainingNormalizationMethod,
+  DataProcessorChoice,
+  RunRequest,
 } from './types';
 
 export function compositionToken(value: unknown): string {
@@ -44,10 +51,15 @@ export function compositionToken(value: unknown): string {
   return JSON.stringify(canonical(value));
 }
 
-export function composedChoice(spec: ComposedProcessingSpec) {
+export function composedChoice(
+  spec: ComposedProcessingSpec,
+  purpose: 'training' | 'norm' = 'training',
+) {
   return {
     name: 'ComposableDataConfig',
-    parameters: { composition: normalizeComposedProcessing(spec) as unknown as RecipeLiteral },
+    parameters: {
+      composition: normalizeComposedProcessing(spec, purpose) as unknown as RecipeLiteral,
+    },
   };
 }
 
@@ -55,7 +67,54 @@ export function trainingProfileSeed(dataset?: Asset): ProcessingProfileSeed {
   return readDatasetProfile(dataset?.metadata?.dataset_profile) || emptyDatasetProfile();
 }
 
-function editableDraft(value: unknown): value is ComposedProcessingSpec {
+export function fillRunRepresentationDefaults(
+  request: RunRequest,
+  assets: readonly Asset[],
+  edited: ReadonlySet<string>,
+): RunRequest {
+  const purpose = request.template_id === 'openpi-norm' ? 'norm' : 'training';
+  const fill = <T extends { dataset_asset_id: string; processor?: DataProcessorChoice }>(
+    row: T,
+    index: number,
+  ): T => {
+    const dataset = assets.find((asset) => asset.id === row.dataset_asset_id);
+    const raw =
+      row.processor?.name === 'ComposableDataConfig'
+        ? row.processor.parameters.composition
+        : undefined;
+    if (!dataset || !editableDraft(raw, purpose)) return row;
+    const spec = normalizeComposedProcessing(raw, purpose);
+    const manual = new Set<RepresentationField>(
+      (['state_representation', 'action_representation'] as const).filter((field) =>
+        edited.has(representationManualMarker([request.node_id, dataset.id, index], field)),
+      ),
+    );
+    const next = fillMissingCompositionRepresentations(
+      spec,
+      trainingProfileSeed(dataset),
+      purpose,
+      manual,
+    );
+    return next === spec ? row : { ...row, processor: composedChoice(next, purpose) };
+  };
+  const bindings = request.dataset_bindings?.map(fill);
+  const norm = request.norm_datasets?.map(fill);
+  if (
+    !bindings?.some((row, index) => row !== request.dataset_bindings![index]) &&
+    !norm?.some((row, index) => row !== request.norm_datasets![index])
+  )
+    return request;
+  return {
+    ...request,
+    ...(bindings ? { dataset_bindings: bindings } : {}),
+    ...(norm ? { norm_datasets: norm } : {}),
+  };
+}
+
+function editableDraft(
+  value: unknown,
+  purpose: 'training' | 'norm' = 'training',
+): value is ComposedProcessingSpec {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const spec = value as ComposedProcessingSpec;
   return (
@@ -70,8 +129,9 @@ function editableDraft(value: unknown): value is ComposedProcessingSpec {
     ) &&
     Array.isArray(spec.action_layout) &&
     spec.action_layout.every((row) => row && typeof row.width === 'number') &&
-    Array.isArray(spec.cameras) &&
-    spec.cameras.every((row) => row && typeof row.key === 'string') &&
+    (purpose === 'norm' ||
+      (Array.isArray(spec.cameras) &&
+        spec.cameras.every((row) => row && typeof row.key === 'string'))) &&
     (spec.gripper_range == null ||
       (Array.isArray(spec.gripper_range) && spec.gripper_range.length === 2)) &&
     Array.isArray(spec.aux_keys)
@@ -86,6 +146,7 @@ export function compositionBindingState({
   index,
   stage,
   imageFeatures,
+  purpose = 'training',
 }: {
   binding: DatasetBinding;
   dataset?: Asset;
@@ -94,17 +155,18 @@ export function compositionBindingState({
   index: number;
   stage: 'sft' | 'value' | 'offline_rl';
   imageFeatures?: readonly ImageFeature[];
+  purpose?: 'training' | 'norm';
 }) {
   const raw =
     binding.processor?.name === 'ComposableDataConfig'
       ? binding.processor.parameters.composition
       : undefined;
-  const errors = composedProcessingErrors(raw);
+  const errors = composedProcessingErrors(raw, purpose);
   const registered = readDatasetProfile(dataset?.metadata?.dataset_profile);
-  const spec = editableDraft(raw) ? normalizeComposedProcessing(raw) : undefined;
+  const spec = editableDraft(raw, purpose) ? normalizeComposedProcessing(raw, purpose) : undefined;
   if (spec && registered && !errors.length)
-    errors.push(...trainingCompositionProfileErrors(registered, spec));
-  if (spec)
+    errors.push(...trainingCompositionProfileErrors(registered, spec, purpose));
+  if (spec && purpose !== 'norm')
     errors.push(...spec.cameras.flatMap((camera) => imageLayoutErrors(camera, imageFeatures)));
   if (!dataset) errors.push('请先选择本组训练数据集。');
   const slot =
@@ -123,7 +185,7 @@ export function compositionBindingState({
     errors.push('价值训练需要在本次处理方案中声明真实 value_target 辅助字段。');
   if (spec && stage === 'offline_rl' && !spec.aux_keys.includes('is_positive'))
     errors.push('离线强化学习需要在本次处理方案中声明真实 is_positive 辅助字段。');
-  const expected = spec ? composedChoice(spec) : undefined;
+  const expected = spec ? composedChoice(spec, purpose) : undefined;
   const matches =
     !!expected &&
     binding.processor?.name === expected.name &&
@@ -152,15 +214,19 @@ export function ComposedDatasetProcessing(props: {
   stage: 'sft' | 'value' | 'offline_rl';
   readOnly?: boolean;
   normalizationOverride?: TrainingNormalizationMethod;
+  purpose?: 'training' | 'norm';
   validationToken?: string;
   onChange: (binding: DatasetBinding) => void;
   onValidityChange?: (valid: boolean) => void;
 }) {
-  const images = useDatasetImageMetadata(props.node, props.dataset);
+  const images = useDatasetImageMetadata(props.node, props.dataset, props.purpose !== 'norm');
   const features = images.inspection?.features;
   const state = compositionBindingState({ ...props, imageFeatures: features });
   const profile = { ...trainingProfileSeed(props.dataset), image_features: features };
   const manualLayouts = useRef(new Set<string>());
+  const manualRepresentations = useRef(new Set<string>());
+  const representationKey = (field: RepresentationField) =>
+    representationManualMarker([props.node?.id, props.dataset?.id, props.index], field);
   const [layoutNotice, setLayoutNotice] = useState<string[]>([]);
   const layoutKey = (key: string, kind: string) =>
     imageLayoutManualMarker([images.scope, props.index, key.trim(), kind]);
@@ -171,13 +237,26 @@ export function ComposedDatasetProcessing(props: {
   }, [state.valid, images.loading, props.validationToken]);
   const update = (spec: ComposedProcessingSpec) => {
     const { recipe_index: _recipe, processor: _processor, ...assets } = props.binding;
-    props.onChange({ ...assets, processor: composedChoice(spec) });
+    props.onChange({ ...assets, processor: composedChoice(spec, props.purpose) });
   };
   const change = useRef(update);
   change.current = update;
+  const representationScope = compositionToken([profile, state.spec]);
+  useEffect(() => {
+    if (!state.spec || props.readOnly) return;
+    const manual = new Set<RepresentationField>(
+      (['state_representation', 'action_representation'] as const).filter(
+        (field) =>
+          manualRepresentations.current.has(representationKey(field)) ||
+          props.imageLayoutEdits?.has(representationKey(field)),
+      ),
+    );
+    const next = fillMissingCompositionRepresentations(state.spec, profile, props.purpose, manual);
+    if (next !== state.spec) change.current(next);
+  }, [representationScope, props.readOnly, props.purpose, props.onValidityChange]);
   const cameraSignature = JSON.stringify(state.spec?.cameras);
   useEffect(() => {
-    if (props.readOnly || !state.spec || !features) return;
+    if (props.purpose === 'norm' || props.readOnly || !state.spec || !features) return;
     const changes: string[] = [];
     const cameras = state.spec.cameras.map((camera) => {
       const key = layoutKey(camera.key, camera.kind);
@@ -193,52 +272,54 @@ export function ComposedDatasetProcessing(props: {
       setLayoutNotice(changes);
       change.current({ ...state.spec, cameras });
     }
-  }, [images.scope, features, cameraSignature, props.readOnly]);
+  }, [images.scope, features, cameraSignature, props.readOnly, props.purpose]);
   const legacy = (props.dataset?.metadata?.dataset_profile as { processing?: unknown } | undefined)
     ?.processing;
-  const canImport = !composedProcessingErrors(legacy).length;
+  const canImport = !composedProcessingErrors(legacy, props.purpose).length;
   return (
     <div className="dataset-processing composed-training-selection">
-      {props.normalizationOverride && (
+      {props.purpose !== 'norm' && props.normalizationOverride && (
         <p className="field-hint">
           本次训练统一使用：{trainingNormalizationLabel(props.normalizationOverride)}
         </p>
       )}
-      <div className="inline-note" role="status">
-        <div>
-          <strong>
-            {images.loading ? '正在读取图像字段并识别布局…' : '图像布局按当前数据集元信息识别'}
-          </strong>
-          {images.loading && <LoaderCircle size={14} className="spin" />}
-          {layoutNotice.length > 0 && (
-            <p>已按当前数据集元信息校准：{layoutNotice.join('；')}。当前手工调整会保留。</p>
-          )}
-          {images.error && <p>{images.error} 可重新读取，或手动核对图像布局。</p>}
-          {images.inspection && (
-            <p>
-              来源：meta/info.json · {images.inspection.source.info_sha256.slice(0, 12)}
-              ；仅填写布局，不自动选择历史帧。
-            </p>
-          )}
-          {!props.readOnly && (
-            <button
-              type="button"
-              className="button outline small"
-              disabled={images.loading || props.node?.status !== 'ONLINE'}
-              onClick={() => {
-                manualLayouts.current.clear();
-                for (const camera of state.spec?.cameras || [])
-                  props.imageLayoutEdits?.set(layoutKey(camera.key, camera.kind), false);
-                setLayoutNotice([]);
-                images.refresh();
-              }}
-            >
-              <RefreshCw size={13} />
-              重新识别图像布局
-            </button>
-          )}
+      {props.purpose !== 'norm' && (
+        <div className="inline-note" role="status">
+          <div>
+            <strong>
+              {images.loading ? '正在读取图像字段并识别布局…' : '图像布局按当前数据集元信息识别'}
+            </strong>
+            {images.loading && <LoaderCircle size={14} className="spin" />}
+            {layoutNotice.length > 0 && (
+              <p>已按当前数据集元信息校准：{layoutNotice.join('；')}。当前手工调整会保留。</p>
+            )}
+            {images.error && <p>{images.error} 可重新读取，或手动核对图像布局。</p>}
+            {images.inspection && (
+              <p>
+                来源：meta/info.json · {images.inspection.source.info_sha256.slice(0, 12)}
+                ；仅填写布局，不自动选择历史帧。
+              </p>
+            )}
+            {!props.readOnly && (
+              <button
+                type="button"
+                className="button outline small"
+                disabled={images.loading || props.node?.status !== 'ONLINE'}
+                onClick={() => {
+                  manualLayouts.current.clear();
+                  for (const camera of state.spec?.cameras || [])
+                    props.imageLayoutEdits?.set(layoutKey(camera.key, camera.kind), false);
+                  setLayoutNotice([]);
+                  images.refresh();
+                }}
+              >
+                <RefreshCw size={13} />
+                重新识别图像布局
+              </button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
       <div
         className={`inline-note ${state.valid ? '' : 'red training-validation-error'}`}
         role={state.valid ? 'status' : 'alert'}
@@ -249,13 +330,14 @@ export function ComposedDatasetProcessing(props: {
             {state.valid ? '本次训练组合方案已配置' : '数据处理配置错误，修正后才能预检'}
           </strong>
           <p>方案随本次训练保存；数据资产的字段标签保持原样。</p>
-          {state.spec && !composedProcessingErrors(state.spec).length && (
+          {state.spec && !composedProcessingErrors(state.spec, props.purpose).length && (
             <p>
               {composedProcessingSummary(
                 state.spec,
                 props.normalizationOverride
                   ? trainingNormalizationLabel(props.normalizationOverride)
                   : undefined,
+                props.purpose,
               )}
             </p>
           )}
@@ -274,7 +356,7 @@ export function ComposedDatasetProcessing(props: {
             <button
               type="button"
               className="button outline small"
-              onClick={() => update(trainingCompositionDraft(profile))}
+              onClick={() => update(trainingCompositionDraft(profile, props.purpose))}
             >
               从登记字段标签重建草稿
             </button>
@@ -293,7 +375,15 @@ export function ComposedDatasetProcessing(props: {
               value={state.spec}
               profile={profile}
               normalizationOverride={props.normalizationOverride}
+              purpose={props.purpose}
               onChange={update}
+              onFieldEdit={(path) => {
+                const field = path.replace(/^processing\./, '');
+                if (field !== 'state_representation' && field !== 'action_representation') return;
+                const marker = representationKey(field);
+                manualRepresentations.current.add(marker);
+                props.imageLayoutEdits?.set(marker, true);
+              }}
               onImageLayoutEdit={(key, kind) => {
                 const marker = layoutKey(key, kind);
                 manualLayouts.current.add(marker);
@@ -316,12 +406,19 @@ export function ComposedDatasetProcessing(props: {
           <p>
             动作：{state.spec.action_key} ·{' '}
             {state.spec.action_layout
-              .map((block) => `${block.arm}/${block.kind} [${block.width}]`)
+              .map((block) =>
+                block.kind === 'shared'
+                  ? `共享动作 [${block.width}]`
+                  : `${block.arm}/${block.kind} [${block.width}]`,
+              )
               .join(' → ')}
           </p>
-          <p>
-            视觉：{state.spec.cameras.map((camera) => `${camera.key} → ${camera.slot}`).join('；')}
-          </p>
+          {props.purpose !== 'norm' && (
+            <p>
+              视觉：
+              {state.spec.cameras.map((camera) => `${camera.key} → ${camera.slot}`).join('；')}
+            </p>
+          )}
         </div>
       )}
     </div>

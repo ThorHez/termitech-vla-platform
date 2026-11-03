@@ -7,6 +7,8 @@ from sqlalchemy import select
 
 from .common import APIError, now, offset_time, uid, under_root
 from .models import Command, Profile
+from .resource_authorization import (COMMAND_AUTHORIZATION_ERRORS, bind_command_actor,
+                                     query_reusable)
 
 
 QUERY_TTL_SECONDS = 15
@@ -15,6 +17,7 @@ MAX_PENDING = 20
 MAX_ENTRIES = 50
 
 ERRORS = {
+    **COMMAND_AUTHORIZATION_ERRORS,
     "PATH_SUGGEST_TIMEOUT": "路径联想超时，可继续手动填写路径，或稍后重试",
     "AGENT_PATH_SUGGEST_UNSUPPORTED": "当前 Agent 不支持路径联想，请更新 Agent；仍可手动填写路径",
     "PATH_OUTSIDE_ROOTS": "该路径不在机器允许访问的目录内",
@@ -173,7 +176,7 @@ def query_dict(command: Command, roots: list[str], profile: Profile | None = Non
     return result
 
 
-def create_query(session, node, prefix: str, limit: int, profile_id: str | None = None) -> dict:
+def create_query(session, node, prefix: str, limit: int, profile_id: str | None = None, *, actor_request=None) -> dict:
     profile, scope = None, {}
     if profile_id is not None:
         profile = session.get(Profile, (node.id, profile_id))
@@ -198,6 +201,8 @@ def create_query(session, node, prefix: str, limit: int, profile_id: str | None 
     for command in session.scalars(recent):
         if (command.payload.get("prefix") == prefix and command.payload.get("limit") == limit
                 and all(command.payload.get(key) == scope.get(key) for key in ("profile_id", "base_path", "python_only"))):
+            if not query_reusable(session, command, actor_request, "assets.query"):
+                continue
             result = query_dict(command, node.roots, profile)
             if result["status"] in {"PENDING", "READY"}:
                 return result
@@ -208,5 +213,6 @@ def create_query(session, node, prefix: str, limit: int, profile_id: str | None 
         raise APIError(429, "PATH_SUGGEST_BUSY", "路径联想请求较多，请稍后重试；仍可手动填写路径")
     command = Command(id=uid(), node_id=node.id, type="PATH_SUGGEST", status="PENDING",
                       payload={"prefix": prefix, "limit": limit, "expires_at": offset_time(QUERY_TTL_SECONDS), **scope}, created_at=now())
+    bind_command_actor(command, actor_request, "assets.query")
     session.add(command)
     return query_dict(command, node.roots, profile)

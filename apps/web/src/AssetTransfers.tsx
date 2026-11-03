@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { date, navigate, post, useApi } from './api';
 import { useAuth } from './auth';
+import { canManageResource, ResourceOwner } from './resourcePermissions';
 import {
   Back,
   Badge,
@@ -76,7 +77,7 @@ export function AssetSyncDialog({
     datasetNormTransferError(asset, assets.data || [], includeNormStats) ||
     assetSyncBlocker({ asset, sourceNode, targetNode, directory, targetName });
   const preview = assetTargetPath(directory, targetName);
-  if (!can('assets.write')) {
+  if (!can('assets.transfer')) {
     return (
       <Modal title="权限不足" close={close}>
         同步资产需要操作员或管理员权限。
@@ -113,7 +114,7 @@ export function AssetSyncDialog({
         className="asset-sync-form"
         onSubmit={async (event) => {
           event.preventDefault();
-          if (pending.current || blocker || !can('assets.write')) return;
+          if (pending.current || blocker || !can('assets.transfer')) return;
           pending.current = true;
           setBusy(true);
           setError(undefined);
@@ -474,11 +475,12 @@ export function AssetTransferCard({
   deleted?: () => void;
 }) {
   const { nodes, refresh } = useData();
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<Error>();
   const [now, setNow] = useState(() => Date.now());
+  const writable = can('assets.transfer') && canManageResource(user, item.owner_user_id);
   const terminal = assetTransferTerminal(item.state);
   const preparing = ['QUEUED', 'PREPARING', 'SCANNING'].includes(item.state);
   useEffect(() => {
@@ -494,7 +496,7 @@ export function AssetTransferCard({
     : 0;
   const registered = item.state === 'SUCCEEDED' && Boolean(item.target_asset_id);
   const perform = async (operation: 'cancel' | 'retry') => {
-    if (busy || deleting || !can('assets.write')) return;
+    if (busy || deleting || !writable) return;
     setBusy(true);
     setError(undefined);
     try {
@@ -508,6 +510,7 @@ export function AssetTransferCard({
   };
   return (
     <article className="asset-transfer-card" aria-label={`数据同步 ${item.name}`}>
+      <ResourceOwner ownerUserId={item.owner_user_id} />
       <div className="asset-transfer-heading">
         <div>
           <strong>
@@ -648,7 +651,7 @@ export function AssetTransferCard({
             <ArrowRight size={13} />
           </button>
         )}
-        {can('assets.write') && ['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(item.state) && (
+        {writable && ['FAILED', 'CANCELLED', 'INTERRUPTED'].includes(item.state) && (
           <button
             type="button"
             className="button outline small"
@@ -659,7 +662,7 @@ export function AssetTransferCard({
             重试同步
           </button>
         )}
-        {can('assets.write') && !terminal && (
+        {writable && !terminal && (
           <button
             type="button"
             className="button ghost small"

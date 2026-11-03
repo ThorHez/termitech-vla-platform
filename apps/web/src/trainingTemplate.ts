@@ -90,6 +90,8 @@ function clearDatasetReferences(snapshot: TrainingDraftSnapshot): TrainingDraftS
       norm_asset_id: '',
     }));
   }
+  if (request.norm_datasets !== undefined)
+    request.norm_datasets = request.norm_datasets.map((row) => ({ ...row, dataset_asset_id: '' }));
   snapshot.step = 0;
   if (!snapshot.editedParameters.includes(TRAINING_TEMPLATE_PROCESSING_MARKER)) {
     snapshot.editedParameters.push(TRAINING_TEMPLATE_PROCESSING_MARKER);
@@ -128,14 +130,14 @@ export function applyTrainingTemplate(
   const gpuIssue = requestedGpuError(
     request,
     selectedNode,
-    request.template_id === 'smoke' ? 0 : 1,
+    ['smoke', 'openpi-norm'].includes(request.template_id) ? 0 : 1,
   );
   if (gpuIssue) issues.push(`模板中的指定 GPU 需要核对：${gpuIssue}`);
 
   const selectedProfile = resources.profiles.find(
     (profile) => profile.id === request.profile_id && profile.node_id === request.node_id,
   );
-  const adapter = ['openpi-sft', 'recap'].includes(request.template_id)
+  const adapter = ['openpi-sft', 'recap', 'openpi-norm'].includes(request.template_id)
     ? 'openpi-sft'
     : request.template_id === 'smoke'
       ? 'smoke'

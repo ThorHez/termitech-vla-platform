@@ -89,7 +89,7 @@ def _optional_unit(value, choices, label):
     return _enum(value, choices, label)
 
 
-def normalize_composition(value):
+def normalize_composition(value, *, norm_stats=False):
     """Normalize the v1 spec; never guess dimensions, encodings or declarations."""
     if (not isinstance(value, dict) or not FIELDS - OPTIONAL_FIELDS <= set(value)
             or set(value) - FIELDS):
@@ -108,8 +108,9 @@ def normalize_composition(value):
     for key, choices in (("action_mode", {"absolute", "delta"}),
                          ("rotation_representation", {"axis_angle", "quaternion", "rotation_6d", "none"})):
         result[key] = _optional_unit(value.get(key), choices, key)
-    for key, choices in (("arm_mode", {"single", "bimanual"}), ("state_representation", {"eef", "joint"}),
-                         ("action_representation", {"eef", "joint"}),
+    representations = {"eef", "joint", "composite"} if norm_stats else {"eef", "joint"}
+    for key, choices in (("arm_mode", {"single", "bimanual"}), ("state_representation", representations),
+                         ("action_representation", representations),
                          ("normalization", {"quantile", "zscore"}), ("model_transform", {"standard"})):
         result[key] = _enum(value[key], choices, key)
     result["state_history"] = _integer(value["state_history"], 1, 64, "state_history")
@@ -136,12 +137,21 @@ def normalize_composition(value):
         _object(item, {"arm", "kind", "width", "normalize"}, "动作分块")
         if type(item["normalize"]) is not bool:
             _fail("动作归一化选项需要布尔值")
-        result["action_layout"].append({"arm": _enum(item["arm"], arms, "动作所属机械臂"),
-            "kind": _enum(item["kind"], STATE_KINDS - {"other"}, "动作分块类型"),
-            "width": _integer(item["width"], 1, 128, "动作分块宽度"), "normalize": item["normalize"]})
+        block = {"arm": _enum(item["arm"], arms | {"shared"}, "动作所属机械臂"),
+            "kind": _enum(item["kind"], (STATE_KINDS - {"other"}) | {"shared"}, "动作分块类型"),
+            "width": _integer(item["width"], 1, 128, "动作分块宽度"), "normalize": item["normalize"]}
+        if (block["arm"] == "shared") != (block["kind"] == "shared"):
+            _fail("共享动作类型必须使用共享归属，普通动作类型必须明确归属机械臂")
+        result["action_layout"].append(block)
     if len({(item["arm"], item["kind"]) for item in result["action_layout"]}) != len(layout):
         _fail("每个机械臂的动作分块类型不能重复")
-    for arm in arms:
+    if result["action_representation"] == "composite" and (len(layout) != 1 or
+            result["action_layout"][0]["kind"] != "shared"):
+        _fail("组合动作向量统计只能使用一个完整共享动作块，不能推断内部机械臂或分量布局")
+    # A shared block is an explicitly sized, unpartitioned raw action vector.
+    # It never stands in for a missing per-arm block in a mixed layout.
+    regular = [block for block in result["action_layout"] if block["kind"] != "shared"]
+    for arm in (arms if regular else ()):
         blocks = {item["kind"]: item["width"] for item in result["action_layout"] if item["arm"] == arm}
         if result["action_representation"] == "joint":
             if ("joint" not in blocks or set(blocks) - {"joint", "gripper"}
@@ -165,8 +175,8 @@ def normalize_composition(value):
         result["gripper_range"] = [_number(item, "夹爪范围") for item in gripper]
         if result["gripper_range"][0] >= result["gripper_range"][1]:
             _fail("夹爪范围最小值必须小于最大值")
-    cameras = value["cameras"]
-    if not isinstance(cameras, list) or not 1 <= len(cameras) <= 3:
+    cameras = [] if norm_stats else value["cameras"]
+    if not isinstance(cameras, list) or not (0 if norm_stats else 1) <= len(cameras) <= 3:
         _fail("标准模型支持 1 到 3 个视觉输入")
     result["cameras"] = []
     for item in cameras:
@@ -199,8 +209,8 @@ def normalize_composition(value):
     return result
 
 
-def composition_digest(value):
-    return hashlib.sha256(json.dumps(normalize_composition(value), sort_keys=True, separators=(",", ":"),
+def composition_digest(value, *, norm_stats=False):
+    return hashlib.sha256(json.dumps(normalize_composition(value, norm_stats=norm_stats), sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
@@ -225,9 +235,9 @@ def validate_profile_composition(profile):
         _fail("组合视觉输入与登记相机字段不一致")
 
 
-def composition_choice(profile):
+def composition_choice(profile, *, norm_stats=False):
     spec = profile.get("processing") if isinstance(profile, dict) else None
-    return None if spec is None else {"name": COMPOSABLE_PROCESSOR, "parameters": {"composition": deepcopy(normalize_composition(spec))}}
+    return None if spec is None else {"name": COMPOSABLE_PROCESSOR, "parameters": {"composition": deepcopy(normalize_composition(spec, norm_stats=norm_stats))}}
 
 
 def normalize_field_annotations(value):
@@ -280,7 +290,7 @@ def normalize_field_annotations(value):
     return result
 
 
-def validate_composition_profile_input(profile, composition):
+def validate_composition_profile_input(profile, composition, *, norm_stats=False):
     """Check a run-owned plan against source labels, never against a legacy plan.
 
     The v1 composable processor repacks tensors; it does not convert EEF/Joint
@@ -289,12 +299,12 @@ def validate_composition_profile_input(profile, composition):
     label identifies an already packed vector, without declaring its internal
     EEF/Joint layout; that layout still belongs to the explicit training plan.
     """
-    spec = normalize_composition(composition)
+    spec = normalize_composition(composition, norm_stats=norm_stats)
     if not isinstance(profile, dict):
         return spec
     if profile.get("format") != "lerobot":
         _fail("组件组合处理首版仅支持 LeRobot 格式")
-    cameras = {(row["key"], row["kind"]) for row in profile.get("cameras", [])}
+    cameras = set() if norm_stats else {(row["key"], row["kind"]) for row in profile.get("cameras", [])}
     if any((camera["key"], camera["kind"]) not in cameras for camera in spec["cameras"]):
         raise ValueError("COMPOSITION_SOURCE_MISMATCH: 组合视觉字段未在数据集中登记或图像类型不一致")
     annotations = profile.get("field_annotations")
@@ -337,9 +347,9 @@ def validate_composition_profile_input(profile, composition):
     return spec
 
 
-def verify_composition_metadata(value, info, *, derived_features=(), action_horizon=None):
+def verify_composition_metadata(value, info, *, derived_features=(), action_horizon=None, norm_stats=False):
     """Validate declared tensor layout against real metadata; no value conversion."""
-    spec = normalize_composition(value)
+    spec = normalize_composition(value, norm_stats=norm_stats)
     features = info.get("features") if isinstance(info, dict) else None
     if not isinstance(features, dict):
         _fail("数据集缺少 features 元信息")
@@ -374,7 +384,7 @@ def verify_composition_metadata(value, info, *, derived_features=(), action_hori
                 _fail("RGB 元信息须明确三通道和 CHW/HWC 布局：" + camera["key"])
         elif len(actual) not in (2, 3) or (len(actual) == 3 and channels != 1):
             _fail("深度元信息须明确单通道布局：" + camera["key"])
-    for key in ([spec["prompt_key"]] if spec["prompt_key"] else []) + spec["aux_keys"]:
+    for key in ([] if norm_stats else ([spec["prompt_key"]] if spec["prompt_key"] else []) + spec["aux_keys"]):
         if key not in features and key not in derived_features:
             _fail("数据集缺少任务或阶段辅助字段：" + key)
     return spec

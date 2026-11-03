@@ -102,6 +102,22 @@ def test_legacy_snapshot_digest_remains_compatible_when_recipe_not_frozen(agent_
     assert snapshot["runtime_digest"] == hashlib.sha256(json.dumps(registered, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def test_snapshot_records_selected_environment_without_following_later_rebindings(agent_fixture):
+    config = agent_fixture["config"]
+    profile = config["profiles"][0]
+    profile["name"] = "My OpenPI"
+    profile["metadata"]["private_setting"] = "not part of the display snapshot"
+    evidence = agent_fixture["root"] / "environment-evidence"
+    frozen = capture_code(profile, config["roots"], evidence)
+    expected = {key: profile[key] for key in ("id", "name", "code_dir", "python", "adapter", "execution_mode")}
+    assert frozen["runtime_profile"] == expected
+    assert json.loads((evidence / "code-snapshot.json").read_text())["runtime_profile"] == expected
+
+    profile.update(name="A different environment", python="/another/venv/bin/python")
+    assert frozen["runtime_profile"] == expected
+    assert "metadata" not in frozen["runtime_profile"]
+
+
 def test_requested_entrypoint_is_frozen_and_ignored_script_changes_are_detected(agent_fixture):
     config, repo = agent_fixture["config"], agent_fixture["repo"]
     profile = config["profiles"][0]

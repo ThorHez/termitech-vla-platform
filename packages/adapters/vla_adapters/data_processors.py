@@ -35,7 +35,7 @@ _UNSET = object()
 _PRIMITIVES = {"bool": "boolean", "int": "integer", "float": "number", "str": "string", "None": "null", "NoneType": "null"}
 
 
-def normalize_processor(value):
+def normalize_processor(value, *, norm_stats=False):
     if not isinstance(value, dict) or set(value) != {"name", "parameters"}:
         raise ValueError("DATA_PROCESSOR_INVALID: 数据处理器需要名称和参数对象")
     if not isinstance(value["name"], str) or _NAME.fullmatch(value["name"]) is None:
@@ -46,7 +46,7 @@ def normalize_processor(value):
     if value["name"] == COMPOSABLE_PROCESSOR:
         if set(parameters) != {"composition"}:
             raise ValueError("COMPOSITION_INVALID: 组合处理器仅接受完整 composition，训练阶段由任务管理")
-        return {"name": COMPOSABLE_PROCESSOR, "parameters": {"composition": normalize_composition(parameters["composition"])}}
+        return {"name": COMPOSABLE_PROCESSOR, "parameters": {"composition": normalize_composition(parameters["composition"], norm_stats=norm_stats)}}
     try:
         clean = validate_overrides({"data." + key: item for key, item in parameters.items()
                                     if isinstance(key, str)})
@@ -328,8 +328,8 @@ def _coerce(value, schema, path):
 
 
 def instantiate_data_processor(processor, config_module, code_dir, *, dataset_path=None, norm_dir=None,
-                               training_stage=None, stage_config=None):
-    processor = normalize_processor(processor)
+                               training_stage=None, stage_config=None, norm_stats=False):
+    processor = normalize_processor(processor, norm_stats=norm_stats)
     cls = _class(config_module, processor["name"], code_dir)
     descriptor = _descriptor(cls, config_module, processor["name"], code_dir)
     if not descriptor["available"]:
@@ -376,8 +376,8 @@ def processor_identity(factory, code_dir, name=None):
     return {"name": name or type(factory).__name__, "module": type(factory).__module__, "source": _source(type(factory), code_dir)}
 
 
-def validate_processor_instance(factory, processor):
-    processor = normalize_processor(processor)
+def validate_processor_instance(factory, processor, *, norm_stats=False):
+    processor = normalize_processor(processor, norm_stats=norm_stats)
     if type(factory).__name__ != processor["name"]:
         raise ValueError("DATA_PROCESSOR_BINDING_MISMATCH: 实际数据处理类与本次选择不一致")
     for path, expected in processor["parameters"].items():

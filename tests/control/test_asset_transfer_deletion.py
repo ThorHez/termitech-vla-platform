@@ -129,7 +129,7 @@ def test_deleted_sync_request_key_cannot_recreate_or_restart_a_transfer(fixture,
     assert platform.client.get(BASE, headers=ADMIN).json() == []
 
 
-@pytest.mark.parametrize("role,expected", [("admin", 204), ("operator", 204), ("viewer", 403)])
+@pytest.mark.parametrize("role,expected", [("admin", 204), ("operator", 403), ("viewer", 403)])
 def test_sync_deletion_requires_asset_write_permission_csrf_and_same_origin(fixture, role, expected):
     platform, *_ = fixture
     task = create(fixture).json()

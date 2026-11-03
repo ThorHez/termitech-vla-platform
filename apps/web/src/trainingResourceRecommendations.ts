@@ -43,6 +43,33 @@ export function recommendTrainingResources(
   };
 }
 
+export function recommendNormResources(
+  metrics?: Record<string, unknown>,
+): TrainingResourceRecommendations {
+  const cpuCount = positiveInteger(metrics?.cpu_count) ? metrics.cpu_count : undefined;
+  const availableCpuCount = positiveInteger(metrics?.available_cpu_count)
+    ? metrics.available_cpu_count
+    : undefined;
+  return {
+    cpuCount,
+    availableCpuCount,
+    num_workers:
+      availableCpuCount === undefined
+        ? 0
+        : Math.max(0, Math.min(8, Math.floor(availableCpuCount / 2), availableCpuCount - 1)),
+  };
+}
+
+export function normResourceRecommendationHint(
+  recommendations: TrainingResourceRecommendations,
+): string {
+  const cpu =
+    recommendations.availableCpuCount === undefined
+      ? `Agent 可见 CPU 数未知${recommendations.cpuCount === undefined ? '' : `（主机总计 ${recommendations.cpuCount} 个）`}，保守推荐 0 个加载进程。`
+      : `Agent 可见 CPU ${recommendations.availableCpuCount} 个，按数量的一半、最多 8 个加载进程估算，加载进程数不超过 CPU 数减 1，给主进程留余量。`;
+  return `${cpu}这是起始建议，可按读取速度和内存占用手动调整；0 表示主进程加载，小数据集可使用 0。`;
+}
+
 export function resourceRecommendationMarker(key: TrainingResourceField): string {
   return RESOURCE_RECOMMENDATION_AUTO_PREFIX + key;
 }
@@ -70,6 +97,14 @@ export function resourceRecommendationTracking(edited: Iterable<string>): Set<st
     TRAINING_RESOURCE_FIELDS.flatMap((key) => [key, resourceRecommendationMarker(key)]),
   );
   return new Set(Array.from(edited).filter((key) => allowed.has(key)));
+}
+
+/** An explicit field edit opts out; old template defaults adopt the recommendation. */
+export function normResourceRecommendationTracking(edited: Iterable<string> = []): Set<string> {
+  const tracked = new Set(edited);
+  if (!tracked.has('num_workers') || automaticResourceRecommendation(tracked, 'num_workers'))
+    setResourceRecommendationMode(tracked, 'num_workers', true);
+  return tracked;
 }
 
 export function retainedTrainingResources(

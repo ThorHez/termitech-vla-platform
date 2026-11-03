@@ -11,6 +11,7 @@ export interface SshPathConnection {
   port?: number;
   username?: string;
   fingerprint?: string;
+  service_name?: string;
 }
 
 interface SshPathSuggestions {

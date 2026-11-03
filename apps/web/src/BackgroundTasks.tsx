@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { date } from './api';
 import { useAuth } from './auth';
+import { ResourceOwner } from './resourcePermissions';
 import { Badge, Empty, ErrorNotice, Loading, PageHeading, ProgressBar } from './components';
 import { useData } from './data';
 import { assetTransferLabels } from './assetTransfer';
@@ -78,6 +79,7 @@ export function BackgroundTaskTable({
                     <div>
                       <strong>{item.name}</strong>
                       <span className="subtext mono">{item.id.slice(0, 12)}</span>
+                      <ResourceOwner ownerUserId={item.owner_user_id} />
                       {task.kind === 'training' && (
                         <span className="subtext">
                           {templates.find((template) => template.id === task.item.template_id)

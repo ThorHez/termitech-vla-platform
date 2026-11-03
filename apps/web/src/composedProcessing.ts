@@ -1,8 +1,9 @@
 import { inferImageLayout, type ImageFeature } from './imageLayout';
+import { fillMissingCompositionRepresentations } from './compositionRepresentationDefaults';
 
 export type Arm = 'left' | 'right';
 export type StateKind = 'position' | 'rotation' | 'joint' | 'gripper' | 'other';
-export type ActionKind = Exclude<StateKind, 'other'>;
+export type ActionKind = Exclude<StateKind, 'other'> | 'shared';
 export type VisualSlot = 'base_0_rgb' | 'left_wrist_0_rgb' | 'right_wrist_0_rgb';
 export interface StateField {
   key: string;
@@ -12,10 +13,18 @@ export interface StateField {
   normalize: boolean;
 }
 export interface ActionBlock {
-  arm: Arm;
+  arm: Arm | 'shared';
   kind: ActionKind;
   width: number;
   normalize: boolean;
+}
+
+export function selectActionKind(block: ActionBlock, kind: ActionKind): ActionBlock {
+  return {
+    ...block,
+    kind,
+    arm: kind === 'shared' ? 'shared' : block.arm === 'shared' ? 'left' : block.arm,
+  };
 }
 export interface ComposedCamera {
   key: string;
@@ -30,10 +39,10 @@ export interface ComposedProcessingSpec {
   schema_version: 1;
   robot_model: string;
   arm_mode: 'single' | 'bimanual';
-  state_representation: 'eef' | 'joint';
+  state_representation: 'eef' | 'joint' | 'composite';
   state_fields: StateField[];
   state_history: number;
-  action_representation: 'eef' | 'joint';
+  action_representation: 'eef' | 'joint' | 'composite';
   action_key: string;
   action_layout: ActionBlock[];
   action_mode: '' | 'absolute' | 'delta';
@@ -63,6 +72,7 @@ export interface ProcessingProfileSeed {
   action_dim?: number;
   state_dim?: number;
   field_annotations?: ProcessingFieldAnnotation[];
+  processing?: ComposedProcessingSpec;
 }
 
 export interface ProcessingFieldAnnotation {
@@ -138,7 +148,10 @@ const choice = (value: unknown, options: readonly string[]) =>
 const blankDeclaration = (value: unknown) =>
   value == null || (typeof value === 'string' && !value.trim());
 
-export function composedProcessingErrors(value: unknown): string[] {
+export function composedProcessingErrors(
+  value: unknown,
+  purpose: 'training' | 'norm' = 'training',
+): string[] {
   const errors: string[] = [];
   if (
     !object(value) ||
@@ -149,8 +162,9 @@ export function composedProcessingErrors(value: unknown): string[] {
   if (value.schema_version !== 1) errors.push('组合处理仅支持版本 1。');
   if (!text(value.robot_model, 100)) errors.push('请填写组合处理的机器人型号。');
   if (!choice(value.arm_mode, ['single', 'bimanual'])) errors.push('请选择组合处理的单臂或双臂。');
-  if (!choice(value.state_representation, ['eef', 'joint'])) errors.push('请选择状态表示。');
-  if (!choice(value.action_representation, ['eef', 'joint'])) errors.push('请选择动作表示。');
+  const representations = purpose === 'norm' ? ['eef', 'joint', 'composite'] : ['eef', 'joint'];
+  if (!choice(value.state_representation, representations)) errors.push('请选择状态表示。');
+  if (!choice(value.action_representation, representations)) errors.push('请选择动作表示。');
   if (!integer(value.state_history, 1, 64))
     errors.push('已打包状态历史长度需要是 1 到 64 的整数。');
   if (!compositionSchemaKey(value.action_key))
@@ -240,9 +254,12 @@ export function composedProcessingErrors(value: unknown): string[] {
         errors.push(`动作分块 ${index + 1} 的属性不完整。`);
         return;
       }
-      if (!choice(block.arm, arms)) errors.push(`动作分块 ${index + 1} 的机械臂归属无效。`);
+      if (block.kind === 'shared' ? block.arm !== 'shared' : !choice(block.arm, arms))
+        errors.push(
+          `动作分块 ${index + 1} 的归属无效；共享动作需使用共享归属，其他类型需选择机械臂。`,
+        );
       if (
-        !choice(block.kind, ['position', 'rotation', 'joint', 'gripper']) ||
+        !choice(block.kind, ['position', 'rotation', 'joint', 'gripper', 'shared']) ||
         typeof block.normalize !== 'boolean'
       )
         errors.push(`动作分块 ${index + 1} 的类型或归一化开关无效。`);
@@ -260,7 +277,18 @@ export function composedProcessingErrors(value: unknown): string[] {
         errors.push('动作分块类型与所选 EEF/Joint 表示不一致。');
     });
     if (width > 512) errors.push('动作总宽度不能超过 512。');
-    for (const arm of arms) {
+    if (
+      value.action_representation === 'composite' &&
+      (value.action_layout.length !== 1 ||
+        !value.action_layout.every(
+          (block) => object(block) && block.arm === 'shared' && block.kind === 'shared',
+        ))
+    )
+      errors.push('组合向量动作必须以一个共享动作分块完整保留，不能隐式拆分。');
+    const regularActions = value.action_layout.some(
+      (block) => object(block) && block.kind !== 'shared',
+    );
+    for (const arm of regularActions ? arms : []) {
       if (value.action_representation === 'eef') {
         const rotationWidth = { axis_angle: 3, quaternion: 4, rotation_6d: 6 }[
           String(value.rotation_representation) as 'axis_angle'
@@ -279,18 +307,20 @@ export function composedProcessingErrors(value: unknown): string[] {
         errors.push(`${arm === 'left' ? '左' : '右'}臂必须有 Joint 关节动作分块。`);
     }
     if (
+      regularActions &&
       value.action_representation === 'joint' &&
       !blankDeclaration(value.rotation_representation) &&
       value.rotation_representation !== 'none'
     )
       errors.push('Joint 动作的旋转编码必须选择“无独立旋转”。');
   }
-  if (!Array.isArray(value.cameras) || value.cameras.length < 1 || value.cameras.length > 3)
+  const cameras = purpose === 'norm' ? [] : value.cameras;
+  if (!Array.isArray(cameras) || (purpose !== 'norm' && cameras.length < 1) || cameras.length > 3)
     errors.push('标准模型只支持 1 到 3 个视觉输入，请使用支持的三个视觉槽位。');
   else {
     const keys = new Set<string>(),
       slots = new Set<string>();
-    value.cameras.forEach((camera, index) => {
+    cameras.forEach((camera, index) => {
       if (!object(camera) || !exact(camera, CAMERA_KEYS)) {
         errors.push(`组合视觉输入 ${index + 1} 的属性不完整。`);
         return;
@@ -316,8 +346,8 @@ export function composedProcessingErrors(value: unknown): string[] {
         errors.push('深度显示范围需要有限且最小值小于最大值。');
     });
   }
-  if (Array.isArray(value.state_fields) && Array.isArray(value.cameras)) {
-    const keys = [...value.state_fields, ...value.cameras].flatMap((field) =>
+  if (Array.isArray(value.state_fields) && Array.isArray(cameras)) {
+    const keys = [...value.state_fields, ...cameras].flatMap((field) =>
       object(field) && typeof field.key === 'string' ? [field.key.trim()] : [],
     );
     const unique = new Set(keys);
@@ -341,7 +371,10 @@ export function composedProcessingErrors(value: unknown): string[] {
   return [...new Set(errors)];
 }
 
-export function normalizeComposedProcessing(spec: ComposedProcessingSpec): ComposedProcessingSpec {
+export function normalizeComposedProcessing(
+  spec: ComposedProcessingSpec,
+  purpose: 'training' | 'norm' = 'training',
+): ComposedProcessingSpec {
   return {
     ...spec,
     robot_model: spec.robot_model.trim(),
@@ -356,7 +389,10 @@ export function normalizeComposedProcessing(spec: ComposedProcessingSpec): Compo
     coordinate_frame: spec.coordinate_frame == null ? '' : spec.coordinate_frame.trim(),
     state_fields: spec.state_fields.map((field) => ({ ...field, key: field.key.trim() })),
     action_layout: spec.action_layout.map((block) => ({ ...block })),
-    cameras: spec.cameras.map((camera) => ({ ...camera, key: camera.key.trim() })),
+    cameras:
+      purpose === 'norm'
+        ? []
+        : spec.cameras.map((camera) => ({ ...camera, key: camera.key.trim() })),
     gripper_range: spec.gripper_range == null ? null : [...spec.gripper_range],
     aux_keys: [...spec.aux_keys],
   };
@@ -411,9 +447,7 @@ export function draftComposedProcessing(profile: ProcessingProfileSeed): Compose
     schema_version: 1,
     robot_model: profile.robot_type,
     arm_mode: profile.arm_mode,
-    state_representation: (profile.action_representation === 'unknown'
-      ? ''
-      : profile.action_representation) as ComposedProcessingSpec['state_representation'],
+    state_representation: '' as ComposedProcessingSpec['state_representation'],
     state_fields: [{ key: '', width: 0, arm: 'shared', kind: 'other', normalize: true }],
     state_history: 1,
     action_representation: (profile.action_representation === 'unknown'
@@ -457,10 +491,16 @@ export function draftComposedProcessing(profile: ProcessingProfileSeed): Compose
 export function composedProcessingSummary(
   spec: ComposedProcessingSpec,
   normalizationLabel?: string,
+  purpose: 'training' | 'norm' = 'training',
 ): string {
   const state = spec.state_fields.reduce((sum, field) => sum + field.width, 0),
     action = spec.action_layout.reduce((sum, block) => sum + block.width, 0);
-  return `${spec.robot_model} · ${spec.arm_mode === 'single' ? '单臂' : '双臂'} · 状态 ${spec.state_representation.toUpperCase()} ${state} 维 × ${spec.state_history} · 动作 ${spec.action_representation.toUpperCase()} ${action} 维 · ${spec.cameras.length} 路视觉 · ${normalizationLabel ?? (spec.normalization === 'quantile' ? '分位数' : 'Z-score')}归一化`;
+  const representation = (value: ComposedProcessingSpec['state_representation']) =>
+    value === 'composite' ? '组合向量（多分量）' : value.toUpperCase();
+  const numeric = `${spec.robot_model} · ${spec.arm_mode === 'single' ? '单臂' : '双臂'} · 状态 ${representation(spec.state_representation)} ${state} 维 × ${spec.state_history} · 动作 ${representation(spec.action_representation)} ${action} 维`;
+  return purpose === 'norm'
+    ? numeric
+    : `${numeric} · ${spec.cameras.length} 路视觉 · ${normalizationLabel ?? (spec.normalization === 'quantile' ? '分位数' : 'Z-score')}归一化`;
 }
 
 export interface SourceActionLayout {
@@ -565,25 +605,20 @@ export function inferSourceActionLayout(
 
 // Field labels describe the source. They only seed this training's editable
 // draft; widths come from actual shapes, never the robot name or total width.
-export function trainingCompositionDraft(profile: ProcessingProfileSeed): ComposedProcessingSpec {
+export function trainingCompositionDraft(
+  profile: ProcessingProfileSeed,
+  purpose: 'training' | 'norm' = 'training',
+): ComposedProcessingSpec {
   const draft = draftComposedProcessing(profile);
+  if (purpose === 'norm') draft.cameras = [];
+  draft.state_representation = '' as ComposedProcessingSpec['state_representation'];
+  draft.action_representation = '' as ComposedProcessingSpec['action_representation'];
   const annotations = profile.field_annotations || [];
   const states = annotations.filter((field) => field.role === 'state');
   const actions = annotations.filter((field) => field.role === 'action');
   const width = (field: ProcessingFieldAnnotation) => {
     const value = field.shape?.at(-1);
     return Number.isInteger(value) && value! > 0 && value! <= 128 ? value! : 0;
-  };
-  const representation = (fields: ProcessingFieldAnnotation[]) => {
-    const values = [
-      ...new Set(
-        fields
-          .filter((field) => field.component !== 'gripper')
-          .map((field) => field.representation)
-          .filter((value): value is 'eef' | 'joint' => value === 'eef' || value === 'joint'),
-      ),
-    ];
-    return values.length === 1 ? values[0] : undefined;
   };
   if (states.length) {
     draft.state_fields = states.map((field) => ({
@@ -593,31 +628,38 @@ export function trainingCompositionDraft(profile: ProcessingProfileSeed): Compos
       kind: field.component,
       normalize: field.component !== 'gripper' && field.component !== 'rotation',
     }));
-    const stateRepresentation = representation(states);
-    if (stateRepresentation) draft.state_representation = stateRepresentation;
     const histories = states.map((field) =>
       field.shape?.length === 1 ? 1 : field.shape?.length === 2 ? field.shape[0] : undefined,
     );
     if (histories.every((value) => value !== undefined && value === histories[0]))
       draft.state_history = histories[0]!;
   }
-  if (actions.length !== 1) return draft;
+  if (actions.length !== 1) return fillMissingCompositionRepresentations(draft, profile, purpose);
   const action = actions[0];
   draft.action_key = action.key;
-  if (action.representation === 'eef' || action.representation === 'joint')
-    draft.action_representation = action.representation;
   draft.action_mode = (
     action.value_mode === 'unknown' ? '' : action.value_mode
   ) as ComposedProcessingSpec['action_mode'];
   const inferred = inferSourceActionLayout(profile, action.key);
   if (inferred.blocks) draft.action_layout = inferred.blocks;
+  if (
+    purpose === 'norm' &&
+    action.representation === 'composite' &&
+    Number.isSafeInteger(inferred.width) &&
+    inferred.width! > 0 &&
+    inferred.width! <= 128
+  )
+    draft.action_layout = [
+      { arm: 'shared', kind: 'shared', width: inferred.width!, normalize: true },
+    ];
   if (action.representation === 'joint') draft.rotation_representation = 'none';
-  return draft;
+  return fillMissingCompositionRepresentations(draft, profile, purpose);
 }
 
 export function trainingCompositionProfileErrors(
   profile: ProcessingProfileSeed,
   spec: ComposedProcessingSpec,
+  purpose: 'training' | 'norm' = 'training',
 ): string[] {
   const errors: string[] = [];
   const facts = profile.field_annotations || [];
@@ -674,7 +716,7 @@ export function trainingCompositionProfileErrors(
     action.shape.at(-1) !== spec.action_layout.reduce((sum, block) => sum + block.width, 0)
   )
     errors.push('动作分块总宽度与原始动作形状不一致。');
-  for (const camera of spec.cameras) {
+  for (const camera of purpose === 'norm' ? [] : spec.cameras) {
     if (!profile.cameras.some((source) => source.key === camera.key && source.kind === camera.kind))
       errors.push(`视觉字段 ${camera.key} 不在登记的相机字段中，或图像类型不一致。`);
   }

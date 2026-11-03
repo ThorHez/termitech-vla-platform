@@ -64,6 +64,13 @@ try {
     assert.equal((html.match(/class="warning"/g) || []).length, 1);
     assert.equal((html.match(/class="bad"/g) || []).length, 1);
   });
+
+  await test('statistics entrypoints have an accessible Chinese label', () => {
+    const html = render([{ name: 'norm_entrypoint', ok: true, message: '统计脚本可用' }]);
+    assert.match(html, /aria-label="通过：统计脚本入口"/);
+    assert.match(html, /<strong>统计脚本入口<\/strong>/);
+    assert.doesNotMatch(html, /norm_entrypoint/);
+  });
 } finally {
   await server.close();
 }

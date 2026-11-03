@@ -476,4 +476,101 @@ try {
     assert.equal(stateFor({ stage: 'offline_rl' }).valid, false);
     assert.equal(stateFor({ stage: 'sft' }).valid, true);
   });
+  await test('shared action selection preserves explicit width and normalization while fixing its ownership', async () => {
+    const { ComposedProcessingEditor } = await server.ssrLoadModule('/src/ComposedProcessingEditor.tsx');
+    const selected=helpers.selectActionKind({arm:'right',kind:'joint',width:14,normalize:false},'shared');
+    assert.deepEqual(selected,{arm:'shared',kind:'shared',width:14,normalize:false});
+    assert.deepEqual(helpers.selectActionKind(selected,'joint'),{arm:'left',kind:'joint',width:14,normalize:false});
+    assert.equal(helpers.selectActionKind({...selected,width:0},'shared').width,0,'the editor must not guess a width');
+    const processing=clone(fixtures.valid.find(value=>value.action_layout.length===1 && value.action_layout[0].kind==='shared'));
+    processing.action_layout=[selected];
+    const rendered=renderToStaticMarkup(React.createElement(ComposedProcessingEditor,{value:processing,profile:profileFor(processing),onChange(){}}));
+    const typeField=rendered.slice(rendered.indexOf('动作类型 1'),rendered.indexOf('</label>',rendered.indexOf('动作类型 1')));
+    assert.match(typeField,/value="shared" selected="">共享动作/);
+    const ownership=rendered.slice(rendered.indexOf('动作归属 1'),rendered.indexOf('</label>',rendered.indexOf('动作归属 1')));
+    assert.match(ownership,/<select[^>]*disabled/);assert.match(ownership,/value="shared" selected="">共享动作归属/);
+    assert.match(rendered,/按原顺序保留此段动作/);assert.match(rendered,/显式填写该段宽度/);
+  });
+  await test('shared whole-vector actions retain source-width validation and remain valid in training bindings', () => {
+    const processing=clone(fixtures.valid.find(value=>value.action_layout.length===1 && value.action_layout[0].kind==='shared'));
+    const profile=profileFor(processing);
+    profile.field_annotations=[{key:'observation.state',role:'state',representation:'composite',component:'other',arm:'shared',value_mode:'absolute',shape:[14]},
+      {key:'actions',role:'action',representation:processing.action_representation,component:'other',arm:'shared',value_mode:'absolute',shape:[50,14]}];
+    assert.deepEqual(helpers.trainingCompositionProfileErrors(profile,processing),[]);
+    const dataset={...asset(processing),metadata:{dataset_profile:profile}};
+    assert.equal(stateFor({binding:configuredBinding(processing),dataset}).valid,true);
+    const wrong=clone(processing);wrong.action_layout[0].width=13;
+    assert.match(helpers.trainingCompositionProfileErrors(profile,wrong).join(),/动作分块总宽度/);
+    assert.equal(readDatasetProfile(applyComposedProcessing(profile,processing)).processing.action_layout[0].kind,'shared');
+    const history=renderToStaticMarkup(React.createElement(DatasetProcessing,{binding:configuredBinding(processing),dataset,entries:[capability],slots:[],index:0,stage:'sft',managedParameters:{},readOnly:true,onChange(){}}));
+    assert.match(history,/共享动作 \[14\]/);
+  });
+  await test('shared actions survive normalization, norm requests, drafts and reusable templates without conversion', async () => {
+    const { encodeTrainingDraft,decodeTrainingDraft }=await server.ssrLoadModule('/src/trainingDraft.ts');
+    const { prepareTrainingTemplate }=await server.ssrLoadModule('/src/trainingTemplate.ts');
+    const { buildNormPreviewRequest }=await server.ssrLoadModule('/src/normStats.ts');
+    const processing=clone(fixtures.valid.find(value=>value.action_layout.length===1 && value.action_layout[0].kind==='shared'));
+    processing.action_layout[0].normalize=false;
+    const request={name:'Shared vector statistics',node_id:'node',profile_id:'profile',template_id:'openpi-norm',inputs:{},
+      auto_config:{model_type:'pi05',finetune_mode:'full',action_horizon:50,action_dim:32},
+      norm_datasets:[{dataset_asset_id:'dataset',processor:composedChoice(processing)}],parameters:{batch_size:32,num_workers:0},gpu_count:0};
+    const snapshot={request,step:0,advancedRecipe:false,editedParameters:[],editedStageParameters:[],entrypointEdited:false};
+    const expected=[{arm:'shared',kind:'shared',width:14,normalize:false}];
+    assert.deepEqual(normalize(processing).action_layout,expected);
+    assert.deepEqual(buildNormPreviewRequest(request).norm_datasets[0].processor.parameters.composition.action_layout,expected);
+    const restored=decodeTrainingDraft(encodeTrainingDraft(snapshot));
+    assert.deepEqual(restored.request.norm_datasets[0].processor.parameters.composition.action_layout,expected);
+    const reusable=decodeTrainingDraft(prepareTrainingTemplate(snapshot));
+    assert.deepEqual(reusable.request.norm_datasets[0].processor.parameters.composition.action_layout,expected);
+    assert.equal(reusable.request.norm_datasets[0].dataset_asset_id,'');
+  });
+  await test('statistics context hides normalization-use controls while training keeps them and serialized masks stay intact', async () => {
+    const { ComposedProcessingEditor }=await server.ssrLoadModule('/src/ComposedProcessingEditor.tsx');
+    const { NormDatasetEditor }=await server.ssrLoadModule('/src/NormDatasetEditor.tsx');
+    const { buildNormPreviewRequest }=await server.ssrLoadModule('/src/normStats.ts');
+    const processing=clone(spec);processing.state_fields[0].normalize=false;
+    processing.action_layout[0].normalize=false;processing.normalization='zscore';
+    const before=clone(processing);
+    const editor=(purpose)=>renderToStaticMarkup(React.createElement(ComposedProcessingEditor,{value:processing,profile:profileFor(processing),purpose,onChange(){}}));
+    const controls=/归一化状态字段|归一化动作分块|组合归一化方式/;
+    assert.doesNotMatch(editor('norm'),controls);
+    for(const label of ['归一化状态字段','归一化动作分块','组合归一化方式']) assert.match(editor('training'),new RegExp(label));
+    const dataset=asset(processing);
+    const common={binding:configuredBinding(processing),dataset,entries:[capability],slots:[],index:0,stage:'sft',managedParameters:{},onChange(){}};
+    assert.doesNotMatch(renderToStaticMarkup(React.createElement(DatasetProcessing,{...common,purpose:'norm'})),controls);
+    assert.match(renderToStaticMarkup(React.createElement(DatasetProcessing,common)),/归一化状态字段/);
+    const row={dataset_asset_id:dataset.id,processor:composedChoice(processing)};
+    assert.doesNotMatch(renderToStaticMarkup(React.createElement(NormDatasetEditor,{rows:[row],assets:[dataset],automatic:true,onChange(){}})),controls);
+    const request=buildNormPreviewRequest({name:'Statistics',node_id:'node',profile_id:'profile',template_id:'openpi-norm',inputs:{},norm_datasets:[row],auto_config:{model_type:'pi05',finetune_mode:'full',action_horizon:50,action_dim:32},parameters:{batch_size:32,num_workers:0},gpu_count:0});
+    assert.deepEqual(request.norm_datasets[0].processor.parameters.composition,{...processing,cameras:[]});
+    assert.deepEqual(processing,before);
+  });
+  await test('statistics composition accepts no visuals only in norm context and ignores stale camera layouts', async () => {
+    const { NormDatasetEditor }=await server.ssrLoadModule('/src/NormDatasetEditor.tsx');
+    const { newNormDataset,buildNormPreviewRequest }=await server.ssrLoadModule('/src/normStats.ts');
+    const processing={...clone(spec),cameras:[]};
+    assert.deepEqual(errors(processing,'norm'),[]);
+    assert.match(errors(processing).join(),/1 到 3 个视觉输入/);
+    const statsBinding={...binding,recipe_index:undefined,processor:composedChoice(processing,'norm')};
+    assert.deepEqual(processorParameterErrors(statsBinding.processor,capability,{},'norm'),[]);
+    assert.match(processorParameterErrors(statsBinding.processor,capability).join(),/视觉输入/);
+    assert.equal(stateFor({binding:statsBinding,purpose:'norm'}).valid,true);
+    assert.equal(stateFor({binding:statsBinding}).valid,false);
+    const oldVisual=clone(spec);oldVisual.cameras[0].layout='';oldVisual.cameras[0].key='missing.image';
+    assert.deepEqual(errors(oldVisual,'norm'),[]);assert.ok(errors(oldVisual).length);
+    const ignored=stateFor({binding:{...binding,processor:{name:'ComposableDataConfig',parameters:{composition:oldVisual}}},purpose:'norm'});
+    assert.equal(ignored.valid,true);assert.deepEqual(ignored.spec.cameras,[]);
+    assert.deepEqual(helpers.trainingCompositionProfileErrors(profileFor(spec),oldVisual,'norm'),[]);
+    assert.ok(helpers.trainingCompositionProfileErrors(profileFor(spec),oldVisual).length);
+    const row={dataset_asset_id:'dataset',processor:composedChoice(spec)};
+    const controls=/模型视觉槽位|原始图像|读取图像字段|重新识别图像布局|路视觉|归一化状态字段|归一化动作分块|组合归一化方式/;
+    const normHtml=renderToStaticMarkup(React.createElement(NormDatasetEditor,{rows:[row],assets:[asset()],automatic:true,onChange(){}}));
+    assert.doesNotMatch(normHtml,controls);
+    const standard=renderToStaticMarkup(React.createElement(DatasetProcessing,{binding:configuredBinding(),dataset:asset(),entries:[capability],slots:[],index:0,stage:'sft',managedParameters:{},onChange(){}}));
+    assert.match(standard,/模型视觉槽位/);assert.match(standard,/重新识别图像布局/);
+    assert.deepEqual(newNormDataset(true,asset()).processor.parameters.composition.cameras,[]);
+    const request=buildNormPreviewRequest({name:'Statistics',node_id:'node',profile_id:'profile',template_id:'openpi-norm',inputs:{},norm_datasets:[row],recipe:'legacy',parameters:{batch_size:32},gpu_count:0});
+    assert.deepEqual(request.norm_datasets[0].processor.parameters.composition.cameras,[]);
+    assert.deepEqual(row.processor.parameters.composition.cameras,spec.cameras,'legacy draft visuals must not be mutated by request construction');
+  });
 } finally { await server.close(); }

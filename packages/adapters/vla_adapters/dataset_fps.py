@@ -74,7 +74,8 @@ def _read_info(path, spec):
 def _roles(spec):
     if not isinstance(spec, dict) or not isinstance(spec.get("inputs"), dict):
         _fail("DATASET_FPS_INVALID", "FPS 策略缺少实际输入资产")
-    inputs, bindings = spec["inputs"], spec.get("dataset_bindings")
+    inputs = spec["inputs"]
+    bindings = spec.get("norm_datasets") if spec.get("norm_datasets") is not None else spec.get("dataset_bindings")
     if bindings is None:
         return ["dataset"] if "dataset" in inputs else []
     if not isinstance(bindings, list) or not 1 <= len(bindings) <= 64:

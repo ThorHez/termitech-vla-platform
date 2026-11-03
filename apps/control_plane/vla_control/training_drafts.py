@@ -12,6 +12,8 @@ from starlette.concurrency import run_in_threadpool
 
 from .common import APIError, now
 from .models import TrainingDraft
+from .account_lifecycle import lock_execution_guard, training_execution_authorized
+from .resource_authorization import require_active_actor
 
 
 MAX_CONTENT_BYTES = 512 * 1024
@@ -95,10 +97,16 @@ def _conflict():
     return APIError(409, "TRAINING_DRAFT_CONFLICT", "训练草稿已在其他窗口更新，请重新读取后再保存")
 
 
-def mutate_draft(db, user_id, expected_revision, content):
+def mutate_draft(db, user_id, expected_revision, content, request=None):
     stamp = now()
     try:
         with db.write() as session:
+            if request is not None:
+                require_active_actor(session, request)
+            else:
+                lock_execution_guard(session)
+                if not training_execution_authorized(session, user_id):
+                    raise APIError(401, "UNAUTHORIZED", "登录账户已不可用")
             existing = session.get(TrainingDraft, user_id)
             if existing is None:
                 if expected_revision != 0:
@@ -144,10 +152,10 @@ def register_routes(app, dependencies, db, auth):
     async def save(request: Request):
         user_id = owner(request)
         revision, content = await _body(request, save=True)
-        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, content))
+        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, content, request))
 
     @app.delete("/api/v1/training-draft", dependencies=dependencies)
     async def clear(request: Request):
         user_id = owner(request)
         revision, _ = await _body(request, save=False)
-        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, None))
+        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, None, request))

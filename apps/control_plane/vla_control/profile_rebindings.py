@@ -9,8 +9,9 @@ from datetime import datetime
 import json
 from pathlib import PurePosixPath
 
+from fastapi import Request
 from fastapi.responses import JSONResponse
-from pydantic import Field
+from pydantic import Field, field_validator
 from sqlalchemy import select
 
 from .common import APIError, TERMINAL, now, offset_time, require_path, uid
@@ -18,11 +19,13 @@ from .models import Attempt, Command, Node, Preview, Profile, Run
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .schemas import InputModel
 from .serialization import profile_dict
+from .resource_authorization import bind_command_actor, require_active_actor
 
 
 TTL_SECONDS = 120
 PATH_FIELDS = ("expected_code_dir", "expected_python", "code_dir", "python")
 ERRORS = {
+    "AGENT_PROFILE_ADD_UNSUPPORTED": "当前 Agent 不支持新增训练环境，请先更新 Agent",
     "AGENT_PROFILE_REBIND_UNSUPPORTED": "当前 Agent 不支持切换训练环境，请先更新 Agent",
     "PROFILE_REBIND_INVALID": "训练环境路径或操作参数无效",
     "PROFILE_REBIND_EXPIRED": "切换命令已过期，Agent 未执行修改，请重试",
@@ -41,6 +44,21 @@ class RebindInput(InputModel):
     expected_python: str = Field(min_length=1, max_length=4096)
     code_dir: str = Field(min_length=1, max_length=4096)
     python: str = Field(min_length=1, max_length=4096)
+
+
+class AddProfileInput(InputModel):
+    profile_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+    name: str = Field(min_length=1, max_length=200)
+    code_dir: str = Field(min_length=1, max_length=4096)
+    python: str = Field(min_length=1, max_length=4096)
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value):
+        value = value.strip()
+        if not value or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+            raise ValueError("环境名称不能为空或包含控制字符")
+        return value
 
 
 def _error(code):
@@ -82,7 +100,7 @@ def require_not_pending(session, node_id, profile_id=None, code_dir=None):
     wanted = str(PurePosixPath(code_dir)) if code_dir is not None else None
     for command in pending(session, node_id):
         if (profile_id is None and wanted is None or command.payload["profile_id"] == profile_id
-                or wanted in {command.payload["expected_code_dir"], command.payload["code_dir"]}):
+                or wanted is not None and wanted in {command.payload.get("expected_code_dir"), command.payload["code_dir"]}):
             raise APIError(409, "PROFILE_REBIND_PENDING", "训练环境正在切换或等待持久化确认，请等待完成后再操作")
 
 
@@ -138,6 +156,9 @@ def query_dict(command):
     result = {"id": command.id, "node_id": command.node_id, "profile_id": command.payload["profile_id"],
         "requested": {key: command.payload[key] for key in ("code_dir", "python")},
         "status": "PENDING", "error": None, "profile": None, "runtime_check": None}
+    result["action"] = command.payload.get("action", "rebind")
+    if result["action"] == "add":
+        result["requested"]["name"] = command.payload["name"]
     receipt = command.result if isinstance(command.result, dict) else {}
     if command.status == "APPLIED":
         result.update(status="READY", profile=deepcopy(receipt["profile"]), runtime_check=deepcopy(receipt["runtime_check"]))
@@ -148,7 +169,7 @@ def query_dict(command):
     return result
 
 
-def create_query(session, node, body):
+def create_query(session, node, body, request=None):
     data = body.model_dump()
     for key in PATH_FIELDS:
         data[key] = _path(data[key], node.roots if key == "code_dir" else None)
@@ -174,6 +195,41 @@ def create_query(session, node, body):
     _require_idle(session, node.id, profile.id, {data["expected_code_dir"], data["code_dir"]})
     command = Command(id=uid(), node_id=node.id, type="PROFILE_REBIND", status="PENDING", created_at=now(),
                       payload={**data, "expires_at": offset_time(TTL_SECONDS)})
+    if request is not None:
+        bind_command_actor(command, request, "machines.manage")
+    session.add(command)
+    session.flush()
+    return query_dict(command)
+
+
+def create_add_query(session, node, body, request=None):
+    data = body.model_dump()
+    for key in ("code_dir", "python"):
+        data[key] = _path(data[key], node.roots if key == "code_dir" else None)
+    data["action"] = "add"
+    profile = session.get(Profile, (node.id, data["profile_id"]))
+    commands = session.scalars(select(Command).where(Command.node_id == node.id,
+        Command.type == "PROFILE_REBIND").order_by(Command.created_at.desc(), Command.id.desc()))
+    for command in commands:
+        if (all(command.payload.get(key) == value for key, value in data.items())
+                and (command.status == "PENDING" or command.status == "APPLIED" and profile is not None
+                     and profile.active and profile.name == data["name"] and _pair(profile) == (data["code_dir"], data["python"])
+                     and not pending(session, node.id, data["profile_id"]))):
+            return query_dict(command)
+    capabilities = (node.metrics or {}).get("capabilities")
+    if not isinstance(capabilities, list) or "PROFILE_ADD" not in capabilities:
+        raise APIError(409, "AGENT_PROFILE_ADD_UNSUPPORTED", ERRORS["AGENT_PROFILE_ADD_UNSUPPORTED"])
+    require_not_pending(session, node.id, data["profile_id"])
+    if profile is not None:
+        raise APIError(409, "PROFILE_REBIND_CONFLICT", "运行环境标识已存在，请选择其他标识")
+    if len(list(session.scalars(select(Profile.id).where(Profile.node_id == node.id)))) >= 100:
+        raise APIError(422, "PROFILE_REBIND_INVALID", "同一机器最多登记 100 个训练环境")
+    require_not_pending(session, node.id, code_dir=data["code_dir"])
+    _require_idle(session, node.id, data["profile_id"], {data["code_dir"]})
+    command = Command(id=uid(), node_id=node.id, type="PROFILE_REBIND", status="PENDING", created_at=now(),
+                      payload={**data, "expires_at": offset_time(TTL_SECONDS)})
+    if request is not None:
+        bind_command_actor(command, request, "machines.manage")
     session.add(command)
     session.flush()
     return query_dict(command)
@@ -237,8 +293,9 @@ def acknowledge(session, command, node, status, result):
     error = result.get("error") if isinstance(result, dict) else None
     if isinstance(error, dict):
         code = error.get("code")
-        code = "AGENT_PROFILE_REBIND_UNSUPPORTED" if code == "COMMAND_UNSUPPORTED" else code
-        known_unmodified = error.get("persisted") is False or code == "AGENT_PROFILE_REBIND_UNSUPPORTED"
+        if code == "COMMAND_UNSUPPORTED":
+            code = "AGENT_PROFILE_ADD_UNSUPPORTED" if payload.get("action") == "add" else "AGENT_PROFILE_REBIND_UNSUPPORTED"
+        known_unmodified = error.get("persisted") is False or code in {"AGENT_PROFILE_REBIND_UNSUPPORTED", "AGENT_PROFILE_ADD_UNSUPPORTED"}
         clean = {"error": _error(code if isinstance(code, str) and code in ERRORS else "PROFILE_REBIND_FAILED"), "persisted": False} if known_unmodified else None
     else:
         runtime = _runtime(result.get("runtime_check"), payload["profile_id"], node.roots, payload["python"]) if isinstance(result, dict) else None
@@ -246,6 +303,11 @@ def acknowledge(session, command, node, status, result):
                   "runtime_check": runtime, "persisted": True}
                  if status == "APPLIED" and isinstance(result, dict) and result.get("persisted") is True and runtime is not None
                  and all(result.get(key) == payload[key] for key in ("profile_id", "code_dir", "python")) else None)
+        if clean is not None and payload.get("action") == "add":
+            if result.get("action") != "add" or result.get("name") != payload["name"]:
+                clean = None
+            else:
+                clean.update(action="add", name=payload["name"])
     if command.status != "PENDING":
         if clean != (command.result or {}).get("agent_result"):
             raise APIError(409, "ACK_CONFLICT", "This command already has a different acknowledgement")
@@ -257,11 +319,19 @@ def acknowledge(session, command, node, status, result):
         command.status, command.result, command.acknowledged_at = "REJECTED", {"agent_result": clean, "error": clean["error"]}, now()
         return
     profile = session.get(Profile, (node.id, payload["profile_id"]))
-    if (profile is None or not profile.active or _pair(profile) != (payload["expected_code_dir"], payload["expected_python"])
+    adding = payload.get("action") == "add"
+    if (adding and profile is not None
+            or not adding and (profile is None or not profile.active or _pair(profile) != (payload["expected_code_dir"], payload["expected_python"]))
             or _in_use(session, node.id, payload["profile_id"])):
         command.result = {"error": _error("PROFILE_REBIND_CONFIRMATION_PENDING")}
         return
-    profile.code_dir, profile.python = payload["code_dir"], payload["python"]
+    if adding:
+        profile = Profile(node_id=node.id, id=payload["profile_id"], name=payload["name"],
+                          code_dir=payload["code_dir"], python=payload["python"], adapter="openpi-sft",
+                          execution_mode="native", recipe=None, metadata_json={}, active=True)
+        session.add(profile)
+    else:
+        profile.code_dir, profile.python = payload["code_dir"], payload["python"]
     _set_runtime_check(node, profile.id, clean["runtime_check"])
     for preview in session.scalars(select(Preview).where(Preview.node_id == node.id, Preview.status.in_({"PENDING", "READY"}))):
         if preview.request.get("profile_id") == profile.id:
@@ -286,9 +356,14 @@ def sync_blocked_profiles(session, node_id, incoming):
             continue
         entry = incoming.get(profile_id)
         if entry is None:
+            if command.payload.get("action") == "add":
+                blocked.add(profile_id)
+                node = session.get(Node, node_id)
+                if node is not None:
+                    _set_runtime_check(node, profile_id, command.result["runtime_check"])
             continue
         pair = (str(PurePosixPath(entry["code_dir"])), str(PurePosixPath(entry["python"])))
-        old = command.payload["expected_code_dir"], command.payload["expected_python"]
+        old = command.payload.get("expected_code_dir"), command.payload.get("expected_python")
         target = command.payload["code_dir"], command.payload["python"]
         if pair == old and old != target:
             blocked.add(profile_id)
@@ -306,13 +381,23 @@ def register_routes(app, admin, db, require_available_node, settings):
     def response(value, status=200):
         return JSONResponse(status_code=status, content=value, headers={"Cache-Control": "no-store"})
 
-    @app.post("/api/v1/nodes/{node_id}/profile-rebindings", dependencies=admin, status_code=202)
-    def create(node_id: str, body: RebindInput):
+    @app.post("/api/v1/nodes/{node_id}/profiles", dependencies=admin, status_code=202)
+    def add(node_id: str, body: AddProfileInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "machines.manage")
+            node = require_available_node(session, node_id)
+            if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
+                raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法新增训练环境")
+            return response(create_add_query(session, node, body, request), 202)
+
+    @app.post("/api/v1/nodes/{node_id}/profile-rebindings", dependencies=admin, status_code=202)
+    def create(node_id: str, body: RebindInput, request: Request):
+        with db.write() as session:
+            require_active_actor(session, request, "machines.manage")
             node = require_available_node(session, node_id)
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法切换训练环境")
-            return response(create_query(session, node, body), 202)
+            return response(create_query(session, node, body, request), 202)
 
     @app.get("/api/v1/nodes/{node_id}/profile-rebindings", dependencies=admin)
     def latest(node_id: str, profile_id: str):

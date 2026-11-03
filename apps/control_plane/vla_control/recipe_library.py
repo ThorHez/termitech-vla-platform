@@ -2,6 +2,7 @@
 
 import copy
 
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import Field, field_validator
 from sqlalchemy import select
@@ -13,6 +14,7 @@ from .models import Command, Profile
 from . import recipe_details
 from .recipe_models import RecipeRevision, SavedRecipe
 from .schemas import InputModel
+from .resource_authorization import require_active_actor
 
 
 class RecipeCreateInput(InputModel):
@@ -162,10 +164,11 @@ def register_recipe_routes(app, admin, db, require_available_node, settings):
         return node
 
     @app.post("/api/v1/nodes/{node_id}/recipe-details", dependencies=admin, status_code=202)
-    def details_create(node_id: str, body: recipe_details.RecipeDetailInput):
+    def details_create(node_id: str, body: recipe_details.RecipeDetailInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "recipes.query")
             node = available(session, node_id)
-            return response(recipe_details.create_query(session, node, body.profile_id, body.recipe), 202)
+            return response(recipe_details.create_query(session, node, body.profile_id, body.recipe, actor_request=request), 202)
 
     @app.get("/api/v1/nodes/{node_id}/recipe-details/{query_id}", dependencies=admin)
     def details_get(node_id: str, query_id: str):
@@ -199,8 +202,9 @@ def register_recipe_routes(app, admin, db, require_available_node, settings):
             return response(revision_dict(session, _get(session, RecipeRevision, revision_id, "Recipe revision")))
 
     @app.post("/api/v1/recipes", dependencies=admin, status_code=201)
-    def recipe_create(body: RecipeCreateInput):
+    def recipe_create(body: RecipeCreateInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "recipes.write")
             node = available(session, body.node_id)
             detail = _save_detail(session, node, body.profile_id, body.detail_query_id)
             duplicate = select(SavedRecipe.id).where(SavedRecipe.node_id == node.id, SavedRecipe.profile_id == body.profile_id,
@@ -215,8 +219,9 @@ def register_recipe_routes(app, admin, db, require_available_node, settings):
             return response(recipe_dict(session, recipe), 201)
 
     @app.post("/api/v1/recipes/{recipe_id}/revisions", dependencies=admin, status_code=201)
-    def revision_create(recipe_id: str, body: RecipeRevisionInput):
+    def revision_create(recipe_id: str, body: RecipeRevisionInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "recipes.write")
             # Lock the node before the recipe, matching run/profile mutations.
             existing = _get(session, SavedRecipe, recipe_id, "Recipe")
             node = available(session, existing.node_id)

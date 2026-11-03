@@ -165,7 +165,7 @@ try {
 
   await test('viewers cannot access the metadata editor and pending forms disable all fields', () => {
     const html = renderEditor(['platform.read']);
-    assert.match(html, /编辑数据特征需要操作员或管理员权限/);
+    assert.match(html, /编辑公共数据特征需要管理员权限/);
     assert.doesNotMatch(html, /保存数据特征|dataset-profile-form/);
     assert.match(render(DatasetProfileForm, { value: profile, onChange() {}, disabled: true }), /<fieldset[^>]*disabled=""/);
   });

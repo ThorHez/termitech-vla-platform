@@ -150,7 +150,7 @@ export function RecipeLibrary({
         </button>
       </div>
       {mode === 'code' ? (
-        can('training.write') ? (
+        can('recipes.query') ? (
           <RecipeAutocomplete
             value={recipe}
             onChange={(value) => {

@@ -60,6 +60,7 @@ const requestKeys = new Set([
   'training_stage',
   'stage_config',
   'dataset_bindings',
+  'norm_datasets',
   'entrypoint',
   'recipe',
   'recipe_revision_id',
@@ -265,6 +266,34 @@ function validRequest(value: unknown): value is RunRequest {
           Object.keys(binding.processor).some((key) => !['name', 'parameters'].includes(key)) ||
           !text(binding.processor.name) ||
           !plainObject(binding.processor.parameters))
+      )
+        return false;
+    }
+  }
+  if (value.norm_datasets !== undefined) {
+    if (
+      value.template_id !== 'openpi-norm' ||
+      !Array.isArray(value.norm_datasets) ||
+      value.norm_datasets.length > 64
+    )
+      return false;
+    for (const row of value.norm_datasets) {
+      if (
+        !plainObject(row) ||
+        Object.keys(row).some(
+          (key) => !['dataset_asset_id', 'recipe_index', 'processor'].includes(key),
+        ) ||
+        !text(row.dataset_asset_id)
+      )
+        return false;
+      if ((row.recipe_index !== undefined) === (row.processor !== undefined)) return false;
+      if (row.recipe_index !== undefined && typeof row.recipe_index !== 'number') return false;
+      if (
+        row.processor !== undefined &&
+        (!plainObject(row.processor) ||
+          Object.keys(row.processor).some((key) => !['name', 'parameters'].includes(key)) ||
+          !text(row.processor.name) ||
+          !plainObject(row.processor.parameters))
       )
         return false;
     }

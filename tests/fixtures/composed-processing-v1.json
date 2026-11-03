@@ -1738,6 +1738,181 @@
       "normalization": "quantile",
       "model_transform": "standard",
       "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "bimanual",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.state",
+          "width": 14,
+          "arm": "shared",
+          "kind": "other",
+          "normalize": true
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "eef",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "shared",
+          "kind": "shared",
+          "width": 14,
+          "normalize": true
+        }
+      ],
+      "action_mode": "absolute",
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "bimanual",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.state",
+          "width": 14,
+          "arm": "shared",
+          "kind": "other",
+          "normalize": true
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "joint",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "shared",
+          "kind": "shared",
+          "width": 14,
+          "normalize": false
+        }
+      ],
+      "action_mode": "absolute",
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "single",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.joints",
+          "width": 6,
+          "arm": "left",
+          "kind": "joint",
+          "normalize": true
+        },
+        {
+          "key": "observation.gripper",
+          "width": 1,
+          "arm": "left",
+          "kind": "gripper",
+          "normalize": false
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "eef",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "left",
+          "kind": "position",
+          "width": 3,
+          "normalize": true
+        },
+        {
+          "arm": "left",
+          "kind": "rotation",
+          "width": 6,
+          "normalize": false
+        },
+        {
+          "arm": "left",
+          "kind": "gripper",
+          "width": 1,
+          "normalize": false
+        },
+        {
+          "arm": "shared",
+          "kind": "shared",
+          "width": 4,
+          "normalize": true
+        }
+      ],
+      "action_mode": "absolute",
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
     }
   ],
   "invalid": [
@@ -4750,6 +4925,300 @@
         }
       ],
       "action_mode": false,
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "bimanual",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.state",
+          "width": 14,
+          "arm": "shared",
+          "kind": "other",
+          "normalize": true
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "eef",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "left",
+          "kind": "shared",
+          "width": 14,
+          "normalize": true
+        }
+      ],
+      "action_mode": "absolute",
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "single",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.joints",
+          "width": 6,
+          "arm": "left",
+          "kind": "joint",
+          "normalize": true
+        },
+        {
+          "key": "observation.gripper",
+          "width": 1,
+          "arm": "left",
+          "kind": "gripper",
+          "normalize": false
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "eef",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "shared",
+          "kind": "position",
+          "width": 3,
+          "normalize": true
+        },
+        {
+          "arm": "left",
+          "kind": "rotation",
+          "width": 6,
+          "normalize": false
+        },
+        {
+          "arm": "left",
+          "kind": "gripper",
+          "width": 1,
+          "normalize": false
+        }
+      ],
+      "action_mode": "absolute",
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "bimanual",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.state",
+          "width": 14,
+          "arm": "shared",
+          "kind": "other",
+          "normalize": true
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "eef",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "shared",
+          "kind": "shared",
+          "width": 7,
+          "normalize": true
+        },
+        {
+          "arm": "shared",
+          "kind": "shared",
+          "width": 7,
+          "normalize": true
+        }
+      ],
+      "action_mode": "absolute",
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "single",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.joints",
+          "width": 6,
+          "arm": "left",
+          "kind": "joint",
+          "normalize": true
+        },
+        {
+          "key": "observation.gripper",
+          "width": 1,
+          "arm": "left",
+          "kind": "gripper",
+          "normalize": false
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "eef",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "left",
+          "kind": "position",
+          "width": 3,
+          "normalize": true
+        },
+        {
+          "arm": "shared",
+          "kind": "shared",
+          "width": 4,
+          "normalize": true
+        }
+      ],
+      "action_mode": "absolute",
+      "rotation_representation": "rotation_6d",
+      "position_unit": "m",
+      "joint_unit": "rad",
+      "coordinate_frame": "robot_base",
+      "gripper_range": [
+        0,
+        1
+      ],
+      "cameras": [
+        {
+          "key": "observation.images.wrist",
+          "slot": "left_wrist_0_rgb",
+          "kind": "rgb",
+          "layout": "chw",
+          "time_index": null,
+          "depth_min": 0,
+          "depth_max": 1
+        }
+      ],
+      "prompt_key": "task",
+      "normalization": "quantile",
+      "model_transform": "standard",
+      "aux_keys": []
+    },
+    {
+      "schema_version": 1,
+      "robot_model": "ARX5",
+      "arm_mode": "single",
+      "state_representation": "joint",
+      "state_fields": [
+        {
+          "key": "observation.state",
+          "width": 14,
+          "arm": "shared",
+          "kind": "other",
+          "normalize": true
+        }
+      ],
+      "state_history": 1,
+      "action_representation": "joint",
+      "action_key": "actions",
+      "action_layout": [
+        {
+          "arm": "shared",
+          "kind": "shared",
+          "width": 14,
+          "normalize": false
+        },
+        {
+          "arm": "left",
+          "kind": "joint",
+          "width": 6,
+          "normalize": true
+        }
+      ],
+      "action_mode": "absolute",
       "rotation_representation": "rotation_6d",
       "position_unit": "m",
       "joint_unit": "rad",

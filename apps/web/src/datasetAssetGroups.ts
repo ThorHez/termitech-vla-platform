@@ -1,6 +1,31 @@
 import type { CatalogAssetEntry } from './modelAssetGroups';
 import type { Asset } from './types';
 
+/** A catalog projection only; the complete asset set remains authoritative for APIs. */
+export function datasetCatalogAssets(assets: readonly Asset[], showArchived = false) {
+  const scope = assets.filter(
+    (asset) => showArchived || (asset.status || asset.state) !== 'ARCHIVED',
+  );
+  const norms = new Map(
+    scope.filter((asset) => asset.kind === 'NORM').map((asset) => [asset.id, asset]),
+  );
+  const boundNorms = new Map<string, Asset>();
+  const embeddedNormIds = new Set<string>();
+  for (const dataset of scope) {
+    if (dataset.kind !== 'DATASET' || !dataset.norm_asset_id) continue;
+    const norm = norms.get(dataset.norm_asset_id);
+    if (!norm || norm.node_id !== dataset.node_id) continue;
+    boundNorms.set(dataset.id, norm);
+    embeddedNormIds.add(norm.id);
+  }
+  return {
+    assets: scope.filter((asset) => asset.kind !== 'NORM' || !embeddedNormIds.has(asset.id)),
+    selectionAssets: scope,
+    boundNorms,
+    embeddedNormIds,
+  };
+}
+
 export interface DatasetAssetGroup {
   kind: 'dataset-group';
   key: string;
@@ -13,56 +38,30 @@ export interface DatasetAssetGroup {
 
 export type AssetCatalogEntry = CatalogAssetEntry | DatasetAssetGroup;
 
-/** Only group bindings whose dataset and norm both survived the current filters. */
-export function groupDatasetNormAssets(entries: CatalogAssetEntry[]): AssetCatalogEntry[] {
-  const norms = new Map<string, Asset>();
-  for (const entry of entries)
-    if (entry.kind === 'asset' && entry.asset.kind === 'NORM')
-      norms.set(entry.asset.id, entry.asset);
-
-  const groups = new Map<string, DatasetAssetGroup>();
-  const assetGroups = new Map<string, DatasetAssetGroup>();
-  for (const entry of entries) {
-    if (entry.kind !== 'asset' || entry.asset.kind !== 'DATASET') continue;
+/** Each filtered dataset owns a parent row, including when several share one norm. */
+export function groupDatasetNormAssets(
+  entries: CatalogAssetEntry[],
+  boundNorms: ReadonlyMap<string, Asset>,
+): AssetCatalogEntry[] {
+  return entries.map((entry) => {
+    if (entry.kind !== 'asset' || entry.asset.kind !== 'DATASET') return entry;
     const dataset = entry.asset;
-    const norm =
-      typeof dataset.norm_asset_id === 'string' ? norms.get(dataset.norm_asset_id) : undefined;
-    if (!norm || norm.node_id !== dataset.node_id) continue;
-    let group = groups.get(norm.id);
-    if (!group) {
-      group = {
-        kind: 'dataset-group',
-        key: `dataset-norm:${JSON.stringify([norm.node_id, norm.id])}`,
-        name: dataset.name,
-        nodeId: dataset.node_id,
-        datasets: [],
-        norm,
-        assets: [],
-      };
-      groups.set(norm.id, group);
-      assetGroups.set(norm.id, group);
-    }
-    group.datasets.push(dataset);
-    assetGroups.set(dataset.id, group);
-  }
-  for (const group of groups.values()) {
-    group.name =
-      group.datasets.length === 1
-        ? group.datasets[0].name
-        : `${group.norm.name} · ${group.datasets.length} 个数据集`;
-    group.assets = [...group.datasets, group.norm];
-  }
-
-  const emitted = new Set<string>();
-  const result: AssetCatalogEntry[] = [];
-  for (const entry of entries) {
-    const group = entry.kind === 'asset' ? assetGroups.get(entry.asset.id) : undefined;
-    if (!group) {
-      result.push(entry);
-    } else if (!emitted.has(group.key)) {
-      emitted.add(group.key);
-      result.push(group);
-    }
-  }
-  return result;
+    const norm = boundNorms.get(dataset.id);
+    if (
+      !norm ||
+      norm.kind !== 'NORM' ||
+      norm.node_id !== dataset.node_id ||
+      norm.id !== dataset.norm_asset_id
+    )
+      return entry;
+    return {
+      kind: 'dataset-group',
+      key: `dataset-norm:${JSON.stringify([dataset.node_id, dataset.id])}`,
+      name: dataset.name,
+      nodeId: dataset.node_id,
+      datasets: [dataset],
+      norm,
+      assets: [dataset, norm],
+    };
+  });
 }

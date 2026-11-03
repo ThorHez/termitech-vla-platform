@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from vla_adapters.dataset_bindings import validate_binding_assets
+from vla_adapters.norm_datasets import validate_norm_assets
 from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_adapters.runtime_options import validate_generated_normalization_method
 from vla_protocol import canonical_digest
@@ -71,6 +72,18 @@ def _validate_training_cache(plan: dict, roots: list[str]):
         local(builder.get("path"))
         if not local(builder.get("cache_dir")).is_relative_to(dataset_cache):
             raise ValueError("dataset builder cache is outside the configured datasets cache")
+
+
+def _validate_numeric_cache(plan: dict, roots: list[str]):
+    from vla_protocol.norm_plan import validate_norm_cache
+    cache = validate_norm_cache(plan.get("training_cache"), plan.get("datasets"), roots)
+    for value in [*cache["paths"].values(), *[item["path"] for item in cache["datasets"]]]:
+        try:
+            path = allowed_path(value, roots, must_exist=False)
+        except AgentError as exc:
+            raise ValueError("statistics numeric environment or source is outside managed roots") from exc
+        if str(path) != value:
+            raise ValueError("statistics numeric path is not canonical")
 
 
 def _probe_process(argv: list[str], cwd: str, environment: dict[str, str], *,
@@ -175,7 +188,9 @@ def _training_probe_limits(spec: dict) -> tuple[int, int]:
     lifetime; a caller-supplied timeout never changes the execution budget.
     """
     try:
-        bindings = validate_binding_assets(spec.get("dataset_bindings"), spec.get("inputs", {}))
+        bindings = (validate_norm_assets(spec.get("norm_datasets"), spec.get("inputs", {}))
+                    if spec.get("template_id") == "openpi-norm" else
+                    validate_binding_assets(spec.get("dataset_bindings"), spec.get("inputs", {})))
     except (ValueError, TypeError, KeyError) as exc:
         raise AgentError("PREFLIGHT_UNSUPPORTED", "训练数据集绑定无效，无法确定自动预检时限") from exc
     count = len(bindings) if bindings is not None else 1
@@ -224,6 +239,21 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
             raise AgentError(error["code"], error["message"])
         if returncode or any(not check["ok"] for check in detailed):
             raise AgentError("RECIPE_VALIDATION_FAILED", "训练配方自动预检未通过，请查看具体检查项")
+        if spec.get("template_id") == "openpi-norm":
+            from vla_protocol.norm_plan import NORM_CHECKS, validate_norm_plan
+            required = NORM_CHECKS - {"output_isolation", "output_storage", "gpu_capacity", "runtime", "local_paths", "code_version", "adapter"}
+            if not required <= {check["name"] for check in detailed if check["ok"]}:
+                raise ValueError("missing statistics validation checks")
+            plan = validate_norm_plan(response.get("plan"), spec, spec["inputs"])
+            _validate_numeric_cache(plan, config["roots"])
+            if configured_cache and any(plan["training_cache"]["paths"].get(key) != value for key, value in configured_cache.items()):
+                raise ValueError("statistics cache differs from configured cache root")
+            if not allowed_path(plan["entrypoint"], [spec["code_dir"]]).is_file():
+                raise ValueError("statistics entrypoint is outside registered code")
+            for role, value in plan["inputs"].items():
+                if str(allowed_path(spec["inputs"][role]["path"], config["roots"])) != value:
+                    raise ValueError("statistics dataset path differs from requested asset")
+            return plan
         required = {"recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache"}
         if spec.get("training_stage") is not None:
             required.add("recap_stage")
@@ -360,6 +390,13 @@ def validate_training(config: dict, launch: dict, checks: list[dict], *, assigne
     checks.append({"name": "output_isolation", "ok": True,
                    "message": f"已核对本次输出路径与代码和输入资产隔离；输出根目录：{isolation['output_root']}"})
     plan = _wrapper_validation(config, launch, checks)
+    if spec.get("template_id") == "openpi-norm":
+        if plan["gpu_count"] != 0 or assigned:
+            raise AgentError("NORM_GPU_UNSUPPORTED", "统计任务使用 CPU，不申请 GPU")
+        checks.append({"name": "gpu_capacity", "ok": True, "message": "CPU 统计任务，无需 GPU"})
+        _check_output_storage(config, plan, checks)
+        return {"schema_version": 1, "scope": VALIDATION_SCOPE, "plan": plan, "plan_digest": canonical_digest(plan),
+                "storage_configuration": {"output_root": config["output_root"], "cache_root": config.get("cache_root")}}
     for name, callback in (("gpu_capacity", lambda: _check_gpu_capacity(plan["gpu_count"], checks, assigned=assigned)),
                            ("output_storage", lambda: _check_output_storage(config, plan, checks))):
         try:

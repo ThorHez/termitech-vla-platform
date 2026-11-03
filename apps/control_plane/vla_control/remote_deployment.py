@@ -29,7 +29,9 @@ from .common import APIError, TERMINAL, digest, now, offset_time, uid
 from .models import Allocation, Attempt, Command, GPUReservation, Node, Profile, Run
 from .onboarding import _path, generate_agent_config, resolve_agent_config_defaults
 from .remote_models import RemoteConnection, RemoteDeployment
-from .remote_schemas import AgentUpgradeInput, RemoteDeploymentInput, SSHAuthenticationInput, SSHConnectionInput, SSHInstallCheckInput, SSHPathSuggestInput
+from .account_lifecycle import lock_execution_guard
+from .resource_authorization import execution_permission_authorized, request_user_id, require_active_actor
+from .remote_schemas import DEFAULT_AGENT_SERVICE_NAME, AgentUpgradeInput, RemoteDeploymentInput, SSHAuthenticationInput, SSHConnectionInput, SSHInstallCheckInput, SSHPathSuggestInput
 
 
 JOB_TERMINAL = {"SUCCEEDED", "FAILED", "INTERRUPTED", "DISCONNECTED", "UNINSTALLED"}
@@ -123,7 +125,37 @@ class DeploymentManager:
             factory = SSHRemote
         return factory(host=connection.host, port=connection.port, username=connection.username,
                        password=self.vault.decrypt(connection.encrypted_password), state_dir=self.state_dir,
-                       expected_fingerprint=connection.fingerprint or None)
+                       expected_fingerprint=connection.fingerprint or None,
+                       service_name=connection.service_name or DEFAULT_AGENT_SERVICE_NAME)
+
+    def _fresh_actor(self, session, actor_request):
+        if actor_request is not None:
+            require_active_actor(session, actor_request, "machines.manage")
+        else:
+            lock_execution_guard(session)
+
+    def _authorize_request(self, actor_request):
+        with self.db.write() as session:
+            self._fresh_actor(session, actor_request)
+
+    def _authorize_job(self, session, job):
+        if execution_permission_authorized(session, job.actor_user_id, "machines.manage",
+                                          allow_legacy=self.settings.legacy_admin_enabled):
+            return True
+        self._change(job, "INTERRUPTED", "INTERRUPTED", "管理操作发起账户或权限已失效，尚未执行；请由管理员重新提交")
+        job.error = {"code": "REMOTE_AUTHORIZATION_REVOKED", "message": "管理操作发起账户或权限已失效，请由管理员重新提交"}
+        job.tunnel_state = "SUPERSEDED"
+        return False
+
+    def _close_revoked_tunnel(self, job_id):
+        with self.db.read() as session:
+            job = session.get(RemoteDeployment, job_id)
+            revoked = job is not None and (job.error or {}).get("code") == "REMOTE_AUTHORIZATION_REVOKED"
+        if revoked:
+            with self._lock:
+                tunnel = self._tunnels.pop(job_id, None)
+            if tunnel is not None:
+                tunnel.close()
 
     def _new_tunnel(self, connection: RemoteConnection, remote_port: int):
         factory = self._tunnel_factory
@@ -251,23 +283,46 @@ class DeploymentManager:
             result["existing_agent"] = clean
         return result
 
-    def test_connection(self, body: SSHConnectionInput):
+    def test_connection(self, body: SSHConnectionInput, *, actor_request=None):
         install_dir = self._install_path(body.install_dir)
         connection = RemoteConnection(id=uid(), host=body.host, port=body.port, username=body.username,
             encrypted_password=self.vault.encrypt(body.password.get_secret_value()), fingerprint="",
-            probe_result={}, install_dir=install_dir, created_at=now(), expires_at=offset_time(86400))
-        return self._test_connection(connection, install_dir)
+            probe_result={}, install_dir=install_dir, service_name=body.service_name,
+            created_at=now(), expires_at=offset_time(86400))
+        return self._test_connection(connection, install_dir, actor_request=actor_request)
 
-    def test_existing_connection(self, connection_id: str, body: SSHInstallCheckInput):
+    def test_existing_connection(self, connection_id: str, body: SSHInstallCheckInput, *, actor_request=None):
         install_dir = self._install_path(body.install_dir)
-        return self._test_connection(self._stored_connection(connection_id), install_dir)
+        connection = self._stored_connection(connection_id)
+        existing_identity = self._probe_identity(connection)
+        # An omitted name preserves the choice made during authentication. Once
+        # a deployment references this credential, its namespace is immutable:
+        # otherwise a later upgrade/uninstall could target another instance.
+        service_name = body.service_name if "service_name" in body.model_fields_set else connection.service_name
+        if service_name != connection.service_name:
+            with self.db.read() as session:
+                if session.scalar(select(RemoteDeployment.id).where(
+                        RemoteDeployment.connection_id == connection.id).limit(1)):
+                    raise APIError(409, "SSH_SERVICE_CHANGED", "此 SSH 连接已用于 Agent 管理；更换服务名请新建 SSH 连接")
+            connection.service_name = service_name
+        return self._test_connection(connection, install_dir, actor_request=actor_request,
+                                     existing_identity=existing_identity)
 
-    def _test_connection(self, connection: RemoteConnection, install_dir: str):
+    @staticmethod
+    def _probe_identity(connection):
+        # This ephemeral comparison is never logged or returned. A slow probe
+        # cannot republish credentials or a namespace replaced while it ran.
+        return tuple(getattr(connection, field) for field in (
+            "id", "host", "port", "username", "encrypted_password", "fingerprint", "service_name"))
+
+    def _test_connection(self, connection: RemoteConnection, install_dir: str, *, actor_request=None,
+                         existing_identity=None):
         remote = self._remote(connection)
         result: queue.Queue = queue.Queue(maxsize=1)
 
         def probe_remote():
             try:
+                self._authorize_request(actor_request)
                 remote.connect()
                 result.put((remote.fingerprint, remote.probe(install_dir), None))
             except Exception as exc:
@@ -289,21 +344,48 @@ class DeploymentManager:
         connection.probe_result = self._probe_view(probe, connection)
         connection.install_dir = install_dir
         with self.db.write() as session:
-            session.add(connection)
+            self._fresh_actor(session, actor_request)
+            original = session.scalar(select(RemoteConnection).where(
+                RemoteConnection.id == connection.id).with_for_update().execution_options(populate_existing=True))
+            if existing_identity is not None:
+                if original is None:
+                    raise APIError(404, "SSH_CONNECTION_NOT_FOUND", "SSH 连接已被移除，请重新连接")
+                if not original.encrypted_password:
+                    raise APIError(409, "SSH_CONNECTION_REVOKED", "此 SSH 凭据已被移除，请重新输入密码并连接")
+                if original.expires_at <= now():
+                    raise APIError(409, "SSH_CONNECTION_EXPIRED", "SSH 连接已过期，请重新输入密码并连接")
+                if original.service_name != connection.service_name and session.scalar(
+                        select(RemoteDeployment.id).where(RemoteDeployment.connection_id == connection.id).limit(1)):
+                    raise APIError(409, "SSH_SERVICE_CHANGED", "此 SSH 连接已用于 Agent 管理；更换服务名请新建 SSH 连接")
+                if self._probe_identity(original) != existing_identity:
+                    raise APIError(409, "SSH_CONNECTION_CHANGED", "SSH 连接身份或凭据已改变，请重新连接后检查安装目录")
+                # Only probe-owned fields may change. In particular, preserve
+                # concurrent expiry shortening and never merge a detached row's
+                # credential, account, timestamps or immutable target identity.
+                for field in ("fingerprint", "probe_result", "install_dir", "service_name"):
+                    setattr(original, field, getattr(connection, field))
+                connection = original
+            else:
+                if original is not None:
+                    raise APIError(409, "SSH_CONNECTION_CHANGED", "SSH 连接标识发生冲突，请重新输入连接信息")
+                session.add(connection)
         return {"connection_id": connection.id, "host": connection.host, "port": connection.port,
                 "username": connection.username, "fingerprint": connection.fingerprint,
+                "service_name": connection.service_name,
                 "expires_at": connection.expires_at, **connection.probe_result}
 
-    def connect_connection(self, body: SSHAuthenticationInput):
+    def connect_connection(self, body: SSHAuthenticationInput, *, actor_request=None):
         """Authenticate browsing before an installation directory is selected."""
         connection = RemoteConnection(id=uid(), host=body.host, port=body.port, username=body.username,
             encrypted_password=self.vault.encrypt(body.password.get_secret_value()), fingerprint="",
-            probe_result={}, install_dir="", created_at=now(), expires_at=offset_time(86400))
+            probe_result={}, install_dir="", service_name=body.service_name,
+            created_at=now(), expires_at=offset_time(86400))
         remote = self._remote(connection)
         result: queue.Queue = queue.Queue(maxsize=1)
 
         def connect_remote():
             try:
+                self._authorize_request(actor_request)
                 remote.connect()
                 result.put((remote.fingerprint, None))
             except Exception as exc:
@@ -322,9 +404,11 @@ class DeploymentManager:
             raise APIError(failure.status, failure.code, self._safe(failure.message, connection))
         connection.fingerprint = fingerprint
         with self.db.write() as session:
+            self._fresh_actor(session, actor_request)
             session.add(connection)
         return {"connection_id": connection.id, "host": connection.host, "port": connection.port,
-                "username": connection.username, "fingerprint": fingerprint, "expires_at": connection.expires_at}
+                "username": connection.username, "fingerprint": fingerprint,
+                "service_name": connection.service_name, "expires_at": connection.expires_at}
 
     def _stored_connection(self, connection_id: str) -> RemoteConnection:
         with self.db.read() as session:
@@ -339,7 +423,7 @@ class DeploymentManager:
                 raise APIError(409, "SSH_CONNECTION_UNVERIFIED", "SSH 机器身份尚未验证，请重新连接")
         return connection
 
-    def path_suggestions(self, connection_id: str, body: SSHPathSuggestInput):
+    def path_suggestions(self, connection_id: str, body: SSHPathSuggestInput, *, actor_request=None):
         from .path_suggestions import validate_prefix
 
         # SSH permissions provide the pre-install scope. No Agent or managed
@@ -357,6 +441,7 @@ class DeploymentManager:
 
         def browse_remote():
             try:
+                self._authorize_request(actor_request)
                 remote.connect()
                 result.put((remote.path_suggestions(body.prefix, limit=body.limit,
                                                    directory_only=body.directory_only), None))
@@ -387,6 +472,14 @@ class DeploymentManager:
         return value
 
     @staticmethod
+    def _target_key(connection, prefix):
+        target = {"host": connection.host, "port": connection.port, "install_dir": prefix}
+        if connection.service_name != DEFAULT_AGENT_SERVICE_NAME:
+            target["service_name"] = connection.service_name
+        # Do not rewrite the canonical target identity used by historical jobs.
+        return digest(target)
+
+    @staticmethod
     def _transport_error(exc: Exception, status: int = 502):
         if isinstance(exc, APIError):
             return exc
@@ -406,7 +499,8 @@ class DeploymentManager:
         command = session.scalar(select(Command.id).where(Command.node_id == node_id, Command.status == "PENDING").limit(1))
         allocation = session.scalar(select(Allocation.node_id).where(Allocation.node_id == node_id).limit(1))
         attempt = session.scalar(select(Attempt.id).where(Attempt.node_id == node_id, Attempt.state.not_in(TERMINAL)).limit(1))
-        reservation = session.scalar(select(GPUReservation.node_id).where(GPUReservation.node_id == node_id).limit(1))
+        from .gpu_reservations import reservation_owners
+        reservation = bool(reservation_owners(session, node_id))
         from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
         deployment = session.scalar(select(PolicyDeployment.id).where(
             PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES)).limit(1))
@@ -465,7 +559,7 @@ class DeploymentManager:
             raise APIError(409, "REMOTE_NODE_MANAGED", "该机器已有正在执行的管理操作，请等待完成后再修改配置",
                            {"deployment_id": other.id})
 
-    def create(self, body: RemoteDeploymentInput, key: str, request_url: str, *, retry=False):
+    def create(self, body: RemoteDeploymentInput, key: str, request_url: str, *, retry=False, actor_request=None):
         if not key or not key.strip() or len(key) > 200:
             raise APIError(422, "IDEMPOTENCY_KEY_REQUIRED", "Provide an Idempotency-Key of 1 to 200 characters")
         prefix = self._install_path(body.install_dir)
@@ -489,12 +583,14 @@ class DeploymentManager:
         config = {key: value for key, value in generated["config"].items() if key != "enrollment_token"}
         mode = "ssh-tunnel" if _loopback_url(config["control_plane_url"]) else "direct"
         with self.db.write() as session:
+            self._fresh_actor(session, actor_request)
             existing = session.scalar(select(RemoteDeployment).where(RemoteDeployment.idempotency_key == key))
             if existing:
                 if existing.request_digest != request_digest:
                     raise APIError(409, "IDEMPOTENCY_CONFLICT", "该幂等键已用于不同的部署配置")
                 return self._view(session, existing)
-            connection = session.get(RemoteConnection, body.connection_id)
+            connection = session.scalar(select(RemoteConnection).where(
+                RemoteConnection.id == body.connection_id).with_for_update())
             if not connection:
                 raise APIError(404, "SSH_CONNECTION_NOT_FOUND", "SSH 连接不存在，请重新测试连接")
             if not connection.encrypted_password:
@@ -511,16 +607,33 @@ class DeploymentManager:
                 if existing_node and existing_node.status == "REMOVED":
                     raise APIError(409, "REMOVED_AGENT_IDENTITY", "机器仍保留已卸载 Agent 的旧身份，请检查安装状态并使用新的 Agent 状态目录")
             self._assert_idle(session, node_id)
-            target = digest({"host": connection.host, "port": connection.port, "install_dir": prefix})
+            target = self._target_key(connection, prefix)
             if self.db.engine.dialect.name == "postgresql":
                 # New machines have no Node row to lock yet. Serialize their
                 # target claims as well as updates through a transaction lock.
-                session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": int(target[:16], 16) - (1 << 63)})
+                claims = {target, digest({"host": connection.host, "port": connection.port, "install_dir": prefix}),
+                          digest({"host": connection.host, "port": connection.port,
+                                  "service_name": connection.service_name})}
+                for claim in sorted(claims):
+                    session.execute(text("SELECT pg_advisory_xact_lock(:key)"),
+                                    {"key": int(claim[:16], 16) - (1 << 63)})
             active = session.scalar(select(RemoteDeployment).where(RemoteDeployment.target_key == target,
                 RemoteDeployment.state.not_in(JOB_TERMINAL)).limit(1))
             if active:
                 raise APIError(409, "REMOTE_TARGET_MANAGED", "该目录已有部署或正在接入，请查看现有部署记录",
                                {"deployment_id": active.id})
+            # Service names and installation directories are both exclusive
+            # resources. Two differently named instances may not race to write
+            # one prefix; one unit may not race to install into two prefixes.
+            claims = session.scalars(select(RemoteDeployment).join(RemoteConnection,
+                RemoteConnection.id == RemoteDeployment.connection_id).where(
+                    RemoteConnection.host == connection.host, RemoteConnection.port == connection.port,
+                    RemoteDeployment.state.not_in(JOB_TERMINAL)))
+            for claim in claims:
+                owner = session.get(RemoteConnection, claim.connection_id)
+                if claim.install_dir == prefix or owner.service_name == connection.service_name:
+                    raise APIError(409, "REMOTE_TARGET_MANAGED", "该安装目录或 Agent 服务已有正在执行的部署",
+                                   {"deployment_id": claim.id})
             prior_node = session.scalar(select(RemoteDeployment.node_id).join(Node, Node.id == RemoteDeployment.node_id).where(
                 RemoteDeployment.target_key == target, RemoteDeployment.node_id.is_not(None), Node.status != "REMOVED",
                 RemoteDeployment.state != "UNINSTALLED").order_by(RemoteDeployment.created_at.desc()).limit(1))
@@ -544,7 +657,10 @@ class DeploymentManager:
                     # after a new administrator-authorized SSH onboarding job.
                     reconnect_node.status = "REGISTERED"
             timestamp = now()
-            job = RemoteDeployment(id=uid(), connection_id=connection.id, idempotency_key=key,
+            if connection.service_name != DEFAULT_AGENT_SERVICE_NAME:
+                config["_service_name"] = connection.service_name
+            job = RemoteDeployment(id=uid(), actor_user_id=request_user_id(actor_request) if actor_request else None,
+                connection_id=connection.id, idempotency_key=key,
                 request_digest=request_digest, target_key=target, onboarding_id=generated["id"], node_id=node_id,
                 state="QUEUED", stage="QUEUED", logs=[], history=[], agent_config=config, install_dir=prefix,
                 control_plane_url=config["control_plane_url"], connection_mode=mode,
@@ -614,6 +730,7 @@ class DeploymentManager:
         return {"node_id": node.id, "node_status": node.status, "managed": latest is not None,
                 "host": connection.host if connection else None, "port": connection.port if connection else None,
                 "username": connection.username if connection else None, "install_dir": latest.install_dir if latest else None,
+                "service_name": connection.service_name if connection else DEFAULT_AGENT_SERVICE_NAME,
                 "deployment_id": latest.id if latest else None, "can_disconnect": busy is None,
                 "can_uninstall": uninstall_reason is None, "reason": busy or uninstall_reason,
                 "disconnect_reason": busy, "uninstall_reason": uninstall_reason,
@@ -638,7 +755,7 @@ class DeploymentManager:
         except (OSError, ValueError):
             raise APIError(503, "AGENT_PACKAGE_UNAVAILABLE", "中台尚未准备可验证版本的 Agent 安装包，请先重新构建安装包") from None
 
-    def upgrade(self, node_id: str, key: str | None, expected_build_id: str | None = None):
+    def upgrade(self, node_id: str, key: str | None, expected_build_id: str | None = None, *, actor_request=None):
         if not key or not key.strip() or len(key) > 200:
             raise APIError(422, "IDEMPOTENCY_KEY_REQUIRED", "Provide an Idempotency-Key of 1 to 200 characters")
         request = {"node_id": node_id, "operation": "upgrade"}
@@ -646,6 +763,7 @@ class DeploymentManager:
             request["expected_build_id"] = expected_build_id
         request_digest = digest(request)
         with self.db.write() as session:
+            self._fresh_actor(session, actor_request)
             node = self._required_node(session, node_id)
             session.scalar(select(Node).where(Node.id == node_id).with_for_update().execution_options(populate_existing=True))
             existing = session.scalar(select(RemoteDeployment).where(RemoteDeployment.idempotency_key == key))
@@ -671,7 +789,10 @@ class DeploymentManager:
             config = {key: value for key, value in source.agent_config.items() if not key.startswith("_")}
             config.update(name=node.name, roots=node.roots, output_root=node.output_root, cache_root=node.cache_root,
                 profiles=profiles, _operation="upgrade", _target_release=release)
-            job = RemoteDeployment(id=uid(), connection_id=connection.id, idempotency_key=key,
+            if connection.service_name != DEFAULT_AGENT_SERVICE_NAME:
+                config["_service_name"] = connection.service_name
+            job = RemoteDeployment(id=uid(), actor_user_id=request_user_id(actor_request) if actor_request else None,
+                connection_id=connection.id, idempotency_key=key,
                 request_digest=request_digest, target_key=source.target_key, onboarding_id=onboarding_id, node_id=node_id,
                 state="QUEUED", stage="QUEUED", logs=[], history=[], agent_config=config,
                 install_dir=source.install_dir, control_plane_url=source.control_plane_url,
@@ -731,11 +852,12 @@ class DeploymentManager:
         tunnel.close()
         return False
 
-    def remove(self, node_id: str, operation: str, key: str | None):
+    def remove(self, node_id: str, operation: str, key: str | None, *, actor_request=None):
         if not key or not key.strip() or len(key) > 200:
             raise APIError(422, "IDEMPOTENCY_KEY_REQUIRED", "Provide an Idempotency-Key of 1 to 200 characters")
         request_digest = digest({"node_id": node_id, "operation": operation})
         with self.db.write() as session:
+            self._fresh_actor(session, actor_request)
             self._required_node(session, node_id)
             session.scalar(select(Node).where(Node.id == node_id).with_for_update().execution_options(populate_existing=True))
             existing = session.scalar(select(RemoteDeployment).where(RemoteDeployment.idempotency_key == key))
@@ -758,7 +880,8 @@ class DeploymentManager:
                 session.flush()
             timestamp = now()
             config = {**(source.agent_config if source else {}), "_operation": operation}
-            job = RemoteDeployment(id=uid(), connection_id=connection.id, idempotency_key=key, request_digest=request_digest,
+            job = RemoteDeployment(id=uid(), actor_user_id=request_user_id(actor_request) if actor_request else None,
+                connection_id=connection.id, idempotency_key=key, request_digest=request_digest,
                 target_key=source.target_key if source else digest({"node_id": node_id}), onboarding_id=uid(), node_id=node_id,
                 state="QUEUED", stage="QUEUED", logs=[], history=[], agent_config=config,
                 install_dir=source.install_dir if source else "", control_plane_url=source.control_plane_url if source else "",
@@ -782,8 +905,11 @@ class DeploymentManager:
         remote = None
         try:
             with self.db.write() as session:
+                lock_execution_guard(session)
                 job = session.get(RemoteDeployment, job_id)
                 if not job or job.state != "QUEUED":
+                    return
+                if not self._authorize_job(session, job):
                     return
                 self._assert_idle(session, job.node_id)
                 connection = session.get(RemoteConnection, job.connection_id)
@@ -798,6 +924,10 @@ class DeploymentManager:
             remote_node = (probe.get("existing_agent") or {}).get("node_id")
             if remote_node and remote_node != node_id:
                 raise APIError(409, "REMOTE_NODE_CHANGED", "远端 Agent 身份与待卸载机器不一致，已停止操作；请重新检查 SSH 接入")
+            with self.db.write() as session:
+                lock_execution_guard(session)
+                if not self._authorize_job(session, session.get(RemoteDeployment, job_id)):
+                    return
             result = remote.uninstall(prefix, lambda stage, message: self._log(job_id, stage, message))
             if self._stop.is_set():
                 return
@@ -826,6 +956,7 @@ class DeploymentManager:
         finally:
             if remote is not None:
                 remote.close()
+            self._close_revoked_tunnel(job_id)
             with self._lock:
                 self._workers.pop(job_id, None)
 
@@ -840,8 +971,11 @@ class DeploymentManager:
         bundle_snapshot = None
         try:
             with self.db.write() as session:
+                lock_execution_guard(session)
                 job = session.get(RemoteDeployment, job_id)
                 if job is None or job.state != "QUEUED":
+                    return
+                if not self._authorize_job(session, job):
                     return
                 connection = session.get(RemoteConnection, job.connection_id)
                 (self._assert_upgrade_safe if self._operation(job) == "upgrade" else self._assert_idle)(session, job.node_id)
@@ -873,6 +1007,8 @@ class DeploymentManager:
                     config = {**public, "cache_root": public.get("cache_root"),
                         "control_plane_url": config["control_plane_url"], "_operation": "upgrade",
                         "_target_release": config["_target_release"]}
+                    if connection.service_name != DEFAULT_AGENT_SERVICE_NAME:
+                        config["_service_name"] = connection.service_name
                     config["profiles"] = [{**profile, "execution_mode": profile.get("execution_mode", "native"),
                         "metadata": {"onboarding_id": job.onboarding_id}} for profile in public["profiles"]]
                     config["_upgrade_expected"] = public
@@ -921,6 +1057,10 @@ class DeploymentManager:
                 if release != config["_target_release"]:
                     raise APIError(409, "AGENT_PACKAGE_CHANGED", "Agent 安装包已更换，请重新提交升级以确认目标版本")
                 bundle = snapshot
+            with self.db.write() as session:
+                lock_execution_guard(session)
+                if not self._authorize_job(session, session.get(RemoteDeployment, job_id)):
+                    return
             remote.install(bundle, config, prefix, lambda stage, message: self._log(job_id, stage, message))
             config.pop("enrollment_token", None)
             remote.close()
@@ -953,6 +1093,7 @@ class DeploymentManager:
                 remote.close()
             if bundle_snapshot is not None:
                 bundle_snapshot.cleanup()
+            self._close_revoked_tunnel(job_id)
             with self._lock:
                 self._workers.pop(job_id, None)
 
@@ -1084,8 +1225,9 @@ class DeploymentManager:
 
     def _view(self, session, job):
         connection = session.get(RemoteConnection, job.connection_id)
-        return {"id": job.id, "connection_id": job.connection_id, "host": connection.host, "port": connection.port,
-                "username": connection.username, "install_dir": job.install_dir, "onboarding_id": job.onboarding_id,
+        return {"id": job.id, "actor_user_id": job.actor_user_id, "connection_id": job.connection_id, "host": connection.host, "port": connection.port,
+                "username": connection.username, "service_name": connection.service_name,
+                "install_dir": job.install_dir, "onboarding_id": job.onboarding_id,
                 "node_id": job.node_id, "state": job.state, "stage": job.stage, "logs": job.logs, "history": job.history,
                 "agent": {key: value for key, value in job.agent_config.items() if not key.startswith("_")},
                 "operation": self._operation(job), "operation_result": job.agent_config.get("_operation_result"),
@@ -1162,20 +1304,20 @@ class DeploymentManager:
                     yield json.dumps(remaining, ensure_ascii=False) + "\n"
         return lines()
 
-    def retry(self, job_id: str, request_url: str, key: str | None):
+    def retry(self, job_id: str, request_url: str, key: str | None, *, actor_request=None):
         old = self.get(job_id)
         if old["state"] not in RETRYABLE:
             raise APIError(409, "DEPLOYMENT_NOT_RETRYABLE", "只有失败或中断的部署可以重试")
         if old["operation"] == "uninstall":
-            return self.remove(old["node_id"], "uninstall", key or f"retry-{job_id}-{uid()}")
+            return self.remove(old["node_id"], "uninstall", key or f"retry-{job_id}-{uid()}", actor_request=actor_request)
         if old["operation"] == "upgrade":
-            return self.upgrade(old["node_id"], key or f"retry-{job_id}-{uid()}")
+            return self.upgrade(old["node_id"], key or f"retry-{job_id}-{uid()}", actor_request=actor_request)
         config = dict(old["agent"])
         config["profiles"] = [{field: profile[field] for field in ("id", "name", "code_dir", "python", "adapter", "recipe", "execution_mode")
                                if field in profile} for profile in config["profiles"]]
         config = {field: config[field] for field in ("name", "control_plane_url", "roots", "output_root", "state_dir", "profiles")}
         body = RemoteDeploymentInput(connection_id=old["connection_id"], install_dir=old["install_dir"], agent=config)
-        return self.create(body, key or f"retry-{job_id}-{uid()}", request_url, retry=True)
+        return self.create(body, key or f"retry-{job_id}-{uid()}", request_url, retry=True, actor_request=actor_request)
 
 
 def register_remote_routes(app: FastAPI, admin, manager: DeploymentManager):
@@ -1183,36 +1325,36 @@ def register_remote_routes(app: FastAPI, admin, manager: DeploymentManager):
         return JSONResponse(status_code=status, content=value, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/v1/ssh-connections/test", dependencies=admin)
-    def test_connection(body: SSHConnectionInput):
-        return response(manager.test_connection(body))
+    def test_connection(body: SSHConnectionInput, request: Request):
+        return response(manager.test_connection(body, actor_request=request))
 
     @app.post("/api/v1/ssh-connections/connect", dependencies=admin)
-    def connect_connection(body: SSHAuthenticationInput):
-        return response(manager.connect_connection(body))
+    def connect_connection(body: SSHAuthenticationInput, request: Request):
+        return response(manager.connect_connection(body, actor_request=request))
 
     @app.post("/api/v1/ssh-connections/{connection_id}/path-suggestions", dependencies=admin)
-    def ssh_path_suggestions(connection_id: str, body: SSHPathSuggestInput):
-        return response(manager.path_suggestions(connection_id, body))
+    def ssh_path_suggestions(connection_id: str, body: SSHPathSuggestInput, request: Request):
+        return response(manager.path_suggestions(connection_id, body, actor_request=request))
 
     @app.post("/api/v1/ssh-connections/{connection_id}/test", dependencies=admin)
-    def test_existing_connection(connection_id: str, body: SSHInstallCheckInput):
-        return response(manager.test_existing_connection(connection_id, body))
+    def test_existing_connection(connection_id: str, body: SSHInstallCheckInput, request: Request):
+        return response(manager.test_existing_connection(connection_id, body, actor_request=request))
 
     @app.get("/api/v1/nodes/{node_id}/management", dependencies=admin)
     def node_management(node_id: str):
         return response(manager.management(node_id))
 
     @app.post("/api/v1/nodes/{node_id}/disconnect", dependencies=admin)
-    def node_disconnect(node_id: str, idempotency_key: str | None = Header(default=None)):
-        return response(manager.remove(node_id, "disconnect", idempotency_key))
+    def node_disconnect(node_id: str, request: Request, idempotency_key: str | None = Header(default=None)):
+        return response(manager.remove(node_id, "disconnect", idempotency_key, actor_request=request))
 
     @app.post("/api/v1/nodes/{node_id}/uninstall", dependencies=admin, status_code=202)
-    def node_uninstall(node_id: str, idempotency_key: str | None = Header(default=None)):
-        return response(manager.remove(node_id, "uninstall", idempotency_key), 202)
+    def node_uninstall(node_id: str, request: Request, idempotency_key: str | None = Header(default=None)):
+        return response(manager.remove(node_id, "uninstall", idempotency_key, actor_request=request), 202)
 
     @app.post("/api/v1/nodes/{node_id}/upgrade", dependencies=admin, status_code=202)
-    def node_upgrade(node_id: str, body: AgentUpgradeInput | None = None, idempotency_key: str | None = Header(default=None)):
-        return response(manager.upgrade(node_id, idempotency_key, body.expected_build_id if body else None), 202)
+    def node_upgrade(node_id: str, request: Request, body: AgentUpgradeInput | None = None, idempotency_key: str | None = Header(default=None)):
+        return response(manager.upgrade(node_id, idempotency_key, body.expected_build_id if body else None, actor_request=request), 202)
 
     @app.get("/api/v1/remote-deployments", dependencies=admin)
     def list_deployments():
@@ -1220,7 +1362,7 @@ def register_remote_routes(app: FastAPI, admin, manager: DeploymentManager):
 
     @app.post("/api/v1/remote-deployments", dependencies=admin, status_code=202)
     def create_deployment(body: RemoteDeploymentInput, request: Request, idempotency_key: str | None = Header(default=None)):
-        return response(manager.create(body, idempotency_key, str(request.base_url)), 202)
+        return response(manager.create(body, idempotency_key, str(request.base_url), actor_request=request), 202)
 
     @app.get("/api/v1/remote-deployments/{job_id}", dependencies=admin)
     def deployment_detail(job_id: str):
@@ -1234,4 +1376,4 @@ def register_remote_routes(app: FastAPI, admin, manager: DeploymentManager):
 
     @app.post("/api/v1/remote-deployments/{job_id}/retry", dependencies=admin, status_code=202)
     def retry_deployment(job_id: str, request: Request, idempotency_key: str | None = Header(default=None)):
-        return response(manager.retry(job_id, str(request.base_url), idempotency_key), 202)
+        return response(manager.retry(job_id, str(request.base_url), idempotency_key, actor_request=request), 202)

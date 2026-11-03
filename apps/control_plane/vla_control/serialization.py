@@ -67,7 +67,7 @@ def asset_dict(asset):
 
 
 def preview_dict(preview):
-    return {"id": preview.id, "status": preview.status, "checks": preview.checks,
+    return {"id": preview.id, "owner_user_id": preview.owner_user_id, "status": preview.status, "checks": preview.checks,
             "code_snapshot": preview.code_snapshot, "error": preview.error, "request": preview.request,
             "created_at": preview.created_at, "expires_at": preview.expires_at}
 
@@ -88,6 +88,7 @@ def run_dict(session, run):
     result["recipe_definition"] = run.code_expectation.get("recipe_definition")
     result["entrypoint"] = run.code_expectation.get("requested_entrypoint")
     result["dataset_bindings"] = run.code_expectation.get("dataset_bindings")
+    result["norm_datasets"] = run.code_expectation.get("norm_datasets")
     result["dataset_profiles"] = run.code_expectation.get("dataset_profiles")
     result["training_stage"] = run.code_expectation.get("training_stage")
     result["stage_config"] = run.code_expectation.get("stage_config")

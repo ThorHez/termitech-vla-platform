@@ -19,16 +19,18 @@ export function DatasetFormatTemplates({
   disabled = false,
   initialName = '',
   saveOnly = false,
+  personalDraft = false,
 }: {
   value: DatasetProfile;
   onApply?: (profile: DatasetProfile) => void;
   disabled?: boolean;
   initialName?: string;
   saveOnly?: boolean;
+  personalDraft?: boolean;
 }) {
   const { user, can } = useAuth();
   const owner = user?.id;
-  const writable = Boolean(owner && can('assets.write'));
+  const writable = Boolean(owner && can('dataset-templates.write'));
   const currentOwner = useRef({ owner, writable });
   currentOwner.current = { owner, writable };
   if (!writable)
@@ -42,6 +44,7 @@ export function DatasetFormatTemplates({
       disabled={disabled}
       initialName={initialName}
       saveOnly={saveOnly}
+      personalDraft={personalDraft}
       ownerCurrent={() => currentOwner.current.owner === owner && currentOwner.current.writable}
     />
   );
@@ -54,6 +57,7 @@ function DatasetFormatTemplatesContent({
   disabled,
   initialName,
   saveOnly,
+  personalDraft,
   ownerCurrent,
 }: {
   owner: string;
@@ -62,6 +66,7 @@ function DatasetFormatTemplatesContent({
   disabled: boolean;
   initialName: string;
   saveOnly: boolean;
+  personalDraft: boolean;
   ownerCurrent: () => boolean;
 }) {
   const [templates, setTemplates] = useState<DatasetFormatTemplateSummary[]>([]);
@@ -145,7 +150,11 @@ function DatasetFormatTemplatesContent({
       setSelected(saved.id);
       setName(saved.name);
       setConfirmDelete(false);
-      setMessage(`已保存“${saved.name}”，可在登记其他数据集时套用。`);
+      setMessage(
+        personalDraft
+          ? `已保存个人模板“${saved.name}”。`
+          : `已保存“${saved.name}”，可在登记其他数据集时套用。`,
+      );
     } catch (cause) {
       if (active(abort)) setError(cause instanceof Error ? cause : new Error(String(cause)));
     } finally {
@@ -174,7 +183,9 @@ function DatasetFormatTemplatesContent({
       setName(saved.name);
       setConfirmDelete(false);
       setMessage(
-        `已套用“${saved.name}”。名称、机器、路径、版本和 norm_stats 绑定保持原样；请核对任务描述。`,
+        personalDraft
+          ? `已载入“${saved.name}”到个人格式草稿；公共数据集保持原样。`
+          : `已套用“${saved.name}”。名称、机器、路径、版本和 norm_stats 绑定保持原样；请核对任务描述。`,
       );
     } catch (cause) {
       if (active(abort)) setError(cause instanceof Error ? cause : new Error(String(cause)));
@@ -211,7 +222,9 @@ function DatasetFormatTemplatesContent({
     >
       <h3 id={titleId}>数据集格式模板</h3>
       <p className="field-hint">
-        保存机器人、视觉和状态/动作字段标签，下次登记直接套用。模板仅当前账户可见。
+        {personalDraft
+          ? '选择模板查看完整格式，或编辑个人草稿并另存副本。模板仅当前账户可见。'
+          : '保存机器人、视觉和状态/动作字段标签，下次登记直接套用。模板仅当前账户可见。'}
       </p>
       {!saveOnly && (
         <div className="dataset-format-template-select">
@@ -242,7 +255,8 @@ function DatasetFormatTemplatesContent({
             disabled={disabled || Boolean(busy) || !chosen || !onApply}
             onClick={() => void apply()}
           >
-            {busy === 'apply' && <LoaderCircle size={14} className="spin" />}套用模板
+            {busy === 'apply' && <LoaderCircle size={14} className="spin" />}
+            {personalDraft ? '载入个人草稿' : '套用模板'}
           </button>
           <button
             type="button"
@@ -353,10 +367,10 @@ export function DatasetFormatTemplateDialog({ asset, close }: { asset: Asset; cl
         </button>
       }
     >
-      {can('assets.write') && asset.kind === 'DATASET' && profile ? (
+      {can('dataset-templates.write') && asset.kind === 'DATASET' && profile ? (
         <DatasetFormatTemplates value={profile} initialName={`${asset.name} 格式`} saveOnly />
       ) : (
-        <p className="field-hint">需要资产编辑权限和完整的数据集特征，才能保存格式模板。</p>
+        <p className="field-hint">需要个人格式模板权限和完整的数据集特征，才能保存格式模板。</p>
       )}
     </Modal>
   );

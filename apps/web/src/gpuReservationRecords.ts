@@ -9,6 +9,7 @@ export interface GpuReservationRecord {
   gpuUuids: string[];
   gpuLabels: string[];
   createdAt: string;
+  expiresAt?: string;
 }
 
 const compareText = (left: string, right: string) => (left < right ? -1 : left > right ? 1 : 0);
@@ -54,6 +55,7 @@ export function gpuReservationRecords(
         gpuUuids: [],
         gpuLabels: [],
         createdAt: row.created_at,
+        ...(row.expires_at ? { expiresAt: row.expires_at } : {}),
       };
       groups.set(key, group);
     }

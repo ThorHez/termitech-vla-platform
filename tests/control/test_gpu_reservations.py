@@ -52,8 +52,12 @@ def test_account_identity_permissions_serialization_and_admin_release(platform):
     assert response.status_code == 200, response.text
     row = response.json()[0]
     assert row == {"node_id": node["node_id"], "gpu_uuid": "GPU-1", "user_id": alice,
-                   "username": "alice", "display_name": "alice", "created_at": row["created_at"]}
-    assert reserve(platform, node, ["GPU-1"]).json() == [row]
+                   "username": "alice", "display_name": "alice", "created_at": row["created_at"],
+                   "expires_at": row["expires_at"]}
+    renewed = reserve(platform, node, ["GPU-1"]).json()[0]
+    assert renewed["expires_at"] >= row["expires_at"]
+    assert renewed["created_at"] == row["created_at"]
+    row = renewed
     detail = platform.client.get(f"/api/v1/nodes/{node['node_id']}").json()
     assert detail["gpus"][0]["user_reservation"] == row
     assert detail["gpus"][0]["reserved_by"] is None
@@ -213,25 +217,27 @@ def test_restart_does_not_inherit_original_users_reservation_rights(platform):
     assert reserve(platform, node, ["GPU-1"]).status_code == 200
     login(platform.client, "bob")
     rejected = action(platform, deployment, "start")
-    assert rejected.status_code == 409 and rejected.json()["error"]["code"] == "GPU_RESERVED_BY_OTHER_USER"
+    assert rejected.status_code == 403
     login(platform.client, "alice")
     restarted = action(platform, deployment, "start")
     assert restarted.status_code == 202 and restarted.json()["owner_user_id"] == alice
 
 
-def test_restart_transfers_resource_ownership_to_the_current_caller(platform):
+def test_restart_cannot_transfer_another_users_deployment_ownership(platform):
     node = register(platform)
     enable_restart(platform, node)
     accounts(platform)
-    login(platform.client, "alice")
+    alice = login(platform.client, "alice")
     deployment, _ = terminal(platform, node)
-    bob = login(platform.client, "bob")
+    login(platform.client, "bob")
     assert reserve(platform, node, ["GPU-1"]).status_code == 200
     restarted = action(platform, deployment, "start")
-    assert restarted.status_code == 202 and restarted.json()["owner_user_id"] == bob
+    assert restarted.status_code == 403
+    with platform.app.state.db.read() as session:
+        assert session.get(PolicyDeployment, deployment["id"]).owner_user_id == alice
     assert reserve(platform, node, []).status_code == 200
     login(platform.client, "alice")
-    assert reserve(platform, node, ["GPU-1"]).json()["error"]["code"] == "GPU_IN_USE"
+    assert reserve(platform, node, ["GPU-1"]).status_code == 200
 
 
 def test_concurrent_personal_reservations_have_exactly_one_owner(platform):

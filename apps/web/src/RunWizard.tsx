@@ -16,10 +16,22 @@ import {
   XCircle,
 } from 'lucide-react';
 import { ApiError, navigate, post, useApi } from './api';
+import { submitTrainingRun } from './runSubmission';
 import { useAuth } from './auth';
 import { CodeVersion, ErrorNotice, Field, Modal } from './components';
 import { inputRoles, requiredInputs, useData } from './data';
 import { RecipeLibrary } from './RecipeLibrary';
+import { NormStatsFields } from './NormStatsFields';
+import { NormDatasetEditor } from './NormDatasetEditor';
+import { fillRunRepresentationDefaults } from './ComposedDatasetProcessing';
+import {
+  buildNormPreviewRequest,
+  inferNormActionHorizon,
+  newNormDataset,
+  normAdvancedRecipe,
+  normDatasetErrors,
+  normDatasetsForRequest,
+} from './normStats';
 import { DatasetBindings, DatasetBindingSummary } from './DatasetBindings';
 import { newDatasetBindings } from './datasetBindingHelpers';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
@@ -74,6 +86,9 @@ import {
   automaticResourceRecommendation,
   isTrainingResourceField,
   recommendTrainingResources,
+  recommendNormResources,
+  normResourceRecommendationHint,
+  normResourceRecommendationTracking,
   resourceRecommendationTracking,
   setResourceRecommendationMode,
   trainingResourceRecommendationHint,
@@ -164,7 +179,7 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
       setSourceImport({ state: 'loading', snapshot });
       try {
         await draft.replace(snapshot);
-        setSourceNotice(props.sourceRun?.name || '原训练');
+        setSourceNotice(props.sourceRun?.name);
         setSourceImport(undefined);
       } catch (cause) {
         setSourceImport({
@@ -285,7 +300,8 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
               <div>
                 <dt>数据集与资源</dt>
                 <dd>
-                  {sourceImport.snapshot?.request.dataset_bindings?.length ||
+                  {sourceImport.snapshot?.request.norm_datasets?.length ||
+                    sourceImport.snapshot?.request.dataset_bindings?.length ||
                     (sourceImport.snapshot?.request.inputs.dataset ? 1 : 0)}{' '}
                   个数据集 · {sourceImport.snapshot?.request.gpu_count} 张 GPU
                 </dd>
@@ -368,24 +384,62 @@ function RunWizardContent({
   sourceRunNotice?: string;
 }) {
   const { nodes, assets, profiles, templates, refresh } = useData();
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const initialAdvancedRecipe = initialDraft
+    ? normAdvancedRecipe(initialDraft.request, initialDraft.advancedRecipe)
+    : false;
   const [step, setStep] = useState(initialDraft?.step || 0);
-  const [advancedRecipe, setAdvancedRecipe] = useState(initialDraft?.advancedRecipe || false);
+  const [advancedRecipe, setAdvancedRecipe] = useState(initialAdvancedRecipe);
   const [confirmedConfigSha256, setConfirmedConfigSha256] = useState<string>();
-  const [request, setRequest] = useState<RunRequest>(
-    () =>
-      initialDraft?.request || {
+  const [request, setRequest] = useState<RunRequest>(() =>
+    fillRunRepresentationDefaults(
+      (initialDraft?.request
+        ? initialDraft.request.template_id === 'openpi-norm'
+          ? {
+              ...initialDraft.request,
+              inputs: {},
+              auto_config: initialAdvancedRecipe
+                ? undefined
+                : {
+                    ...(initialDraft.request.auto_config || DEFAULT_AUTO_CONFIG),
+                    finetune_mode: 'full',
+                  },
+              norm_datasets: normDatasetsForRequest(initialDraft.request).map((row) =>
+                !initialAdvancedRecipe && !row.processor
+                  ? {
+                      ...newNormDataset(
+                        true,
+                        assets.data?.find((asset) => asset.id === row.dataset_asset_id),
+                      ),
+                      dataset_asset_id: row.dataset_asset_id,
+                    }
+                  : row,
+              ),
+            }
+          : initialDraft.request
+        : undefined) || {
         name: '',
         node_id: initialNode || '',
         profile_id: '',
         template_id: initialTemplate || 'openpi-sft',
         inputs: {},
+        ...(initialTemplate === 'openpi-norm' ? { norm_datasets: [newNormDataset(true)] } : {}),
         parameters: {},
-        gpu_count: 1,
+        gpu_count: initialTemplate === 'openpi-norm' ? 0 : 1,
         auto_config: initialTemplate === 'smoke' ? undefined : { ...DEFAULT_AUTO_CONFIG },
-        ...(initialTemplate === 'smoke'
+        ...(['smoke', 'openpi-norm'].includes(initialTemplate || '')
           ? {}
           : { normalization_method: DEFAULT_TRAINING_NORMALIZATION_METHOD }),
       },
+      assets.data || [],
+      new Set(initialDraft?.editedParameters),
+    ),
   );
   const [previewId, setPreviewId] = useState('');
   const [createdPreview, setCreatedPreview] = useState<Preview>();
@@ -393,9 +447,21 @@ function RunWizardContent({
   const [error, setError] = useState<Error>();
   const idempotencyKey = useRef(crypto.randomUUID());
   const recipeSelection = useRef<string | undefined>(undefined);
-  const editedParameters = useRef(new Set<string>(initialDraft?.editedParameters));
+  const editedParameters = useRef(
+    (initialDraft?.request.template_id ?? initialTemplate) === 'openpi-norm'
+      ? normResourceRecommendationTracking(initialDraft?.editedParameters)
+      : new Set<string>(initialDraft?.editedParameters),
+  );
   const defaultedParameterKeys = useRef(new Set<string>());
-  const defaultFillNeedsSave = useRef(false);
+  const defaultFillNeedsSave = useRef(
+    !!initialDraft &&
+      (request.norm_datasets?.some(
+        (row, index) => row !== initialDraft.request.norm_datasets?.[index],
+      ) ||
+        request.dataset_bindings?.some(
+          (row, index) => row !== initialDraft.request.dataset_bindings?.[index],
+        )),
+  );
   const initializedParameterScope = useRef<string | undefined>(undefined);
   const currentStep = useRef(step);
   currentStep.current = step;
@@ -452,7 +518,7 @@ function RunWizardContent({
   const [draftActionBusy, setDraftActionBusy] = useState(false);
   const [unsavedClose, setUnsavedClose] = useState(false);
   const initialDefaultsScope = useRef(
-    initialDraft ? `${initialDraft.request.template_id}:${initialDraft.advancedRecipe}` : undefined,
+    initialDraft ? `${initialDraft.request.template_id}:${initialAdvancedRecipe}` : undefined,
   );
   const initialSelectionInstalled = useRef(false);
   const initialProfile = useRef(initialDraft?.request.profile_id);
@@ -472,11 +538,16 @@ function RunWizardContent({
     preview?.request?.recipe_definition || preview?.code_snapshot?.recipe_definition;
   const template = templates.data?.find((item) => item.id === request.template_id);
   const isRecap = template?.id === 'recap';
+  const isNorm = template?.id === 'openpi-norm';
   const hasLocalTraining = template?.id === 'openpi-sft' || isRecap;
+  const requiresConfigConfirmation = hasLocalTraining || isNorm;
+  const normRows = normDatasetsForRequest(request);
   const automaticMode = hasLocalTraining && !advancedRecipe;
+  const automaticNorm = isNorm && !advancedRecipe;
+  const automaticConfiguration = automaticMode || automaticNorm;
   const generatedConfig = automaticPreflight?.plan.generated_config;
   const configConfirmed =
-    !hasLocalTraining || configurationConfirmed(generatedConfig, confirmedConfigSha256);
+    !requiresConfigConfirmation || configurationConfirmed(generatedConfig, confirmedConfigSha256);
   useEffect(() => {
     setConfirmedConfigSha256(undefined);
   }, [request, previewId, generatedConfig?.sha256]);
@@ -484,7 +555,9 @@ function RunWizardContent({
     ? template?.stages?.find((stage) => stage.id === request.training_stage)
     : undefined;
   const node = nodes.data?.find((item) => item.id === request.node_id);
-  const resourceRecommendations = recommendTrainingResources(request.gpu_count, node?.metrics);
+  const resourceRecommendations = isNorm
+    ? recommendNormResources(node?.metrics)
+    : recommendTrainingResources(request.gpu_count, node?.metrics);
   const parameterScope = JSON.stringify([
     request.node_id,
     request.profile_id,
@@ -590,21 +663,25 @@ function RunWizardContent({
     selectedProfile?.python,
     request.training_stage || 'sft',
     request.dataset_bindings,
+    request.norm_datasets,
+    request.recipe,
     request.stage_config,
     request.auto_config,
   ]);
   const processorsValid =
     processorValidation?.scope === processorValidationScope && processorValidation.valid;
-  const missingProcessors = automaticMode
-    ? (request.dataset_bindings || []).flatMap((binding, index) =>
+  const missingProcessors = automaticConfiguration
+    ? (isNorm ? normRows : request.dataset_bindings || []).flatMap((binding, index) =>
         binding.processor ? [] : [`数据集 ${index + 1}`],
       )
     : [];
   const dataProcessingBlocker =
-    step === 1 && hasLocalTraining && !processorsValid
-      ? missingProcessors.length
-        ? `${missingProcessors.slice(0, 3).join('、')}${missingProcessors.length > 3 ? `等 ${missingProcessors.length} 组数据` : ''}尚未选择数据处理器。自动组装需要为每个数据集明确配置处理方式。`
-        : '数据处理配置错误，修正后才能生成 config 并预检。请检查各数据集列出的错误。'
+    step === 1 && (hasLocalTraining || isNorm) && !processorsValid
+      ? isNorm
+        ? '请返回数据配置，核对每个数据集的统计处理方式。'
+        : missingProcessors.length
+          ? `${missingProcessors.slice(0, 3).join('、')}${missingProcessors.length > 3 ? `等 ${missingProcessors.length} 组数据` : ''}尚未选择数据处理器。自动组装需要为每个数据集明确配置处理方式。`
+          : '数据处理配置错误，修正后才能生成 config 并预检。请检查各数据集列出的错误。'
       : undefined;
   const mixedDropoutUnresolved =
     !!stageRecipeInfo?.mixedDropout &&
@@ -642,13 +719,17 @@ function RunWizardContent({
     [assets.data, request.node_id],
   );
   const actionHorizonInference = useMemo(
-    () => inferDatasetActionHorizon(request.dataset_bindings || [], localAssets),
-    [request.dataset_bindings, localAssets],
+    () =>
+      isNorm
+        ? inferNormActionHorizon(normRows, localAssets)
+        : inferDatasetActionHorizon(request.dataset_bindings || [], localAssets),
+    [isNorm, request.norm_datasets, request.dataset_bindings, localAssets],
   );
-  const actionHorizonErrors = automaticMode
+  const actionHorizonErrors = automaticConfiguration
     ? [
         ...actionHorizonInference.errors,
-        ...(actionHorizonInference.recommendedHorizon !== undefined &&
+        ...(!isNorm &&
+        actionHorizonInference.recommendedHorizon !== undefined &&
         request.auto_config?.action_horizon !== actionHorizonInference.recommendedHorizon
           ? [
               `数据集已存储 ${actionHorizonInference.recommendedHorizon} 步动作，动作预测长度必须与其一致。当前处理器不会自动裁剪或补齐已有动作块。`,
@@ -659,10 +740,19 @@ function RunWizardContent({
   const actionHorizonBlocker = step === 1 ? actionHorizonErrors.join(' ') : '';
   const processingBlocker = actionHorizonBlocker || dataProcessingBlocker;
   useEffect(() => {
-    if (!automaticMode || actionHorizonMode !== 'automatic') return;
+    if (
+      !automaticConfiguration ||
+      actionHorizonMode !== 'automatic' ||
+      step >= 2 ||
+      busy ||
+      draftActionBusy
+    )
+      return;
     setRequest((value) => {
       if (!value.auto_config) return value;
-      const inferred = inferDatasetActionHorizon(value.dataset_bindings || [], localAssets);
+      const inferred = isNorm
+        ? inferNormActionHorizon(normDatasetsForRequest(value), localAssets)
+        : inferDatasetActionHorizon(value.dataset_bindings || [], localAssets);
       const horizon = defaultActionHorizon(
         value.auto_config.action_horizon,
         actionHorizonMode,
@@ -673,7 +763,17 @@ function RunWizardContent({
         ? value
         : { ...value, auto_config: { ...value.auto_config, action_horizon: horizon } };
     });
-  }, [automaticMode, actionHorizonMode, request.dataset_bindings, localAssets]);
+  }, [
+    automaticConfiguration,
+    isNorm,
+    actionHorizonMode,
+    step,
+    busy,
+    draftActionBusy,
+    request.norm_datasets,
+    request.dataset_bindings,
+    localAssets,
+  ]);
   const validatedRecipes = Array.isArray(selectedProfile?.metadata?.validated_recipes)
     ? [
         ...new Set(
@@ -685,6 +785,7 @@ function RunWizardContent({
     : [];
   const minGpus = template?.min_gpus ?? (template?.id === 'smoke' ? 0 : 1);
   useEffect(() => {
+    if (!template) return;
     const modeScope = `${request.template_id}:${advancedRecipe}`;
     if (initialDefaultsScope.current === modeScope) return;
     initialDefaultsScope.current = modeScope;
@@ -694,19 +795,36 @@ function RunWizardContent({
       TRAINING_RESOURCE_FIELDS.forEach((key) =>
         setResourceRecommendationMode(editedParameters.current, key, true),
       );
+    if (isNorm)
+      editedParameters.current = normResourceRecommendationTracking(editedParameters.current);
     setRequest((value) => ({
       ...value,
-      parameters: local ? value.parameters : trainingParameterDefaults(specs(template)),
-      gpu_count:
-        value.requested_gpu_uuids !== undefined
+      parameters: local
+        ? value.parameters
+        : {
+            ...trainingParameterDefaults(specs(template)),
+            ...(isNorm && Object.hasOwn(value.parameters, 'num_workers')
+              ? { num_workers: value.parameters.num_workers }
+              : {}),
+          },
+      gpu_count: isNorm
+        ? 0
+        : value.requested_gpu_uuids !== undefined
           ? value.requested_gpu_uuids.length
           : template?.id === 'smoke'
             ? 0
             : Math.max(template?.min_gpus ?? 1, value.gpu_count),
       auto_config:
-        local && !advancedRecipe ? value.auto_config || { ...DEFAULT_AUTO_CONFIG } : undefined,
+        (local || isNorm) && !advancedRecipe
+          ? isNorm
+            ? { ...(value.auto_config || DEFAULT_AUTO_CONFIG), finetune_mode: 'full' }
+            : value.auto_config || { ...DEFAULT_AUTO_CONFIG }
+          : undefined,
+      normalization_method: local ? value.normalization_method : undefined,
+      requested_gpu_uuids: isNorm ? undefined : value.requested_gpu_uuids,
       inputs: local ? value.inputs : {},
       dataset_bindings: local ? value.dataset_bindings || newDatasetBindings([]) : undefined,
+      norm_datasets: isNorm ? value.norm_datasets || [newNormDataset(!advancedRecipe)] : undefined,
       training_stage: request.template_id === 'recap' ? value.training_stage : undefined,
       stage_config: request.template_id === 'recap' ? value.stage_config : undefined,
       recipe: template?.id === 'smoke' ? 'smoke' : advancedRecipe ? value.recipe : undefined,
@@ -750,7 +868,7 @@ function RunWizardContent({
   useEffect(() => {
     // A generated preview is frozen. Resume resource following only after the
     // user returns to configuration, without changing its approval underneath.
-    if (!hasLocalTraining || step >= 2 || busy || draftActionBusy) return;
+    if ((!hasLocalTraining && !isNorm) || step >= 2 || busy || draftActionBusy) return;
     const next = applyResourceRecommendations(
       request.parameters,
       editedParameters.current,
@@ -762,7 +880,9 @@ function RunWizardContent({
       const parameters = applyResourceRecommendations(
         value.parameters,
         editedParameters.current,
-        recommendTrainingResources(value.gpu_count, node?.metrics),
+        isNorm
+          ? recommendNormResources(node?.metrics)
+          : recommendTrainingResources(value.gpu_count, node?.metrics),
       );
       return parameters === value.parameters ? value : { ...value, parameters };
     });
@@ -771,6 +891,7 @@ function RunWizardContent({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     hasLocalTraining,
+    isNorm,
     advancedRecipe,
     step,
     busy,
@@ -826,6 +947,7 @@ function RunWizardContent({
       entrypoint: undefined,
       inputs: {},
       dataset_bindings: hasLocalTraining ? newDatasetBindings([]) : undefined,
+      norm_datasets: isNorm ? [newNormDataset(!advancedRecipe)] : undefined,
       parameters: value.parameters,
     }));
     setSelectedRecipeRevision(undefined);
@@ -905,7 +1027,8 @@ function RunWizardContent({
     setRecipeDefaults({});
     setStageRecipeDefaults({});
     setStageRecipeInfo(undefined);
-    editedParameters.current.clear();
+    if (isNorm) editedParameters.current = resourceRecommendationTracking(editedParameters.current);
+    else editedParameters.current.clear();
     editedStageParameters.current.clear();
     setRequest((value) => ({
       ...value,
@@ -913,6 +1036,21 @@ function RunWizardContent({
       recipe_revision_id: undefined,
       entrypoint: undefined,
       auto_config: enabled ? undefined : { ...DEFAULT_AUTO_CONFIG },
+      ...(isNorm
+        ? {
+            norm_datasets: normDatasetsForRequest(value).map((row) =>
+              !enabled && !row.processor
+                ? {
+                    ...newNormDataset(
+                      true,
+                      localAssets.find((asset) => asset.id === row.dataset_asset_id),
+                    ),
+                    dataset_asset_id: row.dataset_asset_id,
+                  }
+                : row,
+            ),
+          }
+        : {}),
     }));
   };
   const applyRecipeDefaults = useCallback(
@@ -1074,26 +1212,32 @@ function RunWizardContent({
     setConfirmedConfigSha256(undefined);
     idempotencyKey.current = crypto.randomUUID();
     try {
-      const result = await post<Preview>('/run-previews', {
-        name: request.name,
-        node_id: request.node_id,
-        profile_id: request.profile_id,
-        template_id: request.template_id,
-        inputs: request.inputs,
-        dataset_bindings: hasLocalTraining ? request.dataset_bindings : undefined,
-        training_stage: isRecap ? request.training_stage : undefined,
-        stage_config: isRecap ? request.stage_config : undefined,
-        parameters: request.parameters,
-        gpu_count: request.gpu_count,
-        requested_gpu_uuids: request.requested_gpu_uuids,
-        auto_config: automaticMode ? request.auto_config : undefined,
-        ...(hasLocalTraining && request.normalization_method
-          ? { normalization_method: request.normalization_method }
-          : {}),
-        recipe_revision_id: advancedRecipe ? request.recipe_revision_id : undefined,
-        recipe: automaticMode ? undefined : request.recipe?.trim(),
-        entrypoint: hasLocalTraining && advancedRecipe ? request.entrypoint?.trim() : undefined,
-      });
+      const result = await post<Preview>(
+        '/run-previews',
+        isNorm
+          ? buildNormPreviewRequest(request)
+          : {
+              name: request.name,
+              node_id: request.node_id,
+              profile_id: request.profile_id,
+              template_id: request.template_id,
+              inputs: request.inputs,
+              dataset_bindings: hasLocalTraining ? request.dataset_bindings : undefined,
+              training_stage: isRecap ? request.training_stage : undefined,
+              stage_config: isRecap ? request.stage_config : undefined,
+              parameters: request.parameters,
+              gpu_count: request.gpu_count,
+              requested_gpu_uuids: request.requested_gpu_uuids,
+              auto_config: automaticMode ? request.auto_config : undefined,
+              ...(hasLocalTraining && request.normalization_method
+                ? { normalization_method: request.normalization_method }
+                : {}),
+              recipe_revision_id: advancedRecipe ? request.recipe_revision_id : undefined,
+              recipe: automaticMode ? undefined : request.recipe?.trim(),
+              entrypoint:
+                hasLocalTraining && advancedRecipe ? request.entrypoint?.trim() : undefined,
+            },
+      );
       setCreatedPreview(result);
       setPreviewId(result.id);
     } catch (err) {
@@ -1107,22 +1251,22 @@ function RunWizardContent({
     setBusy(true);
     setError(undefined);
     try {
-      const run = await post<Run>(
-        '/runs',
-        {
-          preflight_id: preview.id,
-          confirmed_config_sha256: hasLocalTraining ? confirmedConfigSha256 : undefined,
+      await submitTrainingRun({
+        preflightId: preview.id,
+        confirmedConfigSha256: requiresConfigConfirmation ? confirmedConfigSha256 : undefined,
+        idempotencyKey: idempotencyKey.current,
+        finishDraft: draftSession.finished,
+        isActive: () => mounted.current,
+        onSubmitted: (run) => {
+          refresh();
+          close();
+          navigate(`/runs/${run.id}`);
         },
-        { 'Idempotency-Key': idempotencyKey.current },
-      );
-      await draftSession.finished().catch(() => {});
-      refresh();
-      close();
-      navigate(`/runs/${run.id}`);
+      });
     } catch (err) {
-      setError(err as Error);
+      if (mounted.current) setError(err as Error);
     } finally {
-      setBusy(false);
+      if (mounted.current) setBusy(false);
     }
   };
   const draftAction = async (operation: () => Promise<void>) => {
@@ -1148,9 +1292,13 @@ function RunWizardContent({
   }[draftSession.status];
   return (
     <Modal
-      title="新建训练"
+      title={isNorm ? '计算 norm_stats' : '新建训练'}
       className="training-run-modal"
-      subtitle="选择数据和初始模型，确认训练方式与参数，预检后核对 config 再启动。"
+      subtitle={
+        isNorm
+          ? '选择本机数据集和处理方式，核对统计配置后提交计算任务。'
+          : '选择数据和初始模型，确认训练方式与参数，预检后核对 config 再启动。'
+      }
       close={() => {
         if (busy || draftActionBusy) return;
         void draftSession
@@ -1262,7 +1410,7 @@ function RunWizardContent({
                 !!actionHorizonBlocker ||
                 !!parameterBlocker ||
                 (step === 1 && !!gpuSelectionError) ||
-                (step === 1 && hasLocalTraining && !processorsValid)
+                (step === 1 && (hasLocalTraining || isNorm) && !processorsValid)
               }
             >
               {step === 1 ? (recipeReading ? '读取配方配置…' : '生成 config 并预检') : '下一步'}
@@ -1274,7 +1422,8 @@ function RunWizardContent({
               disabled={busy || draftActionBusy || preview?.status !== 'READY' || !configConfirmed}
               onClick={() => void start()}
             >
-              {busy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} />}确认启动训练
+              {busy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} />}
+              {isNorm ? '确认开始计算' : '确认启动训练'}
             </button>
           )}
         </>
@@ -1282,8 +1431,8 @@ function RunWizardContent({
     >
       <div className="wizard-steps">
         {[
-          { title: '数据和初始模型', icon: Database },
-          { title: '训练方式与参数', icon: Cpu },
+          { title: isNorm ? '本机数据集' : '数据和初始模型', icon: Database },
+          { title: isNorm ? '统计配置与参数' : '训练方式与参数', icon: Cpu },
           { title: '预检与 config 确认', icon: GitCommitHorizontal },
         ].map((item, index) => (
           <div
@@ -1445,6 +1594,10 @@ function RunWizardContent({
               setError(new Error('请选择在线机器和匹配的本机运行环境。'));
               return;
             }
+            if (isNorm && normDatasetErrors(normRows, automaticNorm).length) {
+              setError(new Error(normDatasetErrors(normRows, automaticNorm).join(' ')));
+              return;
+            }
             if (
               hasLocalTraining &&
               (!request.inputs.model ||
@@ -1479,18 +1632,20 @@ function RunWizardContent({
                 setError(new Error('请选择本次 ReCap 训练阶段。'));
                 return;
               }
-              if (hasLocalTraining && !processorsValid) {
+              if ((hasLocalTraining || isNorm) && !processorsValid) {
                 setError(
                   new Error(
-                    automaticMode
-                      ? '请完成独立数据处理配置；自动组装不使用旧版配方数据项。'
-                      : '请完成数据处理配置，或明确选择沿用代码配方数据项。',
+                    isNorm
+                      ? '请完成每个数据集的统计处理配置。'
+                      : automaticMode
+                        ? '请完成独立数据处理配置；自动组装不使用旧版配方数据项。'
+                        : '请完成数据处理配置，或明确选择沿用代码配方数据项。',
                   ),
                 );
                 return;
               }
               if (
-                automaticMode &&
+                automaticConfiguration &&
                 (!request.auto_config || automaticConfigErrors(request.auto_config).length)
               ) {
                 setError(
@@ -1509,7 +1664,9 @@ function RunWizardContent({
                       ? '请先保存配方修改或还原修改。'
                       : recipeReading
                         ? '正在读取配方配置，完成后再继续。'
-                        : '请在高级设置中选择代码配方。',
+                        : isNorm
+                          ? '请选择统计使用的代码配方。'
+                          : '请在高级设置中选择代码配方。',
                   ),
                 );
                 return;
@@ -1530,15 +1687,21 @@ function RunWizardContent({
           }}
         >
           {step === 0 ? (
-            <div className={`training-data-layout${hasLocalTraining ? ' with-datasets' : ''}`}>
+            <div
+              className={`training-data-layout${hasLocalTraining || isNorm ? ' with-datasets' : ''}`}
+            >
               <section className="training-data-resources" aria-label="训练与运行资源">
-                <h3>训练与运行资源</h3>
-                <Field label="训练名称" required hint="使用清晰的名称，便于查找训练结果。">
+                <h3>{isNorm ? '数据与运行环境' : '训练与运行资源'}</h3>
+                <Field
+                  label={isNorm ? '统计任务名称' : '训练名称'}
+                  required
+                  hint="使用清晰的名称，便于查找任务结果。"
+                >
                   <input
                     required
                     autoFocus
                     maxLength={160}
-                    placeholder="例如 umi-pi05-sft"
+                    placeholder={isNorm ? '例如 umi-norm-stats' : '例如 umi-pi05-sft'}
                     value={request.name}
                     onChange={(event) => update('name', event.target.value)}
                   />
@@ -1605,7 +1768,22 @@ function RunWizardContent({
                     </dl>
                   </details>
                 )}
-                {inputRequirements.length ? (
+                {isNorm ? (
+                  <NormStatsFields
+                    showAutomaticFields={false}
+                    node={node}
+                    profile={selectedProfile}
+                    recipe={request.recipe || ''}
+                    onChange={(recipe) => update('recipe', recipe)}
+                    advanced={advancedRecipe}
+                    onAdvancedChange={toggleRecipeMode}
+                    autoConfig={request.auto_config}
+                    onAutoConfigChange={(config) => update('auto_config', config)}
+                    horizonInference={actionHorizonInference}
+                    horizonMode={actionHorizonMode}
+                    onHorizonModeChange={setActionHorizonMode}
+                  />
+                ) : inputRequirements.length ? (
                   inputRequirements
                     .filter((role) => !hasLocalTraining || role === 'model')
                     .map((role) => {
@@ -1673,6 +1851,24 @@ function RunWizardContent({
                   </label>
                 </details>
               </section>
+              {isNorm && (
+                <section className="training-data-datasets" aria-label="统计数据与处理方式">
+                  <NormDatasetEditor
+                    rows={normRows}
+                    imageLayoutEdits={imageLayoutEdits}
+                    assets={localAssets}
+                    node={node}
+                    profile={selectedProfile}
+                    recipe={request.recipe}
+                    automatic={automaticNorm}
+                    preserveProcessingOnDatasetChange={editedParameters.current.has(
+                      TRAINING_TEMPLATE_PROCESSING_MARKER,
+                    )}
+                    onValidityChange={setProcessorsValid}
+                    onChange={(rows) => update('norm_datasets', rows)}
+                  />
+                </section>
+              )}
               {hasLocalTraining && (
                 <section className="training-data-datasets" aria-label="训练数据与处理方式">
                   <DatasetBindings
@@ -1728,7 +1924,10 @@ function RunWizardContent({
                     setRecipeDirty(false);
                     setRecipeReading(false);
                     entrypointEdited.current = false;
-                    editedParameters.current.clear();
+                    editedParameters.current =
+                      event.target.value === 'openpi-norm'
+                        ? resourceRecommendationTracking(editedParameters.current)
+                        : new Set();
                     editedStageParameters.current.clear();
                     setRequest((value) => ({
                       ...value,
@@ -1757,6 +1956,35 @@ function RunWizardContent({
                   ))}
                 </select>
               </Field>
+              {isNorm && (
+                <>
+                  <NormStatsFields
+                    node={node}
+                    profile={selectedProfile}
+                    recipe={request.recipe || ''}
+                    onChange={(recipe) => update('recipe', recipe)}
+                    advanced={advancedRecipe}
+                    onAdvancedChange={toggleRecipeMode}
+                    autoConfig={request.auto_config}
+                    onAutoConfigChange={(config) => update('auto_config', config)}
+                    horizonInference={actionHorizonInference}
+                    horizonMode={actionHorizonMode}
+                    onHorizonModeChange={setActionHorizonMode}
+                  />
+                  <NormDatasetEditor
+                    rows={normRows}
+                    imageLayoutEdits={imageLayoutEdits}
+                    assets={localAssets}
+                    node={node}
+                    profile={selectedProfile}
+                    recipe={request.recipe}
+                    automatic={automaticNorm}
+                    readOnly
+                    onValidityChange={setProcessorsValid}
+                    onChange={(rows) => update('norm_datasets', rows)}
+                  />
+                </>
+              )}
               {isRecap && (
                 <section className="recap-stage-selection" aria-label="ReCap 训练阶段">
                   <Field
@@ -2139,7 +2367,7 @@ function RunWizardContent({
               )}
               <div className="form-section-title">
                 <Cpu size={16} />
-                <h3>训练参数</h3>
+                <h3>{isNorm ? '统计参数' : '训练参数'}</h3>
                 <span>参数已填入初始值，可直接修改后生成 config</span>
               </div>
               <div className="training-parameter-sections">
@@ -2159,7 +2387,7 @@ function RunWizardContent({
                     key={group.id}
                     aria-label={group.title}
                   >
-                    <h4>{group.title}</h4>
+                    <h4>{isNorm ? '数据加载' : group.title}</h4>
                     <div className="form-grid parameters">
                       {group.entries.map(([key, spec]) => (
                         <Field
@@ -2169,16 +2397,20 @@ function RunWizardContent({
                             !unusedParameters.includes(key) && !optionalTrainingParameter(spec)
                           }
                           hint={
-                            isTrainingResourceField(key)
-                              ? trainingResourceRecommendationHint(key, resourceRecommendations)
-                              : trainingParameterHint(
-                                  key,
-                                  spec,
-                                  advancedRecipe,
-                                  recipeDefaults,
-                                  editedParameters.current.has(key) &&
-                                    Object.hasOwn(request.parameters, key),
-                                )
+                            isNorm
+                              ? key === 'batch_size'
+                                ? '每批读取的样本数；任务始终完整遍历数据集。'
+                                : normResourceRecommendationHint(resourceRecommendations)
+                              : isTrainingResourceField(key)
+                                ? trainingResourceRecommendationHint(key, resourceRecommendations)
+                                : trainingParameterHint(
+                                    key,
+                                    spec,
+                                    advancedRecipe,
+                                    recipeDefaults,
+                                    editedParameters.current.has(key) &&
+                                      Object.hasOwn(request.parameters, key),
+                                  )
                           }
                         >
                           {unusedParameters.includes(key) ? (
@@ -2280,14 +2512,16 @@ function RunWizardContent({
                               )}
                             </>
                           )}
-                          {isTrainingResourceField(key) && (
+                          {isTrainingResourceField(key) && (!isNorm || key === 'num_workers') && (
                             <div
                               className="training-resource-recommendation"
                               id={`training-resource-recommendation-${key}`}
                             >
                               <span>
                                 {resourceRecommendations[key] === undefined
-                                  ? '填写有效 GPU 数量后显示推荐'
+                                  ? isNorm
+                                    ? '等待机器 CPU 信息'
+                                    : '填写有效 GPU 数量后显示推荐'
                                   : `推荐值：${resourceRecommendations[key]}`}
                                 {' · '}
                                 {automaticResourceRecommendation(editedParameters.current, key)
@@ -2296,37 +2530,39 @@ function RunWizardContent({
                                     ? '手动保留'
                                     : '空值沿用配置'}
                               </span>
-                              <button
-                                type="button"
-                                className="button outline small"
-                                id={`training-use-recommendation-${key}`}
-                                aria-label={`使用${spec.label || key}推荐值`}
-                                disabled={
-                                  busy ||
-                                  draftActionBusy ||
-                                  resourceRecommendations[key] === undefined ||
-                                  automaticResourceRecommendation(editedParameters.current, key)
-                                }
-                                onClick={() => {
-                                  setResourceRecommendationMode(
-                                    editedParameters.current,
-                                    key,
-                                    true,
-                                  );
-                                  update(
-                                    'parameters',
-                                    applyResourceRecommendations(
-                                      request.parameters,
+                              {!isNorm && (
+                                <button
+                                  type="button"
+                                  className="button outline small"
+                                  id={`training-use-recommendation-${key}`}
+                                  aria-label={`使用${spec.label || key}推荐值`}
+                                  disabled={
+                                    busy ||
+                                    draftActionBusy ||
+                                    resourceRecommendations[key] === undefined ||
+                                    automaticResourceRecommendation(editedParameters.current, key)
+                                  }
+                                  onClick={() => {
+                                    setResourceRecommendationMode(
                                       editedParameters.current,
-                                      resourceRecommendations,
-                                    ),
-                                  );
-                                }}
-                              >
-                                {automaticResourceRecommendation(editedParameters.current, key)
-                                  ? '已使用推荐'
-                                  : '使用推荐值'}
-                              </button>
+                                      key,
+                                      true,
+                                    );
+                                    update(
+                                      'parameters',
+                                      applyResourceRecommendations(
+                                        request.parameters,
+                                        editedParameters.current,
+                                        resourceRecommendations,
+                                      ),
+                                    );
+                                  }}
+                                >
+                                  {automaticResourceRecommendation(editedParameters.current, key)
+                                    ? '已使用推荐'
+                                    : '使用推荐值'}
+                                </button>
+                              )}
                             </div>
                           )}
                           {parameterIssues.some((issue) => issue.key === key) && (
@@ -2342,7 +2578,7 @@ function RunWizardContent({
                           )}
                         </Field>
                       ))}
-                      {group.id === 'resources' && (
+                      {group.id === 'resources' && !isNorm && (
                         <TrainingGpuSelector
                           request={request}
                           node={node}
@@ -2375,9 +2611,11 @@ function RunWizardContent({
             <div>
               <h3>
                 {preview?.status === 'READY'
-                  ? hasLocalTraining
-                    ? '预检通过，请检查 config 并确认'
-                    : '平台链路测试预检通过'
+                  ? isNorm
+                    ? '统计预检通过，请检查 config 并确认'
+                    : hasLocalTraining
+                      ? '预检通过，请检查 config 并确认'
+                      : '平台链路测试预检通过'
                   : requestFailed
                     ? '预检请求未完成'
                     : previewExpired
@@ -2387,12 +2625,16 @@ function RunWizardContent({
                         : progressUnavailable
                           ? '暂时无法读取预检进度'
                           : busy || preview?.status === 'PENDING'
-                            ? 'Agent 正在自动检查配方与本机资产'
+                            ? isNorm
+                              ? 'Agent 正在检查统计配方与本机数据'
+                              : 'Agent 正在自动检查配方与本机资产'
                             : '尚未发起预检'}
               </h3>
               <p>
                 {preview?.status === 'READY'
-                  ? '已检查配置与本机资产，尚未执行训练。请核对下方生成的 config，勾选确认后启动。'
+                  ? isNorm
+                    ? '已检查统计配方和本机数据。请核对下方生成的 config，勾选确认后开始计算 norm_stats。'
+                    : '已检查配置与本机资产，尚未执行训练。请核对下方生成的 config，勾选确认后启动。'
                   : requestFailed
                     ? '尚未取得预检记录，请根据错误提示修正后重新预检。'
                     : previewExpired
@@ -2401,7 +2643,9 @@ function RunWizardContent({
                         ? '请按失败项修正配置、资产或运行环境，然后重新预检。'
                         : progressUnavailable
                           ? '可重试读取进度；当前显示的结果可能尚未更新。'
-                          : '自动检查配方、数据集、模型、归一化参数、输出空间、GPU 与实际执行代码。'}
+                          : isNorm
+                            ? '自动检查统计配方、数据处理、真实样本、缓存权限、输出空间与统计脚本入口。'
+                            : '自动检查配方、数据集、模型、归一化参数、输出空间、GPU 与实际执行代码。'}
               </p>
             </div>
           </div>
@@ -2425,10 +2669,14 @@ function RunWizardContent({
             <dl className="detail-list inset">
               <div>
                 <dt>自动预检范围</dt>
-                <dd>配方配置与本机资产检查；训练效果需启动后观察。</dd>
+                <dd>
+                  {isNorm
+                    ? '检查配方和本机数据；提交后才执行完整统计。'
+                    : '配方配置与本机资产检查；训练效果需启动后观察。'}
+                </dd>
               </div>
               <div>
-                <dt>训练输入来源</dt>
+                <dt>{isNorm ? '统计输入来源' : '训练输入来源'}</dt>
                 <dd>
                   {automaticPreflight.plan.input_authority === 'registered_assets'
                     ? '本次选择的已登记资产，已核对实际路径与资产身份。'
@@ -2436,7 +2684,7 @@ function RunWizardContent({
                 </dd>
               </div>
               <div>
-                <dt>实际训练入口</dt>
+                <dt>{isNorm ? '实际统计入口' : '实际训练入口'}</dt>
                 <dd>
                   <code>{automaticPreflight.plan.entrypoint}</code>
                 </dd>
@@ -2576,8 +2824,21 @@ function RunWizardContent({
               />
             </div>
           )}
-          {hasLocalTraining && preview?.status === 'READY' && (
+          {isNorm && (
+            <NormDatasetEditor
+              rows={preview?.request?.norm_datasets || normRows}
+              assets={assets.data || []}
+              node={node}
+              profile={selectedProfile}
+              recipe={request.recipe}
+              automatic={!!(preview?.request || request).auto_config}
+              readOnly
+              onChange={() => {}}
+            />
+          )}
+          {requiresConfigConfirmation && preview?.status === 'READY' && (
             <GeneratedConfigReview
+              purpose={isNorm ? 'norm' : 'training'}
               config={generatedConfig}
               confirmedSha256={confirmedConfigSha256}
               onConfirm={setConfirmedConfigSha256}

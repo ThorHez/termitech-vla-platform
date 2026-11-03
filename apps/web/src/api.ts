@@ -6,13 +6,36 @@ import type { RunEvent } from './types';
 const LEGACY_TOKEN_KEY = 'termitech.admin-token';
 const SESSION_EXPIRED = 'termitech:session-expired';
 let csrfToken: string | undefined;
+let operationUser: string | undefined;
 let sessionGeneration = 0;
 let reauthenticate: ((signal?: AbortSignal | null) => Promise<void>) | undefined;
 
 // Human sessions live in HttpOnly cookies. Only the CSRF value is kept in memory.
-export function setSessionCsrf(token?: string) {
-  if (csrfToken !== token) sessionGeneration += 1;
+export function setSessionCsrf(token?: string, userId?: string) {
+  if (csrfToken !== token || operationUser !== userId) sessionGeneration += 1;
   csrfToken = token;
+  operationUser = userId;
+}
+
+/** Bind multi-step work to the account that started it, including after a wait. */
+export function createOperationClient() {
+  const generation = sessionGeneration;
+  const requireCurrent = () => {
+    if (generation !== sessionGeneration)
+      throw new ApiError('SESSION_CHANGED', '登录状态已改变，请重新执行此操作。', 401);
+  };
+  return {
+    requireCurrent,
+    async api<T>(path: string, options: RequestInit = {}) {
+      requireCurrent();
+      const result = await api<T>(path, options);
+      requireCurrent();
+      return result;
+    },
+    post<T>(path: string, body: unknown = {}, options: RequestInit = {}) {
+      return this.api<T>(path, { ...options, method: 'POST', body: JSON.stringify(body) });
+    },
+  };
 }
 export function discardLegacyToken() {
   try {
@@ -43,6 +66,7 @@ export async function authenticatedFetch(path: string, options: RequestInit = {}
   const method = (options.method || 'GET').toUpperCase();
   if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && csrfToken) {
     headers.set('X-CSRF-Token', csrfToken);
+    if (operationUser) headers.set('X-Operation-User', operationUser);
   }
   if (options.body) headers.set('Content-Type', 'application/json');
   const generation = sessionGeneration;
@@ -80,6 +104,7 @@ export class ApiError extends Error {
 }
 
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  options.signal?.throwIfAborted();
   const generation = sessionGeneration;
   // The server rejects the first sensitive request before applying any change.
   // Retry it once after password confirmation, only in the same browser session.
@@ -96,7 +121,12 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
         response.status,
       );
     }
-    if (response.ok) return data as T;
+    if (response.ok) {
+      options.signal?.throwIfAborted();
+      if (generation !== sessionGeneration)
+        throw new ApiError('SESSION_CHANGED', '登录状态已改变，请重新执行此操作。', 401);
+      return data as T;
+    }
     const detail = data as { error?: { code?: string; message?: string }; detail?: string } | null;
     const code = detail?.error?.code || `HTTP_${response.status}`;
     const handler = reauthenticate;

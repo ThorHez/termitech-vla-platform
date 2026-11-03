@@ -202,8 +202,10 @@ def normalize_dataset_inspection(value, expected_path=None):
             for row in _list(item, 32 if key == "state_fields" else 16, 1):
                 state = key == "state_fields"
                 _obj(row, {"key", "width", "arm", "kind"} if state else {"arm", "kind", "width"})
-                result = {"width": _int(row["width"], 128), "arm": _enum(row["arm"], {"left", "right", "shared"} if state else {"left", "right"}),
-                          "kind": _enum(row["kind"], {"position", "rotation", "joint", "gripper", "other"} if state else {"position", "rotation", "joint", "gripper"})}
+                result = {"width": _int(row["width"], 128), "arm": _enum(row["arm"], {"left", "right", "shared"}),
+                          "kind": _enum(row["kind"], {"position", "rotation", "joint", "gripper", "other"} if state else {"position", "rotation", "joint", "gripper", "shared"})}
+                if not state and (result["arm"] == "shared") != (result["kind"] == "shared"):
+                    _fail()
                 if state:
                     result["key"] = _text(row["key"])
                 rows.append(result)

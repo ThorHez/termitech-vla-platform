@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ArrowRight, CheckCircle2, Download, LoaderCircle, RefreshCw, Square } from 'lucide-react';
 import { date, post, useApi } from './api';
 import { useAuth } from './auth';
+import { canManageResource, ResourceOwner } from './resourcePermissions';
 import { Badge, ErrorNotice, Panel, ProgressBar } from './components';
 import { useData } from './data';
 import { PolicyWarnings } from './PolicyWarnings';
@@ -92,7 +93,7 @@ export function TransferCard(props: TransferCardProps) {
 
 function TransferCardContent({ item, changed, useTransfer, compact = false }: TransferCardProps) {
   const { nodes } = useData();
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [now, setNow] = useState(() => Date.now());
@@ -117,9 +118,9 @@ function TransferCardContent({ item, changed, useTransfer, compact = false }: Tr
     ?.split(/\r?\n/)
     .filter((line) => line.trim())
     .at(-1);
-  const writable = can('training.write');
+  const writable = can('training.write') && canManageResource(user, item.owner_user_id);
   const perform = async (operation: string) => {
-    if (busy) return;
+    if (busy || !writable) return;
     setBusy(true);
     setError(undefined);
     try {
@@ -153,6 +154,7 @@ function TransferCardContent({ item, changed, useTransfer, compact = false }: Tr
           label={transferLabels[item.state] || item.state}
         />
       </div>
+      <ResourceOwner ownerUserId={item.owner_user_id} />
       {cancelled && (
         <p className="checkpoint-transfer-stopped" role="status">
           已取消，传输已停止。保留记录和部分文件供重试。
@@ -261,6 +263,9 @@ function TransferCardContent({ item, changed, useTransfer, compact = false }: Tr
             使用此权重部署
             <ArrowRight size={13} />
           </button>
+        )}
+        {!writable && can('training.write') && item.state === 'SUCCEEDED' && useTransfer && (
+          <p className="field-hint">此同步记录仅供查看；请从来源训练新建自己的权重同步和部署。</p>
         )}
         {busy && <LoaderCircle size={14} className="spin" />}
       </div>

@@ -136,7 +136,8 @@ try {
     assert.match(wizard, /consumedSourceRun\.current === source\.id/);
     assert.match(wizard, /sameTrainingConfiguration\(previous, snapshot\)/);
     assert.match(wizard, /载入并替换草稿/);
-    assert.match(wizard, /confirmed_config_sha256: hasLocalTraining \? confirmedConfigSha256 : undefined/);
+    assert.match(wizard, /confirmedConfigSha256: requiresConfigConfirmation \? confirmedConfigSha256 : undefined/);
+    assert.match(wizard, /const requiresConfigConfirmation = hasLocalTraining \|\| isNorm/);
     assert.doesNotMatch(detail, /post[\s\S]{0,40}\/retry/);
   });
 } finally { await server.close(); }

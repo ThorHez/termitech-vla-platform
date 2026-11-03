@@ -8,6 +8,25 @@ import type { GpuReservation, Node } from './types';
 import { gpuReservationRecords } from './gpuReservationRecords';
 import './gpu-reservations.css';
 
+export interface GpuReservationPolicy {
+  max_per_user: number;
+  ttl_seconds: number;
+  reserved_count: number;
+  remaining_count: number;
+}
+
+export function reservationSelectionLimit(
+  policy: GpuReservationPolicy | undefined,
+  currentNodeCount: number,
+  selectedCount: number,
+) {
+  if (!policy) return undefined;
+  const total = Math.max(0, policy.reserved_count - currentNodeCount) + selectedCount;
+  return total > policy.max_per_user
+    ? `每个账号跨机器最多预留 ${policy.max_per_user} 张 GPU；当前选择合计 ${total} 张，请减少选择。`
+    : undefined;
+}
+
 export function RunGpuReservationNotice({
   node,
   gpuUuids,
@@ -53,9 +72,12 @@ export function GpuReservationSaveReceipt({
           <p key={record.createdAt}>
             {record.gpuLabels.join('、')} · {record.displayName || record.username} ·{' '}
             {date(record.createdAt)}
+            {record.expiresAt && <> · 到期 {date(record.expiresAt)}</>}
           </p>
         ))}
-        {rows.length > 0 && <p>持续生效，直到你或管理员主动释放。可在机器资源页查看预留记录。</p>}
+        {rows.length > 0 && (
+          <p>预留到期自动释放，也可由你或管理员提前释放；运行中的任务继续执行。</p>
+        )}
       </div>
     </div>
   );
@@ -74,6 +96,7 @@ export function GpuReservations({
   const { nodes, overview } = useData();
   const path = `/nodes/${encodeURIComponent(node.id)}/gpu-reservations`;
   const reservations = useApi<GpuReservation[]>(path, 5000);
+  const policy = useApi<GpuReservationPolicy>('/gpu-reservation-policy', 5000);
   const [selected, setSelected] = useState<string[]>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
@@ -83,6 +106,7 @@ export function GpuReservations({
   const liveNode = nodes.data?.find((item) => item.id === node.id) || node;
   const rows = reservations.data || [];
   const mine = rows.filter((row) => row.user_id === user?.id).map((row) => row.gpu_uuid);
+  const selectionLimit = reservationSelectionLimit(policy.data, mine.length, selected?.length || 0);
   useEffect(() => {
     if (reservations.data && selected === undefined) {
       setSelected(
@@ -110,7 +134,9 @@ export function GpuReservations({
     if (!pending.current) close();
   };
   const mutate = async (gpuUuid?: string) => {
-    if (pending.current || (!gpuUuid && selected === undefined)) return;
+    if (pending.current || (!gpuUuid && (selected === undefined || selectionLimit)) || !writable)
+      return;
+    if (gpuUuid && !can('machines.manage')) return;
     pending.current = true;
     setBusy(true);
     setError(undefined);
@@ -127,6 +153,7 @@ export function GpuReservations({
         setSelected(ownRows.map((row) => row.gpu_uuid));
       }
       reservations.refresh();
+      policy.refresh();
       nodes.refresh();
       overview.refresh();
       changed?.();
@@ -151,23 +178,40 @@ export function GpuReservations({
           {writable && (
             <button
               className="button primary"
-              disabled={busy || !reservations.data || selected === undefined || unchanged}
+              disabled={
+                busy ||
+                !reservations.data ||
+                selected === undefined ||
+                Boolean(selectionLimit) ||
+                (unchanged && !selected.length)
+              }
               onClick={() => void mutate()}
             >
               {busy && <LoaderCircle size={15} className="spin" />}
-              {busy ? '保存中…' : '保存我的预留'}
+              {busy ? '保存中…' : unchanged && selected?.length ? '续期我的预留' : '保存我的预留'}
             </button>
           )}
         </>
       }
     >
       <p className="gpu-reservation-explanation">
-        预留后，仅你的训练和推理任务可以使用这些
-        GPU。预留持续生效，直到主动释放；运行中的任务会继续占用其 GPU。
+        预留后，仅你的训练和推理任务可以使用这些 GPU。预留到期自动释放，运行中的任务会继续占用其
+        GPU。
       </p>
+      {policy.data && (
+        <p className="field-hint">
+          每个账号跨机器最多预留 {policy.data.max_per_user} 张，当前共 {policy.data.reserved_count}{' '}
+          张； 每次保存或续期后有效 {policy.data.ttl_seconds / 3600} 小时。
+        </p>
+      )}
+      {selectionLimit && (
+        <p className="field-hint required" role="alert">
+          {selectionLimit}
+        </p>
+      )}
       {saved && <GpuReservationSaveReceipt node={liveNode} rows={saved} />}
       <ErrorNotice
-        error={error || reservations.error}
+        error={error || reservations.error || policy.error}
         title={error ? '预留保存失败' : '预留信息读取失败'}
         retry={reservations.refresh}
       />
@@ -203,7 +247,17 @@ export function GpuReservations({
               const disabled =
                 !writable ||
                 busy ||
-                (!checked && (foreign || !device.present || liveNode.status !== 'ONLINE'));
+                (!checked &&
+                  (foreign ||
+                    !device.present ||
+                    liveNode.status !== 'ONLINE' ||
+                    Boolean(
+                      reservationSelectionLimit(
+                        policy.data,
+                        mine.length,
+                        (selected?.length || 0) + 1,
+                      ),
+                    )));
               return (
                 <div className={`gpu-reservation-option ${own ? 'mine' : ''}`} key={device.uuid}>
                   <label>
@@ -233,7 +287,12 @@ export function GpuReservations({
                           : '公共资源'}
                         {!device.present && ' · 设备未上报'}
                       </span>
-                      {row && <span>预留于 {date(row.created_at)} · 持续有效</span>}
+                      {row && (
+                        <span>
+                          预留于 {date(row.created_at)} ·{' '}
+                          {row.expires_at ? `到期 ${date(row.expires_at)}` : '正在读取到期时间'}
+                        </span>
+                      )}
                     </span>
                   </label>
                   {foreign && can('machines.manage') && (

@@ -26,6 +26,14 @@ CACHE_ENV_KEYS = (
 MAX_CACHE_ENTRIES = 20000
 
 
+def inspect_numeric_cache(datasets, spec):
+    """Projected Parquet readers use bounded RAM, with no Hugging Face builder."""
+    paths = {key: str(_managed_path(os.environ[key], spec, label=key))
+             for key in CACHE_ENV_KEYS if os.environ.get(key)}
+    return {"mode": "numeric_projection", "persistent_cache": False, "paths": paths,
+            "datasets": [{"path": row["path"], "columns": row["numeric_io"]["columns"]} for row in datasets]}
+
+
 def _managed_path(value, spec, *, label, strict=False):
     if not isinstance(value, (str, Path)) or not Path(value).expanduser().is_absolute():
         raise ValueError(f"TRAINING_CACHE_UNAVAILABLE: {label} 必须是本机绝对路径：{value}")

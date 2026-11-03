@@ -4,12 +4,15 @@ import json
 from pathlib import PurePosixPath
 import re
 
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import Field
 from sqlalchemy import select
 
 from .common import APIError, now, offset_time, uid, under_root
 from .models import Command, Profile
+from .resource_authorization import (COMMAND_AUTHORIZATION_ERRORS, bind_command_actor,
+                                     query_reusable, require_active_actor)
 from .recipe_details import _hex, _literal, _safe_text
 from .recipe_suggestions import matching_profile, profile_digest, require_profile, SOURCES
 from .schemas import InputModel
@@ -19,6 +22,7 @@ QUERY_TTL_SECONDS = 60
 CACHE_SECONDS = 30
 MAX_PENDING = 5
 ERRORS = {
+    **COMMAND_AUTHORIZATION_ERRORS,
     "DATA_PROCESSORS_TIMEOUT": "读取数据处理器超时，请检查训练环境后重试",
     "AGENT_DATA_PROCESSORS_UNSUPPORTED": "当前 Agent 不支持独立数据处理器，请更新 Agent",
     "DATA_PROCESSORS_PROFILE_CHANGED": "训练环境已变化，请重新读取数据处理器",
@@ -184,7 +188,7 @@ def query_dict(command, profile, roots):
     return result
 
 
-def create_query(session, node, profile_id):
+def create_query(session, node, profile_id, *, actor_request=None):
     profile = require_profile(session, node.id, profile_id)
     digest = profile_digest(profile, node.roots)
     expire_pending(session, node.id)
@@ -192,6 +196,8 @@ def create_query(session, node, profile_id):
                                    Command.created_at >= offset_time(-CACHE_SECONDS), Command.status.in_({"PENDING", "APPLIED"}))
     for command in session.scalars(recent.order_by(Command.created_at.desc())):
         if command.payload.get("profile_digest") == digest:
+            if not query_reusable(session, command, actor_request, "recipes.query"):
+                continue
             cached = query_dict(command, profile, node.roots)
             if cached["status"] in {"PENDING", "READY"}:
                 return cached
@@ -201,6 +207,7 @@ def create_query(session, node, profile_id):
     command = Command(id=uid(), node_id=node.id, type="DATA_PROCESSORS", status="PENDING", created_at=now(),
                       payload={"profile_id": profile_id, "profile_digest": digest, "code_dir": profile.code_dir,
                                "expires_at": offset_time(QUERY_TTL_SECONDS)})
+    bind_command_actor(command, actor_request, "recipes.query")
     session.add(command)
     return query_dict(command, profile, node.roots)
 
@@ -213,7 +220,8 @@ def acknowledge(session, command, node, status, result):
     matches = matching_profile(command, profile, node.roots)
     prior = command.result.get("error") if isinstance(command.result, dict) else None
     if command.status != "PENDING" and (not matches or isinstance(prior, dict) and prior.get("code") in {
-            "DATA_PROCESSORS_TIMEOUT", "DATA_PROCESSORS_PROFILE_CHANGED"}):
+            "DATA_PROCESSORS_TIMEOUT", "DATA_PROCESSORS_PROFILE_CHANGED",
+            "COMMAND_ACTOR_REQUIRED", "COMMAND_AUTHORIZATION_REVOKED"}):
         return
     clean = validated_result(command, node.roots, result) if matches else {"error": _error("DATA_PROCESSORS_PROFILE_CHANGED")}
     if status == "REJECTED" and "error" not in clean:
@@ -232,10 +240,11 @@ def register_routes(app, admin, db, require_available_node, settings):
         return node
 
     @app.post("/api/v1/nodes/{node_id}/data-processors", dependencies=admin, status_code=202)
-    def create(node_id: str, body: CatalogInput):
+    def create(node_id: str, body: CatalogInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "recipes.query")
             node = available(session, node_id)
-            return response(create_query(session, node, body.profile_id), 202)
+            return response(create_query(session, node, body.profile_id, actor_request=request), 202)
 
     @app.get("/api/v1/nodes/{node_id}/data-processors/{query_id}", dependencies=admin)
     def get(node_id: str, query_id: str):

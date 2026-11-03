@@ -36,6 +36,8 @@ export function checkpointSyncAllowed(input: {
 }
 
 export interface CheckpointTransfer {
+  owner_user_id?: string | null;
+  execution_user_id?: string | null;
   id: string;
   record_id?: string | null;
   name: string;

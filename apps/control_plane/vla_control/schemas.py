@@ -165,6 +165,21 @@ class DatasetBindingInput(InputModel):
         return self
 
 
+class NormDatasetInput(InputModel):
+    dataset_asset_id: str = Field(min_length=1, max_length=200)
+    recipe_index: int | None = Field(default=None, ge=0, lt=64, strict=True)
+    processor: dict | None = None
+
+    @model_validator(mode="after")
+    def validate_processor_choice(self):
+        if (self.recipe_index is None) == (self.processor is None):
+            raise ValueError("每个统计数据集必须且只能选择独立数据处理器或配方数据项")
+        if self.processor is not None:
+            from vla_adapters.data_processors import normalize_processor
+            self.processor = normalize_processor(self.processor, norm_stats=True)
+        return self
+
+
 class PreviewInput(InputModel):
     name: str = Field(min_length=1, max_length=200)
     node_id: str
@@ -178,6 +193,7 @@ class PreviewInput(InputModel):
     recipe_revision_id: str | None = Field(default=None, min_length=1, max_length=36)
     entrypoint: str | None = Field(default=None, min_length=1, max_length=4096)
     dataset_bindings: list[DatasetBindingInput] | None = Field(default=None, min_length=1, max_length=64)
+    norm_datasets: list[NormDatasetInput] | None = Field(default=None, min_length=1, max_length=64)
     inputs: dict[str, str] = Field(default_factory=dict)
     parameters: dict = Field(default_factory=dict)
     gpu_count: int = Field(default=1, ge=0, le=256, strict=True)

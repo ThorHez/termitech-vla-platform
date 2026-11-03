@@ -10,6 +10,8 @@ from sqlalchemy import select
 
 from .common import APIError, now, offset_time, uid, under_root
 from .models import Command
+from .resource_authorization import (COMMAND_AUTHORIZATION_ERRORS, bind_command_actor,
+                                     query_reusable)
 from .recipe_suggestions import matching_profile, profile_digest, require_profile
 from vla_adapters.recipe_definitions import RECIPE_SOURCE_PATHS
 from .schemas import InputModel
@@ -23,6 +25,7 @@ MAX_FIELDS = 500
 WARNINGS = {"DYNAMIC_REGISTRY_UNSUPPORTED", "DISCOVERY_LIMIT_REACHED", "INVALID_RECIPE_NAME",
             "DETAIL_FIELDS_TRUNCATED", "DETAIL_EXPRESSION_TRUNCATED", "UNRESOLVED_DEFAULTS", "DETAIL_TEXT_SANITIZED"}
 ERRORS = {
+    **COMMAND_AUTHORIZATION_ERRORS,
     "RECIPE_DETAIL_TIMEOUT": "读取训练配方详情超时，请稍后重试",
     "AGENT_RECIPE_DETAIL_UNSUPPORTED": "当前 Agent 不支持训练配方详情，请更新 Agent",
     "RECIPE_PROFILE_CHANGED": "训练环境配置已变化，请重新读取训练配方详情",
@@ -158,7 +161,7 @@ def query_dict(command, profile, roots):
     return response
 
 
-def create_query(session, node, profile_id, recipe):
+def create_query(session, node, profile_id, recipe, *, actor_request=None):
     profile = require_profile(session, node.id, profile_id)
     snapshot = profile_digest(profile, node.roots)
     expire_pending(session, node.id)
@@ -166,6 +169,8 @@ def create_query(session, node, profile_id, recipe):
                                    Command.created_at >= offset_time(-CACHE_SECONDS), Command.status.in_({"PENDING", "APPLIED"}))
     for command in session.scalars(recent.order_by(Command.created_at.desc())):
         if command.payload.get("profile_digest") == snapshot and command.payload.get("recipe") == recipe:
+            if not query_reusable(session, command, actor_request, "recipes.query"):
+                continue
             cached = query_dict(command, profile, node.roots)
             if cached["status"] in {"PENDING", "READY"}:
                 return cached
@@ -174,6 +179,7 @@ def create_query(session, node, profile_id, recipe):
         raise APIError(429, "RECIPE_DETAIL_BUSY", "配方详情读取请求较多，请稍后重试")
     command = Command(id=uid(), node_id=node.id, type="RECIPE_DETAIL", status="PENDING", created_at=now(),
                       payload={"profile_id": profile_id, "recipe": recipe, "profile_digest": snapshot, "expires_at": offset_time(QUERY_TTL_SECONDS)})
+    bind_command_actor(command, actor_request, "recipes.query")
     session.add(command)
     return query_dict(command, profile, node.roots)
 
@@ -187,7 +193,8 @@ def acknowledge(session, command, node, status, result):
     matches = matching_profile(command, profile, node.roots)
     previous_error = command.result.get("error") if isinstance(command.result, dict) else None
     if command.status != "PENDING" and (not matches or isinstance(previous_error, dict) and previous_error.get("code") in {
-            "RECIPE_DETAIL_TIMEOUT", "RECIPE_PROFILE_CHANGED"}):
+            "RECIPE_DETAIL_TIMEOUT", "RECIPE_PROFILE_CHANGED",
+            "COMMAND_ACTOR_REQUIRED", "COMMAND_AUTHORIZATION_REVOKED"}):
         return
     clean = validated_result(command, node.roots, result) if matches else {"error": _error("RECIPE_PROFILE_CHANGED")}
     if status == "REJECTED" and "error" not in clean:

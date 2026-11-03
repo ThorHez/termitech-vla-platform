@@ -31,7 +31,7 @@ def recap_stages():
 
 
 def runtime_adapter_for(template_id):
-    return "openpi-sft" if template_id == "recap" else template_id
+    return "openpi-sft" if template_id in {"recap", "openpi-norm"} else template_id
 
 
 def validate_training_stage(template_id, training_stage=None, stage_config=None):

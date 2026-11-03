@@ -9,6 +9,7 @@ from .db import Base
 class DeploymentRecord(Base):
     __tablename__ = "deployment_records"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[str] = mapped_column(String(40), index=True)
     deleted_at: Mapped[str | None] = mapped_column(String(40), nullable=True)

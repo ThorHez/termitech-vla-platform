@@ -1,5 +1,7 @@
 """Per-account GPU reservations, enforced at every platform admission boundary."""
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi import Request
 from pydantic import Field, field_validator
 from sqlalchemy import select
@@ -10,6 +12,7 @@ from .gpu_selection import requested_gpu_uuids
 from .models import Allocation, Attempt, GPUReservation, Node, Run
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .schemas import InputModel
+from .resource_authorization import require_active_actor
 
 
 class ReservationInput(InputModel):
@@ -29,17 +32,48 @@ def request_owner(request: Request) -> str | None:
     return None if principal.legacy else principal.user_id
 
 
+def reservation_expiry(row):
+    """Legacy rows receive the default eight-hour policy, never infinity."""
+    try:
+        expiry = datetime.fromisoformat(row.expires_at) if row.expires_at else (
+            datetime.fromisoformat(row.created_at) + timedelta(seconds=28800))
+        if expiry.tzinfo is None:
+            return None
+        return expiry.astimezone(timezone.utc).isoformat(timespec="microseconds")
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _active_reservations(session, node_id=None):
+    query = select(GPUReservation, User).join(User, User.id == GPUReservation.user_id)
+    if node_id is not None:
+        query = query.where(GPUReservation.node_id == node_id)
+    from .auth import ROLE_PERMISSIONS
+    stamp = now()
+    return [(row, user, expiry) for row, user in session.execute(query)
+            if (expiry := reservation_expiry(row)) is not None and expiry > stamp
+            and user.enabled and not user.must_change_password
+            and "training.write" in ROLE_PERMISSIONS.get(user.role, frozenset())]
+
+
 def reservation_owners(session, node_id):
-    return {row.gpu_uuid: row.user_id for row in session.scalars(
-        select(GPUReservation).where(GPUReservation.node_id == node_id))}
+    return {row.gpu_uuid: row.user_id for row, _, _ in _active_reservations(session, node_id)}
 
 
 def reservation_dicts(session, node_id):
-    rows = session.execute(select(GPUReservation, User).join(User, User.id == GPUReservation.user_id)
-        .where(GPUReservation.node_id == node_id).order_by(GPUReservation.created_at, GPUReservation.gpu_uuid))
+    rows = sorted(_active_reservations(session, node_id), key=lambda item: (item[0].created_at, item[0].gpu_uuid))
     return [{"node_id": row.node_id, "gpu_uuid": row.gpu_uuid, "user_id": row.user_id,
-             "username": user.username, "display_name": user.display_name, "created_at": row.created_at}
-            for row, user in rows]
+             "username": user.username, "display_name": user.display_name, "created_at": row.created_at,
+             "expires_at": expiry}
+            for row, user, expiry in rows]
+
+
+def _prune_inactive_reservations(session, node_id):
+    active_keys = {(row.node_id, row.gpu_uuid) for row, _, _ in _active_reservations(session, node_id)}
+    for row in session.scalars(select(GPUReservation).where(GPUReservation.node_id == node_id)):
+        if (row.node_id, row.gpu_uuid) not in active_keys:
+            session.delete(row)
+    session.flush()
 
 
 def require_gpu_access(session, node_id, user_id, gpu_uuids):
@@ -84,7 +118,8 @@ def _validate_additions(session, node, user_id, additions, settings):
     for row in session.scalars(select(PolicyDeployment).where(
             PolicyDeployment.node_id == node.id, PolicyDeployment.state.in_(RESOURCE_STATES))):
         if row.gpu_uuid:
-            occupants.setdefault(row.gpu_uuid, []).append(row.owner_user_id)
+            actor = row.execution_user_id if row.execution_user_id is not None else row.owner_user_id
+            occupants.setdefault(row.gpu_uuid, []).append(actor)
     from .scheduler import gpu_available
     for uuid in additions:
         owners = occupants.get(uuid, [])
@@ -93,6 +128,16 @@ def _validate_additions(session, node, user_id, additions, settings):
 
 
 def register_routes(app, dependencies, db, auth, settings):
+    @app.get("/api/v1/gpu-reservation-policy", dependencies=dependencies)
+    def reservation_policy(request: Request):
+        user_id = request_owner(request)
+        with db.read() as session:
+            count = sum(1 for row, _, _ in _active_reservations(session) if row.user_id == user_id)
+        return {"max_per_user": settings.gpu_reservation_max_per_user,
+                "ttl_seconds": settings.gpu_reservation_ttl_seconds,
+                "reserved_count": count,
+                "remaining_count": max(0, settings.gpu_reservation_max_per_user - count)}
+
     @app.get("/api/v1/nodes/{node_id}/gpu-reservations", dependencies=dependencies)
     def list_reservations(node_id: str):
         with db.read() as session:
@@ -105,22 +150,35 @@ def register_routes(app, dependencies, db, auth, settings):
         if user_id is None:
             raise APIError(403, "GPU_RESERVATION_ACCOUNT_REQUIRED", "请使用个人账户登录后申请 GPU 预留")
         with db.write() as session:
+            # AuthGuard precedes Node/resource locks. It also serializes the
+            # per-account count across simultaneous requests on different nodes.
+            require_active_actor(session, request)
             node = _node(session, node_id, lock=True)
+            _prune_inactive_reservations(session, node_id)
             rows = list(session.scalars(select(GPUReservation).where(GPUReservation.node_id == node_id)))
             owners = {row.gpu_uuid: row.user_id for row in rows}
             selected = set(body.gpu_uuids)
             blocked = [uuid for uuid in body.gpu_uuids if uuid in owners and owners[uuid] != user_id]
             if blocked:
                 raise APIError(409, "GPU_ALREADY_RESERVED", "GPU 已由其他用户预留，请刷新后重新选择", {"gpu_uuids": blocked})
+            other_nodes = sum(1 for row, _, _ in _active_reservations(session)
+                              if row.user_id == user_id and row.node_id != node_id)
+            if selected and other_nodes + len(selected) > settings.gpu_reservation_max_per_user:
+                raise APIError(409, "GPU_RESERVATION_LIMIT", "GPU 预留数量超过当前账户上限", {
+                    "limit": settings.gpu_reservation_max_per_user, "reserved_on_other_nodes": other_nodes})
             additions = selected - owners.keys()
             _validate_additions(session, node, user_id, additions, settings)
             for row in rows:
                 if row.user_id == user_id and row.gpu_uuid not in selected:
                     session.delete(row)
             stamp = now()
+            expiry = offset_time(settings.gpu_reservation_ttl_seconds)
             for uuid in body.gpu_uuids:
                 if uuid in additions:
-                    session.add(GPUReservation(node_id=node_id, gpu_uuid=uuid, user_id=user_id, created_at=stamp))
+                    session.add(GPUReservation(node_id=node_id, gpu_uuid=uuid, user_id=user_id,
+                                               created_at=stamp, expires_at=expiry))
+                else:
+                    next(row for row in rows if row.gpu_uuid == uuid).expires_at = expiry
             session.flush()
             return reservation_dicts(session, node_id)
 
@@ -128,6 +186,7 @@ def register_routes(app, dependencies, db, auth, settings):
     def release_reservation(node_id: str, gpu_uuid: str, request: Request):
         principal = request.state.principal
         with db.write() as session:
+            require_active_actor(session, request)
             _node(session, node_id, lock=True)
             row = session.get(GPUReservation, (node_id, gpu_uuid))
             if row is None:

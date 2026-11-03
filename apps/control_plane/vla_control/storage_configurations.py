@@ -3,6 +3,7 @@
 from copy import deepcopy
 from pathlib import PurePosixPath
 
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import Field
 from sqlalchemy import or_, select
@@ -12,6 +13,7 @@ from .models import Allocation, Attempt, Command, Node, Preview, Run
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .remote_models import RemoteDeployment
 from .schemas import InputModel
+from .resource_authorization import bind_command_actor, require_active_actor
 
 
 COMMAND = "STORAGE_CONFIGURE"
@@ -110,7 +112,7 @@ def query_dict(command):
     return result
 
 
-def create_query(session, node, body):
+def create_query(session, node, body, request=None):
     data = body.model_dump()
     for key in data:
         if data[key] is not None:
@@ -133,6 +135,8 @@ def create_query(session, node, body):
     _require_idle(session, node.id)
     command = Command(id=uid(), node_id=node.id, type=COMMAND, status="PENDING", created_at=now(),
                       payload={**data, "expires_at": offset_time(TTL_SECONDS)})
+    if request is not None:
+        bind_command_actor(command, request, "machines.manage")
     session.add(command)
     session.flush()
     return query_dict(command)
@@ -206,7 +210,7 @@ def acknowledge(session, command, node, status, result):
     session.flush()
 
 
-def snapshot_error(session, node_id, evidence):
+def snapshot_error(session, node_id, evidence, *, norm_stats=False):
     """Old Agent proofs cannot authorize a node after a storage configuration change."""
     node = session.get(Node, node_id)
     if node is None:
@@ -225,6 +229,22 @@ def snapshot_error(session, node_id, evidence):
         plan = evidence.get("plan")
         cache = plan.get("training_cache") if isinstance(plan, dict) else None
         paths = cache.get("paths") if isinstance(cache, dict) else None
+        if norm_stats:
+            from vla_protocol.norm_plan import validate_norm_cache
+            root = PurePosixPath(node.cache_root)
+            hf, hub, temporary = root / "huggingface", root / "huggingface/hub", root / "tmp"
+            expected_paths = {"XDG_CACHE_HOME": str(root), "HF_HOME": str(hf),
+                "HF_DATASETS_CACHE": str(hf / "datasets"), "HF_HUB_CACHE": str(hub),
+                "HUGGINGFACE_HUB_CACHE": str(hub), "TRANSFORMERS_CACHE": str(hub),
+                "JAX_COMPILATION_CACHE_DIR": str(root / "jax"), "OPENPI_DATA_HOME": str(root / "openpi"),
+                "TMPDIR": str(temporary), "TEMP": str(temporary), "TMP": str(temporary)}
+            try:
+                validate_norm_cache(cache, plan.get("datasets") if isinstance(plan, dict) else None, node.roots)
+            except (ValueError, TypeError, KeyError):
+                return {"code": "STORAGE_CHANGED_SINCE_PREFLIGHT", "message": "Agent 实际统计缓存配置无效，请重新预检"}
+            if paths != expected_paths:
+                return {"code": "STORAGE_CHANGED_SINCE_PREFLIGHT", "message": "Agent 实际统计缓存未使用当前缓存目录，请重新预检"}
+            return None
         if (not isinstance(cache, dict) or not isinstance(cache.get("datasets_cache"), str)
                 or cache["datasets_cache"] != str(PurePosixPath(node.cache_root) / "huggingface/datasets")
                 or not isinstance(paths, dict) or not paths
@@ -238,12 +258,13 @@ def register_routes(app, admin, db, require_available_node, settings):
         return JSONResponse(content=value, status_code=status, headers={"Cache-Control": "no-store"})
 
     @app.post("/api/v1/nodes/{node_id}/storage-configurations", dependencies=admin, status_code=202)
-    def create(node_id: str, body: StorageInput):
+    def create(node_id: str, body: StorageInput, request: Request):
         with db.write() as session:
+            require_active_actor(session, request, "machines.manage")
             node = require_available_node(session, node_id)
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，暂时无法修改目录")
-            return response(create_query(session, node, body), 202)
+            return response(create_query(session, node, body, request), 202)
 
     @app.get("/api/v1/nodes/{node_id}/storage-configurations", dependencies=admin)
     def latest(node_id: str):

@@ -17,6 +17,8 @@ class RemoteConnection(Base):
     fingerprint: Mapped[str] = mapped_column(String(255))
     probe_result: Mapped[dict] = mapped_column(JSON)
     install_dir: Mapped[str] = mapped_column(Text)
+    service_name: Mapped[str] = mapped_column(String(100), default="termitech-vla-agent",
+                                              server_default="termitech-vla-agent")
     created_at: Mapped[str] = mapped_column(String(40))
     expires_at: Mapped[str] = mapped_column(String(40))
 
@@ -25,6 +27,7 @@ class RemoteDeployment(Base):
     __tablename__ = "remote_deployments"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    actor_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
     connection_id: Mapped[str] = mapped_column(ForeignKey("remote_connections.id", ondelete="RESTRICT"), index=True)
     idempotency_key: Mapped[str] = mapped_column(String(200), unique=True)
     request_digest: Mapped[str] = mapped_column(String(64))

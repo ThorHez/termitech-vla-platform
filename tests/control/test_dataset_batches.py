@@ -335,7 +335,7 @@ def test_foreign_owner_and_scan_user_switch_fail_closed(batch):
     assert changed.status_code == 403
 
 
-@pytest.mark.parametrize("role,status", [("viewer", 403), ("operator", 202), ("admin", 202)])
+@pytest.mark.parametrize("role,status", [("viewer", 403), ("operator", 403), ("admin", 202)])
 def test_scan_permission_and_csrf_are_enforced(batch, role, status):
     batch[0].state.auth.create_user("role-" + role, PASSWORD, role)
     with TestClient(batch[0], base_url="http://testserver") as client:

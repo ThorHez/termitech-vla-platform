@@ -168,6 +168,87 @@ try {
     assert.match(hint, /起始建议/);
     assert.doesNotMatch(hint, /空闲|预留/);
   });
+
+  await test('norm worker recommendations use half the visible CPUs with an eight-worker ceiling and one CPU retained', () => {
+    for (const [cpus,workers] of [[1,0],[2,1],[3,1],[4,2],[8,4],[16,8],[112,8]]) {
+      const result=helper.recommendNormResources(metrics(cpus));
+      assert.equal(result.num_workers,workers);
+      assert.equal(result.availableCpuCount,cpus);
+      assert.equal(result.fsdp_devices,undefined);assert.equal(result.gpuCount,undefined);
+    }
+    assert.equal(helper.recommendNormResources({...metrics(8),cpu_percent:100}).num_workers,4);
+  });
+
+  await test('norm unknown or invalid visible CPU counts recommend the main process without using total CPUs as a quota', () => {
+    for (const value of [undefined,null,'112',0,-1,1.5,NaN,Infinity]) {
+      const result=helper.recommendNormResources(metrics(value,112));
+      assert.equal(result.num_workers,0);assert.equal(result.availableCpuCount,undefined);
+      assert.match(helper.normResourceRecommendationHint(result),/可见 CPU 数未知/);
+      assert.match(helper.normResourceRecommendationHint(result),/主机总计 112 个/);
+    }
+    assert.equal(helper.recommendNormResources().num_workers,0);
+  });
+
+  await test('norm automatic workers follow machine CPU updates while explicitly edited values stay unchanged', () => {
+    const markers=new Set();helper.setResourceRecommendationMode(markers,'num_workers',true);
+    const source={batch_size:32,num_workers:0};
+    let values=helper.applyResourceRecommendations(source,markers,helper.recommendNormResources(metrics(112)));
+    assert.deepEqual(values,{batch_size:32,num_workers:8});
+    values=helper.applyResourceRecommendations(values,markers,helper.recommendNormResources(metrics(4)));
+    assert.deepEqual(values,{batch_size:32,num_workers:2});
+    helper.setResourceRecommendationMode(markers,'num_workers',false);
+    values=controls.editTrainingParameter(values,'num_workers','0',{type:'integer',min:0,max:64});
+    assert.equal(helper.applyResourceRecommendations(values,markers,helper.recommendNormResources(metrics(112))),values);
+    for(const parameters of [{batch_size:32,num_workers:0},{batch_size:32,num_workers:8},{batch_size:32}])
+      assert.equal(helper.applyResourceRecommendations(parameters,helper.normResourceRecommendationTracking(['num_workers']),helper.recommendNormResources(metrics(4))),parameters);
+    assert.deepEqual(source,{batch_size:32,num_workers:0});
+  });
+
+  await test('norm drafts and templates adopt recommendations unless workers were explicitly edited', () => {
+    for(const mode of ['automatic','manual','legacy']) {
+      const markers=new Set(['auto_config.action_horizon:automatic']);
+      if(mode!=='legacy')helper.setResourceRecommendationMode(markers,'num_workers',mode==='automatic');
+      const source={request:{name:'statistics',node_id:'node-a',profile_id:'profile-a',template_id:'openpi-norm',
+        recipe:'pi05_data',inputs:{},norm_datasets:[{dataset_asset_id:'dataset',recipe_index:0}],
+        parameters:{batch_size:32,num_workers:0},gpu_count:0},
+        step:1,advancedRecipe:true,editedParameters:[...markers],editedStageParameters:[],entrypointEdited:false};
+      const restored=codec.decodeTrainingDraft(codec.encodeTrainingDraft(source));
+      const applied=templates.applyTrainingTemplate(record(templates.prepareTrainingTemplate(source)),resources).snapshot;
+      for(const state of [restored,applied]) {
+        const next=helper.applyResourceRecommendations(state.request.parameters,helper.normResourceRecommendationTracking(state.editedParameters),helper.recommendNormResources(metrics(112)));
+        assert.equal(next.num_workers,mode==='manual'?0:8);assert.equal(next.batch_size,32);
+      }
+    }
+  });
+
+  await test('norm recommendation copy explains the selected-machine CPU heuristic without a GPU or idle-core estimate', () => {
+    const hint=helper.normResourceRecommendationHint(helper.recommendNormResources(metrics(112)));
+    for(const text of ['Agent 可见 CPU 112 个','一半','最多 8 个','不超过 CPU 数减 1','给主进程留余量','起始建议','0 表示主进程加载']) assert.ok(hint.includes(text));
+    assert.doesNotMatch(hint,/GPU|空闲|预留|cpu_percent/);
+  });
+
+  await test('switching SFT recommendations to norm retains automatic provenance while explicit manual zero stays manual', () => {
+    const automatic=bothAutomatic();automatic.add('learning_rate');
+    const carried=helper.resourceRecommendationTracking(automatic);
+    assert.deepEqual(helper.applyResourceRecommendations({batch_size:32,num_workers:2},carried,helper.recommendNormResources(metrics(112))),{batch_size:32,num_workers:8});
+    assert.equal(carried.has('learning_rate'),false);
+    helper.setResourceRecommendationMode(automatic,'num_workers',false);
+    const manual={batch_size:32,num_workers:0};
+    assert.equal(helper.applyResourceRecommendations(manual,helper.resourceRecommendationTracking(automatic),helper.recommendNormResources(metrics(112))),manual);
+  });
+
+  await test('norm migration distinguishes an old template default from an explicit manual edit without changing source tracking', () => {
+    const source=new Set(['auto_config.action_horizon:automatic']);
+    const migrated=helper.normResourceRecommendationTracking(source);
+    assert.equal(helper.automaticResourceRecommendation(migrated,'num_workers'),true);
+    assert.deepEqual([...source],['auto_config.action_horizon:automatic']);
+    assert.equal(migrated.has('auto_config.action_horizon:automatic'),true);
+    assert.deepEqual(helper.applyResourceRecommendations({num_workers:0},migrated,helper.recommendNormResources(metrics(112))),{num_workers:8});
+    const manual=helper.normResourceRecommendationTracking(['num_workers']);
+    assert.equal(helper.automaticResourceRecommendation(manual,'num_workers'),false);
+    helper.setResourceRecommendationMode(migrated,'num_workers',false);
+    assert.equal(helper.automaticResourceRecommendation(helper.normResourceRecommendationTracking(migrated),'num_workers'),false);
+  });
 } finally {
   await server.close();
 }

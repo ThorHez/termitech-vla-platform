@@ -218,7 +218,7 @@ def test_gpu_reservation_allows_upgrade_but_still_blocks_disconnect_and_uninstal
 
     platform, manager, node_id, *_ = connected
     with platform.app.state.db.write() as session:
-        user = User(id=uid(), username="reservation-owner", display_name="Reservation owner", password_hash="unused", role="viewer", enabled=True,
+        user = User(id=uid(), username="reservation-owner", display_name="Reservation owner", password_hash="unused", role="operator", enabled=True,
                     created_at=now(), updated_at=now())
         session.add(user)
         session.flush()

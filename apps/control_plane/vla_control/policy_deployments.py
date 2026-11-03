@@ -22,6 +22,7 @@ from .common import APIError, TERMINAL, now, offset_time, require_path, uid
 from .models import Allocation, Asset, Attempt, Command, Node, Profile, Run
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .gpu_reservations import request_owner, reservation_owners
+from .resource_authorization import bind_command_actor, require_active_actor, require_expected_user, require_resource_owner
 from .profile_rebindings import require_not_pending
 from .recipe_writeback import require_no_pending_writeback
 from .schemas import InputModel
@@ -115,7 +116,7 @@ def deployment_dict(session, row, settings):
     connected = node is not None and node.status == "ONLINE" and node.last_seen >= offset_time(-settings.heartbeat_timeout_seconds)
     pending = _pending(session, row.id)
     result = {key: deepcopy(getattr(row, key)) for key in (
-        "id", "name", "node_id", "profile_id", "owner_user_id", "checkpoint_path", "config_name", "inference_backend", "resolved_backend", "port", "gpu_uuid", "gpu_mode", "gpu_memory_mb",
+        "id", "name", "node_id", "profile_id", "owner_user_id", "execution_user_id", "checkpoint_path", "config_name", "inference_backend", "resolved_backend", "port", "gpu_uuid", "gpu_mode", "gpu_memory_mb",
         "default_prompt", "source_run_id", "state", "endpoint", "pid", "logs", "checks", "error",
         "test_result", "created_at", "updated_at")}
     ownership = session.get(DeploymentRecordRuntime, row.id)
@@ -510,6 +511,40 @@ def _stopped_execution_confirmed(session, row, latest):
     return False
 
 
+def _cancel_undelivered_start(session, row):
+    """Cancel a proven unclaimed execution without asking the Agent to stop it.
+
+    The caller holds AuthGuard and the Node/deployment locks, serializing both
+    first delivery and Agent receipts. Historical delivered_at values are never
+    treated as evidence that a start remained local to the control plane.
+    """
+    latest = _latest_start(session, row.id)
+    if (row.state != "PENDING" or row.pid is not None or row.endpoint is not None
+            or latest is None or latest.status != "PENDING" or latest.delivered_at is not None):
+        return False
+    execution_id = latest.payload.get("execution_id")
+    commands = [command for command in session.scalars(select(Command).where(
+        Command.node_id == row.node_id, Command.type.in_(COMMANDS),
+        Command.payload["deployment_id"].as_string() == row.id).with_for_update())
+        if command.payload.get("execution_id") == execution_id]
+    starts = [command for command in commands if command.type == "POLICY_DEPLOY_START"]
+    if not starts or any(command.status != "PENDING" or command.delivered_at is not None for command in starts):
+        return False
+    for command in commands:
+        result = command.result if isinstance(command.result, dict) else {}
+        if result.get("state") in {"STARTING", "RUNNING"} or result.get("pid") or result.get("endpoint"):
+            return False
+    stamp = now()
+    for command in commands:
+        if command.status == "PENDING":
+            command.status, command.acknowledged_at = "REJECTED", stamp
+            command.result = {"state": "STOPPED", "execution_id": execution_id,
+                "error": _error("POLICY_DEPLOY_CANCELLED_BEFORE_DISPATCH", "部署尚未下发至 Agent，已取消启动")}
+    row.state, row.error, row.updated_at = "STOPPED", None, stamp
+    row.observed_command_at = latest.created_at
+    return True
+
+
 def _admit_resources(session, node, body, owner_user_id=None):
     from .scheduler import gpu_available
 
@@ -566,15 +601,16 @@ def register_routes(app, admin, db, require_available_node, settings):
             raise APIError(409, "NODE_OFFLINE", "机器心跳已过期，无法执行部署操作")
         return node
 
-    def required(session, deployment_id):
+    def required(session, deployment_id, request):
         row = session.get(PolicyDeployment, deployment_id)
         if row is None:
             raise APIError(404, "NOT_FOUND", "部署记录不存在")
+        require_resource_owner(request, row.owner_user_id)
         # Every writer takes node then deployment, matching Agent ACK and the
         # scheduler lock order on PostgreSQL as well as SQLite.
-        require_runtime_record(session, deployment_id)
+        require_runtime_record(session, deployment_id, request=request)
         online(session, row.node_id)
-        require_runtime_record(session, deployment_id, lock=True)
+        require_runtime_record(session, deployment_id, lock=True, request=request)
         return session.scalar(select(PolicyDeployment).where(PolicyDeployment.id == deployment_id)
                               .with_for_update().execution_options(populate_existing=True))
 
@@ -598,7 +634,9 @@ def register_routes(app, admin, db, require_available_node, settings):
 
     @app.post("/api/v1/policy-deployments", dependencies=admin, status_code=202)
     def create_deployment(body: CreateInput, request: Request):
+        require_expected_user(request)
         with db.write() as session:
+            require_active_actor(session, request)
             node = online(session, body.node_id)
             profile = _start_profile(session, node, body.profile_id)
             checkpoint_path = _path(body.checkpoint_path, node.roots)
@@ -606,9 +644,12 @@ def register_routes(app, admin, db, require_available_node, settings):
             if body.transfer_id is not None:
                 from .checkpoint_transfer_models import CheckpointTransfer
                 from .checkpoint_transfers import portable_deployment
+                transfer = session.get(CheckpointTransfer, body.transfer_id)
+                if transfer is None:
+                    raise APIError(404, "NOT_FOUND", "同步任务不存在")
+                require_resource_owner(request, transfer.owner_user_id)
                 portable = portable_deployment(session, body, settings)
                 source = None
-                transfer = session.get(CheckpointTransfer, body.transfer_id)
                 snapshot = (transfer.binding_snapshot or {}).get("source_training") or {}
                 config_name = _training_config_name(snapshot.get("code_expectation"))
             else:
@@ -621,8 +662,9 @@ def register_routes(app, admin, db, require_available_node, settings):
             record = None
             if portable is not None:
                 record = transfer_record(session, transfer)
+                require_resource_owner(request, record.owner_user_id)
                 if body.record_id is not None:
-                    explicit = require_preparation_record(session, body.record_id)
+                    explicit = require_preparation_record(session, body.record_id, request=request)
                     if explicit.id != record.id:
                         raise APIError(422, "DEPLOYMENT_RECORD_CONFLICT", "所选同步与部署记录的明确归属不一致")
                     record = explicit
@@ -632,13 +674,15 @@ def register_routes(app, admin, db, require_available_node, settings):
                     # separate parent and keeps only the existing selected FK.
                     record = None
                 else:
-                    record = require_preparation_record(session, record.id)
+                    record = require_preparation_record(session, record.id, request=request)
             elif body.record_id is not None:
-                record = require_preparation_record(session, body.record_id)
+                record = require_preparation_record(session, body.record_id, request=request)
+            owner_user_id = record.owner_user_id if record is not None else request_owner(request)
             gpu_uuid = _admit_resources(session, node, body, request_owner(request))
             timestamp = now()
             row = PolicyDeployment(id=uid(), name=body.name, node_id=node.id, profile_id=profile.id,
-                owner_user_id=request_owner(request),
+                owner_user_id=owner_user_id,
+                execution_user_id=request_owner(request),
                 checkpoint_path=checkpoint_path, config_name=config_name, port=body.port, gpu_uuid=gpu_uuid,
                 inference_backend=body.inference_backend, resolved_backend=None,
                 gpu_mode=body.gpu_mode, gpu_memory_mb=body.gpu_memory_mb,
@@ -647,7 +691,7 @@ def register_routes(app, admin, db, require_available_node, settings):
             session.add(row)
             session.flush()
             if record is None:
-                record = create_record(session, row.id, body.name, row.created_at)
+                record = create_record(session, row.id, body.name, row.created_at, owner_user_id=row.owner_user_id)
             record.name = body.name
             session.add(DeploymentRecordRuntime(deployment_id=row.id, record_id=record.id))
             session.flush()
@@ -665,10 +709,12 @@ def register_routes(app, admin, db, require_available_node, settings):
 
     @app.post("/api/v1/policy-deployments/{deployment_id}/start", dependencies=admin, status_code=202)
     def restart_deployment(deployment_id: str, request: Request):
+        require_expected_user(request)
         from .checkpoint_transfer_models import PolicyDeploymentTransfer
 
         with db.write() as session:
-            row = required(session, deployment_id)
+            require_active_actor(session, request)
+            row = required(session, deployment_id, request)
             node = session.get(Node, row.node_id)
             capabilities = (node.metrics or {}).get("capabilities")
             if not isinstance(capabilities, list) or "POLICY_DEPLOY_RESTART_V1" not in capabilities:
@@ -716,25 +762,31 @@ def register_routes(app, admin, db, require_available_node, settings):
             row.resolved_backend = None
             row.logs, row.checks = "", []
             row.gpu_uuid, row.config_name = payload["gpu_uuid"], payload["config_name"]
-            row.owner_user_id = request_owner(request)
+            row.execution_user_id = request_owner(request)
             row.updated_at = now()
             started = _enqueue(session, row, "POLICY_DEPLOY_START", payload)
             row.observed_command_at = started.created_at
             return deployment_dict(session, row, settings)
 
     @app.post("/api/v1/policy-deployments/{deployment_id}/refresh", dependencies=admin, status_code=202)
-    def refresh_deployment(deployment_id: str):
+    def refresh_deployment(deployment_id: str, request: Request):
+        require_expected_user(request)
         with db.write() as session:
-            row = required(session, deployment_id)
+            require_active_actor(session, request)
+            row = required(session, deployment_id, request)
             if not _pending(session, row.id):
                 _enqueue(session, row, "POLICY_DEPLOY_STATUS")
             return deployment_dict(session, row, settings)
 
     @app.post("/api/v1/policy-deployments/{deployment_id}/stop", dependencies=admin, status_code=202)
-    def stop_deployment(deployment_id: str):
+    def stop_deployment(deployment_id: str, request: Request):
+        require_expected_user(request)
         with db.write() as session:
-            row = required(session, deployment_id)
+            require_active_actor(session, request)
+            row = required(session, deployment_id, request)
             pending = _pending(session, row.id)
+            if _cancel_undelivered_start(session, row):
+                return deployment_dict(session, row, settings)
             if row.state not in {"STOPPED", "FAILED"} or pending:
                 if not any(command.type == "POLICY_DEPLOY_STOP" for command in pending):
                     _enqueue(session, row, "POLICY_DEPLOY_STOP")
@@ -742,14 +794,17 @@ def register_routes(app, admin, db, require_available_node, settings):
             return deployment_dict(session, row, settings)
 
     @app.post("/api/v1/policy-deployments/{deployment_id}/test", dependencies=admin, status_code=202)
-    def test_deployment(deployment_id: str, body: TestInput):
+    def test_deployment(deployment_id: str, body: TestInput, request: Request):
+        require_expected_user(request)
         with db.write() as session:
-            row = required(session, deployment_id)
+            require_active_actor(session, request)
+            row = required(session, deployment_id, request)
             node = session.get(Node, row.node_id)
             if row.state != "RUNNING":
                 raise APIError(409, "POLICY_DEPLOY_NOT_RUNNING", "推理服务尚未通过就绪检查，请先刷新状态")
             if _pending(session, row.id) or (row.test_result or {}).get("status") == "RUNNING":
                 raise APIError(409, "POLICY_DEPLOY_BUSY", "部署仍有待完成的操作或测试，请等待结果")
             observation = _path(body.observation_path, node.roots)
-            _enqueue(session, row, "POLICY_DEPLOY_TEST", {"observation_path": observation})
+            command = _enqueue(session, row, "POLICY_DEPLOY_TEST", {"observation_path": observation})
+            bind_command_actor(command, request, "training.write")
             return deployment_dict(session, row, settings)

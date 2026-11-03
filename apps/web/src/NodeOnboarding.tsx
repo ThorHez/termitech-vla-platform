@@ -22,6 +22,14 @@ import { Badge, Field, Modal, ViewLink } from './components';
 import { useData } from './data';
 import { DeploymentLogs, deploymentMainStage, deploymentStageLabel } from './DeploymentLogs';
 import { nodeOperationLabel } from './agentUpgradeState';
+import {
+  DEFAULT_AGENT_SERVICE,
+  agentServiceError,
+  checkedProbeConfiguration,
+  deploymentService,
+  sshAuthenticationRequest,
+  sshInstallCheckRequest,
+} from './onboardingService';
 import { SSHPathAutocomplete, type SshPathConnection } from './SSHPathAutocomplete';
 import type {
   AgentConfigDefaults,
@@ -157,6 +165,7 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
   const [username, setUsername] = useState('root');
   const [password, setPassword] = useState('');
   const [installDir, setInstallDir] = useState('/data2/termitech-vla-agent');
+  const [serviceName, setServiceName] = useState(DEFAULT_AGENT_SERVICE);
   const [connection, setConnection] = useState<SshConnectionResult>();
   const [browseConnection, setBrowseConnection] = useState<SshPathConnection>();
   const [sshAction, setSshAction] = useState<'connect' | 'test'>('test');
@@ -293,6 +302,8 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
       return '请填写裸金属 IP 或主机名，不包含协议或端口。';
     if (!/^\d+$/.test(port) || +port < 1 || +port > 65535) return 'SSH 端口须为 1–65535 的整数。';
     if (!username.trim() || /[\s\0\r\n]/.test(username)) return '请填写有效的 SSH 用户名。';
+    const serviceError = agentServiceError(serviceName);
+    if (serviceError) return serviceError;
     return '';
   };
   const validateInstallDir = () => {
@@ -311,12 +322,7 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
       setError(message);
       return;
     }
-    const body = {
-      host: host.trim(),
-      port: +port,
-      username: username.trim(),
-      password,
-    };
+    const body = sshAuthenticationRequest(host, port, username, password, serviceName);
     setPassword('');
     setConnection(undefined);
     setBrowseConnection(undefined);
@@ -355,13 +361,10 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
       ? `/ssh-connections/${browseConnection!.connection_id}/test`
       : '/ssh-connections/test';
     const body = usableConnection
-      ? { install_dir: installDir.trim() }
+      ? sshInstallCheckRequest(installDir, serviceName)
       : {
-          host: host.trim(),
-          port: +port,
-          username: username.trim(),
-          password,
-          install_dir: installDir.trim(),
+          ...sshAuthenticationRequest(host, port, username, password, serviceName),
+          ...sshInstallCheckRequest(installDir, serviceName),
         };
     setPassword('');
     setConnection(undefined);
@@ -374,16 +377,14 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(90000),
       });
+      const configuration = checkedProbeConfiguration(result, serviceName, installDir, host);
       setConnection(result);
       setBrowseConnection(result);
-      const existing = result.existing_agent;
-      if (!dirty.current.has('name')) setName(existing?.name || result.hostname || host.trim());
-      if (existing) {
-        if (!dirty.current.has('roots')) setRoots(existing.roots.length ? existing.roots : ['']);
-        if (!dirty.current.has('outputRoot')) setOutputRoot(existing.output_root);
-        if (!dirty.current.has('stateDir')) setStateDir(existing.state_dir);
-        if (!dirty.current.has('profiles')) setProfiles(existing.profiles);
-      }
+      if (!dirty.current.has('name')) setName(configuration.name);
+      if (!dirty.current.has('roots')) setRoots(configuration.roots);
+      if (!dirty.current.has('outputRoot')) setOutputRoot(configuration.output_root);
+      if (!dirty.current.has('stateDir')) setStateDir(configuration.state_dir);
+      if (!dirty.current.has('profiles')) setProfiles(configuration.profiles);
       if (!result.can_install)
         setError('SSH 已连接，但安装条件未满足。请根据检查结果调整后重新测试。');
     } catch (cause) {
@@ -396,6 +397,8 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
     if (!connection?.can_install) return '请先测试 SSH 连接并确认安装条件通过。';
     if (Date.parse(connection.expires_at) <= Date.now())
       return 'SSH 连接凭据已过期，请返回重新测试连接。';
+    if ((connection.service_name || DEFAULT_AGENT_SERVICE) !== serviceName.trim())
+      return 'Agent 服务名已改变，请返回重新检查连接。';
     if (!name.trim()) return '请填写机器名称。';
     if (customUrl) {
       try {
@@ -519,6 +522,7 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
     setPort(String(job.port || 22));
     setUsername(job.username || 'root');
     setInstallDir(prefix);
+    setServiceName(deploymentService(job));
     setName(job.agent.name || '');
     setRoots(job.agent.roots?.length ? job.agent.roots : ['/data2']);
     setOutputRoot(job.agent.output_root || `${prefix}/outputs`);
@@ -815,6 +819,33 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
               setError('');
             }}
           />
+          <details className="onboard-advanced">
+            <summary>高级：Agent 服务设置</summary>
+            <Field
+              label="Agent 服务名"
+              required
+              hint="默认管理常规 Agent。独立测试 Agent 请使用不同服务名和安装目录，例如 termitech-vla-agent-mac-test。"
+            >
+              <input
+                value={serviceName}
+                disabled={busy}
+                autoComplete="off"
+                spellCheck={false}
+                maxLength={100}
+                onChange={(event) => {
+                  // A deployment loaded for editing belongs to its selected
+                  // service too. A different service must read its own config,
+                  // rather than retain the former service's state or profiles.
+                  if (event.target.value.trim() !== serviceName.trim()) dirty.current.clear();
+                  setServiceName(event.target.value);
+                  setConnection(undefined);
+                  submission.current = undefined;
+                  setError('');
+                }}
+                placeholder={DEFAULT_AGENT_SERVICE}
+              />
+            </Field>
+          </details>
           <div className="inline-note">
             <Terminal size={16} />
             Agent 将使用 SSH 登录用户 {username || '（待填写）'}{' '}
@@ -831,6 +862,9 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
               </div>
               <p className="onboard-fingerprint">
                 主机指纹 <code>{connection.fingerprint}</code>
+              </p>
+              <p className="onboard-caption">
+                Agent 服务：{connection.service_name || DEFAULT_AGENT_SERVICE}
               </p>
               <ul className="runtime-check-list">
                 {connection.checks.map((check, index) => (
@@ -856,7 +890,9 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
             <Server size={16} />
             <span>
               {username}@{host}:{port}
-              <small>Agent 安装至 {installDir}</small>
+              <small>
+                Agent 安装至 {installDir} · 服务 {serviceName.trim()}
+              </small>
             </span>
             <Badge state="READY" label="SSH 已验证" />
           </div>
@@ -1122,7 +1158,8 @@ function NodeOnboardingContent({ close }: { close: () => void }) {
             />
           </div>
           <p className="onboard-caption">
-            {job.install_dir ? `安装目录：${job.install_dir} · ` : ''}创建于 {date(job.created_at)}
+            {job.install_dir ? `安装目录：${job.install_dir} · ` : ''}
+            服务：{deploymentService(job)} · 创建于 {date(job.created_at)}
           </p>
           {(!job.operation || ['install', 'upgrade'].includes(job.operation)) && !retired(job) && (
             <ol className="onboard-deploy-stages">

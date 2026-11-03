@@ -156,7 +156,7 @@ def test_missing_or_wrong_kind_dataset_and_bad_create_path_leave_no_orphan_norm(
         assert rows(platform) == before
 
 
-@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 200), ("viewer", 403)])
+@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 403), ("viewer", 403)])
 def test_direct_path_binding_preserves_role_csrf_and_origin_checks(platform, role, status):
     _, dataset, _ = setup_assets(platform)
     password = "norm-path-policy-fixture-123"
@@ -169,7 +169,7 @@ def test_direct_path_binding_preserves_role_csrf_and_origin_checks(platform, rol
         before = rows(platform)
         response = client.put(url, json={"norm_path": "/machine/role-norm"}, headers={"X-CSRF-Token": csrf})
         assert response.status_code == status, response.text
-        if role == "viewer":
+        if role != "admin":
             assert rows(platform) == before
         else:
             before = rows(platform)

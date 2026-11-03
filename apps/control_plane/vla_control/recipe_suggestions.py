@@ -8,6 +8,8 @@ from vla_protocol.recipe_search import recipe_matches, recipe_sort_key
 
 from .common import APIError, digest, now, offset_time, uid
 from .models import Command, Profile
+from .resource_authorization import (COMMAND_AUTHORIZATION_ERRORS, bind_command_actor,
+                                     query_reusable)
 from .serialization import profile_dict
 
 
@@ -19,6 +21,7 @@ MATCH_MODE = "contains-v1"
 SOURCES = {"src/openpi/training/config.py", "openpi/training/config.py"}
 WARNINGS = {"DYNAMIC_REGISTRY_UNSUPPORTED", "INVALID_RECIPE_NAME", "DISCOVERY_LIMIT_REACHED"}
 ERRORS = {
+    **COMMAND_AUTHORIZATION_ERRORS,
     "RECIPE_SUGGEST_TIMEOUT": "训练配方联想超时，可手动填写或稍后重试",
     "AGENT_RECIPE_SUGGEST_UNSUPPORTED": "当前 Agent 不支持训练配方联想，请更新 Agent；仍可手动填写",
     "RECIPE_PROFILE_CHANGED": "训练环境配置已变化，请重新获取训练配方",
@@ -158,7 +161,8 @@ def query_dict(command: Command, profile: Profile | None, roots: list[str], *, c
     return result
 
 
-def create_query(session, node, profile_id: str, prefix: str, limit: int, *, code_only: bool = False) -> dict:
+def create_query(session, node, profile_id: str, prefix: str, limit: int, *, code_only: bool = False, actor_request=None) -> dict:
+    permission = "training.write" if code_only else "recipes.query"
     if not isinstance(prefix, str) or re.fullmatch(r"[A-Za-z0-9_-]{0,255}", prefix) is None:
         raise APIError(422, "INVALID_RECIPE_PREFIX", "训练配方关键字只能包含英文字母、数字、下划线和连字符")
     profile = require_profile(session, node.id, profile_id)
@@ -170,7 +174,10 @@ def create_query(session, node, profile_id: str, prefix: str, limit: int, *, cod
     ).order_by(Command.created_at.desc())
     for command in session.scalars(recent):
         if (command.payload.get("profile_digest") == snapshot and command.payload.get("prefix") == prefix
-                and command.payload.get("limit") == limit and command.payload.get("match_mode") == MATCH_MODE):
+                and command.payload.get("limit") == limit and command.payload.get("match_mode") == MATCH_MODE
+                and command.payload.get("code_only", False) == code_only):
+            if not query_reusable(session, command, actor_request, permission):
+                continue
             value = query_dict(command, profile, node.roots, code_only=code_only)
             if value["status"] in {"PENDING", "READY"}:
                 return value
@@ -181,7 +188,8 @@ def create_query(session, node, profile_id: str, prefix: str, limit: int, *, cod
         raise APIError(429, "RECIPE_SUGGEST_BUSY", "训练配方联想请求较多，请稍后重试；仍可手动填写")
     command = Command(id=uid(), node_id=node.id, type="RECIPE_SUGGEST", status="PENDING",
                       payload={"profile_id": profile_id, "profile_digest": snapshot, "prefix": prefix,
-                               "limit": limit, "match_mode": MATCH_MODE,
+                               "limit": limit, "match_mode": MATCH_MODE, "code_only": code_only,
                                "expires_at": offset_time(QUERY_TTL_SECONDS)}, created_at=now())
+    bind_command_actor(command, actor_request, permission)
     session.add(command)
     return query_dict(command, profile, node.roots, code_only=code_only)

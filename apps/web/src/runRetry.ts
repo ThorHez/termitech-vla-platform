@@ -6,7 +6,14 @@ import {
 import { TRAINING_TEMPLATE_PROCESSING_MARKER } from './trainingTemplate';
 import { validRequestedGpuList } from './trainingGpuSelection';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
-import type { AutoTrainingConfig, DatasetBinding, RecipeLiteral, Run, RunRequest } from './types';
+import type {
+  AutoTrainingConfig,
+  DatasetBinding,
+  NormDataset,
+  RecipeLiteral,
+  Run,
+  RunRequest,
+} from './types';
 
 const terminalStates = new Set(['FAILED', 'CANCELLED', 'SUCCEEDED']);
 const plain = (value: unknown): value is Record<string, unknown> =>
@@ -75,7 +82,7 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
   if (run.inputs !== undefined && !plain(run.inputs)) throw new Error('原训练资产记录无效。');
   for (const [role, value] of Object.entries(run.inputs || {}))
     if (/^(?:model|dataset|norm|dataset_\d+|norm_\d+)$/.test(role)) inputs[role] = assetId(value);
-  if (run.template_id !== 'smoke' && !inputs.model)
+  if (!['smoke', 'openpi-norm'].includes(run.template_id) && !inputs.model)
     throw new Error('原训练缺少初始模型资产 ID，无法安全恢复。');
   const request: RunRequest = {
     name: retryTrainingName(run.name),
@@ -84,11 +91,11 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
     template_id: run.template_id,
     inputs,
     parameters: numericControls(run.parameters),
-    gpu_count: run.gpu_count ?? (run.template_id === 'smoke' ? 0 : 1),
+    gpu_count: run.gpu_count ?? (['smoke', 'openpi-norm'].includes(run.template_id) ? 0 : 1),
   };
   if (
     !Number.isSafeInteger(request.gpu_count) ||
-    request.gpu_count < (run.template_id === 'smoke' ? 0 : 1)
+    request.gpu_count < (['smoke', 'openpi-norm'].includes(run.template_id) ? 0 : 1)
   )
     throw new Error('原训练 GPU 数量无效。');
   const requestedGpus = setting('requested_gpu_uuids');
@@ -107,8 +114,49 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
       throw new Error('原训练指定 GPU 配置无效，请手动重新选择。');
     request.requested_gpu_uuids = [...requestedGpus];
   }
+  const rawNormDatasets = setting('norm_datasets');
   const rawBindings = setting('dataset_bindings');
-  if (rawBindings != null) {
+  if (rawNormDatasets != null) {
+    if (
+      run.template_id !== 'openpi-norm' ||
+      rawBindings != null ||
+      !Array.isArray(rawNormDatasets) ||
+      !rawNormDatasets.length ||
+      rawNormDatasets.length > 64
+    )
+      throw new Error('原统计任务的数据集配置无效。');
+    const ids = new Set<string>();
+    request.norm_datasets = rawNormDatasets.map((row): NormDataset => {
+      if (
+        !plain(row) ||
+        Object.keys(row).some(
+          (key) => !['dataset_asset_id', 'recipe_index', 'processor'].includes(key),
+        )
+      )
+        throw new Error('原统计任务包含无效的输入字段。');
+      const id = assetId(row.dataset_asset_id);
+      if (ids.has(id)) throw new Error('原统计任务包含重复数据集。');
+      ids.add(id);
+      if ((row.processor != null) === (row.recipe_index !== undefined))
+        throw new Error('原统计任务包含冲突的数据处理配置。');
+      if (plain(row.processor) && text(row.processor.name) && plain(row.processor.parameters))
+        return {
+          dataset_asset_id: id,
+          processor: {
+            name: row.processor.name,
+            parameters: row.processor.parameters as Record<string, RecipeLiteral>,
+          },
+        };
+      if (
+        Number.isSafeInteger(row.recipe_index) &&
+        (row.recipe_index as number) >= 0 &&
+        (row.recipe_index as number) < 64
+      )
+        return { dataset_asset_id: id, recipe_index: row.recipe_index as number };
+      throw new Error('原统计任务的数据处理配置不完整。');
+    });
+    request.inputs = {};
+  } else if (rawBindings != null) {
     if (!Array.isArray(rawBindings) || rawBindings.length < 1 || rawBindings.length > 64)
       throw new Error('原训练数据绑定无效。');
     request.dataset_bindings = rawBindings.map((row): DatasetBinding => {
@@ -148,6 +196,8 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
     request.dataset_bindings = [
       { dataset_asset_id: inputs.dataset, norm_asset_id: inputs.norm, recipe_index: 0, weight: 1 },
     ];
+  } else if (run.template_id === 'openpi-norm') {
+    if (!inputs.dataset) throw new Error('原统计任务缺少数据集资产，请重新选择。');
   } else if (run.template_id !== 'smoke') {
     throw new Error('原训练缺少成对的数据集和归一化参数资产。');
   }
@@ -158,9 +208,11 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
       ? run.entrypoint
       : setting('requested_entrypoint');
   if (rawAuto != null) {
+    const independentDatasets =
+      run.template_id === 'openpi-norm' ? request.norm_datasets : request.dataset_bindings;
     if (
-      !request.dataset_bindings?.length ||
-      request.dataset_bindings.some((binding) => !('processor' in binding))
+      !independentDatasets?.length ||
+      independentDatasets.some((binding) => !('processor' in binding))
     )
       throw new Error('原自动训练缺少独立数据处理器，请手动重新配置数据处理。');
     if (text(requestedEntrypoint, 1024))
@@ -171,6 +223,7 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
       !plain(rawAuto) ||
       !['pi0', 'pi05'].includes(String(rawAuto.model_type)) ||
       !['full', 'lora'].includes(String(rawAuto.finetune_mode)) ||
+      (run.template_id === 'openpi-norm' && rawAuto.finetune_mode !== 'full') ||
       !Number.isSafeInteger(rawAuto.action_horizon) ||
       (rawAuto.action_horizon as number) <= 0 ||
       !Number.isSafeInteger(rawAuto.action_dim) ||

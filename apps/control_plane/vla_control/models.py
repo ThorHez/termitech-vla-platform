@@ -47,6 +47,7 @@ class GPUReservation(Base):
     gpu_uuid: Mapped[str] = mapped_column(String(200), primary_key=True)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), index=True)
     created_at: Mapped[str] = mapped_column(String(40))
+    expires_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
 
 class Profile(Base):
@@ -86,6 +87,7 @@ class Asset(Base):
 class Preview(Base):
     __tablename__ = "previews"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
     node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="RESTRICT"), index=True)
     status: Mapped[str] = mapped_column(String(32), default="PENDING")
     request: Mapped[dict] = mapped_column(JSON)
@@ -187,6 +189,9 @@ class Command(Base):
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[str] = mapped_column(String(40), index=True)
     acknowledged_at: Mapped[str | None] = mapped_column(String(40))
+    delivered_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    actor_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
+    required_permission: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
 class Event(Base):

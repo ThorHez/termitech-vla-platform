@@ -124,7 +124,7 @@ def test_confirmed_terminal_runtime_can_be_removed_and_hidden_from_old_actions(p
     assert platform.client.get(BASE, headers=ADMIN).json() == []
 
 
-@pytest.mark.parametrize("role,expected", [("admin", 204), ("operator", 204), ("viewer", 403)])
+@pytest.mark.parametrize("role,expected", [("admin", 204), ("operator", 403), ("viewer", 403)])
 def test_record_delete_requires_training_permission_csrf_and_same_origin(platform, role, expected):
     record_id = draft(platform)
     username, password = "record-delete-" + role, "record-deletion-test-password"

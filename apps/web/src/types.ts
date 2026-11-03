@@ -8,6 +8,7 @@ export interface GpuReservation {
   username: string;
   display_name: string;
   created_at: string;
+  expires_at?: string | null;
 }
 export interface Gpu {
   uuid: string;
@@ -200,6 +201,10 @@ export type DatasetBinding = DatasetBindingBase &
     | { recipe_index: number; processor?: never }
     | { recipe_index?: never; processor: DataProcessorChoice }
   );
+export type NormDataset = { dataset_asset_id: string } & (
+  | { recipe_index: number; processor?: never }
+  | { recipe_index?: never; processor: DataProcessorChoice }
+);
 export interface RecipeDetailQuery {
   id: string;
   node_id: string;
@@ -313,11 +318,23 @@ export interface AgentConfigResult {
   filename: string;
   config: JsonObject;
 }
+export interface SshAuthenticationRequest {
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  service_name: string;
+}
+export interface SshInstallCheckRequest {
+  install_dir: string;
+  service_name: string;
+}
 export interface SshConnectionResult {
   connection_id: string;
   host: string;
   port: number;
   username: string;
+  service_name?: string;
   fingerprint: string;
   hostname: string;
   expires_at: string;
@@ -332,6 +349,7 @@ export interface RemoteDeployment {
   port: number;
   username: string;
   install_dir: string;
+  service_name?: string;
   onboarding_id: string;
   node_id: string | null;
   state:
@@ -376,6 +394,7 @@ export interface NodeManagementInfo {
   port?: number | null;
   username?: string | null;
   install_dir?: string | null;
+  service_name?: string | null;
   deployment_id?: string | null;
   can_disconnect: boolean;
   can_uninstall: boolean;
@@ -462,6 +481,14 @@ export interface GeneratedTrainingConfig {
   sha256: string;
 }
 export interface CodeSnapshot {
+  runtime_profile?: {
+    id?: string;
+    name?: string;
+    code_dir?: string;
+    python?: string;
+    adapter?: string;
+    execution_mode?: string;
+  };
   normalization_method?: TrainingNormalizationMethod | null;
   auto_config?: AutoTrainingConfig | null;
   confirmed_config_sha256?: string | null;
@@ -470,6 +497,7 @@ export interface CodeSnapshot {
   training_stage?: TrainingStage | null;
   stage_config?: Record<string, number> | null;
   dataset_bindings?: DatasetBinding[] | null;
+  norm_datasets?: NormDataset[] | null;
   requested_entrypoint?: string | null;
   recipe?: string | null;
   recipe_definition?: RecipeDefinition | null;
@@ -511,6 +539,7 @@ export interface Run {
   training_stage?: TrainingStage | null;
   stage_config?: Record<string, number> | null;
   dataset_bindings?: DatasetBinding[] | null;
+  norm_datasets?: NormDataset[] | null;
   entrypoint?: string | null;
   recipe?: string | null;
   recipe_definition?: RecipeDefinition | null;
@@ -557,6 +586,7 @@ export interface RunRequest {
   training_stage?: TrainingStage;
   stage_config?: Record<string, number>;
   dataset_bindings?: DatasetBinding[];
+  norm_datasets?: NormDataset[];
   entrypoint?: string;
   recipe?: string;
   recipe_revision_id?: string;

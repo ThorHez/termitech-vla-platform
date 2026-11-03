@@ -26,10 +26,12 @@ COOKIE_NAME = "vla_session"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 ROLES = ("admin", "operator", "viewer")
 PERMISSIONS = frozenset({"platform.read", "training.write", "assets.write", "recipes.write",
+                         "assets.query", "assets.transfer", "dataset-templates.write", "recipes.query",
                          "machines.manage", "recipes.writeback", "users.manage", "audit.read"})
 ROLE_PERMISSIONS = {
     "admin": PERMISSIONS,
-    "operator": frozenset({"platform.read", "training.write", "assets.write", "recipes.write"}),
+    "operator": frozenset({"platform.read", "training.write", "assets.query", "assets.transfer",
+                           "dataset-templates.write", "recipes.query"}),
     "viewer": frozenset({"platform.read"}),
 }
 USERNAME = re.compile(r"^[a-z0-9][a-z0-9_.-]{2,79}$")
@@ -154,6 +156,9 @@ class AuthManager:
     def require(self, request: Request, permission: str | None = None) -> Principal:
         self.check_origin(request)
         principal = self.current(request)
+        if request.method not in SAFE_METHODS:
+            from .resource_authorization import require_expected_user
+            require_expected_user(request)
         if request.method not in SAFE_METHODS and not principal.legacy:
             with self.db.read() as session:
                 row = session.get(UserSession, principal.session_id)
@@ -448,6 +453,9 @@ class AuthManager:
             user.updated_at = now()
             if revoke:
                 session.execute(delete(UserSession).where(UserSession.user_id == user.id))
+            if not enabled or "training.write" not in ROLE_PERMISSIONS.get(role, frozenset()):
+                from .account_lifecycle import revoke_pending_work
+                revoke_pending_work(session, user.id, "ACCOUNT_DISABLED" if not enabled else "ACCOUNT_PERMISSION_REVOKED")
             self._audit(session, request, "users.update", 200, {"target_user_id": user.id, "role": role, "enabled": enabled})
             return user_dict(user)
 
@@ -521,6 +529,7 @@ def register_auth_routes(app: FastAPI, manager: AuthManager) -> None:
     def logout(request: Request, response: Response):
         principal = manager.require(request)
         with manager.db.write() as session:
+            manager.lock_accounts(session)
             if principal.session_id:
                 session.execute(delete(UserSession).where(UserSession.id == principal.session_id))
             manager._audit(session, request, "auth.logout", 204)

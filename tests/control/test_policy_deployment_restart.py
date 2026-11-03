@@ -260,6 +260,12 @@ def test_restart_permission_is_training_write(platform, monkeypatch, role, expec
     platform.app.state.auth.create_user("restart-user", "test-user-password", role)
     platform.client.base_url = "https://testserver"
     login = platform.client.post("/api/v1/auth/login", json={"username": "restart-user", "password": "test-user-password"})
+    from vla_control.deployment_record_models import DeploymentRecord, DeploymentRecordRuntime
+    with platform.app.state.db.write() as session:
+        owner = login.json()["user"]["id"]
+        session.get(PolicyDeployment, deployment["id"]).owner_user_id = owner
+        parent = session.get(DeploymentRecordRuntime, deployment["id"])
+        session.get(DeploymentRecord, parent.record_id).owner_user_id = owner
     response = platform.client.post(BASE + "/" + deployment["id"] + "/start",
         headers={"X-CSRF-Token": login.json()["csrf_token"]})
     assert response.status_code == expected, response.text

@@ -41,6 +41,7 @@ export function DatasetProcessing(props: {
   automatic?: boolean;
   readOnly?: boolean;
   normalizationOverride?: TrainingNormalizationMethod;
+  purpose?: 'training' | 'norm';
   validationToken?: string;
   initialMode?: DatasetProcessingMode;
   onModeChange?: (mode: DatasetProcessingMode) => void;
@@ -61,7 +62,7 @@ export function DatasetProcessing(props: {
   const annotations = trainingProfileSeed(props.dataset).field_annotations;
   return (
     <section className="training-dataset-processing" aria-label={`数据处理方式 ${props.index + 1}`}>
-      {props.normalizationOverride && !composed && (
+      {props.purpose !== 'norm' && props.normalizationOverride && !composed && (
         <p className="field-hint">
           本次训练统一使用：{trainingNormalizationLabel(props.normalizationOverride)}
         </p>
@@ -83,7 +84,7 @@ export function DatasetProcessing(props: {
                   props.onChange({
                     ...assets,
                     processor: composedChoice(
-                      trainingCompositionDraft(trainingProfileSeed(props.dataset)),
+                      trainingCompositionDraft(trainingProfileSeed(props.dataset), props.purpose),
                     ),
                   });
                 }
@@ -171,6 +172,7 @@ function LegacyDatasetProcessing({
   automatic: automaticMode = false,
   recommend = true,
   readOnly = false,
+  purpose = 'training',
   validationToken,
   onChange,
   onValidityChange,
@@ -185,6 +187,7 @@ function LegacyDatasetProcessing({
   automatic?: boolean;
   recommend?: boolean;
   readOnly?: boolean;
+  purpose?: 'training' | 'norm';
   validationToken?: string;
   onChange: (binding: DatasetBinding) => void;
   onValidityChange?: (valid: boolean) => void;
@@ -252,6 +255,7 @@ function LegacyDatasetProcessing({
         binding.processor,
         entries.find((entry) => entry.name === binding.processor?.name),
         managedParameters,
+        purpose,
       )
     : [];
   const picker = (
@@ -262,6 +266,7 @@ function LegacyDatasetProcessing({
       index={index}
       managedParameters={managedParameters}
       allowRecipeDefault={!automaticMode}
+      purpose={purpose}
       onChange={(value) => {
         setManual(true);
         setConfirmedScope('');

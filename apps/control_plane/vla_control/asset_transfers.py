@@ -9,7 +9,7 @@ from pathlib import PurePosixPath
 import re
 import threading
 
-from fastapi import Query
+from fastapi import Query, Request
 from fastapi.responses import Response
 from pydantic import Field, field_validator
 from sqlalchemy import or_, select, text
@@ -27,10 +27,13 @@ from .remote_models import RemoteConnection
 from .schemas import InputModel
 from .ssh_remote import RemoteError
 from .storage_configurations import require_not_pending
+from .account_lifecycle import lock_execution_guard, task_execution_authorized
+from .resource_authorization import (request_user_id, require_active_actor, require_expected_user,
+    require_resource_owner, scoped_request_key)
 
 
 LOG = logging.getLogger(__name__)
-PUBLIC_FIELDS = ('id', 'name', 'source_asset_id', 'source_node_id', 'source_path', 'source_kind',
+PUBLIC_FIELDS = ('id', 'owner_user_id', 'execution_user_id', 'name', 'source_asset_id', 'source_node_id', 'source_path', 'source_kind',
     'target_node_id', 'target_directory', 'target_name', 'target_path', 'asset_path', 'target_asset_id',
     'include_norm_stats', 'norm_sync', 'exclude_train_state',
     'state', 'attempt', 'bytes_total', 'bytes_transferred', 'files_total', 'files_transferred',
@@ -209,7 +212,19 @@ def _check_snapshot(session, row, settings):
         target_directory=row.target_directory, target_name=row.target_name,
         include_norm_stats=row.include_norm_stats, exclude_train_state=row.exclude_train_state)
     current = _bindings(session, body, settings)
+    comparable = current
     if current != row.binding_snapshot:
+        # A generated model label can be upgraded without changing the copy's
+        # bytes, provenance, paths or SSH binding. Every other field remains
+        # part of the original immutable snapshot comparison.
+        from .model_names import equivalent_model_names
+        previous_source = row.binding_snapshot.get('source_asset', {}) if isinstance(row.binding_snapshot, dict) else {}
+        if (current['source_asset']['kind'] == 'MODEL' and isinstance(previous_source, dict)
+                and equivalent_model_names(session, row.source_asset_id,
+                    previous_source.get('name'), current['source_asset']['name'])):
+            comparable = deepcopy(current)
+            comparable['source_asset']['name'] = previous_source['name']
+    if comparable != row.binding_snapshot:
         raise APIError(409, 'ASSET_TRANSFER_BINDING_CHANGED', '源资产、机器目录或 SSH 接入已变化，请新建同步任务')
     return current
 
@@ -314,7 +329,7 @@ def _validate_result(result, source, directory, name):
     return manifest, expected, asset_path
 
 
-def _copy_asset(row, source, asset_path, digest, *, part=None):
+def _copy_asset(row, source, asset_path, digest, *, part=None, name=None):
     metadata = {k: deepcopy(v) for k, v in source['metadata'].items() if k in SEMANTIC_METADATA}
     metadata['asset_sync'] = {'transfer_id': row.id, 'source_asset_id': source['id'],
         'source_node_id': source['node_id'], 'source_path': source['path'],
@@ -325,7 +340,7 @@ def _copy_asset(row, source, asset_path, digest, *, part=None):
     if row.exclude_train_state and source['kind'] == 'MODEL':
         metadata['asset_sync'].update(exclude_train_state=True, excluded_root_directories=['train_state'])
     return Asset(id=uid(), node_id=row.target_node_id, kind=source['kind'],
-        name=source['name'], path=asset_path, version=source['version'], state='REGISTERED',
+        name=name or source['name'], path=asset_path, version=source['version'], state='REGISTERED',
         metadata_json=metadata, created_at=now())
 
 
@@ -471,8 +486,16 @@ class AssetTransferManager:
             if not acquired:
                 return
             with self.db.write() as session:
+                lock_execution_guard(session)
                 row = _locked(session, transfer_id)
                 if row is None or row.attempt != attempt or row.state not in ASSET_TRANSFER_WORKING:
+                    return
+                if not task_execution_authorized(session, row.owner_user_id, row.execution_user_id,
+                        allow_legacy=self.settings.legacy_admin_enabled):
+                    row.state, row.finished_at = 'INTERRUPTED', now()
+                    row.error = {'code': 'ACCOUNT_EXECUTION_REVOKED', 'message': '本次执行发起账户当前无执行权限；同步尚未开始，恢复权限后可重试'}
+                    _stop_norm(row, 'INTERRUPTED', row.error)
+                    _log(row, row.error['message'])
                     return
                 bindings = _check_snapshot(session, row, self.settings)
                 for side in ('source', 'target'):
@@ -530,7 +553,10 @@ class AssetTransferManager:
                     return
                 _check_snapshot(session, row, self.settings)
                 source = row.binding_snapshot['source_asset']
-                asset = _copy_asset(row, source, asset_path, result['manifest_sha256'])
+                from .model_names import model_asset_name
+                original = session.get(Asset, source['id'])
+                label = model_asset_name(session, original) if source['kind'] == 'MODEL' else None
+                asset = _copy_asset(row, source, asset_path, result['manifest_sha256'], name=label)
                 if norm_source is not None:
                     norm = _copy_asset(row, norm_source, norm_path, norm_result['manifest_sha256'], part='norm_stats')
                     session.add(norm)
@@ -544,7 +570,9 @@ class AssetTransferManager:
                         'progress_pct': 100}
                 session.add(asset)
                 session.flush()
-                queue_validation(session, asset, heartbeat_timeout_seconds=self.settings.heartbeat_timeout_seconds)
+                queue_validation(session, asset, heartbeat_timeout_seconds=self.settings.heartbeat_timeout_seconds,
+                    actor_user_id=row.execution_user_id if row.execution_user_id is not None else row.owner_user_id,
+                    source_transfer_id=row.id)
                 row.target_path, row.asset_path, row.target_asset_id = expected, asset_path, asset.id
                 row.manifest, row.manifest_sha256 = deepcopy(manifest), result['manifest_sha256']
                 row.bytes_total = row.bytes_transferred = manifest['bytes_total'] + (norm_manifest['bytes_total'] if norm_manifest else 0)
@@ -612,11 +640,14 @@ def register_routes(app, admin, manager):
             return asset_transfer_dict(row)
 
     @app.delete('/api/v1/asset-transfers/{transfer_id}', dependencies=admin, status_code=204)
-    def delete_transfer(transfer_id: str):
+    def delete_transfer(transfer_id: str, request: Request):
+        require_expected_user(request)
         with db.write() as session:
+            require_active_actor(session, request, 'assets.transfer')
             row = _locked(session, transfer_id, include_deleted=True)
             if row is None:
                 raise APIError(404, 'NOT_FOUND', '同步任务不存在')
+            require_resource_owner(request, row.owner_user_id)
             if row.deleted_at is None:
                 if row.state not in ASSET_TRANSFER_TERMINAL:
                     raise APIError(409, 'ASSET_TRANSFER_NOT_TERMINAL', '只能删除已结束的数据同步记录，请先取消同步并等待执行结束')
@@ -626,8 +657,9 @@ def register_routes(app, admin, manager):
         return Response(status_code=204)
 
     @app.post('/api/v1/asset-transfers', dependencies=admin, status_code=202)
-    def create_transfer(body: AssetTransferInput):
-        key = body.idempotency_key or uid()
+    def create_transfer(body: AssetTransferInput, request: Request):
+        require_expected_user(request)
+        key = scoped_request_key(request, body.idempotency_key or uid())
         try:
             digest_fields = body.model_dump(exclude={'idempotency_key'})
             if not body.exclude_train_state:
@@ -640,9 +672,11 @@ def register_routes(app, admin, manager):
             raise APIError(422, 'ASSET_TRANSFER_INVALID_TEXT', '同步请求包含无效文本编码') from None
         try:
             with db.write() as session:
+                require_active_actor(session, request, 'assets.transfer')
                 _admission_lock(session)
                 existing = session.scalar(select(AssetTransfer).where(AssetTransfer.request_key == key))
                 if existing is not None:
+                    require_resource_owner(request, existing.owner_user_id)
                     return _replay(existing, request_digest)
                 bindings = _bindings(session, body, settings)
                 if len(active_asset_transfers(session)) >= 20:
@@ -657,7 +691,8 @@ def register_routes(app, admin, manager):
                         raise APIError(422, 'ASSET_TRANSFER_PATH_OVERLAP', '数据集与 norm_stats 目标目录不能相同')
                     _target_available(session, body.target_node_id, bindings['target_directory'], companion['target_name'])
                     _check_companion_paths(bindings, companion['target_name'])
-                row = AssetTransfer(id=transfer_id, request_key=key, request_digest=request_digest,
+                row = AssetTransfer(id=transfer_id, owner_user_id=request_user_id(request),
+                    execution_user_id=request_user_id(request), request_key=key, request_digest=request_digest,
                     name=body.name or (source['name'] + ' · 资产同步')[:200],
                     source_asset_id=source['id'], source_node_id=source['node_id'], source_path=source['path'],
                     source_kind=source['kind'], target_node_id=body.target_node_id,
@@ -672,26 +707,31 @@ def register_routes(app, admin, manager):
             with db.read() as session:
                 existing = session.scalar(select(AssetTransfer).where(AssetTransfer.request_key == key))
                 if existing is not None and existing.request_digest == request_digest:
+                    require_resource_owner(request, existing.owner_user_id)
                     return _replay(existing, request_digest)
             raise APIError(409, 'IDEMPOTENCY_CONFLICT', '同步请求已提交或发生并发冲突，请刷新后重试') from None
         manager._launch(transfer_id)
         return result
 
     @app.post('/api/v1/asset-transfers/{transfer_id}/retry', dependencies=admin, status_code=202)
-    def retry_transfer(transfer_id: str):
+    def retry_transfer(transfer_id: str, request: Request):
+        require_expected_user(request)
         with db.read() as session:
             row = session.get(AssetTransfer, transfer_id)
             if row is None or row.deleted_at is not None:
                 raise APIError(404, 'NOT_FOUND', '同步任务不存在')
+            require_resource_owner(request, row.owner_user_id)
         with manager._lock:
             worker = manager._workers.get(transfer_id)
             if worker is not None and worker.is_alive():
                 raise APIError(409, 'ASSET_TRANSFER_CANCELLING', '上一次同步仍在结束，请稍后重试')
         with db.write() as session:
+            require_active_actor(session, request, 'assets.transfer')
             _admission_lock(session)
             row = _locked(session, transfer_id)
             if row is None:
                 raise APIError(404, 'NOT_FOUND', '同步任务不存在')
+            require_resource_owner(request, row.owner_user_id)
             if row.state not in ASSET_TRANSFER_RETRYABLE:
                 raise APIError(409, 'ASSET_TRANSFER_NOT_RETRYABLE', '只有失败、取消或中断的同步可以重试')
             if len(active_asset_transfers(session)) >= 20:
@@ -702,6 +742,7 @@ def register_routes(app, admin, manager):
                 _target_available(session, row.target_node_id, row.target_directory, row.norm_sync['target_name'], excluding=row.id)
             _verify_saved_ssh_credentials(session, bindings, manager)
             row.attempt += 1
+            row.execution_user_id = request_user_id(request)
             row.state, row.error, row.finished_at = 'QUEUED', None, None
             row.bytes_total = row.bytes_transferred = row.files_total = row.files_transferred = 0
             row.progress_pct = row.speed_bytes_per_second = 0
@@ -713,14 +754,17 @@ def register_routes(app, admin, manager):
         return result
 
     @app.post('/api/v1/asset-transfers/{transfer_id}/cancel', dependencies=admin, status_code=202)
-    def cancel_transfer(transfer_id: str):
+    def cancel_transfer(transfer_id: str, request: Request):
+        require_expected_user(request)
         with manager._lock:
             worker = manager._workers.get(transfer_id)
             alive = worker is not None and worker.is_alive()
         with db.write() as session:
+            require_active_actor(session, request, 'assets.transfer')
             row = _locked(session, transfer_id)
             if row is None:
                 raise APIError(404, 'NOT_FOUND', '同步任务不存在')
+            require_resource_owner(request, row.owner_user_id)
             if row.state in ASSET_TRANSFER_ACTIVE:
                 row.state = 'CANCELLING' if alive else 'CANCELLED'
                 row.speed_bytes_per_second = 0

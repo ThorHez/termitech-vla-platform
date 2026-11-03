@@ -3,7 +3,7 @@
 from sqlalchemy import select
 
 from vla_control.common import offset_time
-from vla_control.models import Command
+from vla_control.models import Command, Preview
 
 from .conftest import ADMIN
 
@@ -12,6 +12,9 @@ def test_large_preflight_backlog_cannot_starve_cancel_start_or_lightweight_comma
     node = platform.register()
     run = platform.run(node)
     assert platform.schedule() == 1
+    # A delivered START may already be running with a late acknowledgement;
+    # cancellation must still reach the Agent behind the synthetic backlog.
+    assert any(command["type"] == "START" for command in platform.commands(node))
     response = platform.client.post(f"/api/v1/runs/{run['id']}/cancel", headers=ADMIN)
     assert response.status_code == 202, response.text
     with platform.app.state.db.write() as session:
@@ -21,6 +24,8 @@ def test_large_preflight_backlog_cannot_starve_cancel_start_or_lightweight_comma
         # insertion order must not affect which 100 commands are delivered.
         backlog_time = offset_time(-1200)
         for index in reversed(range(105)):
+            session.add(Preview(id=f"pending-{index}", node_id=node["node_id"], request={},
+                                status="PENDING", checks=[], created_at=backlog_time, expires_at=offset_time(900)))
             session.add(Command(id=f"backlog-{index:03d}", node_id=node["node_id"], type="PREFLIGHT",
                                 payload={"preview_id": f"pending-{index}"}, status="PENDING",
                                 created_at=backlog_time))

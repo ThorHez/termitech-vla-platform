@@ -4,6 +4,7 @@ import { Field } from './components';
 import { RobotTypeField } from './RobotTypeField';
 import { inferImageLayout } from './imageLayout';
 import { trainingNormalizationLabel } from './trainingNormalization';
+import { inferCompositionRepresentations } from './compositionRepresentationDefaults';
 import type { TrainingNormalizationMethod } from './types';
 import {
   composedProcessingErrors,
@@ -15,6 +16,7 @@ import {
   VISUAL_SLOTS,
   type ActionBlock,
   type ActionKind,
+  selectActionKind,
   type ComposedCamera,
   type ComposedProcessingSpec,
   type ProcessingProfileSeed,
@@ -38,6 +40,13 @@ const kinds = {
   other: '其他状态',
 };
 const arms = { left: '左臂', right: '右臂', shared: '共享状态' };
+const actionKinds = {
+  position: '位置',
+  rotation: '旋转',
+  joint: '关节',
+  gripper: '夹爪',
+  shared: '共享动作',
+};
 const slotLabels = {
   base_0_rgb: '主视角 · base_0_rgb',
   left_wrist_0_rgb: '左腕 · left_wrist_0_rgb',
@@ -61,6 +70,7 @@ export function ComposedProcessingEditor({
   onFieldEdit,
   onImageLayoutEdit,
   normalizationOverride,
+  purpose = 'training',
   disabled = false,
 }: {
   value: ComposedProcessingSpec;
@@ -69,6 +79,7 @@ export function ComposedProcessingEditor({
   onFieldEdit?: (path: string) => void;
   onImageLayoutEdit?: (key: string, kind: ComposedCamera['kind']) => void;
   normalizationOverride?: TrainingNormalizationMethod;
+  purpose?: 'training' | 'norm';
   disabled?: boolean;
 }) {
   const set = <K extends keyof ComposedProcessingSpec>(key: K, next: ComposedProcessingSpec[K]) => {
@@ -90,7 +101,8 @@ export function ComposedProcessingEditor({
       'cameras',
       value.cameras.map((field, row) => (row === index ? { ...field, ...next } : field)),
     );
-  const errors = composedProcessingErrors(value);
+  const errors = composedProcessingErrors(value, purpose);
+  const representationEvidence = inferCompositionRepresentations(profile, value, purpose);
   const sourceAction = inferSourceActionLayout(profile, value.action_key);
   const actionWidth = value.action_layout.reduce(
     (sum, block) => sum + (Number.isFinite(block.width) ? block.width : 0),
@@ -178,10 +190,12 @@ export function ComposedProcessingEditor({
             <option value="bimanual">双臂</option>
           </select>
         </Field>
-        <Field label="状态表示" required>
+        <Field label="状态表示" required hint={representationEvidence.state_representation.reason}>
           <select
             value={
-              value.state_representation === 'eef' || value.state_representation === 'joint'
+              value.state_representation === 'eef' ||
+              value.state_representation === 'joint' ||
+              (purpose === 'norm' && value.state_representation === 'composite')
                 ? value.state_representation
                 : ''
             }
@@ -195,12 +209,19 @@ export function ComposedProcessingEditor({
             <option value="">请选择状态表示</option>
             <option value="eef">EEF · 末端状态</option>
             <option value="joint">Joint · 关节状态</option>
+            {purpose === 'norm' && <option value="composite">组合向量（多分量）</option>}
           </select>
         </Field>
-        <Field label="组合动作表示" required>
+        <Field
+          label="组合动作表示"
+          required
+          hint={representationEvidence.action_representation.reason}
+        >
           <select
             value={
-              value.action_representation === 'eef' || value.action_representation === 'joint'
+              value.action_representation === 'eef' ||
+              value.action_representation === 'joint' ||
+              (purpose === 'norm' && value.action_representation === 'composite')
                 ? value.action_representation
                 : ''
             }
@@ -214,6 +235,7 @@ export function ComposedProcessingEditor({
             <option value="">请选择动作表示</option>
             <option value="eef">EEF · 末端动作</option>
             <option value="joint">Joint · 关节动作</option>
+            {purpose === 'norm' && <option value="composite">组合向量（多分量）</option>}
           </select>
         </Field>
       </div>
@@ -335,14 +357,16 @@ export function ComposedProcessingEditor({
                 </select>
               </Field>
             </div>
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={field.normalize}
-                onChange={(event) => state(index, { normalize: event.target.checked })}
-              />
-              归一化状态字段 {index + 1}
-            </label>
+            {purpose !== 'norm' && (
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={field.normalize}
+                  onChange={(event) => state(index, { normalize: event.target.checked })}
+                />
+                归一化状态字段 {index + 1}
+              </label>
+            )}
           </div>
         ))}
       </section>
@@ -424,7 +448,7 @@ export function ComposedProcessingEditor({
         )}
         <p className="field-hint">
           分块从动作向量第 0
-          维依次排列。总宽度来自原始动作形状；分块有明确的坐标名称或字段标签时自动填入，无法识别时手动配置。双臂须分别声明左右臂。
+          维依次排列。总宽度来自原始动作形状；分块有明确的坐标名称或字段标签时自动填入，无法识别时手动配置。整段保留的动作向量可选择“共享动作”并填写宽度；包含普通机械臂分块时，双臂仍须分别声明。
         </p>
         {value.action_layout.map((block, index) => (
           <div className="composed-row" key={index}>
@@ -469,37 +493,41 @@ export function ComposedProcessingEditor({
               <Field label={`动作归属 ${index + 1}`}>
                 <select
                   value={block.arm}
+                  disabled={block.kind === 'shared'}
                   onChange={(event) =>
                     action(index, { arm: event.target.value as ActionBlock['arm'] })
                   }
                 >
                   <option value="left">左臂</option>
                   <option value="right">右臂</option>
+                  {block.kind === 'shared' && <option value="shared">共享动作归属</option>}
                 </select>
               </Field>
               <Field label={`动作类型 ${index + 1}`}>
                 <select
                   value={block.kind}
-                  onChange={(event) => action(index, { kind: event.target.value as ActionKind })}
+                  onChange={(event) =>
+                    action(index, selectActionKind(block, event.target.value as ActionKind))
+                  }
                 >
-                  {Object.entries(kinds)
-                    .filter(([name]) => name !== 'other')
-                    .map(([name, label]) => (
-                      <option value={name} key={name}>
-                        {label}
-                      </option>
-                    ))}
+                  {Object.entries(actionKinds).map(([name, label]) => (
+                    <option value={name} key={name}>
+                      {label}
+                    </option>
+                  ))}
                 </select>
               </Field>
               <Field
                 label={`动作宽度 ${index + 1}`}
                 required
                 hint={
-                  value.action_representation === 'eef' && block.kind === 'position'
-                    ? 'EEF 位置分块必须为 3 维。'
-                    : value.action_representation === 'eef' && block.kind === 'rotation'
-                      ? '旋转分块宽度需与所选旋转编码一致。'
-                      : '当前分块占用的维数。'
+                  block.kind === 'shared'
+                    ? '按原顺序保留此段动作，不按左右臂拆分；请显式填写该段宽度。'
+                    : value.action_representation === 'eef' && block.kind === 'position'
+                      ? 'EEF 位置分块必须为 3 维。'
+                      : value.action_representation === 'eef' && block.kind === 'rotation'
+                        ? '旋转分块宽度需与所选旋转编码一致。'
+                        : '当前分块占用的维数。'
                 }
               >
                 <input
@@ -513,175 +541,183 @@ export function ComposedProcessingEditor({
                 />
               </Field>
             </div>
-            <label className="checkbox-label">
-              <input
-                type="checkbox"
-                checked={block.normalize}
-                onChange={(event) => action(index, { normalize: event.target.checked })}
-              />
-              归一化动作分块 {index + 1}
-            </label>
+            {purpose !== 'norm' && (
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={block.normalize}
+                  onChange={(event) => action(index, { normalize: event.target.checked })}
+                />
+                归一化动作分块 {index + 1}
+              </label>
+            )}
           </div>
         ))}
       </section>
-      <section aria-label="模型视觉槽位">
-        <div className="composed-section-title">
-          <strong>视觉输入与模型槽位</strong>
-          <span>{value.cameras.length} 路 / 最多 3 路</span>
-          <button
-            type="button"
-            className="button outline small"
-            disabled={disabled || value.cameras.length >= 3}
-            onClick={() =>
-              set('cameras', [
-                ...value.cameras,
-                {
-                  key: '',
-                  slot:
-                    VISUAL_SLOTS.find(
-                      (slot) => !value.cameras.some((camera) => camera.slot === slot),
-                    ) || 'base_0_rgb',
-                  kind: 'rgb',
-                  layout: '',
-                  time_index: null,
-                  depth_min: 0,
-                  depth_max: 1,
-                },
-              ])
-            }
-          >
-            <Plus size={14} />
-            添加组合视觉输入
-          </button>
-        </div>
-        <p className="field-hint">
-          每个模型槽位最多绑定一个真实字段。深度仅按显式显示范围映射为图像，不代表生成新的视角或转换测量单位。
-        </p>
-        {value.cameras.map((item, index) => (
-          <div className="composed-row" key={index}>
-            <div className="composed-row-title">
-              <strong>组合视觉输入 {index + 1}</strong>
-              <button
-                type="button"
-                className="icon-button"
-                aria-label={`移除组合视觉输入 ${index + 1}`}
-                disabled={disabled || value.cameras.length === 1}
-                onClick={() =>
-                  set(
-                    'cameras',
-                    value.cameras.filter((_, row) => row !== index),
-                  )
-                }
-              >
-                <Trash2 size={14} />
-              </button>
-            </div>
-            <Field label={`组合视觉字段 ${index + 1}`} required>
-              <input
-                required
-                maxLength={256}
-                value={item.key}
-                onChange={(event) => {
-                  const key = event.target.value;
-                  const inferred = inferImageLayout(profile.image_features, key, item.kind);
-                  camera(index, { key, layout: inferred.layout || '' });
-                }}
-              />
-            </Field>
-            <div className="form-grid">
-              <Field label={`模型视觉槽位 ${index + 1}`}>
-                <select
-                  value={item.slot}
-                  onChange={(event) =>
-                    camera(index, { slot: event.target.value as ComposedCamera['slot'] })
+      {purpose !== 'norm' && (
+        <section aria-label="模型视觉槽位">
+          <div className="composed-section-title">
+            <strong>视觉输入与模型槽位</strong>
+            <span>{value.cameras.length} 路 / 最多 3 路</span>
+            <button
+              type="button"
+              className="button outline small"
+              disabled={disabled || value.cameras.length >= 3}
+              onClick={() =>
+                set('cameras', [
+                  ...value.cameras,
+                  {
+                    key: '',
+                    slot:
+                      VISUAL_SLOTS.find(
+                        (slot) => !value.cameras.some((camera) => camera.slot === slot),
+                      ) || 'base_0_rgb',
+                    kind: 'rgb',
+                    layout: '',
+                    time_index: null,
+                    depth_min: 0,
+                    depth_max: 1,
+                  },
+                ])
+              }
+            >
+              <Plus size={14} />
+              添加组合视觉输入
+            </button>
+          </div>
+          <p className="field-hint">
+            每个模型槽位最多绑定一个真实字段。深度仅按显式显示范围映射为图像，不代表生成新的视角或转换测量单位。
+          </p>
+          {value.cameras.map((item, index) => (
+            <div className="composed-row" key={index}>
+              <div className="composed-row-title">
+                <strong>组合视觉输入 {index + 1}</strong>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={`移除组合视觉输入 ${index + 1}`}
+                  disabled={disabled || value.cameras.length === 1}
+                  onClick={() =>
+                    set(
+                      'cameras',
+                      value.cameras.filter((_, row) => row !== index),
+                    )
                   }
                 >
-                  {VISUAL_SLOTS.map((slot) => (
-                    <option value={slot} key={slot}>
-                      {slotLabels[slot]}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-              <Field label={`组合图像类型 ${index + 1}`}>
-                <select
-                  value={item.kind}
-                  onChange={(event) =>
-                    camera(index, { kind: event.target.value as ComposedCamera['kind'] })
-                  }
-                >
-                  <option value="rgb">RGB 彩色</option>
-                  <option value="depth">深度</option>
-                </select>
-              </Field>
-              <Field
-                label={`图像布局 ${index + 1}`}
-                required
-                hint={(() => {
-                  const inferred = inferImageLayout(profile.image_features, item.key, item.kind);
-                  return inferred.layout
-                    ? `原始形状 [${inferred.shape?.join(' × ')}]，识别为 ${inferred.layout.toUpperCase()}。`
-                    : inferred.reason;
-                })()}
-              >
-                <select
-                  required
-                  value={item.layout}
-                  onChange={(event) => {
-                    onImageLayoutEdit?.(item.key, item.kind);
-                    camera(index, { layout: event.target.value as ComposedCamera['layout'] });
-                  }}
-                >
-                  <option value="" disabled>
-                    待读取或手动选择布局
-                  </option>
-                  <option value="chw">CHW · 通道/高/宽</option>
-                  <option value="hwc">HWC · 高/宽/通道</option>
-                </select>
-              </Field>
-              <Field
-                label={`图像时间索引 ${index + 1}`}
-                hint="静态图像留空；已有时间维时显式选择帧。"
-              >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+              <Field label={`组合视觉字段 ${index + 1}`} required>
                 <input
-                  type="number"
-                  min={-64}
-                  max={63}
-                  step={1}
-                  value={item.time_index ?? ''}
-                  onChange={(event) =>
-                    camera(index, {
-                      time_index: event.target.value === '' ? null : Number(event.target.value),
-                    })
-                  }
+                  required
+                  maxLength={256}
+                  value={item.key}
+                  onChange={(event) => {
+                    const key = event.target.value;
+                    const inferred = inferImageLayout(profile.image_features, key, item.kind);
+                    camera(index, { key, layout: inferred.layout || '' });
+                  }}
                 />
               </Field>
-              {item.kind === 'depth' && (
-                <>
-                  <Field label={`原始深度最小值 ${index + 1}`} required>
-                    <input
-                      type="number"
-                      required
-                      step="any"
-                      value={shown(item.depth_min)}
-                      onChange={(event) => camera(index, { depth_min: number(event.target.value) })}
-                    />
-                  </Field>
-                  <Field label={`原始深度最大值 ${index + 1}`} required>
-                    <input
-                      type="number"
-                      required
-                      step="any"
-                      value={shown(item.depth_max)}
-                      onChange={(event) => camera(index, { depth_max: number(event.target.value) })}
-                    />
-                  </Field>
-                </>
-              )}
+              <div className="form-grid">
+                <Field label={`模型视觉槽位 ${index + 1}`}>
+                  <select
+                    value={item.slot}
+                    onChange={(event) =>
+                      camera(index, { slot: event.target.value as ComposedCamera['slot'] })
+                    }
+                  >
+                    {VISUAL_SLOTS.map((slot) => (
+                      <option value={slot} key={slot}>
+                        {slotLabels[slot]}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label={`组合图像类型 ${index + 1}`}>
+                  <select
+                    value={item.kind}
+                    onChange={(event) =>
+                      camera(index, { kind: event.target.value as ComposedCamera['kind'] })
+                    }
+                  >
+                    <option value="rgb">RGB 彩色</option>
+                    <option value="depth">深度</option>
+                  </select>
+                </Field>
+                <Field
+                  label={`图像布局 ${index + 1}`}
+                  required
+                  hint={(() => {
+                    const inferred = inferImageLayout(profile.image_features, item.key, item.kind);
+                    return inferred.layout
+                      ? `原始形状 [${inferred.shape?.join(' × ')}]，识别为 ${inferred.layout.toUpperCase()}。`
+                      : inferred.reason;
+                  })()}
+                >
+                  <select
+                    required
+                    value={item.layout}
+                    onChange={(event) => {
+                      onImageLayoutEdit?.(item.key, item.kind);
+                      camera(index, { layout: event.target.value as ComposedCamera['layout'] });
+                    }}
+                  >
+                    <option value="" disabled>
+                      待读取或手动选择布局
+                    </option>
+                    <option value="chw">CHW · 通道/高/宽</option>
+                    <option value="hwc">HWC · 高/宽/通道</option>
+                  </select>
+                </Field>
+                <Field
+                  label={`图像时间索引 ${index + 1}`}
+                  hint="静态图像留空；已有时间维时显式选择帧。"
+                >
+                  <input
+                    type="number"
+                    min={-64}
+                    max={63}
+                    step={1}
+                    value={item.time_index ?? ''}
+                    onChange={(event) =>
+                      camera(index, {
+                        time_index: event.target.value === '' ? null : Number(event.target.value),
+                      })
+                    }
+                  />
+                </Field>
+                {item.kind === 'depth' && (
+                  <>
+                    <Field label={`原始深度最小值 ${index + 1}`} required>
+                      <input
+                        type="number"
+                        required
+                        step="any"
+                        value={shown(item.depth_min)}
+                        onChange={(event) =>
+                          camera(index, { depth_min: number(event.target.value) })
+                        }
+                      />
+                    </Field>
+                    <Field label={`原始深度最大值 ${index + 1}`} required>
+                      <input
+                        type="number"
+                        required
+                        step="any"
+                        value={shown(item.depth_max)}
+                        onChange={(event) =>
+                          camera(index, { depth_max: number(event.target.value) })
+                        }
+                      />
+                    </Field>
+                  </>
+                )}
+              </div>
             </div>
-          </div>
-        ))}
-      </section>
+          ))}
+        </section>
+      )}
       <details
         className="composed-advanced"
         open={advanced}
@@ -705,24 +741,26 @@ export function ComposedProcessingEditor({
               onChange={(event) => set('state_history', number(event.target.value))}
             />
           </Field>
-          <Field label="组合归一化方式">
-            {normalizationOverride ? (
-              <span>本次训练统一使用：{trainingNormalizationLabel(normalizationOverride)}</span>
-            ) : (
-              <select
-                value={value.normalization}
-                onChange={(event) =>
-                  set(
-                    'normalization',
-                    event.target.value as ComposedProcessingSpec['normalization'],
-                  )
-                }
-              >
-                <option value="quantile">沿用统计文件方式（旧配置）</option>
-                <option value="zscore">均值方差（Z-score）</option>
-              </select>
-            )}
-          </Field>
+          {purpose !== 'norm' && (
+            <Field label="组合归一化方式">
+              {normalizationOverride ? (
+                <span>本次训练统一使用：{trainingNormalizationLabel(normalizationOverride)}</span>
+              ) : (
+                <select
+                  value={value.normalization}
+                  onChange={(event) =>
+                    set(
+                      'normalization',
+                      event.target.value as ComposedProcessingSpec['normalization'],
+                    )
+                  }
+                >
+                  <option value="quantile">沿用统计文件方式（旧配置）</option>
+                  <option value="zscore">均值方差（Z-score）</option>
+                </select>
+              )}
+            </Field>
+          )}
           <Field label="组合动作模式（可选）">
             <select
               value={value.action_mode}
@@ -876,6 +914,7 @@ export function ComposedProcessingEditor({
           {composedProcessingSummary(
             value,
             normalizationOverride ? trainingNormalizationLabel(normalizationOverride) : undefined,
+            purpose,
           )}
         </p>
       )}

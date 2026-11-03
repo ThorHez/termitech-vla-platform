@@ -21,6 +21,7 @@ from .remote_models import RemoteDeployment
 from .settings import Settings
 from .gpu_selection import requested_gpu_uuids
 from .gpu_reservations import reservation_owners
+from .account_lifecycle import lock_execution_guard, training_execution_authorized
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ def tick(db: Database, settings: Settings) -> int:
         node_ids = list(session.scalars(select(Node.id).order_by(Node.id)))
     for node_id in node_ids:
         with db.write() as session:
+            lock_execution_guard(session)
             node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
             if node.status in {"DISCONNECTED", "REMOVED"}:
                 continue
@@ -77,6 +79,13 @@ def tick(db: Database, settings: Settings) -> int:
                         if attempt.state != "UNKNOWN":
                             attempt.previous_state, attempt.state = attempt.state, "UNKNOWN"
             queued = list(session.scalars(select(Run).where(Run.node_id == node_id, Run.state == "QUEUED").order_by(Run.created_at).with_for_update()))
+            authorized = []
+            for run in queued:
+                if training_execution_authorized(session, run.owner_user_id, allow_legacy=settings.legacy_admin_enabled):
+                    authorized.append(run)
+                elif run.queue_reason != "ACCOUNT_EXECUTION_REVOKED":
+                    run.queue_reason, run.updated_at = "ACCOUNT_EXECUTION_REVOKED", now()
+            queued = authorized
             maintenance = session.scalar(select(RemoteDeployment.id).where(
                 RemoteDeployment.node_id == node_id,
                 RemoteDeployment.state.in_({"QUEUED", "RUNNING", "WAITING_AGENT"}),
@@ -154,6 +163,7 @@ def tick(db: Database, settings: Settings) -> int:
                     **({"confirmed_config_sha256": run.code_expectation["confirmed_config_sha256"]} if run.code_expectation.get("confirmed_config_sha256") else {}),
                     **({"training_stage": run.code_expectation["training_stage"], "stage_config": run.code_expectation.get("stage_config", {})} if run.code_expectation.get("training_stage") is not None else {}),
                     **({"dataset_bindings": run.code_expectation["dataset_bindings"]} if run.code_expectation.get("dataset_bindings") is not None else {}),
+                    **({"norm_datasets": run.code_expectation["norm_datasets"]} if run.code_expectation.get("norm_datasets") is not None else {}),
                     **({"recipe": run.code_expectation["recipe"]} if "recipe" in run.code_expectation else {}),
                     **({"recipe_definition": run.code_expectation["recipe_definition"], "node_id": node_id} if run.code_expectation.get("recipe_definition") else {}),
                 })

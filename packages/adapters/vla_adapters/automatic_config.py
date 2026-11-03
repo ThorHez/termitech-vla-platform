@@ -39,7 +39,7 @@ def automatic_recipe_name(auto_config, training_stage=None):
             f"_d{clean['action_dim']}_{training_stage or 'sft'}")
 
 
-def automatic_data_layout(auto_config, bindings):
+def automatic_data_layout(auto_config, bindings, *, norm_stats=False):
     """Use declared processing semantics, never raw dataset width guesses."""
     slots, state_widths = {}, []
     compositions = []
@@ -49,7 +49,7 @@ def automatic_data_layout(auto_config, bindings):
         if processor["name"] != COMPOSABLE_PROCESSOR:
             independent = True
             continue
-        composition = normalize_composition(processor["parameters"]["composition"])
+        composition = normalize_composition(processor["parameters"]["composition"], norm_stats=norm_stats)
         compositions.append(composition)
         state_widths.append(composition["state_history"] * sum(item["width"] for item in composition["state_fields"]))
         if sum(item["width"] for item in composition["action_layout"]) > auto_config["action_dim"]:
@@ -72,7 +72,44 @@ def automatic_data_layout(auto_config, bindings):
     padding = max(state_widths) if auto_config["model_type"] == "pi05" and state_widths else auto_config["action_dim"]
     vision = ({"image_keys": tuple(slot for slot in SLOTS if slots.get(slot) == "rgb"),
                "depth_keys": tuple(slot for slot in SLOTS if slots.get(slot) == "depth")} if slots else {})
-    return vision, padding
+    return ({"image_keys": (), "depth_keys": ()} if norm_stats else vision), padding
+
+
+def build_automatic_model(auto_config, config_module, bindings, training_stage=None, *, norm_stats=False):
+    """Share the exact SFT model and declared camera/state layout semantics."""
+    clean = normalize_auto_config(auto_config)
+    model_module = getattr(config_module, "pi0_value" if training_stage == "value" else "pi0_config", None)
+    model_cls = getattr(model_module, "Pi0ValueConfig" if training_stage == "value" else "Pi0Config", None)
+    if not isinstance(model_cls, type) or not dataclasses.is_dataclass(model_cls):
+        raise ValueError("AUTO_CONFIG_UNSUPPORTED: 训练环境未导出所选 Pi0/Pi05 模型配置")
+    kwargs = {"pi05": clean["model_type"] == "pi05", "action_dim": clean["action_dim"],
+              "action_horizon": clean["action_horizon"]}
+    vision, state_padding = automatic_data_layout(clean, bindings, norm_stats=norm_stats)
+    kwargs.update(vision)
+    if clean["finetune_mode"] == "lora":
+        if training_stage == "value":
+            raise ValueError("AUTO_CONFIG_UNSUPPORTED: 自动价值训练暂不支持 LoRA，请使用全量微调或高级代码配方")
+        kwargs.update(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
+    return model_cls(**kwargs), state_padding
+
+
+def build_automatic_norm_base(spec, config_module, factory, row):
+    """Construct one independent statistics config without a code recipe.
+
+    Each row owns its model data layout. Other batch rows never introduce
+    mixture compatibility checks, shared padding, weights or normalization.
+    """
+    clean = normalize_auto_config(spec.get("auto_config"))
+    if clean is None or clean["finetune_mode"] != "full":
+        raise ValueError("AUTO_CONFIG_UNSUPPORTED: 自动统计配置仅支持 full 模型结构")
+    name = automatic_recipe_name(clean)
+    if spec.get("recipe") not in (None, "", name) or spec.get("recipe_definition") is not None:
+        raise ValueError("AUTO_CONFIG_CONFLICT: 自动统计配置不能同时指定代码配方或自定义配方版本")
+    try:
+        model, _ = build_automatic_model(clean, config_module, [row], norm_stats=True)
+        return config_module.TrainConfig(name=name, model=model, data=factory)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError("AUTO_CONFIG_UNSUPPORTED: 训练环境无法构造所选模型或数据处理配置") from exc
 
 
 def build_automatic_base(spec, config_module, weight_loaders):
@@ -90,20 +127,8 @@ def build_automatic_base(spec, config_module, weight_loaders):
     bindings = validate_binding_assets(spec.get("dataset_bindings"), spec["inputs"])
     if not bindings or any("processor" not in row for row in bindings):
         raise ValueError("AUTO_CONFIG_PROCESSOR_REQUIRED: 自动配置要求每组数据使用独立数据处理器")
-    model_module = getattr(config_module, "pi0_value" if stage == "value" else "pi0_config", None)
-    model_cls = getattr(model_module, "Pi0ValueConfig" if stage == "value" else "Pi0Config", None)
-    if not isinstance(model_cls, type) or not dataclasses.is_dataclass(model_cls):
-        raise ValueError("AUTO_CONFIG_UNSUPPORTED: 训练环境未导出所选 Pi0/Pi05 模型配置")
-    kwargs = {"pi05": clean["model_type"] == "pi05", "action_dim": clean["action_dim"],
-              "action_horizon": clean["action_horizon"]}
-    vision, state_padding = automatic_data_layout(clean, bindings)
-    kwargs.update(vision)
-    if clean["finetune_mode"] == "lora":
-        if stage == "value":
-            raise ValueError("AUTO_CONFIG_UNSUPPORTED: 自动价值训练暂不支持 LoRA，请使用全量微调或高级代码配方")
-        kwargs.update(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
     try:
-        model = model_cls(**kwargs)
+        model, state_padding = build_automatic_model(clean, config_module, bindings, stage)
         # Reuse the existing registered processor implementation. resolve_config
         # rebinds every selected row and applies the common asset/stage checks.
         processor = bindings[0]["processor"]

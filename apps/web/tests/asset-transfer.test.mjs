@@ -63,7 +63,12 @@ try {
     renderToStaticMarkup(
       React.createElement(
         AuthContext.Provider,
-        { value: { can: (permission) => permission === 'assets.write' && writable } },
+        {
+          value: {
+            user: { id: 'test-admin', role: 'admin' },
+            can: (permission) => permission === 'assets.transfer' && writable,
+          },
+        },
         React.createElement(DataProvider, { enabled: false }, element),
       ),
     );

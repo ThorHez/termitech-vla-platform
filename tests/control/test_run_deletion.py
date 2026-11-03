@@ -164,7 +164,7 @@ def test_deleted_run_cannot_be_recreated_by_submission_retries(platform):
     assert platform.client.get("/api/v1/runs", headers=ADMIN).json() == []
 
 
-@pytest.mark.parametrize("role,expected", [("admin", 204), ("operator", 204), ("viewer", 403)])
+@pytest.mark.parametrize("role,expected", [("admin", 204), ("operator", 403), ("viewer", 403)])
 def test_delete_requires_training_permission_and_csrf(platform, role, expected):
     _, run, _ = finished(platform)
     username = "delete-" + role

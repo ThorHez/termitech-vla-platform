@@ -65,7 +65,7 @@ def normalize_dataset_contract(value):
 
 
 def verify_registered_dataset_profile(profile, info, *, derived_features=(), selected_composition=None,
-                                      warnings=None):
+                                      warnings=None, norm_stats=False):
     """Check declared fields against real LeRobot metadata, returning a copy.
 
     Robot identity, task prose and units are declarations, not proof from
@@ -79,7 +79,7 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
     the caller applies the registered value to the loader's in-memory metadata.
     """
     if selected_composition is not None:
-        selected_composition = normalize_composition(selected_composition)
+        selected_composition = normalize_composition(selected_composition, norm_stats=norm_stats)
 
     def fail(message, code="DATASET_PROFILE_MISMATCH"):
         raise ValueError(code + ": " + message)
@@ -115,8 +115,8 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
                 or any((ord(char) < 32 and not (key == "task_description" and char in "\n\t"))
                        or 127 <= ord(char) <= 159 for char in value)):
             fail("数据集登记文本无效：" + key)
-    cameras = clean["cameras"]
-    if not isinstance(cameras, list) or not 1 <= len(cameras) <= 16:
+    cameras = [] if norm_stats else clean["cameras"]
+    if not isinstance(cameras, list) or not (0 if norm_stats else 1) <= len(cameras) <= 16:
         fail("数据集相机登记数量无效")
     names, keys = set(), set()
     features = info["features"]
@@ -140,7 +140,7 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
     if (not isinstance(declared, list) or len(declared) > MAX_FEATURES or not all(_text(key) for key in declared)
             or len(set(declared)) != len(declared)):
         fail("登记的数据字段列表无效")
-    for key in declared:
+    for key in ([] if norm_stats else declared):
         if key not in features and key not in derived_features:
             fail("登记的数据字段不在 meta/info.json features 中：" + key)
 
@@ -185,7 +185,7 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
     if clean.get("processing") is not None:
         # Historical assets retain their saved plan for import. It does not
         # constrain which fields/order/history the current training selects.
-        historical = normalize_composition(clean["processing"])
+        historical = normalize_composition(clean["processing"], norm_stats=norm_stats)
         clean["processing"] = historical
     action_labels = [row for row in annotations or [] if row["role"] == "action"]
     action_key = (action_labels[0]["key"] if len(action_labels) == 1 else

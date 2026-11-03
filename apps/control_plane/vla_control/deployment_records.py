@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 
+from fastapi import Request
 from fastapi.responses import Response
 from sqlalchemy import select
 
@@ -11,6 +12,7 @@ from .common import APIError, now, uid
 from .deployment_record_models import DeploymentRecord, DeploymentRecordRuntime, DeploymentRecordTransfer
 from .models import Command
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
+from .resource_authorization import require_active_actor, require_expected_user, require_resource_owner
 
 
 def _record_name(name):
@@ -81,16 +83,22 @@ def resolve_record(session, identifier, *, lock=False, include_deleted=False):
     return record
 
 
-def require_runtime_record(session, deployment_id, *, lock=False):
+def require_runtime_record(session, deployment_id, *, lock=False, request=None):
     """Keep legacy unlinked runtimes visible; deleted parents cannot be reused."""
     link = session.get(DeploymentRecordRuntime, deployment_id)
-    return resolve_record(session, link.record_id, lock=lock) if link is not None else None
+    record = resolve_record(session, link.record_id, lock=lock) if link is not None else None
+    if record is not None and request is not None:
+        require_resource_owner(request, record.owner_user_id)
+    return record
 
 
-def require_transfer_record(session, transfer_id, *, lock=False):
+def require_transfer_record(session, transfer_id, *, lock=False, request=None):
     """Check the exact transfer owner, without inferring lineage from assets."""
     link = session.get(DeploymentRecordTransfer, transfer_id)
-    return resolve_record(session, link.record_id, lock=lock) if link is not None else None
+    record = resolve_record(session, link.record_id, lock=lock) if link is not None else None
+    if record is not None and request is not None:
+        require_resource_owner(request, record.owner_user_id)
+    return record
 
 
 def record_runtime(session, record_id):
@@ -98,17 +106,19 @@ def record_runtime(session, record_id):
     return session.get(PolicyDeployment, link.deployment_id) if link is not None else None
 
 
-def require_preparation_record(session, record_id):
+def require_preparation_record(session, record_id, *, request=None):
     record = resolve_record(session, record_id, lock=True)
+    if request is not None:
+        require_resource_owner(request, record.owner_user_id)
     if record_runtime(session, record.id) is not None:
         raise APIError(409, "DEPLOYMENT_RECORD_HAS_RUNTIME", "该部署记录已有推理服务，请在原记录中启动或停止服务")
     return record
 
 
-def create_record(session, record_id, name, created_at):
+def create_record(session, record_id, name, created_at, *, owner_user_id=None):
     if session.get(DeploymentRecord, record_id) is not None:
         record_id = uid()
-    record = DeploymentRecord(id=record_id, name=_record_name(name), created_at=created_at)
+    record = DeploymentRecord(id=record_id, owner_user_id=owner_user_id, name=_record_name(name), created_at=created_at)
     session.add(record)
     session.flush()
     return record
@@ -117,7 +127,7 @@ def create_record(session, record_id, name, created_at):
 def transfer_record(session, transfer):
     link = session.get(DeploymentRecordTransfer, transfer.id)
     if link is None:
-        record = create_record(session, transfer.id, transfer.name, transfer.created_at)
+        record = create_record(session, transfer.id, transfer.name, transfer.created_at, owner_user_id=transfer.owner_user_id)
         session.add(DeploymentRecordTransfer(transfer_id=transfer.id, record_id=record.id,
             provenance={"origin": "standalone_transfer", "linked_at": now()}))
         session.flush()
@@ -160,7 +170,7 @@ def record_dict(session, record, settings, *, detail=False):
     for provenance in session.scalars(select(DeploymentRecordTransfer.provenance).where(DeploymentRecordTransfer.record_id == record.id)):
         if isinstance(provenance, dict) and isinstance(provenance.get("linked_at"), str):
             dates.append(provenance["linked_at"])
-    result = {"id": record.id, "name": record.name, "node_id": node_id, "profile_id": profile_id,
+    result = {"id": record.id, "owner_user_id": record.owner_user_id, "name": record.name, "node_id": node_id, "profile_id": profile_id,
         "source_run_id": source_run_id,
         "state": state, "created_at": record.created_at, "updated_at": max(dates),
         "deployment_id": runtime.id if runtime else None,
@@ -173,8 +183,10 @@ def record_dict(session, record, settings, *, detail=False):
     return result
 
 
-def delete_record(session, identifier):
+def delete_record(session, identifier, *, request=None):
     record = resolve_record(session, identifier, lock=True, include_deleted=True)
+    if request is not None:
+        require_resource_owner(request, record.owner_user_id)
     if record.deleted_at is not None:
         return
     # Human mutations lock the owning record before its runtime/transfer.
@@ -297,7 +309,9 @@ def register_routes(app, admin, db, settings):
             return record_dict(session, resolve_record(session, record_id), settings, detail=True)
 
     @app.delete("/api/v1/deployment-records/{record_id}", dependencies=admin, status_code=204)
-    def remove_record(record_id: str):
+    def remove_record(record_id: str, request: Request):
+        require_expected_user(request)
         with db.write() as session:
-            delete_record(session, record_id)
+            require_active_actor(session, request)
+            delete_record(session, record_id, request=request)
         return Response(status_code=204)

@@ -223,7 +223,7 @@ def test_norm_binding_by_path_does_not_rewrite_frozen_jobs_or_enqueue_file_opera
         assert [(row.id, row.payload) for row in session.scalars(select(Command))] == commands
 
 
-@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 200), ("viewer", 403)])
+@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 403), ("viewer", 403)])
 def test_auto_registration_uses_existing_role_csrf_and_origin_protection(platform, role, status):
     node = platform.register()
     dataset = register_asset(platform, node).json()

@@ -228,11 +228,14 @@ export function applyComposedProcessing(
         ? processing.robot_model
         : profile.robot_type,
     arm_mode: changed('arm_mode') ? processing.arm_mode : profile.arm_mode,
-    action_representation: changed('action_representation')
-      ? processing.action_representation
-      : profile.action_representation,
+    action_representation:
+      changed('action_representation') &&
+      (processing.action_representation === 'eef' || processing.action_representation === 'joint')
+        ? processing.action_representation
+        : profile.action_representation,
     action_mode:
-      changed('action_mode') && (processing.action_mode === 'absolute' || processing.action_mode === 'delta')
+      changed('action_mode') &&
+      (processing.action_mode === 'absolute' || processing.action_mode === 'delta')
         ? processing.action_mode
         : profile.action_mode,
     rotation_representation:
@@ -459,7 +462,7 @@ export function DatasetProfileEditor(props: { asset: Asset; close: () => void })
   if (!can('assets.write'))
     return (
       <Modal title="权限不足" close={props.close}>
-        编辑数据特征需要操作员或管理员权限。
+        编辑公共数据特征需要管理员权限。
       </Modal>
     );
   return <DatasetProfileEditorContent key={props.asset.id} {...props} />;
@@ -511,7 +514,12 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
     >
       <p className="field-hint">用于后续新建训练的处理器匹配；已创建训练保留原配置。</p>
       <code className="dataset-profile-path">{asset.path}</code>
-      <DatasetFormatTemplates value={value} onApply={inspectionDraft.applyTemplate} disabled={busy} initialName={`${asset.name} 格式`} />
+      <DatasetFormatTemplates
+        value={value}
+        onApply={inspectionDraft.applyTemplate}
+        disabled={busy}
+        initialName={`${asset.name} 格式`}
+      />
       <div ref={errorArea}>
         <ErrorNotice error={error} title="数据特征保存失败" />
       </div>

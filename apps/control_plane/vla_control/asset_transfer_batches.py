@@ -22,6 +22,8 @@ from .checkpoint_transfers import _online, _verify_saved_ssh_credentials
 from .common import APIError, now, require_path, uid
 from .models import Asset
 from .schemas import InputModel
+from .account_lifecycle import lock_execution_guard
+from .resource_authorization import require_active_actor, require_expected_user
 
 
 MAX_ENTRIES = 20
@@ -78,7 +80,7 @@ def _owner(session, user_id):
                           .execution_options(populate_existing=True))
     if user is None or not user.enabled:
         raise APIError(401, "UNAUTHORIZED", "登录账户已不可用")
-    if user.must_change_password or "assets.write" not in ROLE_PERMISSIONS.get(user.role, frozenset()):
+    if user.must_change_password or "assets.transfer" not in ROLE_PERMISSIONS.get(user.role, frozenset()):
         raise APIError(403, "FORBIDDEN", "当前账户没有资产同步权限")
 
 
@@ -130,7 +132,7 @@ def _validate_plans(session, plans):
                     raise APIError(422, "ASSET_TRANSFER_PATH_OVERLAP", "本批次目标目录不能与同一物理机器上的任一来源资产重叠")
 
 
-def create_batch(manager, user_id, body):
+def create_batch(manager, user_id, body, *, request=None):
     ids = [entry.source_asset_id for entry in body.entries]
     if len(set(ids)) != len(ids):
         raise APIError(422, "ASSET_TRANSFER_BATCH_DUPLICATE_SOURCE", "本批次不能重复选择同一来源资产")
@@ -147,10 +149,14 @@ def create_batch(manager, user_id, body):
     launches = []
     try:
         with manager.db.write() as session:
+            if request is not None:
+                require_active_actor(session, request, "assets.transfer")
+            else:
+                lock_execution_guard(session)
+            _owner(session, user_id)
             # This is the same first lock used by single create and retry, so
             # global capacity and target overlap checks cannot race each other.
             _admission_lock(session)
-            _owner(session, user_id)
             previous = session.scalar(select(AssetTransferBatch).where(
                 AssetTransferBatch.user_id == user_id, AssetTransferBatch.request_key == body.idempotency_key))
             if previous is not None:
@@ -181,7 +187,8 @@ def create_batch(manager, user_id, body):
             batch_id, transfers = uid(), []
             for index, (transfer_id, bindings, companion) in enumerate(plans):
                 source = bindings["source_asset"]
-                row = AssetTransfer(id=transfer_id, request_key=f"asset-batch:{batch_id}:{index}",
+                row = AssetTransfer(id=transfer_id, owner_user_id=user_id, execution_user_id=user_id,
+                    request_key=f"asset-batch:{batch_id}:{index}",
                     request_digest=canonical_digest({"batch": batch_id, "index": index, "bindings": bindings}),
                     name=(source["name"] + " · 资产同步")[:200],
                     source_asset_id=source["id"], source_node_id=source["node_id"], source_path=source["path"],
@@ -234,7 +241,7 @@ async def _body(request):
 
 def register_routes(app, admin, manager, auth):
     def owner(request):
-        principal = auth.require(request, "assets.write")
+        principal = auth.require(request, "assets.transfer")
         if principal.legacy or not principal.session_id:
             raise APIError(403, "ASSET_TRANSFER_BATCH_ACCOUNT_REQUIRED", "请使用个人账户登录后批量同步资产")
         expected = request.headers.get("x-asset-transfer-batch-user")
@@ -244,8 +251,9 @@ def register_routes(app, admin, manager, auth):
 
     @app.post("/api/v1/asset-transfer-batches", dependencies=admin, status_code=202)
     async def create(request: Request):
+        require_expected_user(request)
         user_id = owner(request)
         body = await _body(request)
         owner(request)
-        result = await run_in_threadpool(create_batch, manager, user_id, body)
+        result = await run_in_threadpool(create_batch, manager, user_id, body, request=request)
         return JSONResponse(result, status_code=202, headers={"Cache-Control": "no-store"})

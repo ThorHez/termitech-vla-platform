@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { LoaderCircle, Trash2 } from 'lucide-react';
 import { useAuth } from './auth';
+import { canManageResource } from './resourcePermissions';
 import { ErrorNotice, Modal } from './components';
 import { canDeleteAssetTransferRecord, deleteAssetTransferRecord } from './assetTransferDeletion';
 import type { AssetTransfer } from './assetTransfer';
@@ -19,16 +20,28 @@ export function AssetTransferDeleteAction({
   onDeleted?: () => void;
   onBusyChange?: (busy: boolean) => void;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
-  if (!can('assets.write') || !canDeleteAssetTransferRecord(item)) return null;
+  if (
+    !can('assets.transfer') ||
+    !canManageResource(user, item.owner_user_id) ||
+    !canDeleteAssetTransferRecord(item)
+  )
+    return null;
   const close = () => {
     if (!busy) setConfirm(false);
   };
   const remove = async () => {
-    if (busy || disabled || !can('assets.write') || !canDeleteAssetTransferRecord(item)) return;
+    if (
+      busy ||
+      disabled ||
+      !can('assets.transfer') ||
+      !canManageResource(user, item.owner_user_id) ||
+      !canDeleteAssetTransferRecord(item)
+    )
+      return;
     setBusy(true);
     onBusyChange?.(true);
     setError(undefined);

@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { BookOpen, Check, Code2, LoaderCircle, RotateCcw, Save } from 'lucide-react';
-import { api, ApiError, post } from './api';
+import { api, ApiError, createOperationClient } from './api';
 import { useAuth } from './auth';
 import { Badge, ErrorNotice, Field } from './components';
 import { recipeDatasetSlots } from './datasetBindingHelpers';
@@ -227,22 +227,33 @@ function writebackError(job: RecipeWriteback) {
           : '';
   return new ApiError(code, `${job.error?.message || '配置写入或 Git 提交失败。'}${suffix}`, 0);
 }
-async function finishWriteback(key: string, pending: PendingRecipeSave, request = true) {
+async function finishWriteback(
+  key: string,
+  pending: PendingRecipeSave,
+  request = true,
+  client = createOperationClient(),
+  signal?: AbortSignal,
+) {
   const active = activeRecipeWrites.get(key);
   if (active) return active;
   const operation = (async () => {
+    client.requireCurrent();
+    signal?.throwIfAborted();
     if (request && !pending.job) {
-      pending.job = await post<RecipeWriteback>(
+      pending.job = await client.post<RecipeWriteback>(
         `/recipe-revisions/${encodeURIComponent(pending.saved.latest_revision.id)}/writeback`,
         { config_name: pending.configName },
+        { signal },
       );
       rememberPending(key, pending);
     }
     if (!pending.job) throw new Error('平台草稿已保存，请继续写入配置并提交。');
     while (pending.job.status === 'PENDING') {
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      pending.job = await api<RecipeWriteback>(
+      signal?.throwIfAborted();
+      pending.job = await client.api<RecipeWriteback>(
         `/recipe-writebacks/${encodeURIComponent(pending.job.id)}`,
+        { signal },
       );
       rememberPending(key, pending);
     }
@@ -283,10 +294,10 @@ export function RecipeDetails({
   restoredEditorDraft?: RecipeEditorDraft;
   onEditorDraftChange?: (draft: RecipeEditorDraft | undefined) => void;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const mayEdit = can('recipes.write');
   const mayWriteback = can('recipes.writeback');
-  const mayQuery = can('training.write');
+  const mayQuery = can('recipes.query');
   const id = useId();
   const [query, setQuery] = useState<{ scope: string; value: RecipeDetailQuery }>();
   const [loading, setLoading] = useState(false);
@@ -311,7 +322,9 @@ export function RecipeDetails({
   const loadingRef = useRef(onLoadingChange);
   const editorChangeRef = useRef(onEditorDraftChange);
   const ignoredEditorToken = useRef<string | undefined>(undefined);
-  const hydratedEditor = useRef<{ scope: string; token: string; sourceSha256: string } | undefined>(undefined);
+  const hydratedEditor = useRef<{ scope: string; token: string; sourceSha256: string } | undefined>(
+    undefined,
+  );
   const publishedEditor = useRef<{ scope: string; token: string } | undefined>(undefined);
   const editorPublishReady = useRef(false);
   defaultsRef.current = onDefaults;
@@ -331,9 +344,11 @@ export function RecipeDetails({
   ]);
   const scopeRef = useRef(scope);
   const mountedRef = useRef(true);
+  const operationAbort = useRef(new AbortController());
   const saveTriggerRef = useRef<HTMLButtonElement | null>(null);
   const pendingSaves = useRef(new Set<string>());
   const writeKey = JSON.stringify([
+    user?.id,
     node?.id,
     profile?.id,
     profile?.code_dir,
@@ -349,8 +364,10 @@ export function RecipeDetails({
   scopeRef.current = scope;
   useEffect(() => {
     mountedRef.current = true;
+    operationAbort.current = new AbortController();
     return () => {
       mountedRef.current = false;
+      operationAbort.current.abort();
     };
   }, []);
   const current = query?.scope === scope ? query.value : undefined;
@@ -478,7 +495,16 @@ export function RecipeDetails({
     if (!active && (!pending?.job || pending.job.status === 'FAILED')) return;
     let live = true;
     setSaving(true);
-    void (active || finishWriteback(writeKey, pending!, false))
+    void (
+      active ||
+      finishWriteback(
+        writeKey,
+        pending!,
+        false,
+        createOperationClient(),
+        operationAbort.current.signal,
+      )
+    )
       .then((job) => {
         if (live) acceptWriteback(job, writeKey, scope);
       })
@@ -779,6 +805,8 @@ export function RecipeDetails({
     !requiresAssetReview &&
     !cachedEditorBlocked;
   const save = async () => {
+    const client = createOperationClient();
+    const signal = operationAbort.current.signal;
     if (
       !mayEdit ||
       !node ||
@@ -815,8 +843,11 @@ export function RecipeDetails({
         const body = { detail_query_id: current.id, overrides, description: description.trim() };
         const result =
           showSave === 'revision' && saved
-            ? await post<SavedRecipe>(`/recipes/${encodeURIComponent(saved.id)}/revisions`, body)
-            : await post<SavedRecipe>('/recipes', {
+            ? await client.post<SavedRecipe>(
+                `/recipes/${encodeURIComponent(saved.id)}/revisions`,
+                body,
+              )
+            : await client.post<SavedRecipe>('/recipes', {
                 ...body,
                 node_id: node.id,
                 profile_id: profile.id,
@@ -843,8 +874,11 @@ export function RecipeDetails({
         const body = { detail_query_id: current.id, overrides, description: description.trim() };
         const result =
           showSave === 'revision' && saved
-            ? await post<SavedRecipe>(`/recipes/${encodeURIComponent(saved.id)}/revisions`, body)
-            : await post<SavedRecipe>('/recipes', {
+            ? await client.post<SavedRecipe>(
+                `/recipes/${encodeURIComponent(saved.id)}/revisions`,
+                body,
+              )
+            : await client.post<SavedRecipe>('/recipes', {
                 ...body,
                 node_id: node.id,
                 profile_id: profile.id,
@@ -855,7 +889,9 @@ export function RecipeDetails({
         if (mountedRef.current && scopeRef.current === scope) setPendingSave(operation);
       }
       if (!operation) throw new Error('请重新读取配方配置。');
-      return finishWriteback(writeKey, operation);
+      signal.throwIfAborted();
+      client.requireCurrent();
+      return finishWriteback(writeKey, operation, true, client, signal);
     })();
     activeRecipeSaves.set(writeKey, operationPromise);
     try {
@@ -1043,7 +1079,7 @@ export function RecipeDetails({
       </div>
     );
   };
-  if (!recipe) return <p className="field-hint">选定配方后读取详细配置，可保存为自己的配方。</p>;
+  if (!recipe) return <p className="field-hint">选定配方后读取详细配置；公共配方由管理员维护。</p>;
   return (
     <section
       className="recipe-details"
@@ -1134,7 +1170,7 @@ export function RecipeDetails({
               ? '可修改训练超参数，以及模型、数据处理和优化器中的静态配置值。保存会在来源配置文件中新增独立配方，并自动执行一次 Git 提交。'
               : mayEdit
                 ? '可修改训练超参数，以及模型、数据处理和优化器中的静态配置值。保存将创建平台配方版本；写入训练代码需要管理员权限。'
-                : '当前为只读配方快照，可查看配置和来源。编辑配方需要操作员或管理员权限。'}
+                : '当前为只读配方快照，可查看配置和来源。编辑公共配方需要管理员权限。'}
           </p>
           <div className="inline-note" role="note">
             代码中的资产字段仅为默认值；本次训练以“资产与参数”中选择的数据集、归一化参数、初始模型及混采权重为准。

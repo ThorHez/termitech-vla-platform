@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { ApiError, date, navigate, post, useApi } from './api';
 import { useAuth } from './auth';
+import { canManageResource, ResourceOwner } from './resourcePermissions';
 import { Badge, Empty, ErrorNotice, Field, Loading, Modal, PageHeading, Panel } from './components';
 import { useData } from './data';
 import { PathAutocomplete } from './PathAutocomplete';
@@ -80,7 +81,7 @@ export default function PolicyDeployments({
   path?: string;
   tab?: string;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const { nodes } = useData();
   const list = useApi<DeploymentRecordSummary[]>('/deployment-records', 8000);
   const [createdDeployment, setCreatedDeployment] = useState<PolicyDeployment>();
@@ -99,8 +100,16 @@ export default function PolicyDeployments({
     }
   }, [initialRun, writable]);
   const entries = list.data ? buildDeploymentWorkspaceEntries(list.data) : [];
-  const continueConfig = (record: DeploymentRecordDetail, transfer?: CheckpointTransfer) =>
-    setForm({ record, transfer, run: record.source_run_id || transfer?.source_run_id });
+  const continueConfig = (record: DeploymentRecordDetail, transfer?: CheckpointTransfer) => {
+    if (!writable || !canManageResource(user, record.owner_user_id)) return;
+    const ownedTransfer =
+      transfer && canManageResource(user, transfer.owner_user_id) ? transfer : undefined;
+    setForm({
+      record,
+      transfer: ownedTransfer,
+      run: record.source_run_id || ownedTransfer?.source_run_id,
+    });
+  };
   return (
     <>
       {route.kind === 'list' ? (
@@ -218,7 +227,10 @@ export function DeploymentWorkspaceList({
               data-record-kind="record"
               href={'#' + deploymentRecordPath(record.id)}
             >
-              <strong>{record.name}</strong>
+              <strong>
+                {record.name}
+                <ResourceOwner ownerUserId={record.owner_user_id} />
+              </strong>
               <span className="policy-deployment-record-machine">{machine}</span>
               <Badge
                 state={record.state === 'READY_TO_DEPLOY' ? 'READY' : record.state}
@@ -394,7 +406,7 @@ export function DeploymentRecordView({
   changed: () => void;
   continueConfig: (record: DeploymentRecordDetail, transfer?: CheckpointTransfer) => void;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const { nodes, profiles } = useData();
   if (record.deployment_id || record.deployment) {
     if (!record.deployment || record.deployment.id !== record.deployment_id)
@@ -440,15 +452,24 @@ export function DeploymentRecordView({
         description={`创建于 ${date(record.created_at)} · 尚未启动服务`}
         actions={
           <>
-            {activeTab !== 'workflow' && can('training.write') && (
-              <button
-                className="button primary"
-                onClick={() => continueConfig(record, record.transfers[0])}
-              >
-                <Plus size={15} />
-                继续配置部署
-              </button>
-            )}
+            {activeTab !== 'workflow' &&
+              can('training.write') &&
+              canManageResource(user, record.owner_user_id) && (
+                <button
+                  className="button primary"
+                  onClick={() =>
+                    continueConfig(
+                      record,
+                      record.transfers.find((transfer) =>
+                        canManageResource(user, transfer.owner_user_id),
+                      ),
+                    )
+                  }
+                >
+                  <Plus size={15} />
+                  继续配置部署
+                </button>
+              )}
             <DeploymentRecordDeleteAction
               record={record}
               deployment={record.deployment}
@@ -461,6 +482,7 @@ export function DeploymentRecordView({
           </>
         }
       />
+      <ResourceOwner ownerUserId={record.owner_user_id} />
       <nav className="tabs policy-deployment-detail-tabs" role="tablist" aria-label="部署详情">
         {tabs.map((value) => (
           <a
@@ -486,7 +508,7 @@ export function DeploymentRecordView({
         >
           <div className="policy-deployment-body">
             <p className="field-hint">
-              此部署记录尚未创建推理服务。同步记录和取消历史保留在本记录的“权重同步”中，可继续配置部署。
+              此部署记录尚未创建推理服务。同步记录和取消历史保留在本记录的“权重同步”中；创建者或管理员可继续配置部署。
             </p>
             <dl className="policy-deployment-facts">
               <div>
@@ -616,7 +638,7 @@ export function DeploymentDetail({
   deletionRecord?: DeploymentRecordDetail;
   tab?: string;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const { nodes, profiles } = useData();
   const detail = useApi<PolicyDeployment>(`/policy-deployments/${encodeURIComponent(id)}`, 3000);
   const [error, setError] = useState<Error>();
@@ -640,9 +662,9 @@ export function DeploymentDetail({
   const profile = profiles.data?.find(
     (value) => value.id === item?.profile_id && value.node_id === item?.node_id,
   );
-  const writable = can('training.write');
+  const writable = can('training.write') && canManageResource(user, item?.owner_user_id);
   const request = async (operation: string, body: unknown = {}) => {
-    if (running.current) return;
+    if (running.current || !writable) return;
     if (
       operation === 'start' &&
       (!item || deploymentStartBlockedReason(item, node, writable, !!busy))
@@ -758,6 +780,7 @@ export function DeploymentDetail({
           </>
         }
       />
+      <ResourceOwner ownerUserId={item.owner_user_id} />
       <nav className="tabs policy-deployment-detail-tabs" aria-label="部署详情" role="tablist">
         {deploymentDetailTabs.map((value) => (
           <a

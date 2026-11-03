@@ -57,9 +57,10 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
                  recipe_definition: dict | None = None, entrypoint: str | None = None,
                  dataset_bindings: list[dict] | None = None, training_stage: str | None = None,
                  stage_config: dict | None = None, auto_config: dict | None = None,
-                 normalization_method: str | None = None) -> dict:
+                 normalization_method: str | None = None, norm_datasets: list[dict] | None = None) -> dict:
     root = allowed_path(profile["code_dir"], roots)
     from vla_adapters.dataset_bindings import normalize_dataset_bindings
+    from vla_adapters.norm_datasets import normalize_norm_datasets
     from vla_adapters.entrypoints import validate_entrypoint
     from vla_adapters.recap import validate_training_stage
     from vla_adapters.automatic_config import normalize_auto_config
@@ -86,6 +87,10 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         dataset_bindings = normalize_dataset_bindings(dataset_bindings)
     except ValueError as exc:
         raise AgentError("DATASET_BINDINGS_INVALID", str(exc)) from exc
+    try:
+        norm_datasets = normalize_norm_datasets(norm_datasets)
+    except ValueError as exc:
+        raise AgentError("NORM_DATASETS_INVALID", str(exc)) from exc
     try:
         entrypoint = validate_entrypoint(entrypoint)
     except ValueError as exc:
@@ -216,6 +221,8 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         runtime["requested_entrypoint"] = entrypoint
     if dataset_bindings is not None:
         runtime["dataset_bindings"] = dataset_bindings
+    if norm_datasets is not None:
+        runtime["norm_datasets"] = norm_datasets
     if auto_config is not None:
         runtime["auto_config"] = auto_config
     if normalization_method is not None:
@@ -231,6 +238,9 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         selected_recipe = "smoke"
     snapshot = {
         "repo_url": remote, "code_dir": str(root), "repository_root": str(repository_root),
+        "runtime_profile": {"id": profile.get("id"), "name": profile.get("name"), "code_dir": str(root),
+                            "python": profile.get("python"), "adapter": profile.get("adapter"),
+                            "execution_mode": profile.get("execution_mode", "native")},
         "branch": branch, "commit_sha": commit,
         "commit_message": git(root, "log", "-1", "--format=%s").decode().strip(),
         "committed_at": git(root, "log", "-1", "--format=%cI").decode().strip(),
@@ -253,6 +263,8 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         snapshot["recipe_definition"] = recipe_definition
     if dataset_bindings is not None:
         snapshot["dataset_bindings"] = dataset_bindings
+    if norm_datasets is not None:
+        snapshot["norm_datasets"] = norm_datasets
     if auto_config is not None:
         snapshot["auto_config"] = auto_config
     if normalization_method is not None:
@@ -281,7 +293,7 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
 def compare_code(expected: dict, actual: dict, *, compare_automatic: bool = True):
     if not expected.get("complete") or not actual.get("complete"):
         raise AgentError("CODE_VERSION_UNAVAILABLE", "Code snapshot is incomplete; repeat preflight after resolving missing evidence")
-    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "training_stage", "stage_config", "auto_config", "normalization_method")
+    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "norm_datasets", "training_stage", "stage_config", "auto_config", "normalization_method")
     changed = [field for field in fields if expected.get(field) != actual.get(field)]
     if changed:
         raise AgentError("CODE_CHANGED_SINCE_PREFLIGHT", "Code changed after preflight: " + ", ".join(changed))

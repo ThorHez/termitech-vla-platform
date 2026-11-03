@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { createServer } from 'vite';
 
 const server = await createServer({
@@ -20,21 +22,25 @@ const asset = (id, kind = 'DATASET', changes = {}) => ({
   ...changes,
 });
 const entry = (asset) => ({ kind: 'asset', asset });
-const entries = (assets) => assets.map(entry);
-const fixtures = () => {
-  const norm = asset('normalization', 'NORM');
-  const data = asset('dataset', 'DATASET', { norm_asset_id: norm.id });
-  return { norm, data };
-};
+const norm = asset('normalization', 'NORM', { path: '/stats/norm_stats.json' });
+const data = asset('dataset', 'DATASET', { norm_asset_id: norm.id });
+const second = asset('dataset-2', 'DATASET', { norm_asset_id: norm.id });
 
 try {
-  const { groupDatasetNormAssets: group } = await server.ssrLoadModule(
-    '/src/datasetAssetGroups.ts',
+  const { datasetCatalogAssets: project, groupDatasetNormAssets: nest } =
+    await server.ssrLoadModule('/src/datasetAssetGroups.ts');
+  const { paginateAssetCatalog } = await server.ssrLoadModule('/src/assetCatalogPagination.ts');
+  const { reconcileBatchSyncSelection, toggleBatchSyncVisible } = await server.ssrLoadModule(
+    '/src/batchAssetSyncData.ts',
   );
+  const { AssetGroupRows } = await server.ssrLoadModule('/src/AssetGroupRows.tsx');
+  const catalog = (assets, filter = () => true, showArchived = false) => {
+    const projection = project(assets, showArchived);
+    return nest(projection.assets.filter(filter).map(entry), projection.boundNorms);
+  };
 
-  await test('one explicit same-node binding produces a dataset-first group with stable identity', () => {
-    const { data, norm } = fixtures();
-    const rows = group(entries([data, norm]));
+  await test('each dataset owns a stable parent containing exactly its two real assets', () => {
+    const rows = catalog([data, norm]);
     assert.equal(rows.length, 1);
     assert.equal(rows[0].kind, 'dataset-group');
     assert.equal(rows[0].name, data.name);
@@ -42,114 +48,77 @@ try {
     assert.deepEqual(rows[0].datasets, [data]);
     assert.strictEqual(rows[0].norm, norm);
     assert.deepEqual(rows[0].assets, [data, norm]);
-    assert.ok(rows[0].key.startsWith('dataset-norm:'));
-    assert.equal(group(entries([norm, data]))[0].key, rows[0].key);
+    assert.equal(catalog([norm, data])[0].key, rows[0].key);
+    const rebound = { ...data, norm_asset_id: 'new-norm' };
+    assert.equal(catalog([rebound, asset('new-norm', 'NORM')])[0].key, rows[0].key);
   });
 
-  await test('shared norms combine all matching datasets exactly once in filtered dataset order', () => {
-    const { data, norm } = fixtures();
-    const second = asset('dataset-2', 'DATASET', { norm_asset_id: norm.id });
-    const third = asset('dataset-3', 'DATASET', { norm_asset_id: norm.id });
-    const rows = group(entries([second, norm, data, third]));
-    assert.equal(rows.length, 1);
-    assert.equal(rows[0].name, `${norm.name} · 3 个数据集`);
-    assert.deepEqual(rows[0].datasets, [second, data, third]);
-    assert.deepEqual(rows[0].assets, [second, data, third, norm]);
-    assert.equal(rows[0].assets.filter((item) => item.id === norm.id).length, 1);
-  });
-
-  await test('groups occupy their earliest member position even when the norm appeared first', () => {
-    const { data, norm } = fixtures();
-    const before = asset('before', 'MODEL');
-    const between = asset('between', 'DATASET');
-    const after = asset('after', 'NORM');
-    const rows = group(entries([before, norm, between, data, after]));
+  await test('shared normalization produces independent named dataset parents in dataset order', () => {
+    const rows = catalog([second, norm, data]);
+    assert.equal(rows.length, 2);
     assert.deepEqual(
-      rows.map((item) => (item.kind === 'asset' ? item.asset.id : 'group')),
-      ['before', 'group', 'between', 'after'],
-    );
-    assert.deepEqual(rows[1].assets, [data, norm]);
-  });
-
-  await test('distinct bindings remain separate and retain independent first-member ordering', () => {
-    const left = fixtures();
-    const rightNorm = asset('right-norm', 'NORM');
-    const rightData = asset('right-data', 'DATASET', { norm_asset_id: rightNorm.id });
-    const rows = group(entries([left.norm, rightData, rightNorm, left.data]));
-    assert.deepEqual(
-      rows.map((row) => row.norm.id),
-      [left.norm.id, rightNorm.id],
+      rows.map((row) => row.name),
+      [second.name, data.name],
     );
     assert.notEqual(rows[0].key, rows[1].key);
-  });
-
-  await test('missing, empty and unknown bindings never group by name, metadata or matching paths', () => {
-    const norm = asset('norm', 'NORM', { name: 'matching', path: '/data/shared/norm_stats.json' });
-    const data = asset('data', 'DATASET', {
-      name: 'matching',
-      path: '/data/shared',
-      metadata: { norm_asset_id: norm.id },
-    });
-    const assets = [
-      data,
-      norm,
-      asset('null', 'DATASET', { norm_asset_id: null }),
-      asset('empty', 'DATASET', { norm_asset_id: '' }),
-      asset('missing', 'DATASET', { norm_asset_id: 'gone' }),
-    ];
-    const source = entries(assets);
-    assert.deepEqual(group(source), source);
-  });
-
-  await test('wrong-kind and cross-machine targets stay as independent assets', () => {
-    const wrong = asset('wrong', 'MODEL');
-    const remote = asset('remote', 'NORM', { node_id: 'node-2' });
-    const assets = [
-      asset('wrong-data', 'DATASET', { norm_asset_id: wrong.id }),
-      wrong,
-      asset('remote-data', 'DATASET', { norm_asset_id: remote.id }),
-      remote,
-    ];
-    const source = entries(assets);
-    assert.deepEqual(group(source), source);
-  });
-
-  await test('kind and search filtering do not pull hidden norms or datasets back into results', () => {
-    const { data, norm } = fixtures();
-    const second = asset('other-data', 'DATASET', { norm_asset_id: norm.id });
-    assert.deepEqual(group(entries([data])), entries([data]));
-    assert.deepEqual(group(entries([norm])), entries([norm]));
-    const rows = group(entries([data, norm]));
-    assert.deepEqual(rows[0].assets, [data, norm]);
-    assert.ok(!rows[0].assets.some((asset) => asset.id === second.id));
-  });
-
-  await test('archive visibility belongs to the caller and never reintroduces excluded members', () => {
-    const { data, norm } = fixtures();
-    const archivedNorm = { ...norm, state: 'ARCHIVED' };
-    const all = entries([data, archivedNorm]);
-    assert.deepEqual(group(all)[0].assets, [data, archivedNorm]);
-    const live = all.filter((item) => item.asset.state !== 'ARCHIVED');
-    assert.deepEqual(group(live), entries([data]));
-    const archivedData = { ...data, state: 'ARCHIVED' };
-    const normOnly = entries([archivedData, norm]).filter(
-      (item) => item.asset.state !== 'ARCHIVED',
+    assert.deepEqual(rows[0].assets, [second, norm]);
+    assert.deepEqual(rows[1].assets, [data, norm]);
+    assert.deepEqual(
+      rows.map((row) => row.datasets.length),
+      [1, 1],
     );
-    assert.deepEqual(group(normOnly), entries([norm]));
   });
 
-  await test('shared norm grouping only contains visible dataset subset and leaves the other dataset excluded', () => {
-    const { data, norm } = fixtures();
-    const another = asset('another', 'DATASET', { norm_asset_id: norm.id });
-    const archived = asset('archived', 'DATASET', { norm_asset_id: norm.id, state: 'ARCHIVED' });
-    const visible = [data, another, archived, norm].filter((asset) => asset.state !== 'ARCHIVED');
-    const rows = group(entries(visible));
-    assert.deepEqual(rows[0].datasets, [data, another]);
-    assert.deepEqual(rows[0].assets, [data, another, norm]);
+  await test('parent positions belong to datasets, not an earlier norm or another dataset sharing it', () => {
+    const before = asset('before', 'MODEL');
+    const between = asset('between');
+    const rows = catalog([before, norm, between, second, data]);
+    assert.deepEqual(
+      rows.map((row) => (row.kind === 'asset' ? row.asset.id : row.name)),
+      ['before', 'between', second.name, data.name],
+    );
   });
 
-  await test('model groups are preserved by identity and are never flattened or consumed as norm targets', () => {
-    const { data, norm } = fixtures();
+  await test('binding targets must be explicit same-machine norms; provenance and names never suffice', () => {
+    for (const candidate of [
+      { ...data, norm_asset_id: null },
+      { ...data, norm_asset_id: 'missing' },
+      { ...data, node_id: 'other' },
+      { ...data, norm_asset_id: 'model' },
+    ]) {
+      const rows = catalog([
+        candidate,
+        { ...norm, metadata: { source_dataset_asset_id: candidate.id } },
+        asset('model', 'MODEL'),
+      ]);
+      assert.ok(rows.every((row) => row.kind === 'asset'));
+      assert.ok(rows.some((row) => row.asset.id === norm.id));
+    }
+  });
+
+  await test('dataset and query filters retain children under matching parents without standalone norm resurrection', () => {
+    const raw = [data, second, norm, asset('standalone', 'NORM')];
+    assert.deepEqual(
+      catalog(raw, (item) => item.kind === 'NORM').map((row) => row.asset.id),
+      ['standalone'],
+    );
+    const rows = catalog(raw, (item) => item.id === data.id);
+    assert.deepEqual(rows[0].assets, [data, norm]);
+    assert.equal(rows.length, 1);
+    assert.ok(!rows[0].assets.includes(second));
+  });
+
+  await test('archive visibility keeps valid owners and standalone fallback without reintroducing archived rows', () => {
+    const archived = { ...data, status: 'ARCHIVED' };
+    assert.deepEqual(
+      catalog([archived, norm]).map((row) => row.asset.id),
+      [norm.id],
+    );
+    assert.deepEqual(catalog([archived, norm], undefined, true)[0].assets, [archived, norm]);
+    assert.deepEqual(catalog([data, { ...norm, status: 'ARCHIVED' }]), [entry(data)]);
+  });
+
+  await test('model group wrappers and caller objects remain unchanged', () => {
     const model = asset('model', 'MODEL');
     const modelGroup = {
       kind: 'model-group',
@@ -159,37 +128,94 @@ try {
       assets: [model],
       latest: model,
     };
-    const rows = group([entry(norm), modelGroup, entry(data)]);
-    assert.strictEqual(rows[1], modelGroup);
-    assert.equal(rows[0].kind, 'dataset-group');
-    const wrongData = asset('wrong-data', 'DATASET', { norm_asset_id: model.id });
-    assert.deepEqual(group([entry(wrongData), modelGroup]), [entry(wrongData), modelGroup]);
-  });
-
-  await test('group construction leaves input wrappers, asset objects and arrays unchanged', () => {
-    const { data, norm } = fixtures();
-    const standalone = asset('alone');
-    const source = entries([norm, standalone, data]);
+    const source = [entry(data), modelGroup];
     const before = structuredClone(source);
-    source.forEach((item) => {
-      Object.freeze(item.asset);
-      Object.freeze(item);
-    });
+    Object.freeze(source[0]);
     Object.freeze(source);
-    const rows = group(source);
+    const rows = nest(source, new Map([[data.id, norm]]));
     assert.deepEqual(source, before);
-    assert.strictEqual(rows[0].norm, norm);
-    assert.strictEqual(rows[0].datasets[0], data);
-    assert.strictEqual(rows[1], source[1]);
-    assert.notStrictEqual(rows, source);
+    assert.strictEqual(rows[1], modelGroup);
+    assert.strictEqual(rows[0].assets[0], data);
+    assert.strictEqual(rows[0].assets[1], norm);
+    assert.deepEqual(nest([], new Map()), []);
   });
 
-  await test('empty and fully unbound catalogs preserve the original entry sequence', () => {
-    assert.deepEqual(group([]), []);
-    const source = entries([asset('data'), asset('norm', 'NORM'), asset('model', 'MODEL')]);
-    const rows = group(source);
-    assert.deepEqual(rows, source);
-    assert.ok(rows.every((item, index) => item === source[index]));
+  await test('shared norm children are selectable once globally and survive filtering and pagination', () => {
+    const fillers = Array.from({ length: 19 }, (_, i) => asset(`filler-${i}`));
+    const raw = [data, norm, ...fillers, second];
+    const rows = catalog(raw);
+    const first = paginateAssetCatalog(rows, 1);
+    const next = paginateAssetCatalog(rows, 2);
+    assert.equal(first.total, 21);
+    assert.deepEqual(next.items[0].assets, [second, norm]);
+    assert.deepEqual(next.assetIds, [second.id, norm.id]);
+    const selected = toggleBatchSyncVisible(first.assetIds, next.assetIds, true);
+    assert.equal(selected.filter((id) => id === norm.id).length, 1);
+    assert.deepEqual(
+      reconcileBatchSyncSelection([norm.id, data.id, second.id], project(raw).selectionAssets, [
+        { id: 'node-1', status: 'ONLINE' },
+      ]),
+      [norm.id, data.id, second.id],
+    );
+    assert.deepEqual(toggleBatchSyncVisible([norm.id, data.id], [data.id], false), [norm.id]);
+  });
+
+  const render = (group, selectedIds = []) =>
+    renderToStaticMarkup(
+      React.createElement(
+        'table',
+        null,
+        React.createElement(AssetGroupRows, {
+          group,
+          node: { name: 'source' },
+          selectedIds,
+          eligibleIds: group.assets.map((item) => item.id),
+          canSelect: true,
+          onSelectionChange() {},
+          viewDataset() {},
+          renderAsset: (item) =>
+            React.createElement(
+              'tr',
+              { key: item.id },
+              React.createElement(
+                'td',
+                null,
+                React.createElement(
+                  'button',
+                  { 'aria-label': `查看资产：${item.name}` },
+                  item.name,
+                ),
+                React.createElement('code', null, item.path),
+              ),
+            ),
+        }),
+      ),
+    );
+
+  await test('dataset parent exposes disclosure and dataset identity while both real child assets remain available', () => {
+    const group = catalog([data, { ...norm, status: 'UNAVAILABLE' }])[0];
+    const html = render(group);
+    const heading = html.match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/)[1];
+    assert.match(heading, /aria-label="展开数据集 dataset"/);
+    assert.match(heading, /aria-expanded="false"/);
+    assert.match(heading, /查看数据集统计 dataset/);
+    assert.ok(heading.includes(data.path));
+    assert.ok(heading.includes(data.version));
+    assert.match(heading, />数据集<|>数据集<!--/);
+    assert.match(heading, /已登记/);
+    assert.doesNotMatch(heading, /UNAVAILABLE|数据集集合|可用 1/);
+    assert.match(html, /asset-dataset-group-items[^>]*hidden=""/);
+    for (const item of [data, norm]) {
+      assert.ok(html.includes(`aria-label="查看资产：${item.name}"`));
+      assert.ok(html.includes(item.path));
+    }
+  });
+
+  await test('parent checkbox represents only the actual dataset and never silently selects its norm child', () => {
+    const group = catalog([data, norm])[0];
+    assert.doesNotMatch(render(group, [norm.id]).match(/<input\b[^>]*>/)[0], /checked/);
+    assert.match(render(group, [data.id]).match(/<input\b[^>]*>/)[0], /checked/);
+    assert.match(render(group), /归一化参数可展开单独选择/);
   });
 } finally {
   await server.close();

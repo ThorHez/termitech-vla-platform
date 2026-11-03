@@ -27,6 +27,8 @@ def test_user_deployment_does_not_require_shared_admin_token_and_defaults_privat
     assert 'VLA_SESSION_TTL_SECONDS="28800"' in environment
     assert 'VLA_SESSION_IDLE_SECONDS="3600"' in environment
     assert 'VLA_SESSION_REAUTH_SECONDS="300"' in environment
+    assert 'VLA_GPU_RESERVATION_MAX_PER_USER="2"' in environment
+    assert 'VLA_GPU_RESERVATION_TTL_SECONDS="28800"' in environment
     assert 'VLA_LEGACY_ADMIN_ENABLED="false"' in environment
     assert 'isolated-enrollment-test' not in result.stdout
     assert (output / 'control.env').stat().st_mode & 0o777 == 0o600

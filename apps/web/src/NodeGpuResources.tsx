@@ -46,6 +46,7 @@ export function GpuReservationDeviceTable({
             <th>GPU</th>
             <th>预留用户</th>
             <th>预留时间</th>
+            <th>到期时间</th>
             <th>预留状态</th>
           </tr>
         </thead>
@@ -77,6 +78,13 @@ export function GpuReservationDeviceTable({
                 <td>
                   {reservation ? (
                     <time dateTime={reservation.created_at}>{date(reservation.created_at)}</time>
+                  ) : (
+                    '—'
+                  )}
+                </td>
+                <td>
+                  {reservation?.expires_at ? (
+                    <time dateTime={reservation.expires_at}>{date(reservation.expires_at)}</time>
                   ) : (
                     '—'
                   )}

@@ -54,6 +54,35 @@ def test_running_checkpoint_is_visible_with_its_node_and_attempt_provenance(plat
     assert [item["id"] for item in assets] == [asset["id"]]
 
 
+def test_openpi_checkpoint_uses_training_name_and_id_across_reports_and_completion(platform):
+    node, run, attempt = running(platform)
+    recipe = 'auto_pi05_full_h16_d32_sft'
+    output = checkpoint(attempt, 59999, name=f'{recipe} / 59999',
+        metadata={'format': 'openpi-orbax', 'recipe': recipe, 'step': 59999, 'evaluated': False})
+    expected = f"{run['name']} · {run['id'][:8]} / 59999"
+    assert platform.emit(node, attempt['id'], 2, 'ARTIFACT', {'outputs': [output]}).status_code == 200
+    first = platform.get_run(run)['outputs'][0]
+    assert first['name'] == expected
+    assert first['path'] == output['path'] and first['metadata'] == output['metadata']
+    assert platform.emit(node, attempt['id'], 3, 'ARTIFACT', {'outputs': [output]}).status_code == 200
+    assert platform.emit(node, attempt['id'], 4, 'SUCCEEDED', {'exit_code': 0, 'outputs': [output]}).status_code == 200
+    final = platform.get_run(run)['outputs'][0]
+    assert final['name'] == expected and final['id'] == first['id']
+    assert final['path'] == first['path'] and final['metadata'] == first['metadata']
+
+
+def test_named_openpi_output_does_not_replace_an_explicit_custom_model_name(platform):
+    node, run, attempt = running(platform)
+    output = checkpoint(attempt, 59999, name='我手动命名的模型',
+        metadata={'format': 'openpi-orbax', 'recipe': 'auto_pi05_full_h16_d32_sft', 'step': 59999})
+    assert platform.emit(node, attempt['id'], 2, 'ARTIFACT', {'outputs': [output]}).status_code == 200
+    assert platform.get_run(run)['outputs'][0]['name'] == output['name']
+    legacy = {**output, 'name': 'auto_pi05_full_h16_d32_sft / 59999'}
+    assert platform.emit(node, attempt['id'], 3, 'ARTIFACT', {'outputs': [legacy]}).status_code == 200
+    assert platform.emit(node, attempt['id'], 4, 'SUCCEEDED', {'exit_code': 0, 'outputs': [legacy]}).status_code == 200
+    assert platform.get_run(run)['outputs'][0]['name'] == output['name']
+
+
 def test_repeated_reports_and_final_manifest_reuse_the_same_asset_across_restart(platform):
     node, run, attempt = running(platform)
     output = checkpoint(attempt)

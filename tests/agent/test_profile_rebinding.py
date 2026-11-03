@@ -60,6 +60,84 @@ def assert_unchanged(fixture, before, memory):
     assert config["profiles"] == memory
 
 
+def add_request(fixture, **changes):
+    request = fixture[-1]
+    return {"action": "add", "profile_id": "another-openpi", "name": "Another OpenPI",
+            **{key: request[key] for key in ("code_dir", "python", "expires_at")}, **changes}
+
+
+def test_add_profile_persists_without_changing_existing_environments_and_recovers_lost_receipt(fixture, monkeypatch):
+    config, state, path, _, _ = fixture
+    original = json.loads(path.read_text())
+    request = add_request(fixture)
+    result = rebinder.rebind_profile(config, state, request, operation_id="add-1")
+    disk = json.loads(path.read_text())
+    assert result["action"] == "add" and result["name"] == request["name"]
+    assert result["persisted"] is True and result["runtime_check"]["status"] == "READY"
+    assert disk["profiles"][:-1] == original["profiles"]
+    assert disk["profiles"][-1] == {"id": request["profile_id"], "name": request["name"],
+        "code_dir": request["code_dir"], "python": request["python"], "adapter": "openpi-sft",
+        "execution_mode": "native", "recipe": None, "metadata": {}}
+    assert disk["unknown_extra"] == original["unknown_extra"]
+    config["profiles"] = original["profiles"]  # Persistence succeeded, but live-memory confirmation was interrupted.
+    monkeypatch.setattr(rebinder, "check_runtime", lambda *a, **k: pytest.fail("retry must reuse durable receipt"))
+    assert rebinder.rebind_profile(config, state, request, operation_id="add-1") == result
+    assert config["profiles"] == disk["profiles"]
+    assert len(load_config(path)["profiles"]) == len(original["profiles"]) + 1
+
+
+@pytest.mark.parametrize("where", ["disk", "memory"])
+def test_add_rejects_duplicate_identifiers_in_disk_or_memory(fixture, where):
+    config, state, path, _, _ = fixture
+    request = add_request(fixture)
+    if where == "disk":
+        disk = json.loads(path.read_text()); disk["profiles"].append({**disk["profiles"][0], "id": request["profile_id"]})
+        path.write_text(json.dumps(disk))
+    else:
+        config["profiles"].append({**config["profiles"][0], "id": request["profile_id"]})
+    before = path.read_bytes(); memory = copy.deepcopy(config["profiles"])
+    with pytest.raises(AgentError) as failure:
+        rebinder.rebind_profile(config, state, request, operation_id="duplicate-add")
+    assert failure.value.code == "PROFILE_REBIND_CONFLICT"
+    assert_unchanged(fixture, before, memory)
+
+
+@pytest.mark.parametrize("changes", [{"profile_id": "invalid/id"}, {"name": " "}, {"name": "bad\nname"},
+                                      {"code_dir": "/outside/project"}, {"python": "python"}])
+def test_add_invalid_request_preserves_existing_profiles(fixture, changes):
+    config, state, path, _, _ = fixture
+    before = path.read_bytes(); memory = copy.deepcopy(config["profiles"])
+    with pytest.raises(AgentError) as failure:
+        rebinder.rebind_profile(config, state, add_request(fixture, **changes), operation_id="invalid-add")
+    assert failure.value.as_dict()["persisted"] is False
+    assert_unchanged(fixture, before, memory)
+
+
+def test_add_runtime_failure_does_not_publish_environment(fixture, monkeypatch):
+    config, state, path, _, _ = fixture
+    before = path.read_bytes(); memory = copy.deepcopy(config["profiles"])
+    monkeypatch.setattr(rebinder, "check_runtime", lambda *a, **k: {"status": "FAILED", "error": "missing JAX"})
+    with pytest.raises(AgentError) as failure:
+        rebinder.rebind_profile(config, state, add_request(fixture), operation_id="failed-add")
+    assert failure.value.code == "PROFILE_REBIND_RUNTIME_UNAVAILABLE"
+    assert_unchanged(fixture, before, memory)
+
+
+@pytest.mark.parametrize("uses_target", [False, True])
+def test_add_allows_unrelated_training_but_blocks_target_checkout_in_use(fixture, uses_target):
+    config, state, path, checkout, _ = fixture
+    payload = {"attempt_id": "active", "profile_id": config["profiles"][0]["id"]}
+    if uses_target:
+        payload["code_expectation"] = {"code_dir": str(checkout)}
+    state.create_attempt(payload, str(path.parent / "outputs"))
+    if uses_target:
+        with pytest.raises(AgentError) as failure:
+            rebinder.rebind_profile(config, state, add_request(fixture), operation_id="busy-add")
+        assert failure.value.code == "PROFILE_REBIND_BUSY"
+    else:
+        assert rebinder.rebind_profile(config, state, add_request(fixture), operation_id="idle-add")["persisted"] is True
+
+
 def test_live_rebind_probes_actual_origin_and_preserves_private_configuration(fixture):
     config, state, path, checkout, request = fixture
     old = path.read_bytes();original = json.loads(old)

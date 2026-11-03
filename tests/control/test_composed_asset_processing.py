@@ -15,17 +15,25 @@ from .test_task_recipe import request_preview
 from .test_automatic_preflight import acknowledge, submit
 
 
-def description():
+def description(*, action_layout=None, arm_mode="single", action_representation="eef"):
     spec = json.loads((Path(__file__).resolve().parents[1] / "fixtures/composed-processing-v1.json").read_text())["valid"][0]
-    return {"schema_version": 1, "format": "lerobot", "robot_type": "ARX5", "arm_mode": "single",
-            "action_representation": "eef", "cameras": [{"name": "wrist", "key": spec["cameras"][0]["key"], "kind": "rgb"}],
-            "task_description": "Pick up cup", "action_dim": 10, "state_dim": 7, "processing": spec}
+    spec["arm_mode"] = arm_mode
+    spec["action_representation"] = action_representation
+    if action_representation == "joint":
+        spec["rotation_representation"] = "none"
+    if action_layout is not None:
+        spec["action_layout"] = deepcopy(action_layout)
+    return {"schema_version": 1, "format": "lerobot", "robot_type": "ARX5", "arm_mode": arm_mode,
+            "action_representation": action_representation,
+            "cameras": [{"name": "wrist", "key": spec["cameras"][0]["key"], "kind": "rgb"}],
+            "task_description": "Pick up cup", "action_dim": sum(row["width"] for row in spec["action_layout"]),
+            "state_dim": 7, "processing": spec}
 
 
-def setup_composed(platform, *, source_only=False):
+def setup_composed(platform, *, source_only=False, **composition_options):
     node, inputs, rows = configured(platform)
     rows = rows[:1]
-    declared = description()
+    declared = description(**composition_options)
     selected = composition_choice(declared)
     if source_only:
         declared.pop("processing")
@@ -34,8 +42,8 @@ def setup_composed(platform, *, source_only=False):
              "component": "joint", "arm": "left", "shape": [6]},
             {"key": "observation.gripper", "role": "state", "representation": "unknown", "value_mode": "absolute",
              "component": "gripper", "arm": "left", "shape": [1]},
-            {"key": "actions", "role": "action", "representation": "eef", "value_mode": "absolute",
-             "component": "other", "arm": "unknown", "shape": [16, 10]},
+            {"key": "actions", "role": "action", "representation": "composite", "value_mode": "absolute",
+             "component": "other", "arm": "shared", "shape": [16, declared["action_dim"]]},
         ]
     response = platform.client.patch(f"/api/v1/assets/{rows[0]['dataset_asset_id']}/dataset-profile", headers=ADMIN,
                                      json={"dataset_profile": declared})
@@ -46,8 +54,8 @@ def setup_composed(platform, *, source_only=False):
     return node, inputs, rows, profile
 
 
-def pending(platform, *, source_only=False, customized=False):
-    node, inputs, rows, profile = setup_composed(platform, source_only=source_only)
+def pending(platform, *, source_only=False, customized=False, **composition_options):
+    node, inputs, rows, profile = setup_composed(platform, source_only=source_only, **composition_options)
     selected = rows[0]["processor"]["parameters"]["composition"]
     if customized:
         selected["state_fields"].reverse()
@@ -59,14 +67,16 @@ def pending(platform, *, source_only=False, customized=False):
     evidence = automatic_preflight(command["payload"])
     data = evidence["plan"]["datasets"][0]
     data["registered_profile"] = deepcopy(profile)
+    raw_action = sum(field["width"] for field in selected["action_layout"])
     data["composition"] = {"schema_version": 1, "spec": deepcopy(selected),
         "digest": composition_digest(selected), "training_stage": "sft", "model_type": "Pi0Config",
         "action_horizon": 16, "action_dim": 32,
-        "pi05": True, "raw_state_dim": 7, "raw_action_dim": 10, "state_history": 1, "normalization": selected["normalization"],
+        "pi05": True, "raw_state_dim": 7, "raw_action_dim": raw_action, "state_history": 1, "normalization": selected["normalization"],
         "image_keys": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"], "depth_keys": [],
-        "action_metadata_sha256": data["metadata_sha256"], "action_sequence_keys": [], "action_loss_mask": [1.] * 10 + [0.] * 22,
+        "action_metadata_sha256": data["metadata_sha256"], "action_sequence_keys": [],
+        "action_loss_mask": [1.] * raw_action + [0.] * (32 - raw_action),
         "source": {"path": "src/openpi/training/composed_processing.py", "sha256": "c" * 64}}
-    data["actions_shape"] = [16, 10]
+    data["actions_shape"] = [16, raw_action]
     evidence["plan_digest"] = canonical_digest(evidence["plan"])
     code = snapshot(recipe="mixed", dataset_bindings=rows, automatic_preflight=evidence)
     return node, identifier, command, code, profile
@@ -156,6 +166,14 @@ def test_non_lerobot_asset_can_keep_history_but_cannot_select_composable_trainin
     assert response.status_code == 200
     preview = request_preview(platform, node, inputs=inputs, dataset_bindings=rows)
     assert preview.status_code == 422, preview.text
+
+
+def test_training_still_requires_visual_configuration_when_norm_stats_does_not(platform):
+    node, inputs, rows, _ = setup_composed(platform)
+    rows[0]["processor"]["parameters"]["composition"]["cameras"] = []
+    response = request_preview(platform, node, inputs=inputs, dataset_bindings=rows)
+    assert response.status_code == 422, response.text
+    assert platform.commands(node) == []
 
 
 def test_profile_and_composition_share_javascript_unicode_trimming(platform):

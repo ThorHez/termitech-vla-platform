@@ -160,7 +160,7 @@ def test_binding_request_rejects_missing_invalid_and_unrelated_fields(platform, 
     assert listed(platform, dataset["id"]) == dataset
 
 
-@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 200), ("viewer", 403)])
+@pytest.mark.parametrize("role,status", [("admin", 200), ("operator", 403), ("viewer", 403)])
 def test_norm_binding_requires_asset_write_permission_and_valid_csrf(platform, role, status):
     node = platform.register()
     norm = register_asset(platform, node, "NORM").json()

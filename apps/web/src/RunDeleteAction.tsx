@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { LoaderCircle, Trash2 } from 'lucide-react';
 import { useAuth } from './auth';
+import { canManageResource } from './resourcePermissions';
 import { ErrorNotice, Modal } from './components';
 import { canDeleteRunRecord, deleteRunRecord } from './runDeletion';
 import type { Run } from './types';
@@ -15,16 +16,27 @@ export function RunDeleteAction({
   compact?: boolean;
   onDeleted?: () => void;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
-  if (!can('training.write') || !canDeleteRunRecord(run)) return null;
+  if (
+    !can('training.write') ||
+    !canManageResource(user, run.owner_user_id) ||
+    !canDeleteRunRecord(run)
+  )
+    return null;
   const close = () => {
     if (!busy) setConfirm(false);
   };
   const remove = async () => {
-    if (busy || !can('training.write') || !canDeleteRunRecord(run)) return;
+    if (
+      busy ||
+      !can('training.write') ||
+      !canManageResource(user, run.owner_user_id) ||
+      !canDeleteRunRecord(run)
+    )
+      return;
     setBusy(true);
     setError(undefined);
     try {

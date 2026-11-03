@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { createPortal } from 'react-dom';
 import { LoaderCircle, Trash2 } from 'lucide-react';
 import { useAuth } from './auth';
+import { canManageResource } from './resourcePermissions';
 import { ErrorNotice, Modal } from './components';
 import { canDeleteDeploymentRecord, deleteDeploymentRecord } from './deploymentRecordDeletion';
 import type { CheckpointTransfer } from './checkpointTransfer';
@@ -22,11 +23,15 @@ export function DeploymentRecordDeleteAction({
   disabled?: boolean;
   onDeleted?: () => void;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
-  if (!can('training.write') || !canDeleteDeploymentRecord(record, deployment, transfers))
+  if (
+    !can('training.write') ||
+    !canManageResource(user, record.owner_user_id) ||
+    !canDeleteDeploymentRecord(record, deployment, transfers)
+  )
     return null;
   const close = () => {
     if (!busy) setConfirm(false);
@@ -36,6 +41,7 @@ export function DeploymentRecordDeleteAction({
       busy ||
       disabled ||
       !can('training.write') ||
+      !canManageResource(user, record.owner_user_id) ||
       !canDeleteDeploymentRecord(record, deployment, transfers)
     )
       return;

@@ -255,6 +255,8 @@ def render(args) -> dict:
         "VLA_SESSION_TTL_SECONDS": "28800",
         "VLA_SESSION_IDLE_SECONDS": "3600",
         "VLA_SESSION_REAUTH_SECONDS": "300",
+        "VLA_GPU_RESERVATION_MAX_PER_USER": "2",
+        "VLA_GPU_RESERVATION_TTL_SECONDS": "28800",
         "VLA_ENROLLMENT_TOKEN": credential_value["enrollment_token"],
         "VLA_DATABASE_URL": "sqlite:///" + state + "/control.db",
         "VLA_HOST": args.bind,

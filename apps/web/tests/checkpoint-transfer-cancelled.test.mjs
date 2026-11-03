@@ -40,7 +40,10 @@ try {
       React.createElement(
         AuthContext.Provider,
         {
-          value: { can: (permission) => permission === 'training.write' },
+          value: {
+            user: { id: 'test-admin', role: 'admin' },
+            can: (permission) => permission === 'training.write',
+          },
         },
         React.createElement(DataProvider, { enabled: false }, element),
       ),

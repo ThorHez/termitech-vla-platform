@@ -24,6 +24,8 @@ class Settings:
     scheduler_interval_seconds: float = 2.0
     heartbeat_timeout_seconds: int = 90
     preview_ttl_seconds: int = 900
+    gpu_reservation_max_per_user: int = 2
+    gpu_reservation_ttl_seconds: int = 28800
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -45,6 +47,8 @@ class Settings:
             scheduler_enabled=os.getenv("VLA_SCHEDULER_ENABLED", "true").lower() in {"1", "true", "yes"},
             scheduler_interval_seconds=float(os.getenv("VLA_SCHEDULER_INTERVAL_SECONDS", "2")),
             heartbeat_timeout_seconds=int(os.getenv("VLA_HEARTBEAT_TIMEOUT_SECONDS", "90")),
+            gpu_reservation_max_per_user=int(os.getenv("VLA_GPU_RESERVATION_MAX_PER_USER", "2")),
+            gpu_reservation_ttl_seconds=int(os.getenv("VLA_GPU_RESERVATION_TTL_SECONDS", "28800")),
         )
 
     def validate(self) -> None:
@@ -62,5 +66,9 @@ class Settings:
             raise ValueError("Sensitive-operation verification must be between 30 seconds and 900 seconds, within the idle timeout")
         if self.scheduler_interval_seconds <= 0 or self.heartbeat_timeout_seconds <= 0:
             raise ValueError("Scheduler and heartbeat intervals must be positive")
+        if not 1 <= self.gpu_reservation_max_per_user <= 256:
+            raise ValueError("GPU reservation limit must be between 1 and 256 devices per account")
+        if not 60 <= self.gpu_reservation_ttl_seconds <= 7 * 86400:
+            raise ValueError("GPU reservation lifetime must be between 60 seconds and 7 days")
         from .transport_security import validate_transport_settings
         validate_transport_settings(self)

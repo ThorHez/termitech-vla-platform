@@ -39,9 +39,9 @@ export const roleLabels: Record<UserRole, string> = {
   viewer: '只读用户',
 };
 export const roleDescriptions: Record<UserRole, string> = {
-  admin: '管理用户、机器连接、资产与训练，并可回写配方和查看审计。',
-  operator: '查看资源，管理资产与配方，创建和取消训练。',
-  viewer: '查看训练、资产与资源状态。',
+  admin: '管理用户、机器、公共资产与配方，管理全部任务和历史记录，并查看审计。',
+  operator: '使用公共资产与配方，创建训练、同步和部署；只管理自己的任务及个人模板。',
+  viewer: '查看共享的训练、日志、资产、部署与资源状态。',
 };
 interface AuthState {
   user?: User;
@@ -180,7 +180,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       revision.current += 1;
       hadSession.current = true;
       sessionRef.current = next;
-      setSessionCsrf(next.csrf_token);
+      setSessionCsrf(next.csrf_token, next.user.id);
       setSession(next);
       setExpired(false);
       setError(undefined);

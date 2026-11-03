@@ -473,6 +473,8 @@ def _handle_policy_command(config, command_type, payload, *, prepared=None):
             if gpu is not None and (not isinstance(gpu, str) or not re.fullmatch(r"(?:GPU|MIG)-[A-Za-z0-9/-]{1,196}", gpu)):
                 raise AgentError("POLICY_GPU_INVALID", "GPU must be selected using its UUID")
             gpu_policy = _requested_gpu_policy(payload)
+            from .resource_guard import require_gpu_access
+            require_gpu_access(config, [gpu] if gpu else [])
             if gpu_policy["mode"] == "shared" and not gpu:
                 raise AgentError("POLICY_GPU_INVALID", "共享部署必须明确选择 GPU")
             import vla_adapters
@@ -489,6 +491,8 @@ def _handle_policy_command(config, command_type, payload, *, prepared=None):
                         "gpu_policy": gpu_policy, "agent_python": sys.executable,
                         "agent_root": str(Path(__file__).resolve().parent.parent),
                         "protocol_root": str(Path(vla_protocol.__file__).resolve().parent.parent), **inference}
+            if config.get("resource_guard") is not None:
+                manifest["resource_guard"] = config["resource_guard"]
             if inference.get("frozen_request") is not None or inference.get("portable_policy") is not None:
                 manifest["inference_config_schema"] = 1
             manifest.update(_execution_receipt(payload))

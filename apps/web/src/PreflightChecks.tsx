@@ -14,6 +14,7 @@ const labels: Record<string, string> = {
   norm_contract: '归一化参数',
   model_checkpoint: '模型检查点',
   training_entrypoint: '训练入口',
+  norm_entrypoint: '统计脚本入口',
   training_cache: '训练缓存与数据加载权限',
   output_storage: '输出目录与磁盘空间',
   output_isolation: '输出目录与代码、资产隔离',

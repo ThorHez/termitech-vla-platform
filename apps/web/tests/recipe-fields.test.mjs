@@ -15,7 +15,7 @@ const server = await createServer({
 try {
   const { RecipeDetails } = await server.ssrLoadModule('/src/RecipeDetails.tsx');
   const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
-  const granted = ['training.write', 'recipes.write', 'recipes.writeback'];
+  const granted = ['training.write', 'recipes.query', 'recipes.write', 'recipes.writeback'];
   const auth = (permissions) => ({
     permissions,
     loading: false,
@@ -240,12 +240,11 @@ try {
     assert.doesNotMatch(html, /其他可覆盖参数/);
   });
 
-  await test('operator can edit platform recipes and is told code writes require an admin', () => {
-    const html = render({}, ['training.write', 'recipes.write']);
-    control(allFields(html), prompt, 'select');
-    assert.match(html, /保存将创建平台配方版本；写入训练代码需要管理员权限/);
-    assert.match(html, /另存为新配方/);
-    assert.doesNotMatch(html, /保存会在 config\.py 中新增独立配方/);
+  await test('operator can read a public recipe without public revision or writeback controls', () => {
+    const html = render({}, ['training.write', 'recipes.query']);
+    assert.match(html, /当前为只读配方快照/);
+    assert.match(html, /DataConfig/);
+    assert.doesNotMatch(html, /aria-label="修改|另存为新配方|保存新版本/);
   });
 } finally {
   await server.close();

@@ -272,7 +272,7 @@ def test_client_cannot_forge_internal_receipt_and_non_dataset_assets_do_not_get_
     assert platform.client.get(f"/api/v1/assets/{asset['id']}/validation", headers=ADMIN).status_code == 404
 
 
-@pytest.mark.parametrize("role,expected", [("admin", 202), ("operator", 202), ("viewer", 403)])
+@pytest.mark.parametrize("role,expected", [("admin", 202), ("operator", 403), ("viewer", 403)])
 def test_write_permission_csrf_read_permissions_and_machine_ownership(platform, role, expected):
     node = worker(platform)
     asset = register(platform, node)

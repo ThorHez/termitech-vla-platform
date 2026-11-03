@@ -63,19 +63,31 @@ const buttons = (html) =>
   }));
 const button = (html, pattern) => buttons(html).find((value) => pattern.test(value.label));
 const normAction = /^(?:绑定|修改) norm_stats$/;
-const mutation = /^(?:(?:绑定|修改) norm_stats|(?:编辑|补录)数据特征|同步到其他机器|删除(?:登记|资产)?(?:登记)?)$/;
+const mutation =
+  /^(?:(?:绑定|修改) norm_stats|(?:编辑|补录)数据特征|同步到其他机器|删除(?:登记|资产)?(?:登记)?)$/;
 
 try {
   const { AssetDetail } = await server.ssrLoadModule('/src/AssetDetail.tsx');
   const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
-  const render = (asset = dataset, source = node, role = 'operator', assets = [dataset, norm]) =>
+  const render = (
+    asset = dataset,
+    source = node,
+    role = 'admin',
+    assets = [dataset, norm],
+    props = {},
+  ) =>
     renderToStaticMarkup(
       React.createElement(
         AuthContext.Provider,
         {
           value: {
-            can: (permission) => role !== 'viewer' && permission === 'assets.write',
-            permissions: role === 'viewer' ? [] : ['assets.write'],
+            can: (permission) =>
+              role === 'admin'
+                ? ['assets.write', 'assets.transfer', 'dataset-templates.write'].includes(
+                    permission,
+                  )
+                : role === 'operator' &&
+                  ['assets.transfer', 'dataset-templates.write'].includes(permission),
           },
         },
         React.createElement(AssetDetail, {
@@ -87,6 +99,7 @@ try {
           bindNorm() {},
           sync() {},
           remove() {},
+          ...props,
         }),
       ),
     );
@@ -112,14 +125,47 @@ try {
     assert.match(html, /30/);
   });
 
-  await test('operators and administrators can find dataset operations inside details', () => {
-    for (const role of ['operator', 'admin']) {
+  await test('bound norm state and repair entry remain visible inside dataset details', () => {
+    for (const [status, label] of [
+      ['REGISTERED', '待校验'],
+      ['UNAVAILABLE', 'UNAVAILABLE'],
+      ['ARCHIVED', '已归档'],
+    ]) {
+      const html = render(dataset, node, 'admin', [dataset, { ...norm, status }]);
+      assert.match(html, new RegExp(`aria-label="norm_stats 状态"[\\s\\S]*?${label}`));
+      assert.ok(html.includes(norm.name));
+      assert.ok(html.includes(norm.path));
+      assert.ok(html.includes(norm.version));
+      assert.ok(button(html, normAction));
+    }
+  });
+
+  await test('each dataset sharing a norm retains its own details and a descriptively named dataset picker', () => {
+    const second = { ...dataset, id: 'second', name: 'second dataset' };
+    for (const current of [dataset, second]) {
+      const html = render(current, node, 'admin', [dataset, second, norm], {
+        datasetChoices: [dataset, second],
+        selectDataset() {},
+      });
+      assert.match(html, /aria-label="使用此归一化参数的数据集"/);
+      assert.doesNotMatch(html, /集合中的数据集/);
+      assert.ok(html.includes(norm.path));
+      assert.ok(button(html, normAction));
+    }
+  });
+
+  await test('administrators can maintain public datasets while operators can only synchronize them', () => {
+    for (const role of ['admin']) {
       const html = render(dataset, node, role);
       for (const label of [normAction, /数据特征/, /同步到其他机器/, /删除/]) {
         assert.ok(button(html, label), `missing operation ${label} for ${role}`);
       }
       assert.doesNotMatch(button(html, /同步到其他机器/).attributes, /\bdisabled/);
     }
+    const operator = render(dataset, node, 'operator');
+    assert.ok(button(operator, /同步到其他机器/));
+    for (const label of [normAction, /数据特征/, /删除/])
+      assert.equal(button(operator, label), undefined);
   });
 
   await test('viewers can inspect every detail without being offered mutations', () => {

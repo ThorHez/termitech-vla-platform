@@ -31,6 +31,17 @@ def read(path):
     return inspection.inspect_dataset({"roots": [str(path.parent)]}, query(path))
 
 
+def test_inspection_protocol_accepts_explicit_shared_action_and_rejects_half_shared_pairs(tmp_path):
+    result = read(dataset(tmp_path))
+    result["processing"]["action_layout"] = [{"arm": "shared", "kind": "shared", "width": 7}]
+    assert normalize_dataset_inspection(result)["processing"]["action_layout"] == result["processing"]["action_layout"]
+    for arm, kind in [("left", "shared"), ("shared", "joint")]:
+        malformed = deepcopy(result)
+        malformed["processing"]["action_layout"][0].update(arm=arm, kind=kind)
+        with pytest.raises(ValueError, match="INVALID_DATASET_INSPECTION"):
+            normalize_dataset_inspection(malformed)
+
+
 def test_complete_metadata_fills_only_supported_defaults_with_evidence(tmp_path):
     path = dataset(tmp_path);result = read(path)
     assert result == normalize_dataset_inspection(result, expected_path=str(path))

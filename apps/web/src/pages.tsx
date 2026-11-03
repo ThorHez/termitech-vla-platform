@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -54,6 +54,7 @@ import { ResourceHistory } from './ResourceHistory';
 import { GpuReservations } from './GpuReservations';
 import { NodeGpuResources } from './NodeGpuResources';
 import { ProfileRebinding } from './ProfileRebinding';
+import { ProfileAddition } from './ProfileAddition';
 import { StorageConfiguration } from './StorageConfiguration';
 import { matchesNodeQuery, nodeAddressText } from './nodeAddress';
 import { PathAutocomplete } from './PathAutocomplete';
@@ -62,17 +63,27 @@ import type { AssetTransfer } from './assetTransfer';
 import { BackgroundTasksPage } from './BackgroundTasks';
 import { RunDeleteAction } from './RunDeleteAction';
 import { DatasetInspection, useDatasetInspectionDraft } from './DatasetInspection';
-import { DatasetNormBindingDialog, DatasetNormField, DatasetNormSummary } from './DatasetNormBinding';
+import {
+  DatasetNormBindingDialog,
+  DatasetNormField,
+  DatasetNormSummary,
+} from './DatasetNormBinding';
 import { AssetDetail } from './AssetDetail';
 import { catalogAssetGroups } from './modelAssetGroups';
 import { AssetGroupRows } from './AssetGroupRows';
-import { groupDatasetNormAssets } from './datasetAssetGroups';
+import { datasetCatalogAssets, groupDatasetNormAssets } from './datasetAssetGroups';
 import { ASSET_CATALOG_PAGE_SIZE, paginateAssetCatalog } from './assetCatalogPagination';
 import { DatasetValidationBadge } from './DatasetValidation';
 import { BatchDatasetRegistration } from './BatchDatasetRegistration';
 import { BatchAssetSync } from './BatchAssetSync';
-import { BATCH_ASSET_SYNC_LIMIT, batchSyncSourceError, reconcileBatchSyncSelection, toggleBatchSyncVisible } from './batchAssetSyncData';
+import {
+  BATCH_ASSET_SYNC_LIMIT,
+  batchSyncSourceError,
+  reconcileBatchSyncSelection,
+  toggleBatchSyncVisible,
+} from './batchAssetSyncData';
 import { DatasetFormatTemplates, DatasetFormatTemplateDialog } from './DatasetFormatTemplates';
+import { PersonalDatasetFormats } from './PersonalDatasetFormats';
 import { datasetNormBindingPayload, datasetNormInputError } from './datasetNormAssets';
 import './asset-registration.css';
 import './asset-catalog.css';
@@ -405,10 +416,10 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
             : gpu.user_reservation
               ? '用户预留'
               : unknown
-              ? '占用未知'
-              : gpuIdle(gpu)
-                ? '空闲'
-                : '资源占用'}
+                ? '占用未知'
+                : gpuIdle(gpu)
+                  ? '空闲'
+                  : '资源占用'}
         </span>
       </div>
       <div className="gpu-measures">
@@ -434,10 +445,13 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
         <code title={gpu.uuid}>{gpu.uuid}</code>
         {reservedRun && <a href={`#/runs/${reservedRun.id}`}>查看任务</a>}
       </div>
-      {gpu.user_reservation && <div className="gpu-user-reservation">
-        <LockKeyhole size={13} />
-        预留给 {gpu.user_reservation.display_name || gpu.user_reservation.username}（{gpu.user_reservation.username}）
-      </div>}
+      {gpu.user_reservation && (
+        <div className="gpu-user-reservation">
+          <LockKeyhole size={13} />
+          预留给 {gpu.user_reservation.display_name || gpu.user_reservation.username}（
+          {gpu.user_reservation.username}）
+        </div>
+      )}
       {!!gpu.processes?.length && (
         <div className="process-info">
           {gpu.processes.map((process) => (
@@ -571,7 +585,8 @@ export function NodesPage() {
               {can('machines.manage') && (
                 <div className="machine-card-management">
                   <button className="text-link" onClick={() => setTerminalNode(node)}>
-                    <Terminal size={13} />终端
+                    <Terminal size={13} />
+                    终端
                   </button>
                   <button className="text-link" onClick={() => setManaging(node)}>
                     <Settings2 size={13} />
@@ -642,10 +657,9 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
   const node =
     (raw && 'node' in raw ? raw.node : (raw as NodeDetail | undefined)) ||
     nodes.data?.find((item) => item.id === id);
-  const nodeAssets =
-    assets.data?.filter(
-      (asset) => asset.node_id === id && (asset.state || asset.status) !== 'ARCHIVED',
-    ) || [];
+  const nodeAssets = datasetCatalogAssets(assets.data || []).assets.filter(
+    (asset) => asset.node_id === id,
+  );
   const nodeProfiles = profiles.data?.filter((profile) => profile.node_id === id) || [];
   const nodeRuns = runs.data?.filter((run) => run.node_id === id) || [];
   return (
@@ -668,7 +682,8 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                   disabled={!node}
                   onClick={() => setShowTerminal(true)}
                 >
-                  <Terminal size={16} />终端
+                  <Terminal size={16} />
+                  终端
                 </button>
                 <button
                   className="button outline"
@@ -754,7 +769,12 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
           <ResourceHistory key={`history-${id}`} nodeId={id} status={node.status} />
           <div className="detail-columns">
             <div>
-              <NodeGpuResources key={`gpu-${id}`} node={node} refreshToken={reservationRevision} onManage={() => setShowReservations(true)}>
+              <NodeGpuResources
+                key={`gpu-${id}`}
+                node={node}
+                refreshToken={reservationRevision}
+                onManage={() => setShowReservations(true)}
+              >
                 {node.gpus?.length ? (
                   <div className="gpu-list">
                     {node.gpus.map((gpu, index) => (
@@ -784,6 +804,9 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                         <div>
                           <strong>{asset.name}</strong>
                           <span className="mono">{asset.path}</span>
+                          {asset.kind === 'DATASET' && (
+                            <DatasetNormSummary asset={asset} assets={assets.data || []} />
+                          )}
                         </div>
                         <span className="tag">{assetKinds[asset.kind]}</span>
                       </div>
@@ -799,7 +822,20 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               </Panel>
             </div>
             <div>
-              <Panel title="运行环境" subtitle="来自 Agent 的可信配置">
+              <Panel
+                title="运行环境"
+                subtitle="每套环境绑定独立代码目录与 Python，创建训练时选择"
+                action={
+                  <ProfileAddition
+                    node={node}
+                    changed={() => {
+                      profiles.refresh();
+                      nodes.refresh();
+                      details.refresh();
+                    }}
+                  />
+                }
+              >
                 {nodeProfiles.length ? (
                   <div className="profile-list">
                     {nodeProfiles.map((profile) => (
@@ -838,9 +874,18 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                           </div>
                         </dl>
                         <RuntimeCheckView check={runtimeCheckFor(node, profile.id)} />
-                        <ProfileRebinding node={node} profile={profile}
-                          inUse={nodeRuns.some(run => run.profile_id === profile.id && activeStates.has(run.state))}
-                          changed={() => { profiles.refresh(); nodes.refresh(); details.refresh(); }} />
+                        <ProfileRebinding
+                          node={node}
+                          profile={profile}
+                          inUse={nodeRuns.some(
+                            (run) => run.profile_id === profile.id && activeStates.has(run.state),
+                          )}
+                          changed={() => {
+                            profiles.refresh();
+                            nodes.refresh();
+                            details.refresh();
+                          }}
+                        />
                       </div>
                     ))}
                   </div>
@@ -848,7 +893,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                   <Empty
                     icon={Terminal}
                     title="尚无运行环境"
-                    description="在 Agent 配置中登记解释器、代码目录与适配器。"
+                    description="添加代码目录与 Python 环境后，即可在创建训练时选择。"
                   />
                 )}
               </Panel>
@@ -886,13 +931,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                   </div>
                   <div>
                     <dt>训练缓存根目录</dt>
-                    <dd>
-                      {node.cache_root ? (
-                        <code>{node.cache_root}</code>
-                      ) : (
-                        '默认跟随训练项目'
-                      )}
-                    </dd>
+                    <dd>{node.cache_root ? <code>{node.cache_root}</code> : '默认跟随训练项目'}</dd>
                   </div>
                   <div>
                     <dt>CPU 利用率</dt>
@@ -949,7 +988,17 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
       {can('machines.manage') && showTerminal && node && (
         <NodeTerminal node={node} close={() => setShowTerminal(false)} />
       )}
-      {showReservations && node && <GpuReservations key={node.id} node={node} close={() => setShowReservations(false)} changed={() => { details.refresh(); setReservationRevision((value) => value + 1); }} />}
+      {showReservations && node && (
+        <GpuReservations
+          key={node.id}
+          node={node}
+          close={() => setShowReservations(false)}
+          changed={() => {
+            details.refresh();
+            setReservationRevision((value) => value + 1);
+          }}
+        />
+      )}
     </>
   );
 }
@@ -971,6 +1020,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const [editingProfile, setEditingProfile] = useState<Asset>();
   const [bindingDataset, setBindingDataset] = useState<Asset>();
   const [templateAsset, setTemplateAsset] = useState<Asset>();
+  const [personalFormatsOpen, setPersonalFormatsOpen] = useState(false);
   const [detailId, setDetailId] = useState<string>();
   const detailAsset = assets.data?.find((asset) => asset.id === detailId);
   const [syncAsset, setSyncAsset] = useState<Asset>();
@@ -980,6 +1030,13 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [showArchived, setShowArchived] = useState(false);
+  const catalogProjection = useMemo(
+    () => datasetCatalogAssets(assets.data || [], showArchived),
+    [assets.data, showArchived],
+  );
+  const catalogAssets = catalogProjection.assets;
+  const selectableCatalogAssets = catalogProjection.selectionAssets;
+  const canTransferAssets = can('assets.transfer');
   const canWriteAssets = can('assets.write');
   const selectionOwner = user?.id || '';
   const filterKey = JSON.stringify([selectionOwner, kind, nodeId, query, showArchived]);
@@ -989,49 +1046,48 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
     );
   }, [filterKey]);
   const selectedSyncIds =
-    canWriteAssets && selectionOwner && syncSelection.owner === selectionOwner
-      ? reconcileBatchSyncSelection(syncSelection.ids, assets.data || [], nodes.data || [])
+    canTransferAssets && selectionOwner && syncSelection.owner === selectionOwner
+      ? reconcileBatchSyncSelection(syncSelection.ids, selectableCatalogAssets, nodes.data || [])
       : [];
   useEffect(() => {
     setSyncSelection((previous) => {
       const ids =
-        canWriteAssets && selectionOwner && previous.owner === selectionOwner
-          ? reconcileBatchSyncSelection(previous.ids, assets.data || [], nodes.data || [])
+        canTransferAssets && selectionOwner && previous.owner === selectionOwner
+          ? reconcileBatchSyncSelection(previous.ids, selectableCatalogAssets, nodes.data || [])
           : [];
       return previous.owner === selectionOwner &&
         JSON.stringify(previous.ids) === JSON.stringify(ids)
         ? previous
         : { owner: selectionOwner, ids };
     });
-    if (!canWriteAssets || batchSyncOwner !== selectionOwner) setBatchSyncOwner('');
-  }, [selectionOwner, canWriteAssets, assets.data, nodes.data, batchSyncOwner]);
+    if (!canTransferAssets || batchSyncOwner !== selectionOwner) setBatchSyncOwner('');
+  }, [selectionOwner, canTransferAssets, selectableCatalogAssets, nodes.data, batchSyncOwner]);
   useEffect(() => {
     if (canWriteAssets) return;
     setBatchRegister(false);
     setEditingProfile(undefined);
     setBindingDataset(undefined);
-    setTemplateAsset(undefined);
-    setSyncAsset(undefined);
     setArchiving(undefined);
   }, [canWriteAssets]);
-  const assetSearchText = (asset: Asset) =>
-    `${asset.name} ${asset.path} ${readDatasetProfile(asset.metadata?.dataset_profile)?.robot_type || ''} ${readDatasetProfile(asset.metadata?.dataset_profile)?.task_description || ''}`;
-  const scopedAssets = (assets.data || []).filter(
-    (asset) =>
-      (kind === 'ALL' || asset.kind === kind) &&
-      (!nodeId || asset.node_id === nodeId) &&
-      (showArchived || (asset.status || asset.state) !== 'ARCHIVED'),
+  useEffect(() => {
+    if (!canTransferAssets) setSyncAsset(undefined);
+    if (!can('dataset-templates.write')) {
+      setTemplateAsset(undefined);
+      setPersonalFormatsOpen(false);
+    }
+  }, [canTransferAssets, can]);
+  const assetSearchText = (asset: Asset) => {
+    const norm = catalogProjection.boundNorms.get(asset.id);
+    return `${asset.name} ${asset.path} ${readDatasetProfile(asset.metadata?.dataset_profile)?.robot_type || ''} ${readDatasetProfile(asset.metadata?.dataset_profile)?.task_description || ''} ${norm?.name || ''} ${norm?.path || ''}`;
+  };
+  const scopedAssets = catalogAssets.filter(
+    (asset) => (kind === 'ALL' || asset.kind === kind) && (!nodeId || asset.node_id === nodeId),
   );
-  const scopedEntries = groupDatasetNormAssets(
-    catalogAssetGroups(scopedAssets, assets.data || [], runs.data),
-  );
+  const scopedEntries = catalogAssetGroups(scopedAssets, assets.data || [], runs.data);
   const groupSearchText = new Map<string, string>();
   for (const entry of scopedEntries) {
     if (entry.kind === 'asset') continue;
-    const search =
-      entry.kind === 'dataset-group'
-        ? `${entry.name} ${entry.assets.map(assetSearchText).join(' ')}`
-        : entry.name;
+    const search = entry.name;
     for (const asset of entry.assets) groupSearchText.set(asset.id, search);
   }
   const filtered = scopedAssets.filter((asset) =>
@@ -1041,6 +1097,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   );
   const catalogEntries = groupDatasetNormAssets(
     catalogAssetGroups(filtered, assets.data || [], runs.data),
+    catalogProjection.boundNorms,
   );
   const catalogPage = paginateAssetCatalog(
     catalogEntries,
@@ -1059,15 +1116,26 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
     assetTableRef.current?.focus({ preventScroll: true });
   };
   const modelGroupCount = catalogEntries.filter((entry) => entry.kind === 'model-group').length;
-  const datasetGroupCount = catalogEntries.filter((entry) => entry.kind === 'dataset-group').length;
+  const datasetParentCount = catalogEntries.filter(
+    (entry) => entry.kind === 'dataset-group',
+  ).length;
   const groupSummary = [
+    datasetParentCount ? `${datasetParentCount} 个数据集` : '',
     modelGroupCount ? `${modelGroupCount} 个训练模型组` : '',
-    datasetGroupCount ? `${datasetGroupCount} 个数据集集合` : '',
   ]
     .filter(Boolean)
     .join('，');
-  const visibleSyncIds = catalogPage.assetIds.filter((id) =>
-    !batchSyncSourceError(assets.data?.find((asset) => asset.id === id), nodes.data || []),
+  const assetCount = new Set(
+    catalogEntries.flatMap((entry) =>
+      entry.kind === 'asset' ? [entry.asset.id] : entry.assets.map((asset) => asset.id),
+    ),
+  ).size;
+  const visibleSyncIds = catalogPage.assetIds.filter(
+    (id) =>
+      !batchSyncSourceError(
+        assets.data?.find((asset) => asset.id === id),
+        nodes.data || [],
+      ),
   );
   const selectedVisibleSyncCount = visibleSyncIds.filter((id) =>
     selectedSyncIds.includes(id),
@@ -1079,7 +1147,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       owner: selectionOwner,
       ids: toggleBatchSyncVisible(
         previous.owner === selectionOwner
-          ? reconcileBatchSyncSelection(previous.ids, assets.data || [], nodes.data || [])
+          ? reconcileBatchSyncSelection(previous.ids, selectableCatalogAssets, nodes.data || [])
           : [],
         visibleIds,
         checked,
@@ -1093,7 +1161,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           aria-label={`选择同步资产 ${asset.name}`}
           checked={selectedSyncIds.includes(asset.id)}
           disabled={
-            !canWriteAssets ||
+            !canTransferAssets ||
             !selectionOwner ||
             Boolean(batchSyncSourceError(asset, nodes.data || []))
           }
@@ -1146,7 +1214,12 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         <div className="asset-catalog-validation">
           <Badge
             state={asset.status || asset.state || 'REGISTERED'}
-            label={asset.kind === 'DATASET' && (asset.status || asset.state || 'REGISTERED') === 'REGISTERED' ? '已登记' : undefined}
+            label={
+              asset.kind === 'DATASET' &&
+              (asset.status || asset.state || 'REGISTERED') === 'REGISTERED'
+                ? '已登记'
+                : undefined
+            }
           />
           {asset.kind === 'DATASET' && <DatasetValidationBadge validation={asset.validation} />}
         </div>
@@ -1176,27 +1249,39 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         title="数据与模型"
         description="统一登记本地资产，清晰关联机器、训练与产出。"
         actions={
-          can('assets.write') && (
-            <>
+          <>
+            {can('dataset-templates.write') && (
               <button
                 type="button"
                 className="button outline"
-                disabled={!enabled || !nodes.data?.length}
-                onClick={() => setBatchRegister(true)}
+                onClick={() => setPersonalFormatsOpen(true)}
               >
-                <Database size={17} />
-                批量登记数据集
+                <FileSliders size={17} />
+                我的格式模板
               </button>
-              <button
-                className="button primary"
-                disabled={!enabled || !nodes.data?.length}
-                onClick={() => setRegister(true)}
-              >
-                <Plus size={17} />
-                登记资产
-              </button>
-            </>
-          )
+            )}
+            {can('assets.write') && (
+              <>
+                <button
+                  type="button"
+                  className="button outline"
+                  disabled={!enabled || !nodes.data?.length}
+                  onClick={() => setBatchRegister(true)}
+                >
+                  <Database size={17} />
+                  批量登记数据集
+                </button>
+                <button
+                  className="button primary"
+                  disabled={!enabled || !nodes.data?.length}
+                  onClick={() => setRegister(true)}
+                >
+                  <Plus size={17} />
+                  登记资产
+                </button>
+              </>
+            )}
+          </>
         }
       />
       <div className="info-strip">
@@ -1247,7 +1332,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           </div>
         </div>
       </div>
-      {canWriteAssets && (
+      {canTransferAssets && (
         <div className="batch-asset-selection" aria-label="资产批量选择">
           <span>
             已选择 {selectedSyncIds.length} 项 · 当前页 {selectedVisibleSyncCount} 项
@@ -1286,8 +1371,8 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       <div className="table-meta">
         <span>
           {groupSummary
-            ? `${catalogEntries.length} 项显示 · ${filtered.length} 个资产（${groupSummary}）`
-            : `${filtered.length} 项资产`}
+            ? `${catalogEntries.length} 项显示 · ${assetCount} 个资产（${groupSummary}）`
+            : `${assetCount} 项资产`}
         </span>
         <label className="checkbox-label">
           <input
@@ -1298,6 +1383,9 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           显示已归档
         </label>
       </div>
+      {kind === 'NORM' && (
+        <p className="field-hint">已绑定的 norm_stats 可展开对应数据集查看，此处仅列独立项。</p>
+      )}
       <ErrorNotice error={assets.error || error} retry={assets.refresh} />
       <div className="panel">
         {assets.loading && enabled && !assets.data ? (
@@ -1318,7 +1406,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                           input.indeterminate =
                             selectedVisibleSyncCount > 0 && !allVisibleSyncSelected;
                       }}
-                      disabled={!canWriteAssets || !selectionOwner || !visibleSyncIds.length}
+                      disabled={!canTransferAssets || !selectionOwner || !visibleSyncIds.length}
                       onChange={(event) =>
                         updateSyncSelection(visibleSyncIds, event.target.checked)
                       }
@@ -1344,7 +1432,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                     eligibleIds={entry.assets
                       .filter((asset) => visibleSyncIds.includes(asset.id))
                       .map((asset) => asset.id)}
-                    canSelect={canWriteAssets && Boolean(selectionOwner)}
+                    canSelect={canTransferAssets && Boolean(selectionOwner)}
                     onSelectionChange={updateSyncSelection}
                     renderAsset={renderAsset}
                     viewDataset={(dataset) => setDetailId(dataset.id)}
@@ -1395,7 +1483,9 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
               <ChevronLeft size={14} />
               上一页
             </button>
-            <span aria-live="polite">第 {catalogPage.page} / {catalogPage.totalPages} 页</span>
+            <span aria-live="polite">
+              第 {catalogPage.page} / {catalogPage.totalPages} 页
+            </span>
             <button
               type="button"
               className="button outline small"
@@ -1419,12 +1509,17 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         !templateAsset && (
           <AssetDetail
             asset={detailAsset}
-            datasetChoices={detailAsset.kind === 'DATASET' && detailAsset.norm_asset_id
-              ? (assets.data || []).filter((asset) =>
-                asset.kind === 'DATASET' && asset.node_id === detailAsset.node_id &&
-                asset.norm_asset_id === detailAsset.norm_asset_id &&
-                (showArchived || (asset.status || asset.state) !== 'ARCHIVED'))
-              : undefined}
+            datasetChoices={
+              detailAsset.kind === 'DATASET' && detailAsset.norm_asset_id
+                ? (assets.data || []).filter(
+                    (asset) =>
+                      asset.kind === 'DATASET' &&
+                      asset.node_id === detailAsset.node_id &&
+                      asset.norm_asset_id === detailAsset.norm_asset_id &&
+                      (showArchived || (asset.status || asset.state) !== 'ARCHIVED'),
+                  )
+                : undefined
+            }
             selectDataset={setDetailId}
             node={nodes.data?.find((node) => node.id === detailAsset.node_id)}
             assets={assets.data || []}
@@ -1441,7 +1536,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             }}
           />
         )}
-      {can('assets.write') && syncAsset && (
+      {can('assets.transfer') && syncAsset && (
         <AssetSyncDialog
           key={syncAsset.id}
           asset={syncAsset}
@@ -1453,7 +1548,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           }}
         />
       )}
-      {canWriteAssets && selectionOwner && batchSyncOwner === selectionOwner && (
+      {canTransferAssets && selectionOwner && batchSyncOwner === selectionOwner && (
         <BatchAssetSync
           assetIds={selectedSyncIds}
           close={() => setBatchSyncOwner('')}
@@ -1479,7 +1574,10 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           close={() => setBindingDataset(undefined)}
         />
       )}
-      {can('assets.write') && templateAsset && (
+      {can('dataset-templates.write') && personalFormatsOpen && (
+        <PersonalDatasetFormats close={() => setPersonalFormatsOpen(false)} />
+      )}
+      {can('dataset-templates.write') && templateAsset && (
         <DatasetFormatTemplateDialog
           key={templateAsset.id}
           asset={templateAsset}
@@ -1555,7 +1653,7 @@ function RegisterAsset(props: { close: () => void; initialNode?: string }) {
   if (!can('assets.write'))
     return (
       <Modal title="权限不足" close={props.close}>
-        登记资产需要操作员或管理员权限。
+        登记公共资产需要管理员权限。
       </Modal>
     );
   return <RegisterAssetContent {...props} />;
@@ -1592,7 +1690,10 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
   const nameEdited = useRef(false);
   const profileErrors =
     form.kind === 'DATASET' && !deferProfile ? datasetProfileErrors(datasetProfile) : [];
-  const normError = form.kind === 'DATASET' ? datasetNormInputError(form.node_id, normAssetId, normPath, assets.data || []) : undefined;
+  const normError =
+    form.kind === 'DATASET'
+      ? datasetNormInputError(form.node_id, normAssetId, normPath, assets.data || [])
+      : undefined;
   const set = (key: keyof typeof form, value: string) => {
     if (key === 'name') nameEdited.current = true;
     const fillName = key === 'path' && !nameEdited.current;
@@ -1613,9 +1714,11 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
       title="登记本地资产"
       wide
       className={`asset-register-modal ${showDatasetConfig ? '' : 'asset-register-simple'}`}
-      subtitle={form.kind === 'DATASET'
-        ? '登记后自动在后台执行基础校验，可在资产列表与详情查看结果。'
-        : '建立资产元数据与裸金属本地路径的关联。'}
+      subtitle={
+        form.kind === 'DATASET'
+          ? '登记后自动在后台执行基础校验，可在资产列表与详情查看结果。'
+          : '建立资产元数据与裸金属本地路径的关联。'
+      }
       close={() => {
         if (!pending.current) close();
       }}
@@ -1653,7 +1756,9 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
           try {
             await post('/assets', {
               ...form,
-              ...(form.kind === 'DATASET' ? datasetNormBindingPayload(normAssetId, normPath) : { norm_asset_id: null }),
+              ...(form.kind === 'DATASET'
+                ? datasetNormBindingPayload(normAssetId, normPath)
+                : { norm_asset_id: null }),
               metadata:
                 form.kind === 'DATASET' && !deferProfile
                   ? { dataset_profile: normalizedDatasetProfile(datasetProfile) }
@@ -1792,7 +1897,11 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
         </section>
         {showDatasetConfig && (
           <section className="asset-registration-features" aria-label="数据集配置">
-            <DatasetFormatTemplates value={datasetProfile} onApply={inspectionDraft.applyTemplate} disabled={busy} />
+            <DatasetFormatTemplates
+              value={datasetProfile}
+              onApply={inspectionDraft.applyTemplate}
+              disabled={busy}
+            />
             <DatasetProfileForm
               compact
               showTaskDescription={false}
@@ -1820,6 +1929,7 @@ const algorithmInfo: Record<string, { icon: typeof Workflow; color: string; text
   RECAP: { icon: ArrowDownRight, color: 'orange', text: 'VALUE-GUIDED TRAINING' },
   RLT: { icon: Sparkles, color: 'teal', text: 'REINFORCEMENT LEARNING' },
   SMOKE: { icon: Terminal, color: 'gray', text: 'CONTROL-PLANE SMOKE TEST' },
+  NORM: { icon: FileSliders, color: 'teal', text: 'NORMALIZATION STATISTICS' },
 };
 export function TemplatesPage({
   createRun,

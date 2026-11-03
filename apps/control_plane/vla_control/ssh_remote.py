@@ -34,6 +34,15 @@ class RemoteError(Exception):
         super().__init__(message)
 
 
+DEFAULT_AGENT_SERVICE_NAME = "termitech-vla-agent"
+
+
+def _agent_service_name(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
+        raise RemoteError("SSH_SERVICE_INVALID", "Agent 服务名需为 1 到 100 个字母、数字、下划线或连字符，不含 .service")
+    return value
+
+
 _INSTALL_PHASES = frozenset({"CHECKING", "ENVIRONMENT", "DEPENDENCIES", "PACKAGE", "VERIFY", "CONFIG", "SERVICE", "STARTING"})
 _OUTPUT_LIMIT = 256 * 1024
 _STREAM_LIMIT = 2 * 1024 * 1024
@@ -258,7 +267,7 @@ def installation_idle(prefix, proc_root=pathlib.Path('/proc')):
 
 
 _PROBE_SCRIPT = r'''
-import json, os, pathlib, platform, pwd, shutil, sqlite3, subprocess, sys
+import json, os, pathlib, platform, pwd, re, shutil, sqlite3, subprocess, sys
 ''' + _INSTALLATION_IDLE_SCRIPT + "\nupgrade_config_fields = " + repr(_UPGRADE_CONFIG_FIELDS) + "\nupgrade_profile_fields = " + repr(_UPGRADE_PROFILE_FIELDS) + r'''
 prefix = pathlib.Path(sys.argv[1])
 checks = []
@@ -268,6 +277,9 @@ check("linux", sys.platform == "linux", "目标系统需要 Linux")
 runtime_kind = sys.argv[2] if len(sys.argv) > 2 else "venv"
 conda = sys.argv[3] if len(sys.argv) > 3 else ""
 service_user = sys.argv[4] if len(sys.argv) > 4 else pwd.getpwuid(os.getuid()).pw_name
+service_name = sys.argv[5] if len(sys.argv) > 5 else 'termitech-vla-agent'
+if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', service_name):
+    raise ValueError('Invalid Agent service name')
 try:
     pwd.getpwnam(service_user)
     check("agent_user", True, "Agent 将使用 SSH 登录用户 " + service_user + " 运行")
@@ -289,8 +301,8 @@ for command in ("systemctl", "systemd-analyze", "git", "runuser", "tar", "sha256
     check(command, shutil.which(command) is not None, "检查系统命令 " + command)
 check("systemd", pathlib.Path("/run/systemd/system").is_dir(), "Agent 使用 systemd 常驻运行")
 check("installation_idle", installation_idle(prefix), "同一安装目录不能存在仍在执行的 Agent 安装进程；请等待完成后重试")
-result = {"hostname": platform.node(), "checks": checks}
-unit = "termitech-vla-agent.service"
+result = {"hostname": platform.node(), "service_name": service_name, "checks": checks}
+unit = service_name + ".service"
 service = subprocess.run(["systemctl", "show", unit, "--property=ExecStart", "--value"], capture_output=True, text=True) if shutil.which("systemctl") else None
 has_service = service is not None and service.returncode == 0 and bool(service.stdout.strip())
 if has_service:
@@ -300,6 +312,22 @@ if has_service:
     matches = bool(re.search(r"(?:^|[\s=;{])" + re.escape(expected) + r"(?:[\s;}\x00]|$)", service.stdout))
     check("service_location", matches, "已有 Agent 服务必须使用同一安装目录")
 old = prefix / "config/agent.json"
+if service_name != 'termitech-vla-agent' and old.exists():
+    # A custom unit must not adopt another Agent's existing program/state
+    # directory merely because its own unit name has not been created yet.
+    ownership = subprocess.run(['systemctl', 'show', '*.service', '--property=Id,ExecStart'],
+        capture_output=True, text=True, timeout=10)
+    exclusive = ownership.returncode == 0
+    expected = str(prefix / '.venv/bin/vla-agent')
+    configuration = str(old)
+    for block in ownership.stdout.split('\n\n'):
+        properties = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        startup = properties.get('ExecStart', '')
+        def contains(value):
+            return bool(re.search(r'(?:^|[\s=;{])' + re.escape(value) + r'(?:[\s;}\x00]|$)', startup))
+        if properties.get('Id') != unit and (contains(expected) or contains(configuration)):
+            exclusive = False
+    check('service_ownership', exclusive, '独立 Agent 服务必须使用未被其他服务占用的安装目录')
 if old.is_file():
     try:
         config = json.loads(old.read_text())
@@ -375,6 +403,32 @@ def safe_path(value):
         fail('AGENT_UNINSTALL_UNSAFE_PATH')
     return path
 
+MOUNTINFO_PATH = pathlib.Path('/proc/self/mountinfo')
+
+def require_no_mounted_components(paths):
+    # Bind mounts can share a device with their parent, so ismount() alone does
+    # not prove that moving a state directory will leave shared data untouched.
+    # Read the kernel's complete nested mount list before stopping any service.
+    if any(os.path.ismount(path) for path in paths):
+        fail('AGENT_UNINSTALL_SHARED_MOUNT')
+    try:
+        lines = MOUNTINFO_PATH.read_text().splitlines()
+    except OSError:
+        if sys.platform == 'linux':
+            fail('AGENT_UNINSTALL_SHARED_MOUNT')
+        return  # Non-Linux execution is only used by offline script tests.
+    for line in lines:
+        fields = line.partition(' - ')[0].split()
+        if len(fields) < 6:
+            fail('AGENT_UNINSTALL_SHARED_MOUNT')
+        # mountinfo escapes spaces, tabs, newlines and backslashes as octal.
+        raw = re.sub(r'\\([0-7]{3})', lambda match: chr(int(match.group(1), 8)), fields[4])
+        mount = pathlib.Path(raw)
+        if not mount.is_absolute():
+            fail('AGENT_UNINSTALL_SHARED_MOUNT')
+        if any(mount == path or path in mount.parents for path in paths):
+            fail('AGENT_UNINSTALL_SHARED_MOUNT')
+
 def command(*args, required=True):
     result = subprocess.run(list(args), capture_output=True, text=True, timeout=40)
     if required and result.returncode:
@@ -408,9 +462,11 @@ def require_idle(state, runtime_python=None):
     if count:
         fail('AGENT_ACTIVE_TASKS')
 
-def uninstall_agent(value, unit_directory=pathlib.Path('/etc/systemd/system')):
+def uninstall_agent(value, unit_directory=pathlib.Path('/etc/systemd/system'), service_name='termitech-vla-agent'):
     prefix = safe_path(value)
-    unit = 'termitech-vla-agent.service'
+    if not isinstance(service_name, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', service_name):
+        fail('AGENT_SERVICE_INVALID')
+    unit = service_name + '.service'
     config_path = prefix / 'config/agent.json'
     loaded = command('systemctl', 'show', unit, '--property=LoadState', '--value', required=False)
     if loaded.stdout.strip() == 'not-found':
@@ -482,6 +538,7 @@ def uninstall_agent(value, unit_directory=pathlib.Path('/etc/systemd/system')):
                      'instance-id', 'agent.lock', 'locks', 'runner-logs', 'runner-configs', 'dataset-validation-cache'}
     if not state.is_dir() or any(p.name not in allowed_state or p.is_symlink() for p in state.iterdir()):
         fail('AGENT_UNINSTALL_STATE_INVALID')
+    require_no_mounted_components([*components, *protected])
     agent_python = prefix / '.venv/bin/python'
     reader_python = str(agent_python) if agent_python.is_file() else sys.executable
     require_idle(state, reader_python)
@@ -492,6 +549,7 @@ def uninstall_agent(value, unit_directory=pathlib.Path('/etc/systemd/system')):
     try:
         # No Runner may have accepted a final command while stop was in progress.
         require_idle(state, reader_python)
+        require_no_mounted_components([*components, *protected])
     except UninstallError:
         if was_enabled:
             command('systemctl', 'enable', unit, required=False)
@@ -521,7 +579,7 @@ def uninstall_agent(value, unit_directory=pathlib.Path('/etc/systemd/system')):
 
 if __name__ == '__main__':
     try:
-        print(json.dumps(uninstall_agent(sys.argv[1])))
+        print(json.dumps(uninstall_agent(sys.argv[1], service_name=sys.argv[2] if len(sys.argv)>2 else 'termitech-vla-agent')))
     except UninstallError as error:
         print(json.dumps({'error': str(error)}))
     except Exception:
@@ -531,7 +589,8 @@ if __name__ == '__main__':
 
 class SSHRemote:
     def __init__(self, host: str, port: int, username: str, password: str,
-                 state_dir: str | Path, expected_fingerprint: str | None = None):
+                 state_dir: str | Path, expected_fingerprint: str | None = None,
+                 service_name: str = DEFAULT_AGENT_SERVICE_NAME):
         if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]+", host) or len(host) > 253:
             raise RemoteError("SSH_HOST_INVALID", "请输入有效的裸金属 IP 或主机名")
         if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
@@ -541,6 +600,7 @@ class SSHRemote:
         if not isinstance(password, str) or not password or len(password.encode()) > 4096 or "\n" in password or "\r" in password or "\x00" in password:
             raise RemoteError("SSH_PASSWORD_INVALID", "请输入有效的 SSH 密码")
         self.host, self.port, self.username = host, port, username
+        self.service_name = _agent_service_name(service_name)
         self._password, self.expected_fingerprint = password, expected_fingerprint
         self.state_dir = Path(state_dir)
         self.client = None
@@ -796,8 +856,11 @@ class SSHRemote:
             if found != existing_python:
                 return {"hostname": self.host, "checks": [root_check, selection_error], "can_install": False}
             runtime = {"kind": "existing", "python": existing_python, "conda": ""}
-        command = "env -u PYTHONHOME -u PYTHONPATH " + " ".join(shlex.quote(part) for part in (
-            runtime["python"], "-I", "-c", _PROBE_SCRIPT, prefix, runtime["kind"], runtime["conda"], self.username))
+        arguments = (runtime["python"], "-I", "-c", _PROBE_SCRIPT, prefix,
+                     runtime["kind"], runtime["conda"], self.username)
+        if self.service_name != DEFAULT_AGENT_SERVICE_NAME:
+            arguments += (self.service_name,)
+        command = "env -u PYTHONHOME -u PYTHONPATH " + " ".join(shlex.quote(part) for part in arguments)
         try:
             result = json.loads(self.run(command, sudo=privileged and not self._is_root))
             if not isinstance(result, dict) or not isinstance(result.get("checks"), list):
@@ -901,6 +964,7 @@ class SSHRemote:
             install_argv = (runtime["python"], "-I", "-u", temporary + "/install_agent.py",
                             "--runtime-kind", runtime["kind"], "--conda-executable", runtime["conda"],
                             "--service-user", self.username,
+                            "--service-name", self.service_name,
                             "--config", remote_config, "--prefix", prefix)
             command = ("umask 022; tar -xzf " + shlex.quote(remote_bundle) + " -C " + shlex.quote(temporary)
                        + " && env -u PYTHONHOME -u PYTHONPATH " + " ".join(shlex.quote(part) for part in install_argv))
@@ -917,7 +981,7 @@ class SSHRemote:
                         raise RemoteError(code, message)
                 raise RemoteError("AGENT_INSTALL_FAILED", f"Agent 安装失败（退出码 {status}），请查看部署日志中的具体错误；已有服务可能需要检查恢复")
             emit("starting", "正在确认 Agent 系统服务已启动")
-            status, _ = self._execute("systemctl is-active --quiet termitech-vla-agent.service", sudo=sudo)
+            status, _ = self._execute(shlex.join(("systemctl", "is-active", "--quiet", self.service_name + ".service")), sudo=sudo)
             if status:
                 raise RemoteError("AGENT_SERVICE_NOT_ACTIVE", "Agent 已安装，但系统服务未处于运行状态，请检查远程服务日志")
             emit("started", "Agent 系统服务已启动，等待机器向中台登记")
@@ -953,9 +1017,11 @@ class SSHRemote:
             raise RemoteError("AGENT_UNINSTALL_UNVERIFIED", "无法确认已有 Agent 配置和状态，已停止卸载")
         interpreter = probe.get("_maintenance_python") or self._select_runtime()["python"]
         emit("UNINSTALLING", "正在停止 Agent、移除系统服务并备份程序与身份状态")
-        command = "env -u PYTHONHOME -u PYTHONPATH " + " ".join(shlex.quote(part) for part in (interpreter, "-I", "-c", _UNINSTALL_SCRIPT, prefix))
+        command = "env -u PYTHONHOME -u PYTHONPATH " + " ".join(shlex.quote(part) for part in (interpreter, "-I", "-c", _UNINSTALL_SCRIPT, prefix, self.service_name))
         status, output = self._execute(command, sudo=not self._is_root, timeout=180)
         errors = {
+            "AGENT_SERVICE_INVALID": "Agent 服务名无效，已停止卸载",
+            "AGENT_UNINSTALL_SHARED_MOUNT": "Agent 状态包含共享挂载，请先解除测试实例的共享锁挂载后再卸载",
             "AGENT_ACTIVE_TASKS": "该 Agent 仍有活动或待对账任务，请先结束任务并完成对账",
             "AGENT_INSTALL_PATH_CONFLICT": "已有 Agent 服务使用其他安装目录，已停止卸载",
             "AGENT_UNINSTALL_UNVERIFIED": "无法确认标准 Agent 服务和配置，已停止卸载，请先检查现有安装",
