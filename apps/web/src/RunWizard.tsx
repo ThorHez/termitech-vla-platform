@@ -37,6 +37,7 @@ import { newDatasetBindings } from './datasetBindingHelpers';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { PreflightChecks } from './PreflightChecks';
 import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft';
+import { trainingTemplateEntry } from './trainingTemplateEntry';
 import type { ImageLayoutEdits } from './imageLayout';
 import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
 import { retryTrainingSnapshot, sameTrainingConfiguration } from './runRetry';
@@ -168,10 +169,69 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
     error?: Error;
   }>();
   const [sourceNotice, setSourceNotice] = useState<string>();
+  const initialTemplateSelection = useRef<string | undefined>(undefined);
+  const [consumedInitialTemplate, setConsumedInitialTemplate] = useState<string>();
+  const [entryTemplateAction, setEntryTemplateAction] = useState<{
+    state: 'loading' | 'error';
+    snapshot: TrainingDraftSnapshot;
+    template: Template;
+    error?: Error;
+  }>();
   const savedRevisionId = draft.initialSnapshot?.request.recipe_revision_id;
   const resources = [data.nodes, data.profiles, data.assets, data.templates];
   const resourceError = resources.find((resource) => resource.error)?.error;
   const ready = resources.every((resource) => resource.data !== undefined);
+  const loadEntryTemplate = useCallback(
+    async (snapshot: TrainingDraftSnapshot, template: Template) => {
+      setEntryTemplateAction({ state: 'loading', snapshot, template });
+      try {
+        const selected = trainingTemplateEntry(snapshot, template, {
+          assets: data.assets.data || [],
+          profiles: data.profiles.data || [],
+          nodes: data.nodes.data || [],
+        });
+        if (selected) await draft.replace(selected);
+        setEntryTemplateAction(undefined);
+      } catch (cause) {
+        setEntryTemplateAction({
+          state: 'error',
+          snapshot,
+          template,
+          error: cause instanceof Error ? cause : new Error(String(cause)),
+        });
+      }
+    },
+    [draft.replace, data.assets.data, data.profiles.data, data.nodes.data],
+  );
+  useEffect(() => {
+    if (
+      props.sourceRun ||
+      !props.initialTemplate ||
+      !draft.loaded ||
+      !ready ||
+      initialTemplateSelection.current === props.initialTemplate
+    )
+      return;
+    initialTemplateSelection.current = props.initialTemplate;
+    setConsumedInitialTemplate(props.initialTemplate);
+    const selected = data.templates.data?.find(
+      (item) => item.id === props.initialTemplate && item.status === 'AVAILABLE',
+    );
+    if (!selected) return;
+    if (draft.initialSnapshot && draft.initialSnapshot.request.template_id !== selected.id)
+      void loadEntryTemplate(draft.initialSnapshot, selected);
+  }, [
+    props.sourceRun,
+    props.initialTemplate,
+    draft.loaded,
+    ready,
+    draft.initialSnapshot,
+    data.templates.data,
+    data.assets.data,
+    data.profiles.data,
+    data.nodes.data,
+    loadEntryTemplate,
+  ]);
   const loadSource = useCallback(
     async (snapshot: TrainingDraftSnapshot) => {
       if (sourceImportInFlight.current) return;
@@ -315,6 +375,48 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
       </Modal>
     );
   }
+  if (
+    !props.sourceRun &&
+    ((props.initialTemplate && consumedInitialTemplate !== props.initialTemplate) ||
+      entryTemplateAction)
+  )
+    return (
+      <Modal
+        title={entryTemplateAction?.template.name || '载入模板'}
+        close={props.close}
+        footer={
+          entryTemplateAction?.state === 'error' ? (
+            <>
+              <button type="button" className="button outline" onClick={props.close}>
+                关闭
+              </button>
+              <button
+                type="button"
+                className="button primary"
+                onClick={() =>
+                  void loadEntryTemplate(entryTemplateAction.snapshot, entryTemplateAction.template)
+                }
+              >
+                重试载入模板
+              </button>
+            </>
+          ) : undefined
+        }
+      >
+        {entryTemplateAction?.state === 'error' ? (
+          <ErrorNotice
+            title="模板未载入"
+            error={entryTemplateAction.error}
+            hint="原草稿已保留，请先处理草稿同步问题或版本冲突，再重新载入模板。"
+          />
+        ) : (
+          <p className="training-draft-loading">
+            <LoaderCircle size={16} className="spin" />
+            正在载入所选模板与数据集配置…
+          </p>
+        )}
+      </Modal>
+    );
   return (
     <RestoredRunWizard
       key={`${draft.generation}:${savedRevisionId || ''}`}
