@@ -98,14 +98,24 @@ def test_norm_composite_action_cannot_hide_regular_action_chunks_inside_shared_v
     assert response.status_code == 422, response.text
 
 
-def test_sft_still_requires_explicit_joint_or_eef_even_when_source_vectors_are_composite(platform):
-    _, request, *_ = pending_composite_norm(platform)
+def test_sft_inherits_composite_fields_as_shared_raw_actions_and_keeps_training_vision(platform):
+    _, request, *_, profile = pending_composite_norm(platform)
     node, inputs, rows = configured(platform)
     processor = deepcopy(request['norm_datasets'][0]['processor'])
     processor['parameters']['composition']['cameras'] = description()['processing']['cameras']
     rows = rows[:1]
     rows[0].pop('recipe_index')
     rows[0]['processor'] = processor
+    response = platform.client.patch(f"/api/v1/assets/{rows[0]['dataset_asset_id']}/dataset-profile", headers=ADMIN,
+                                     json={'dataset_profile': profile})
+    assert response.status_code == 200, response.text
     response = request_preview(platform, node, inputs=inputs, dataset_bindings=rows)
-    assert response.status_code == 422, response.text
-    assert platform.commands(node) == []
+    assert response.status_code == 202, response.text
+    command = next(item for item in platform.commands(node) if item['type'] == 'PREFLIGHT')
+    composition = command['payload']['dataset_bindings'][0]['processor']['parameters']['composition']
+    assert composition['state_representation'] == composition['action_representation'] == 'composite'
+    assert composition['action_layout'] == [{'kind': 'shared', 'arm': 'shared', 'width': 14, 'normalize': True}]
+    assert composition['cameras'] == description()['processing']['cameras']
+    frozen = command['payload']['inputs']['dataset_0']['dataset_profile']
+    assert frozen['action_representation'] == 'unknown'
+    assert all(row['representation'] == 'composite' for row in frozen['field_annotations'])

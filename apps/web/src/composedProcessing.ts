@@ -162,7 +162,7 @@ export function composedProcessingErrors(
   if (value.schema_version !== 1) errors.push('组合处理仅支持版本 1。');
   if (!text(value.robot_model, 100)) errors.push('请填写组合处理的机器人型号。');
   if (!choice(value.arm_mode, ['single', 'bimanual'])) errors.push('请选择组合处理的单臂或双臂。');
-  const representations = purpose === 'norm' ? ['eef', 'joint', 'composite'] : ['eef', 'joint'];
+  const representations = ['eef', 'joint', 'composite'];
   if (!choice(value.state_representation, representations)) errors.push('请选择状态表示。');
   if (!choice(value.action_representation, representations)) errors.push('请选择动作表示。');
   if (!integer(value.state_history, 1, 64))
@@ -643,7 +643,6 @@ export function trainingCompositionDraft(
   const inferred = inferSourceActionLayout(profile, action.key);
   if (inferred.blocks) draft.action_layout = inferred.blocks;
   if (
-    purpose === 'norm' &&
     action.representation === 'composite' &&
     Number.isSafeInteger(inferred.width) &&
     inferred.width! > 0 &&

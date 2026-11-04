@@ -108,7 +108,9 @@ def normalize_composition(value, *, norm_stats=False):
     for key, choices in (("action_mode", {"absolute", "delta"}),
                          ("rotation_representation", {"axis_angle", "quaternion", "rotation_6d", "none"})):
         result[key] = _optional_unit(value.get(key), choices, key)
-    representations = {"eef", "joint", "composite"} if norm_stats else {"eef", "joint"}
+    # Composite is a declared, opaque source vector in training as well as
+    # statistics. It never supplies an inferred EEF/Joint interpretation.
+    representations = {"eef", "joint", "composite"}
     for key, choices in (("arm_mode", {"single", "bimanual"}), ("state_representation", representations),
                          ("action_representation", representations),
                          ("normalization", {"quantile", "zscore"}), ("model_transform", {"standard"})):
@@ -147,7 +149,7 @@ def normalize_composition(value, *, norm_stats=False):
         _fail("每个机械臂的动作分块类型不能重复")
     if result["action_representation"] == "composite" and (len(layout) != 1 or
             result["action_layout"][0]["kind"] != "shared"):
-        _fail("组合动作向量统计只能使用一个完整共享动作块，不能推断内部机械臂或分量布局")
+        _fail("组合动作向量只能使用一个完整共享动作块，不能推断内部机械臂或分量布局")
     # A shared block is an explicitly sized, unpartitioned raw action vector.
     # It never stands in for a missing per-arm block in a mixed layout.
     regular = [block for block in result["action_layout"] if block["kind"] != "shared"]

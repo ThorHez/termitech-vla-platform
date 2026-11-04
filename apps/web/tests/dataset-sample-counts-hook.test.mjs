@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -65,9 +66,23 @@ function App(){const[config,setConfig]=useState(window.__initial);
 window.__update=patch=>{if(Object.hasOwn(patch,'userId'))setSessionCsrf('fixture',patch.userId||undefined);setConfig(old=>({...old,...patch}));};
 return <AuthContext.Provider value={{user:config.userId?{id:config.userId}:undefined,loading:false,expired:false}}><Probe config={config}/></AuthContext.Provider>;}
 setSessionCsrf('fixture',window.__initial.userId);createRoot(document.getElementById('root')).render(<App/>);`;
+    const cacheDir = await mkdtemp(path.join(tmpdir(), 'vla-sample-counts-hook-'));
+    t.after(() => rm(cacheDir, { recursive: true, force: true }));
     const server = await createServer({
       root: fileURLToPath(new URL('..', import.meta.url)),
       configFile: false,
+      // Other test workers use different Vite configs; never replace their optimizer cache.
+      cacheDir,
+      optimizeDeps: {
+        noDiscovery: true,
+        include: [
+          'react',
+          'react-dom/client',
+          'react/jsx-runtime',
+          'react/jsx-dev-runtime',
+          'lucide-react',
+        ],
+      },
       resolve: { dedupe: ['react', 'react-dom'] },
       plugins: [
         react(),
@@ -108,8 +123,19 @@ setSessionCsrf('fixture',window.__initial.userId);createRoot(document.getElement
         contexts.push(context);
         const page = await context.newPage();
         const requests = [],
-          errors = [];
+          errors = [],
+          loadingErrors = [];
         page.on('pageerror', (error) => errors.push(error.message));
+        page.on('console', (message) => {
+          if (message.type() === 'error') loadingErrors.push(message.text());
+        });
+        page.on('requestfailed', (request) => {
+          loadingErrors.push(`${new URL(request.url()).pathname}: ${request.failure()?.errorText}`);
+        });
+        page.on('response', (response) => {
+          if (response.status() >= 400)
+            loadingErrors.push(`${new URL(response.url()).pathname}: HTTP ${response.status()}`);
+        });
         await page.addInitScript(
           (initial) => {
             window.__initial = initial;
@@ -145,7 +171,9 @@ setSessionCsrf('fixture',window.__initial.userId);createRoot(document.getElement
         try {
           await page.locator('#counts').waitFor({ timeout: 10000 });
         } catch (error) {
-          throw new Error(`${error.message}; page errors: ${errors.join('; ')}`);
+          throw new Error(
+            `${error.message}; page errors: ${errors.join('; ')}; loading errors: ${loadingErrors.join('; ')}`,
+          );
         }
         const wait = (predicate) => page.waitForFunction(predicate);
         const counts = () => page.locator('#counts').textContent().then(JSON.parse);

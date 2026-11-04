@@ -5,6 +5,7 @@ import pytest
 from vla_adapters.composition_spec import (normalize_composition, composition_choice, composition_digest,
     validate_composition_profile_input, verify_composition_metadata)
 from vla_adapters.dataset_contracts import verify_registered_dataset_profile
+from vla_adapters.data_processors import normalize_processor
 from vla_adapters.norm_datasets import normalize_norm_datasets
 from vla_adapters import norm_entry
 from vla_adapters.training_plan import dataset_contract
@@ -30,27 +31,51 @@ def opaque_source():
     return spec, declared, info
 
 
-def test_numeric_statistics_preserve_explicit_composite_source_labels_without_guessing_joint_or_eef(core):
+def training_source():
     spec, declared, info = opaque_source()
+    spec["cameras"] = deepcopy(profile()["processing"]["cameras"])
+    declared["cameras"] = [{"name": f"view-{index}", "key": camera["key"], "kind": camera["kind"]}
+                           for index, camera in enumerate(spec["cameras"])]
+    info["features"].update({camera["key"]: {"dtype": "image", "shape":
+        [3, 224, 224] if camera["layout"] == "chw" else [224, 224, 3]} for camera in spec["cameras"]})
+    info["features"][spec["prompt_key"]] = {"dtype": "string", "shape": [1]}
+    return spec, declared, info
+
+
+@pytest.mark.parametrize("norm_stats", [False, True])
+def test_training_and_statistics_preserve_composite_source_labels_without_guessing_joint_or_eef(core, norm_stats):
+    spec, declared, info = opaque_source() if norm_stats else training_source()
     original = deepcopy((spec, declared, info))
-    clean = normalize_composition(spec, norm_stats=True)
-    assert clean == core.normalize_composition(spec, norm_stats=True)
+    clean = normalize_composition(spec, norm_stats=norm_stats)
+    assert clean == core.normalize_composition(spec, norm_stats=norm_stats)
     assert clean["state_representation"] == clean["action_representation"] == "composite"
-    assert validate_composition_profile_input(declared, clean, norm_stats=True) == clean
-    assert verify_composition_metadata(clean, info, action_horizon=50, norm_stats=True) == clean
-    assert verify_registered_dataset_profile(declared, info, selected_composition=clean, norm_stats=True) == declared
-    choice = composition_choice({"processing": spec}, norm_stats=True)
-    assert normalize_norm_datasets([{"dataset_asset_id": "data", "processor": choice}])[0]["processor"] == choice
-    assert composition_digest(spec, norm_stats=True) == composition_digest(clean, norm_stats=True)
+    assert validate_composition_profile_input(declared, clean, norm_stats=norm_stats) == clean
+    assert verify_composition_metadata(clean, info, action_horizon=50, norm_stats=norm_stats) == clean
+    assert verify_registered_dataset_profile(declared, info, selected_composition=clean, norm_stats=norm_stats) == declared
+    choice = composition_choice({"processing": spec}, norm_stats=norm_stats)
+    if norm_stats:
+        assert normalize_norm_datasets([{"dataset_asset_id": "data", "processor": choice}])[0]["processor"] == choice
+    else:
+        assert normalize_processor(choice) == choice
+    assert composition_digest(spec, norm_stats=norm_stats) == composition_digest(clean, norm_stats=norm_stats)
     assert (spec, declared, info) == original
 
 
-@pytest.mark.parametrize("field", ["state_representation", "action_representation"])
-def test_composite_representation_never_relaxes_training_normalizers(core, field):
-    spec = deepcopy(profile()["processing"])
-    spec[field] = "composite"
+def test_composite_training_still_requires_vision_while_statistics_do_not(core):
+    spec, _, _ = opaque_source()
     for validate in [normalize_composition, core.normalize_composition]:
-        with pytest.raises(ValueError, match=field):
+        with pytest.raises(ValueError, match="视觉"):
+            validate(spec)
+        assert validate(spec, norm_stats=True)["cameras"] == []
+
+
+@pytest.mark.parametrize("field", ["state_representation", "action_representation"])
+@pytest.mark.parametrize("representation", ["unknown", "infer_joint"])
+def test_composite_support_does_not_accept_unknown_or_guessed_representations(core, field, representation):
+    spec, _, _ = training_source()
+    spec[field] = representation
+    for validate in [normalize_composition, core.normalize_composition]:
+        with pytest.raises(ValueError):
             validate(spec)
 
 
@@ -59,16 +84,19 @@ def test_composite_representation_never_relaxes_training_normalizers(core, field
     [{"arm": "shared", "kind": "shared", "width": 7, "normalize": False},
      {"arm": "left", "kind": "joint", "width": 7, "normalize": False}],
 ])
-def test_composite_action_requires_one_complete_shared_vector_in_both_runtimes(core, layout):
-    spec, _, _ = opaque_source(); spec["action_layout"] = layout
+@pytest.mark.parametrize("norm_stats", [False, True])
+def test_composite_action_requires_one_complete_shared_vector_in_both_runtimes(core, layout, norm_stats):
+    spec, _, _ = opaque_source() if norm_stats else training_source()
+    spec["action_layout"] = layout
     for validate in [normalize_composition, core.normalize_composition]:
         with pytest.raises(ValueError, match="完整共享动作块"):
-            validate(spec, norm_stats=True)
+            validate(spec, norm_stats=norm_stats)
 
 
 @pytest.mark.parametrize("change", ["state_width", "state_kind", "state_arm", "action_width", "action_mode", "action_source", "state_source", "horizon"])
-def test_composite_statistics_keep_source_identity_width_mode_and_horizon_checks(change):
-    spec, declared, info = opaque_source()
+@pytest.mark.parametrize("norm_stats", [False, True])
+def test_composite_training_and_statistics_keep_source_identity_width_mode_and_horizon_checks(change, norm_stats):
+    spec, declared, info = opaque_source() if norm_stats else training_source()
     if change == "state_width": spec["state_fields"][0]["width"] = 13
     elif change == "state_kind": spec["state_fields"][0]["kind"] = "joint"
     elif change == "state_arm": spec["state_fields"][0]["arm"] = "left"
@@ -78,8 +106,8 @@ def test_composite_statistics_keep_source_identity_width_mode_and_horizon_checks
     elif change == "state_source": declared["field_annotations"][0].update(representation="joint", component="joint")
     else: info["features"]["actions"]["shape"] = [49, 14]
     with pytest.raises(ValueError, match="COMPOSITION"):
-        validate_composition_profile_input(declared, spec, norm_stats=True)
-        verify_composition_metadata(spec, info, action_horizon=50, norm_stats=True)
+        validate_composition_profile_input(declared, spec, norm_stats=norm_stats)
+        verify_composition_metadata(spec, info, action_horizon=50, norm_stats=norm_stats)
 
 
 def test_automatic_norm_config_and_dataset_contract_keep_real_composite_labels(automatic_norm):
@@ -100,5 +128,5 @@ def test_automatic_norm_config_and_dataset_contract_keep_real_composite_labels(a
     assert frozen["action_horizon"] == 50 and frozen["action_dim"] == 32
     assert frozen["image_keys"] == frozen["depth_keys"] == []
     assert evidence["registered_profile"]["action_representation"] == "unknown"
-    with pytest.raises(ValueError, match="state_representation"):
+    with pytest.raises(ValueError, match="视觉"):
         dataset_contract(config.data, spec, declared, model_config=config.model, binding=selected)

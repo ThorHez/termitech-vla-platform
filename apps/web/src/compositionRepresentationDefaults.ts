@@ -11,9 +11,9 @@ const label = (value: CompositionRepresentation) =>
   value === 'eef' ? 'EEF' : value === 'joint' ? 'Joint' : '组合向量（多分量）';
 const supported = (
   value: unknown,
-  purpose: 'training' | 'norm',
+  _purpose: 'training' | 'norm',
 ): value is CompositionRepresentation =>
-  value === 'eef' || value === 'joint' || (purpose === 'norm' && value === 'composite');
+  value === 'eef' || value === 'joint' || value === 'composite';
 const sameKeys = (first: string[], second: string[]) =>
   first.length === second.length &&
   [...first].sort().every((key, index) => key === [...second].sort()[index]);
@@ -76,7 +76,7 @@ export function inferCompositionRepresentations(
         stateFacts,
         unknownStates,
         savedStates,
-        '所选状态字段未声明 EEF/Joint 表示，不能从动作表示、维数或机器人型号推断。',
+        '所选状态字段未声明 EEF/Joint/组合向量表示，不能从动作表示、维数或机器人型号推断。',
       )
     : { reason: '请先选择状态真实字段，再读取对应的表示标签。' };
 

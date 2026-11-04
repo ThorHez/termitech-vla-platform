@@ -67,15 +67,15 @@ try {
     const plain = html(DatasetFieldLabelsEditor, { value: [label('action', { representation: 'eef' })], onChange() {} });
     assert.doesNotMatch(plain, /aria-label="字段分量 1"[^>]*disabled=""/);
   });
-  await test('total width alone does not infer mixed action partitions or an EEF versus Joint representation', () => {
+  await test('explicit composite labels preserve the entire source vector without inferring EEF or Joint partitions', () => {
     const source = profile(), before = structuredClone(source);
     const inferred = processing.inferSourceActionLayout(source, 'actions');
     assert.equal(inferred.width, 10);
     assert.equal(inferred.blocks, undefined);
     const draft = processing.trainingCompositionDraft(source);
-    assert.equal(draft.action_representation, '');
-    assert.equal(draft.state_representation, '');
-    assert.equal(draft.action_layout[0].width, 0);
+    assert.equal(draft.action_representation, 'composite');
+    assert.equal(draft.state_representation, 'composite');
+    assert.deepEqual(draft.action_layout, [{ arm: 'shared', kind: 'shared', width: 10, normalize: true }]);
     assert.deepEqual(draft.state_fields, [{ key: 'observation.packed_state', width: 10, arm: 'left', kind: 'other', normalize: true }]);
     assert.deepEqual(source, before);
   });

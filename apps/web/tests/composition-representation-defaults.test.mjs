@@ -31,25 +31,28 @@ try {
     assert.deepEqual(spec.action_layout,[{arm:'shared',kind:'shared',width:14,normalize:true}]);
     assert.deepEqual(spec.state_fields,[{key:'observation.state',width:14,arm:'shared',kind:'other',normalize:true}]);
     assert.deepEqual(spec.cameras,[]);assert.deepEqual(processing.composedProcessingErrors(spec,'norm'),[]);
-    assert.ok(processing.composedProcessingErrors(spec).some(error=>error==='请选择状态表示。'));
+    assert.ok(processing.composedProcessingErrors(spec).some(error=>error.includes('视觉输入')));
     const train=processing.trainingCompositionDraft(seed);
-    assert.equal(train.state_representation,'');assert.equal(train.action_representation,'');
+    assert.equal(train.state_representation,'composite');assert.equal(train.action_representation,'composite');
+    assert.deepEqual(train.action_layout,spec.action_layout);
+    assert.equal(train.cameras.length,1,'SFT keeps registered visual inputs');
     assert.deepEqual(seed,before);
     seed.field_annotations[1].shape=undefined;
     assert.equal(processing.trainingCompositionDraft(seed,'norm').action_layout[0].width,0,'missing source width must never be guessed');
   });
 
-  await test('norm displays the composite choice while training retains only explicit EEF and Joint representations', () => {
+  await test('SFT and norm display inherited composite choices while retaining their distinct visual and normalization controls', () => {
     const seed=profile(), value=processing.trainingCompositionDraft(seed,'norm');
     const norm=renderToStaticMarkup(React.createElement(ComposedProcessingEditor,{value,profile:seed,purpose:'norm',onChange(){}}));
     const sft=renderToStaticMarkup(React.createElement(ComposedProcessingEditor,{value,profile:seed,onChange(){}}));
     for(const label of ['状态表示','组合动作表示']) {
       assert.match(fieldHtml(norm,label),/value="composite" selected="">组合向量（多分量）/);
-      assert.doesNotMatch(fieldHtml(sft,label),/value="composite"/);
-      assert.match(fieldHtml(sft,label),/value="" selected/);
+      assert.match(fieldHtml(sft,label),/value="composite" selected="">组合向量（多分量）/);
     }
     assert.match(norm,/observation.state 的登记标签/);assert.match(norm,/action 的登记标签/);
     assert.doesNotMatch(norm,/归一化状态字段|归一化动作分块|组合归一化方式|模型视觉槽位/);
+    assert.match(sft,/归一化状态字段|归一化动作分块/);
+    assert.match(sft,/视觉输入与模型槽位/);
   });
 
   await test('old blank choices are filled from selected labels without changing the existing shared layout or normalization settings', () => {
@@ -106,6 +109,7 @@ try {
 
   await test('matching legacy processing supplies only missing semantics and conflicts are not resolved by majority', () => {
     const seed=profile(), selected=processing.trainingCompositionDraft(seed,'norm');
+    for(const field of seed.field_annotations) field.representation='unknown';
     seed.processing={...structuredClone(selected),state_representation:'joint',action_representation:'eef',cameras:[]};
     const blank={...selected,state_representation:'',action_representation:''};
     const filled=helper.fillMissingCompositionRepresentations(blank,seed);
@@ -140,5 +144,65 @@ try {
     assert.equal(fillRunRepresentationDefaults(prepared,[dataset(seed)],new Set()),prepared,'already prepared configuration retains its identity');
     const manual=new Set(['state_representation','action_representation'].map(field=>helper.representationManualMarker(['node','data',0],field)));
     assert.equal(fillRunRepresentationDefaults(request,[dataset(seed)],manual),request);
+  });
+
+  await test('new SFT drafts inherit explicit composite fields as whole raw vectors and still require valid visual inputs', () => {
+    const seed=profile(), before=structuredClone(seed);
+    seed.image_features=[{key:'observation.images.wrist',dtype:'image',shape:[3,224,224]}];
+    const spec=processing.trainingCompositionDraft(seed);
+    assert.equal(spec.state_representation,'composite');assert.equal(spec.action_representation,'composite');
+    assert.deepEqual(spec.action_layout,[{arm:'shared',kind:'shared',width:14,normalize:true}]);
+    assert.deepEqual(spec.state_fields,[{key:'observation.state',width:14,arm:'shared',kind:'other',normalize:true}]);
+    assert.equal(spec.cameras[0].key,'observation.images.wrist');assert.equal(spec.cameras[0].layout,'chw');
+    assert.deepEqual(processing.composedProcessingErrors(spec),[]);
+    assert.deepEqual(processing.trainingCompositionProfileErrors(seed,spec),[]);
+    assert.ok(processing.composedProcessingErrors({...spec,cameras:[]}).some(error=>error.includes('视觉输入')));
+    const split={...spec,action_layout:[{arm:'left',kind:'joint',width:7,normalize:true},{arm:'right',kind:'joint',width:7,normalize:true}]};
+    assert.match(processing.composedProcessingErrors(split).join(),/一个共享动作分块/);
+    const wrong={...spec,action_layout:[{...spec.action_layout[0],width:13}]};
+    assert.match(processing.trainingCompositionProfileErrors(seed,wrong).join(),/动作分块总宽度/);
+    assert.deepEqual(seed.field_annotations,before.field_annotations,'initialization never relabels source facts');
+    seed.field_annotations[1].shape=undefined;
+    assert.equal(processing.trainingCompositionDraft(seed).action_layout[0].width,0,'missing real width is not inferred from action_dim');
+  });
+
+  await test('SFT restoration fills only blank representations and keeps manual selections, normalization and existing layout', () => {
+    const seed=profile(), composition=processing.trainingCompositionDraft(seed);
+    composition.state_representation='';composition.action_representation='';composition.normalization='zscore';
+    composition.action_layout[0].normalize=false;
+    const request={name:'SFT',node_id:'node',profile_id:'profile',template_id:'openpi-sft',inputs:{model:'model'},
+      dataset_bindings:[{dataset_asset_id:'data',norm_asset_id:'norm',weight:1,
+        processor:{name:'ComposableDataConfig',parameters:{composition}}}],
+      auto_config:{model_type:'pi05',finetune_mode:'full',action_horizon:50,action_dim:32},parameters:{batch_size:32},gpu_count:1};
+    const before=structuredClone(request), prepared=fillRunRepresentationDefaults(request,[dataset(seed)],new Set());
+    const restored=prepared.dataset_bindings[0].processor.parameters.composition;
+    assert.equal(restored.state_representation,'composite');assert.equal(restored.action_representation,'composite');
+    assert.deepEqual(restored.action_layout,composition.action_layout);
+    assert.deepEqual(restored.cameras,composition.cameras);assert.equal(restored.normalization,'zscore');
+    assert.deepEqual(request,before);
+    const snapshot={request:prepared,step:0,advancedRecipe:false,editedParameters:[],editedStageParameters:[],entrypointEdited:false};
+    assert.deepEqual(decodeTrainingDraft(encodeTrainingDraft(snapshot)),snapshot);
+    const manual=new Set(['state_representation','action_representation'].map(field=>helper.representationManualMarker(['node','data',0],field)));
+    assert.equal(fillRunRepresentationDefaults(request,[dataset(seed)],manual),request);
+    const explicit={...restored,state_representation:'joint',action_representation:'eef',action_layout:[{arm:'right',kind:'position',width:14,normalize:false}]};
+    assert.equal(helper.fillMissingCompositionRepresentations(explicit,seed),explicit,'existing user choices and layout remain intact');
+  });
+
+  await test('SFT never invents composite, EEF or Joint from a robot name, total width, mixed labels or conflicting saved semantics', () => {
+    const seed=profile();
+    for(const field of seed.field_annotations) field.representation='unknown';
+    let spec=processing.trainingCompositionDraft(seed);
+    assert.equal(spec.state_representation,'');assert.equal(spec.action_representation,'');assert.equal(spec.action_layout[0].width,0);
+    seed.field_annotations[0].representation='eef';
+    seed.field_annotations.push({...seed.field_annotations[0],key:'other.state',representation:'joint'});
+    spec=processing.trainingCompositionDraft(seed);
+    assert.equal(spec.state_representation,'');
+    assert.match(helper.inferCompositionRepresentations(seed,spec).state_representation.reason,/冲突/);
+    const known=profile(), knownSpec=processing.trainingCompositionDraft(known);
+    known.processing={...structuredClone(knownSpec),state_representation:'joint',action_representation:'eef'};
+    const evidence=helper.inferCompositionRepresentations(known,knownSpec);
+    assert.equal(evidence.state_representation.value,undefined);assert.equal(evidence.action_representation.value,undefined);
+    assert.match(evidence.state_representation.reason,/冲突/);assert.match(evidence.action_representation.reason,/冲突/);
+    assert.equal(helper.fillMissingCompositionRepresentations({...knownSpec,state_representation:'',action_representation:''},known).state_representation,'');
   });
 } finally { await server.close(); }

@@ -195,7 +195,7 @@ export function ComposedProcessingEditor({
             value={
               value.state_representation === 'eef' ||
               value.state_representation === 'joint' ||
-              (purpose === 'norm' && value.state_representation === 'composite')
+              value.state_representation === 'composite'
                 ? value.state_representation
                 : ''
             }
@@ -209,7 +209,7 @@ export function ComposedProcessingEditor({
             <option value="">请选择状态表示</option>
             <option value="eef">EEF · 末端状态</option>
             <option value="joint">Joint · 关节状态</option>
-            {purpose === 'norm' && <option value="composite">组合向量（多分量）</option>}
+            <option value="composite">组合向量（多分量）</option>
           </select>
         </Field>
         <Field
@@ -221,7 +221,7 @@ export function ComposedProcessingEditor({
             value={
               value.action_representation === 'eef' ||
               value.action_representation === 'joint' ||
-              (purpose === 'norm' && value.action_representation === 'composite')
+              value.action_representation === 'composite'
                 ? value.action_representation
                 : ''
             }
@@ -235,7 +235,7 @@ export function ComposedProcessingEditor({
             <option value="">请选择动作表示</option>
             <option value="eef">EEF · 末端动作</option>
             <option value="joint">Joint · 关节动作</option>
-            {purpose === 'norm' && <option value="composite">组合向量（多分量）</option>}
+            <option value="composite">组合向量（多分量）</option>
           </select>
         </Field>
       </div>

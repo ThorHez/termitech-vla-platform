@@ -117,7 +117,7 @@ try {
   await test('unconfirmed representations select a visible placeholder and remain required without defaulting to EEF', async () => {
     const { ComposedProcessingEditor } = await server.ssrLoadModule('/src/ComposedProcessingEditor.tsx');
     for (const [key, label, requiredError] of representationFields) {
-      for (const unconfirmed of ['', 'unknown', 'composite', null, undefined, 42]) {
+      for (const unconfirmed of ['', 'unknown', null, undefined, 42]) {
         const draft = { ...clone(spec), [key]: unconfirmed };
         const before = clone(draft);
         const html = renderToStaticMarkup(React.createElement(ComposedProcessingEditor, {

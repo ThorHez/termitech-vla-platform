@@ -116,8 +116,15 @@ def test_packed_label_does_not_skip_real_metadata_or_horizon_validation():
 
 
 @pytest.mark.parametrize("field", ["state_representation", "action_representation"])
-def test_composite_is_a_source_tag_not_a_new_training_target_representation(field):
-    declared, _, selected = packed_source()
+def test_explicit_composite_labels_can_be_retained_by_training_without_inventing_physical_components(field):
+    declared, info, selected = packed_source()
+    original = deepcopy(declared)
     selected[field] = "composite"
-    with pytest.raises(ValueError, match="COMPOSITION_INVALID"):
-        validate_composition_profile_input(declared, selected)
+    if field == "action_representation":
+        with pytest.raises(ValueError, match="完整共享动作块"):
+            validate_composition_profile_input(declared, selected)
+        selected["action_layout"] = [{"arm": "shared", "kind": "shared", "width": 10, "normalize": True}]
+    assert validate_composition_profile_input(declared, selected) == selected
+    assert verify_composition_metadata(selected, info, action_horizon=16) == selected
+    assert declared == original
+    assert declared["action_representation"] == "unknown"
