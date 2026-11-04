@@ -62,11 +62,22 @@ class Config:
 def training(tmp_path, monkeypatch):
     # These fixture files exercise plan assembly, not Parquet decoding. Actual
     # timestamp reads and failure cases have real-file tests in their own suite.
-    monkeypatch.setattr(training_plan, "inspect_dataset_timestamps", lambda data, spec: {
+    monkeypatch.setattr(training_plan, "require_cached_dataset_timestamps", lambda data, spec: {
         "schema_version": 1, "status": "verified", "checked_rows": data["frames"],
+        "checked_episodes": data["episodes"], "metadata_sha256": data["metadata_sha256"],
         "effective_fps": data.get("effective_fps"), "data_manifest_digest": data["data_manifest_digest"]})
-    monkeypatch.setattr(training_plan, "inspect_composed_samples_isolated", lambda factory, config, spec, data: {
-        "schema_version": 1, "status": "verified" if "composition" in data else "not_applicable"})
+    def registered_source(data, spec):
+        # Plan-assembly fixtures represent completed registration; real private
+        # receipt identity/missing cases are tested by the cache/integration suite.
+        info = json.loads((Path(data["path"]) / "meta/info.json").read_text())
+        fields = {key: {"shape": field["shape"], "dtype": "float32"}
+                  for key, field in info["features"].items() if "shape" in field}
+        indices = sorted({0, data["frames"] // 2, data["frames"] - 1})
+        return {"schema_version": 1, "status": "verified", "path": data["path"],
+                "raw_samples": {"selection": "first_middle_last", "checked_samples": len(indices),
+                                "sample_indices": indices, "samples": [
+                                    {"index": index, "fields": fields} for index in indices]}}
+    monkeypatch.setattr(training_plan, "require_cached_dataset_source", registered_source)
     # The generic fixture has no real OpenPI processors. Its tests exercise
     # adapter plan assembly; metadata-only startup planning has dedicated
     # actual-helper tests in test_auto_training_normalization.py.
@@ -83,7 +94,7 @@ def training(tmp_path, monkeypatch):
     for name in ("old", "new1", "new2"):
         path = tmp_path / name
         (path / "meta").mkdir(parents=True)
-        (path / "meta/info.json").write_text(json.dumps({"total_frames": 20, "total_episodes": 2,
+        (path / "meta/info.json").write_text(json.dumps({"total_frames": 20, "total_episodes": 2, "fps": 20.0,
             "features": {"actions": {"shape": [16, 10]}}}))
         (path / "data").mkdir()
         (path / "data/episode_000000.parquet").write_bytes(b"PAR1-dataset-fixture-PAR1")
@@ -148,21 +159,21 @@ def test_real_timestamp_failure_is_reported_before_model_or_cache_validation(tra
     def mismatch(data, spec):
         raise ValueError("DATASET_TIMESTAMPS_INVALID: 生效 20 Hz，实测帧间隔 0.016667 秒")
 
-    monkeypatch.setattr(training_plan, "inspect_dataset_timestamps", mismatch)
+    monkeypatch.setattr(training_plan, "require_cached_dataset_timestamps", mismatch)
     monkeypatch.setattr(training_plan, "model_contract", lambda *_: pytest.fail("Do not continue after invalid timestamps"))
     with pytest.raises(ValueError, match="DATASET_TIMESTAMPS_INVALID"):
         inspect_training_config(config, training[1], checks=checks)
     assert checks[-1]["name"] == "dataset_timestamps" and checks[-1]["ok"] is False
 
 
-def test_decoded_sample_failure_blocks_before_model_or_cache_validation(training, monkeypatch):
+def test_missing_base_validation_blocks_before_model_or_cache_validation(training, monkeypatch):
     config = resolve(training)
     checks = []
     def mismatch(*args):
-        raise ValueError("DATASET_SAMPLE_INVALID: sample=0 camera=front actual=[3,224,224] declared=hwc")
-    monkeypatch.setattr(training_plan, "inspect_composed_samples_isolated", mismatch)
+        raise ValueError("DATASET_BASE_VALIDATION_REQUIRED: 请先完成基础校验")
+    monkeypatch.setattr(training_plan, "require_cached_dataset_source", mismatch)
     monkeypatch.setattr(training_plan, "model_contract", lambda *_: pytest.fail("Do not continue after a sample failure"))
-    with pytest.raises(ValueError, match="DATASET_SAMPLE_INVALID"):
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED"):
         inspect_training_config(config, training[1], checks=checks)
     assert checks[-1]["name"] == "dataset_samples" and checks[-1]["ok"] is False
 

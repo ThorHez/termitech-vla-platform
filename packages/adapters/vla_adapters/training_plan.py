@@ -1,7 +1,7 @@
 """Bounded local contract checks, executed only by the training interpreter.
 
-This inspects configuration, metadata, file manifests and bounded decoded
-samples. It neither initializes CUDA nor loads model tensors, constructs a
+This inspects configuration, metadata, file manifests and previously registered
+source evidence. Submission never loads or decodes training samples. It neither initializes CUDA nor loads model tensors, constructs a
 batched dataloader, or performs an SGD step.
 """
 
@@ -25,9 +25,8 @@ if __package__:
     from .dataset_bindings import validate_binding_assets
     from .dataset_contracts import verify_registered_dataset_profile
     from .dataset_fps import resolve_registered_fps
-    from .dataset_timestamps import inspect_dataset_timestamps
-    from .dataset_samples import inspect_composed_samples_isolated
-    from .dataset_validation_cache import get_or_validate
+    from .dataset_timestamps import require_cached_dataset_timestamps
+    from .submission_validation import MODE, require_cached_dataset_source, submission_evidence
     from .entrypoints import read_entrypoint, validate_entrypoint
     from .recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
     from .runtime_options import normalize_normalization_method
@@ -40,9 +39,8 @@ else:
     from dataset_bindings import validate_binding_assets
     from dataset_contracts import verify_registered_dataset_profile
     from dataset_fps import resolve_registered_fps
-    from dataset_timestamps import inspect_dataset_timestamps
-    from dataset_samples import inspect_composed_samples_isolated
-    from dataset_validation_cache import get_or_validate
+    from dataset_timestamps import require_cached_dataset_timestamps
+    from submission_validation import MODE, require_cached_dataset_source, submission_evidence
     from entrypoints import read_entrypoint, validate_entrypoint
     from recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
     from runtime_options import normalize_normalization_method
@@ -581,11 +579,11 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
     passed("data_contract", "已核对所有数据集的 LeRobot 元数据与 parquet 文件：" + "、".join(d["path"] for d in datasets))
     for data in datasets:
         try:
-            data["timestamp_contract"] = inspect_dataset_timestamps(data, spec)
+            data["timestamp_contract"] = require_cached_dataset_timestamps(data, spec)
         except ValueError as exc:
             checks.append({"name": "dataset_timestamps", "ok": False, "message": str(exc)[:2000]})
             raise
-    passed("dataset_timestamps", "已按本次生效 FPS 和训练加载器容差，逐帧核对所有数据集的真实时间戳")
+    passed("dataset_timestamps", "已复用与当前数据、生效 FPS 及加载器容差匹配的基础时间戳校验结果")
     automatic_norm = multi and getattr(config.data, "auto_shared_norm", False) is True and len(factories) > 1
     for data, factory in zip(datasets, factories):
         data.update(reference_norm_contract(factory, spec) if automatic_norm else
@@ -615,50 +613,14 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             data["recipe_index"] = binding["recipe_index"]
     passed("norm_contract", ("已核对参考统计；训练启动前将按本次数据与权重完整计算一份共享统计，所有数据集统一使用"
                              if automatic_norm else "所有数据集归一化统计可读，数值有限且维度一致"))
-    sampled = 0
-    for index, (data, factory) in enumerate(zip(datasets, factories)):
+    for data in datasets:
         try:
-            def context():
-                model = getattr(config, "model", None)
-                return {"composition": data.get("composition"),
-                        "factory_composition": getattr(factory, "composition", None),
-                        "binding": bindings[index] if bindings is not None else {"recipe_index": 0},
-                        "norm_path": data.get("norm_path"),
-                        "model_type": type(model).__module__ + "." + type(model).__qualname__,
-                        "model": {key: getattr(model, key, None) for key in (
-                            "action_horizon", "action_dim", "pi05", "image_keys", "depth_keys",
-                            "allow_all_masked_images", "discrete_state_input", "max_token_len")},
-                        "stage": spec.get("training_stage"), "stage_config": spec.get("stage_config"),
-                        "acp_dropout": getattr(factory, "acp_dropout", None)}
-            validate = lambda: inspect_composed_samples_isolated(factory, config, spec, data)
-            evidence = (get_or_validate("samples", data, spec, validate, context=context)
-                        if "composition" in data else validate())
-            expected_status = "verified" if "composition" in data else "not_applicable"
-            if not isinstance(evidence, dict) or evidence.get("status") != expected_status:
-                raise ValueError("DATASET_SAMPLE_CHECK_UNAVAILABLE: 真实样本检查未返回完整证据")
-            if expected_status == "verified":
-                # Decoder reads must not reuse evidence for files or transforms
-                # changed while the bounded sample subprocess was running.
-                path = Path(data["path"])
-                _, metadata_sha = read_json(path / "meta/info.json", spec)
-                _, _, manifest = file_manifest(path / "data", spec)
-                source = Path(spec["code_dir"]) / data["composition"]["source"]["path"]
-                unchanged = (metadata_sha == data["metadata_sha256"]
-                             and manifest == data["data_manifest_digest"]
-                             and hashlib.sha256(source.read_bytes()).hexdigest() == data["composition"]["source"]["sha256"])
-                if "video_manifest_digest" in data:
-                    unchanged = unchanged and file_manifest(path / "videos", spec)[2] == data["video_manifest_digest"]
-                current_norm = reference_norm_contract(factory, spec) if automatic_norm else norm_contract(factory, spec)
-                unchanged = unchanged and current_norm == {key: data[key] for key in current_norm}
-                if not unchanged:
-                    raise ValueError("DATASET_SAMPLE_INVALID: 样本检查期间数据、归一化参数或处理源码已改变，请重新预检")
-            data["sample_probe"] = evidence
-            sampled += expected_status == "verified"
+            source = require_cached_dataset_source(data, spec)
+            data["submission_validation"] = submission_evidence(data, source)
         except ValueError as exc:
             checks.append({"name": "dataset_samples", "ok": False, "message": str(exc)[:2000]})
             raise
-    passed("dataset_samples", (f"已对 {sampled} 组组合数据执行有限真实样本解码、重排、数据处理和模型视觉输入校验；未加载模型或执行训练"
-                               if sampled else "本配方未使用组合处理器，组合样本检查不适用；其他检查仍按各自范围执行"))
+    passed("dataset_samples", "已复用数据集基础校验结果，并检查本次字段组合、相机映射和模型配置；提交阶段未重新加载或解码数据")
     stage, stage_config = stage_request(spec)
     stage_contract = inspect_stage(config, spec, factories, datasets)
     if stage_contract is not None:
@@ -692,11 +654,11 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "parameters": spec["parameters"], "gpu_count": spec["gpu_count"], "entrypoint": str(entry),
             "entrypoint_sha256": hashlib.sha256(read_entrypoint(entry)).hexdigest(),
             "adapter_sha256": fingerprint({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py")}),
-            "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
+                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "submission_validation.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py")}),
+            "data_validation_mode": MODE, "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),
             **({"auto_shared_norm": True} if automatic_norm else {}),
             "normalization": normalization,
             "model": model, "storage": storage_estimate(config, model, reference), "training_cache": cache,
-            "evidence_scope": "metadata hashes, file path/size/mtime manifests, all source timestamp/episode rows, and bounded decoded samples for composable processing; model tensors and training steps are not loaded"}
+            "evidence_scope": "metadata hashes, file path/size/mtime manifests, cached registered source/timestamp validation, and current configuration contracts; submission does not reload source rows, decode samples, or execute transforms; training validates actual transformed samples at runtime"}

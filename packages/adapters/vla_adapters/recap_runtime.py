@@ -14,10 +14,12 @@ from pathlib import Path
 if __package__:
     from .composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
     from .cache_contract import _managed_path
+    from .dataset_validation_cache import get_or_validate, lookup_cached
     from .recap import validate_training_stage
 else:
     from composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
     from cache_contract import _managed_path
+    from dataset_validation_cache import get_or_validate, lookup_cached
     from recap import validate_training_stage
 
 
@@ -129,14 +131,17 @@ def _parquet_evidence(path, required, supervised, *, stage, value_min, value_max
     indices = sorted({round(i * (len(files) - 1) / min(15, len(files) - 1))
                       for i in range(min(16, len(files)))}) if len(files) > 1 else [0]
     rows = []
+    summary = {key: {"min": None, "max": None, "count": 0} for key in supervised}
     deadline = time.monotonic() + 15
     for index in indices:
         if time.monotonic() > deadline:
             raise ValueError("RECAP_DATA_SCAN_LIMIT: 阶段数据列检查超时")
         file = files[index]
+        source = None
         try:
             source = parquet.ParquetFile(file)
-            missing = sorted(set(required) - set(source.schema_arrow.names))
+            columns = sorted(source.schema_arrow.names)
+            missing = sorted((set(required) | set(supervised)) - set(columns))
             if missing:
                 raise ValueError(f"RECAP_DATA_SCHEMA_INVALID: {file} 缺少阶段数据列：{', '.join(missing)}")
             batch = next(iter(source.iter_batches(batch_size=64, columns=supervised)), None)
@@ -148,15 +153,85 @@ def _parquet_evidence(path, required, supervised, *, stage, value_min, value_max
                     number = _scalar(raw)
                     if key == "is_positive" and number not in (0, 1):
                         raise ValueError(f"RECAP_LABEL_INVALID: {file} 的 is_positive 必须为 0 或 1；请先完成离线优势标注")
-                    if key == "value_target" and not value_min <= number <= value_max:
+                    if key == "value_target" and value_min is not None and value_max is not None and not value_min <= number <= value_max:
                         raise ValueError(f"RECAP_LABEL_INVALID: {file} 的 value_target 超出 [{value_min}, {value_max}]")
-            rows.append({"path": str(file.relative_to(path)), "sample_rows": batch.num_rows})
+                    measured = summary[key]
+                    measured["min"] = number if measured["min"] is None else min(measured["min"], number)
+                    measured["max"] = number if measured["max"] is None else max(measured["max"], number)
+                    measured["count"] += 1
+            rows.append({"path": str(file.relative_to(path)), "sample_rows": batch.num_rows, "columns": columns})
         except ValueError:
             raise
         except Exception as exc:
             raise ValueError(f"RECAP_DATA_SCHEMA_INVALID: 无法读取阶段数据列 {file}: {exc}") from exc
+        finally:
+            close = getattr(source, "close", None)
+            if callable(close):
+                close()
+    if "is_positive" in summary:
+        summary["is_positive"]["binary"] = True
     return {"parquet_files": len(files), "checked_files": rows,
+            "supervision_summary": summary,
             "scope": "bounded parquet schema and first 64 supervision rows from up to 16 evenly spaced files"}
+
+
+_SUPERVISION_CONTEXT = {"scope": "recap_supervision"}
+
+
+def prepare_source_supervision(data, spec, info):
+    """Measure optional ReCap labels only during the dataset's basic validation."""
+    features = info.get("features", {})
+    supervised = [key for key in ("value_target", "is_positive") if key in features]
+    if not supervised:
+        return None
+
+    def validate():
+        return {"schema_version": 1, "status": "verified", "path": data["path"],
+                **_parquet_evidence(data["path"], supervised, supervised, stage="source",
+                                    value_min=None, value_max=None)}
+
+    return get_or_validate("source", data, spec, validate, context=_SUPERVISION_CONTEXT)
+
+
+def _base_validation_required(dataset):
+    raise ValueError("DATASET_BASE_VALIDATION_REQUIRED: 数据集 " + str(dataset.get("path", ""))[:512]
+                     + " 的 ReCap 监督基础校验证据缺失或已失效，请先在数据集配置中执行基础校验，再重新提交训练")
+
+
+def require_cached_supervision(dataset, spec):
+    """Read an existing source-bound label receipt; never scan or load on a miss."""
+    evidence = lookup_cached("source", dataset, spec, context=_SUPERVISION_CONTEXT)
+    if (not isinstance(evidence, dict) or evidence.get("schema_version") != 1
+            or evidence.get("status") != "verified" or evidence.get("path") != dataset.get("path")):
+        _base_validation_required(dataset)
+    checked = evidence.get("checked_files")
+    summary = evidence.get("supervision_summary")
+    if (type(evidence.get("parquet_files")) is not int or not isinstance(checked, list)
+            or not 1 <= len(checked) <= min(16, evidence["parquet_files"])
+            or not isinstance(summary, dict) or not summary or set(summary) - {"value_target", "is_positive"}):
+        _base_validation_required(dataset)
+    count = 0
+    for row in checked:
+        if not isinstance(row, dict):
+            _base_validation_required(dataset)
+        path = row.get("path")
+        columns = row.get("columns")
+        if (not isinstance(path, str) or Path(path).is_absolute() or ".." in Path(path).parts
+                or not path.startswith("data/") or not path.endswith(".parquet")
+                or type(row.get("sample_rows")) is not int or not 1 <= row["sample_rows"] <= 64
+                or not isinstance(columns, list) or not columns
+                or any(not isinstance(column, str) or not column for column in columns)
+                or len(set(columns)) != len(columns) or not set(summary) <= set(columns)):
+            _base_validation_required(dataset)
+        count += row["sample_rows"]
+    for key, measured in summary.items():
+        if (not isinstance(measured, dict) or type(measured.get("count")) is not int or measured["count"] != count
+                or any(type(measured.get(bound)) not in (int, float) or not math.isfinite(measured[bound])
+                       for bound in ("min", "max")) or measured["min"] > measured["max"]
+                or (key == "is_positive" and (measured.get("binary") is not True
+                                              or measured["min"] not in (0, 1) or measured["max"] not in (0, 1)))):
+            _base_validation_required(dataset)
+    return evidence
 
 
 def _value_runtime_cache(spec):
@@ -222,10 +297,22 @@ def inspect_stage(config, spec, factories, datasets):
         if mapping.get(required_supervision) != required_supervision:
             raise ValueError("RECAP_DATA_SCHEMA_UNSUPPORTED: 阶段监督字段必须保留标准列名")
         supervised = [key for key in ("value_target", "is_positive") if key in required]
+        cached = require_cached_supervision(dataset, spec)
+        summary = cached["supervision_summary"]
+        if not set(supervised) <= set(summary):
+            _base_validation_required(dataset)
+        for checked in cached["checked_files"]:
+            missing = sorted(set(required) - set(checked["columns"]))
+            if missing:
+                raise ValueError("RECAP_DATA_SCHEMA_INVALID: " + checked["path"]
+                                 + " 的基础校验证据缺少阶段数据列：" + ", ".join(missing))
+        if "value_target" in supervised and not minimum <= summary["value_target"]["min"] <= summary["value_target"]["max"] <= maximum:
+            raise ValueError(f"RECAP_LABEL_INVALID: {dataset['path']} 的 value_target 超出 [{minimum}, {maximum}]")
         row = {"path": dataset["path"], "required_columns": required,
                "supervision_columns": supervised,
-               **_parquet_evidence(dataset["path"], required, supervised, stage=stage,
-                                   value_min=minimum, value_max=maximum)}
+               "parquet_files": cached["parquet_files"], "checked_files": cached["checked_files"],
+               "supervision_summary": {key: summary[key] for key in supervised},
+               "scope": "reused bounded supervision evidence from dataset basic validation; no Parquet rows read at submission"}
         if stage == "offline_rl":
             row["acp_dropout"] = factory.acp_dropout
         rows.append(row)

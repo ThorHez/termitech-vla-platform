@@ -1,5 +1,7 @@
 import copy
 import dataclasses
+import hashlib
+import json
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
@@ -68,9 +70,12 @@ def recap(training, monkeypatch):
         (Path(spec["code_dir"]) / "scripts" / entry).write_text(
             "raise AssertionError('preflight must not execute entry')\n"
             "def main(config): pass\ndef init_wandb(*a, **kw): pass\n")
-    monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda path, required, supervised, **kw: {
-        "parquet_files": 1, "checked_files": [{"path": "data/episode_000000.parquet", "sample_rows": 20}],
-        "scope": "unit fixture"})
+    monkeypatch.setattr(recap_runtime, "require_cached_supervision", lambda dataset, spec: {
+        "parquet_files": 1, "checked_files": [{"path": "data/episode_000000.parquet", "sample_rows": 20,
+            "columns": ["actions", "value_target", "is_positive", "episode_index", "frame_index"]}],
+        "supervision_summary": {"value_target": {"min": -0.8, "max": 0., "count": 20},
+                                "is_positive": {"min": 0, "max": 1, "count": 20, "binary": True}},
+        "scope": "existing basic validation unit fixture"})
     return base, spec, module, loaders
 
 
@@ -253,3 +258,122 @@ def test_inherited_value_validation_parameters_must_be_valid(recap, key, value):
     setattr(base, key, value)
     with pytest.raises(ValueError, match="RECAP_STAGE_CONFIG_INVALID"):
         resolve_config(base, spec, module, loaders)
+
+
+@pytest.fixture
+def supervision_source(training, monkeypatch):
+    _, spec, *_ = training
+    code = Path(spec["code_dir"])
+    for relative in ("src/openpi", "third_party/lerobot/lerobot", "packages/openpi-client"):
+        source = code / relative / "implementation.py"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("VERSION = 1\n")
+    path = Path(spec["inputs"]["dataset_0"]["path"])
+    info = json.loads((path / "meta/info.json").read_text())
+    info["fps"] = 20
+    info["features"].update(value_target={"shape": [1], "dtype": "float32"},
+                            is_positive={"shape": [1], "dtype": "float32"})
+    (path / "meta/info.json").write_text(json.dumps(info))
+    spec["validation_cache_dir"] = str(code.parent / "supervision-receipts")
+    data = {"path": str(path), "frames": info["total_frames"], "episodes": info["total_episodes"],
+            "effective_fps": 20, "metadata_sha256": hashlib.sha256((path / "meta/info.json").read_bytes()).hexdigest(),
+            "data_manifest_digest": training_plan.file_manifest(path / "data", spec)[2]}
+    install_fake_parquet(monkeypatch, names=["actions", "episode_index", "frame_index", "value_target", "is_positive"],
+                         values={"value_target": [-1.25, 0.25], "is_positive": [0, 1]})
+    monkeypatch.setenv("HOME", str(code.parent / "home"))
+    return data, spec, info
+
+
+def test_basic_supervision_records_observed_range_and_binary_labels_without_training_clip(supervision_source):
+    data, spec, info = supervision_source
+    evidence = recap_runtime.prepare_source_supervision(data, spec, info)
+    assert evidence["status"] == "verified"
+    assert evidence["supervision_summary"]["value_target"] == {"min": -1.25, "max": 0.25, "count": 2}
+    assert evidence["supervision_summary"]["is_positive"] == {"min": 0, "max": 1, "count": 2, "binary": True}
+    assert evidence["checked_files"][0]["sample_rows"] == 2
+    assert "actions" in evidence["checked_files"][0]["columns"]
+    assert recap_runtime.require_cached_supervision(data, spec) == evidence
+
+
+def test_value_submission_reuses_receipt_and_checks_current_range_without_parquet_reads(supervision_source, monkeypatch):
+    data, spec, info = supervision_source
+    recap_runtime.prepare_source_supervision(data, spec, info)
+    monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda *a, **kw: pytest.fail("Submission must not read Parquet rows"))
+    monkeypatch.setattr(sys.modules["pyarrow.parquet"], "ParquetFile", lambda *a, **kw: pytest.fail("No Parquet constructor at submission"))
+    factory = ValueFactory(data["path"], Assets(data["path"]))
+    config = ReCapConfig(data=factory, model=Pi0ValueConfig(value_min=-2., value_max=1.),
+                         weight_loader=CheckpointWeightLoaderWithValueHead("weights"))
+    spec.update(template_id="recap", training_stage="value", stage_config={})
+    first = recap_runtime.inspect_stage(config, spec, [factory], [data])
+    assert first == recap_runtime.inspect_stage(config, spec, [factory], [data])
+    assert first["value_range"] == [-2., 1.]
+    assert first["datasets"][0]["supervision_summary"]["value_target"]["min"] == -1.25
+    config.model = Pi0ValueConfig(value_min=-1., value_max=0.)
+    with pytest.raises(ValueError, match="RECAP_LABEL_INVALID.*value_target"):
+        recap_runtime.inspect_stage(config, spec, [factory], [data])
+
+
+def test_offline_submission_reuses_binary_receipt_without_scanning_data(supervision_source, monkeypatch):
+    data, spec, info = supervision_source
+    recap_runtime.prepare_source_supervision(data, spec, info)
+    monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda *a, **kw: pytest.fail("No late supervision scanning"))
+    factory = ACPFactory(data["path"], Assets(data["path"]))
+    config = ReCapConfig(data=factory, model=Pi0Config(),
+                         weight_loader=CheckpointWeightLoaderWithGripperHead("weights"))
+    spec.update(template_id="recap", training_stage="offline_rl", stage_config={})
+    result = recap_runtime.inspect_stage(config, spec, [factory], [data])
+    assert result["datasets"][0]["supervision_columns"] == ["is_positive"]
+    assert result["datasets"][0]["supervision_summary"]["is_positive"]["binary"] is True
+
+
+@pytest.mark.parametrize("case", ["missing", "changed_data", "changed_metadata", "changed_fps"])
+def test_missing_or_stale_supervision_requires_basic_validation_without_fallback(supervision_source, monkeypatch, case):
+    data, spec, info = supervision_source
+    if case != "missing":
+        recap_runtime.prepare_source_supervision(data, spec, info)
+    if case == "changed_data":
+        (Path(data["path"]) / "data/episode_000000.parquet").write_bytes(b"new source")
+    elif case == "changed_metadata":
+        (Path(data["path"]) / "meta/info.json").write_text(json.dumps({**info, "fps": 25}))
+    elif case == "changed_fps":
+        data["effective_fps"] = 25
+    monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda *a, **kw: pytest.fail("No fallback scan on missing/stale receipt"))
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED.*基础校验"):
+        recap_runtime.require_cached_supervision(data, spec)
+
+
+def test_basic_validation_rejects_nonbinary_labels_and_submission_checks_actual_columns(supervision_source, monkeypatch):
+    data, spec, info = supervision_source
+    install_fake_parquet(monkeypatch, names=["actions", "value_target", "is_positive"],
+                         values={"value_target": [-0.5], "is_positive": [0.4]})
+    with pytest.raises(ValueError, match="RECAP_LABEL_INVALID.*is_positive"):
+        recap_runtime.prepare_source_supervision(data, spec, info)
+    assert not list(Path(spec["validation_cache_dir"]).glob("*.json"))
+    install_fake_parquet(monkeypatch, names=["value_target", "is_positive"],
+                         values={"value_target": [-0.5], "is_positive": [1]})
+    recap_runtime.prepare_source_supervision(data, spec, info)
+    factory = ACPFactory(data["path"], Assets(data["path"]))
+    config = ReCapConfig(data=factory, model=Pi0Config())
+    spec.update(template_id="recap", training_stage="offline_rl", stage_config={})
+    monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda *a, **kw: pytest.fail("No fallback for missing stage columns"))
+    with pytest.raises(ValueError, match="RECAP_DATA_SCHEMA_INVALID.*actions"):
+        recap_runtime.inspect_stage(config, spec, [factory], [data])
+
+
+def test_basic_supervision_retains_sixteen_file_and_sixty_four_row_coverage(supervision_source, monkeypatch):
+    data, spec, info = supervision_source
+    root = Path(data["path"])
+    for index in range(1, 20):
+        (root / "data" / f"episode_{index:06d}.parquet").write_bytes(b"bounded supervision fixture")
+    info["total_frames"] = data["frames"] = 20 * 64
+    (root / "meta/info.json").write_text(json.dumps(info))
+    data["metadata_sha256"] = hashlib.sha256((root / "meta/info.json").read_bytes()).hexdigest()
+    data["data_manifest_digest"] = training_plan.file_manifest(root / "data", spec)[2]
+    install_fake_parquet(monkeypatch, names=["value_target", "is_positive"],
+                         values={"value_target": [-0.5] * 64, "is_positive": [0, 1] * 32})
+    evidence = recap_runtime.prepare_source_supervision(data, spec, info)
+    assert evidence["parquet_files"] == 20 and len(evidence["checked_files"]) == 16
+    assert evidence["checked_files"][0]["path"].endswith("episode_000000.parquet")
+    assert evidence["checked_files"][-1]["path"].endswith("episode_000019.parquet")
+    assert all(row["sample_rows"] == 64 for row in evidence["checked_files"])
+    assert evidence["supervision_summary"]["value_target"]["count"] == 16 * 64

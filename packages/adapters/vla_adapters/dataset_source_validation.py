@@ -20,12 +20,14 @@ if __package__:
     from .dataset_timestamps import inspect_dataset_timestamps
     from .dataset_validation_cache import cache_key, get_or_validate
     from .training_plan import file_manifest, fingerprint, local_path, read_json
+    from .recap_runtime import prepare_source_supervision
 else:
     from cache_contract import configure_cache
     from dataset_fps import install_registered_fps
     from dataset_timestamps import inspect_dataset_timestamps
     from dataset_validation_cache import cache_key, get_or_validate
     from training_plan import file_manifest, fingerprint, local_path, read_json
+    from recap_runtime import prepare_source_supervision
 
 
 PREFIX = "VLA_DATASET_VALIDATION:"
@@ -109,6 +111,7 @@ def validate_source(spec):
                 if not video.is_relative_to(path / "videos") or relative not in available:
                     raise ValueError("DATASET_SOURCE_INVALID: 视频路径逃逸或文件缺失")
     timestamps = inspect_dataset_timestamps(data, spec)
+    supervision = prepare_source_supervision(data, spec, info)
     context = {"scope": "dataset_source"}
     sampled = get_or_validate("source", data, spec, lambda: _raw_samples(path, info), context=context)
     source_id = cache_key("source", data, spec, context=context)
@@ -128,6 +131,7 @@ def validate_source(spec):
     return {"schema_version": 1, "scope": "dataset_source", "path": str(path),
             "profile_id": spec["profile_id"], "source_fingerprint": source_id,
             "checks": checks, "timestamp_contract": timestamps, "raw_samples": sampled["raw_samples"],
+            **({"recap_supervision": supervision} if supervision is not None else {}),
             "runtime": {"python_executable": sys.executable, "python_version": platform.python_version(),
                         "loader_path": str(loader), "loader_sha256": hashlib.sha256(loader.read_bytes()).hexdigest(),
                         "validator_path": runtime["validator_path"], "validator_sha256": runtime["validator_sha256"]}}

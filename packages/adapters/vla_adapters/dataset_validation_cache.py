@@ -1,8 +1,9 @@
 """Private, content/configuration-bound receipts for successful data checks.
 
-Receipts are an optimization, never a source of validation authority supplied by
-the client. Missing, unsafe or corrupt caches fall back to the actual validator.
-Evidence is returned unchanged so cache hits cannot change execution-plan digests.
+Receipts are never validation authority supplied by the client. Registration can
+refresh missing evidence with get_or_validate; lookup_cached only reads existing
+evidence and never falls back to a validator. Evidence is returned unchanged so
+cache hits cannot change execution-plan digests.
 """
 
 from contextlib import contextmanager
@@ -349,6 +350,31 @@ def _write(directory, filename, kind, key, evidence):
             os.unlink(temporary, dir_fd=directory)
         except FileNotFoundError:
             pass
+
+
+def lookup_cached(kind, data, spec, *, context=None):
+    """Read stable successful evidence without creating or refreshing anything.
+
+    The receipt must already exist in the Agent's private cache. Both source
+    fingerprints are freshly computed; missing, unsafe, corrupt or changed
+    evidence is a miss. In particular, this path creates no directory or lock
+    and never invokes a dataset validator, loader or decoder.
+    """
+    key = cache_key(kind, data, spec, context=context)
+    if key is None:
+        return None
+    try:
+        directory = _open_path(_managed(spec["validation_cache_dir"], spec), directory=True)
+        try:
+            details = os.fstat(directory)
+            if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o700:
+                raise _UnsafeCache()
+            evidence = _read(directory, kind + "-" + key + ".json", kind, key)
+            return evidence if cache_key(kind, data, spec, context=context) == key else None
+        finally:
+            os.close(directory)
+    except (OSError, ValueError, TypeError, KeyError, RecursionError, _UnsafeCache):
+        return None
 
 
 def get_or_validate(kind, data, spec, validate, *, context=None):

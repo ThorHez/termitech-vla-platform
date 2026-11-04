@@ -215,6 +215,25 @@ def inspect_dataset_timestamps(data, spec):
                            lambda: _inspect_dataset_timestamps(data, spec), context=context)
 
 
+def require_cached_dataset_timestamps(data, spec):
+    """Require registration's existing timestamp proof without scanning rows."""
+    if __package__:
+        from .dataset_validation_cache import lookup_cached
+    else:
+        from dataset_validation_cache import lookup_cached
+
+    def context():
+        runtime, tolerance = _runtime()
+        return {"runtime": runtime, "tolerance_s": tolerance}
+
+    evidence = lookup_cached("timestamps", data, spec, context=context)
+    if evidence is None:
+        _fail("数据集 " + str(data.get("path", ""))[:512]
+              + " 的基础校验证据缺失或已失效，请先在数据集配置中执行基础校验，再重新提交训练",
+              "DATASET_BASE_VALIDATION_REQUIRED")
+    return evidence
+
+
 def _inspect_dataset_timestamps(data, spec):
     """Verify every timestamp pair under the exact effective FPS declaration."""
     deadline = time.monotonic() + SCAN_SECONDS

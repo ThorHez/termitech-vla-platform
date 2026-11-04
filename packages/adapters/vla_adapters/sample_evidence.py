@@ -1,8 +1,10 @@
-"""Validate positive, task-bound evidence from decoded composition samples.
+"""Validate source reuse or historical decoded-sample evidence.
 
 This validates the evidence envelope at Agent and control-plane boundaries. The
 native sample probe remains responsible for decoding and executing transforms.
 """
+
+from .submission_validation import MODE, validate_submission_evidence
 
 
 COMPOSABLE_PROCESSOR = "ComposableDataConfig"
@@ -18,6 +20,17 @@ def validate_sample_evidence(plan):
     datasets = plan.get("datasets") if isinstance(plan, dict) else None
     if not isinstance(datasets, list):
         raise ValueError("missing datasets for decoded sample evidence")
+    mode = plan.get("data_validation_mode")
+    if mode is not None:
+        if mode != MODE or not datasets:
+            raise ValueError("invalid submission data validation mode")
+        for dataset in datasets:
+            if not isinstance(dataset, dict) or "sample_probe" in dataset:
+                raise ValueError("invalid registered source submission evidence")
+            validate_submission_evidence(dataset)
+        return
+    if any(isinstance(dataset, dict) and "submission_validation" in dataset for dataset in datasets):
+        raise ValueError("missing submission data validation mode")
     bindings = plan.get("dataset_bindings")
     for position, dataset in enumerate(datasets):
         if not isinstance(dataset, dict):

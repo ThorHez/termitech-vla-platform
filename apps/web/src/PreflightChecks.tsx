@@ -10,7 +10,7 @@ const labels: Record<string, string> = {
   data_contract: '数据集与数据协议',
   dataset_fps: '数据集采样频率',
   dataset_timestamps: '真实数据时间戳与采样率',
-  dataset_samples: '真实样本解码与数据处理',
+  dataset_samples: '基础校验证据与数据处理配置',
   norm_contract: '归一化参数',
   model_checkpoint: '模型检查点',
   training_entrypoint: '训练入口',

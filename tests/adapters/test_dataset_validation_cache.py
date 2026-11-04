@@ -300,6 +300,164 @@ def test_change_after_reading_a_hit_cannot_return_old_evidence(source, monkeypat
     assert len(calls) == 2
 
 
+@pytest.mark.parametrize("kind", ["timestamps", "samples", "source"])
+def test_lookup_reuses_matching_receipt_with_only_readonly_opens(source, monkeypatch, kind):
+    data, spec = source
+    options = {"context": context(data)} if kind == "samples" else {}
+    cache.get_or_validate(kind, data, spec, success, **options)
+    directory = Path(spec["validation_cache_dir"])
+    before = {path.name: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
+              for path in directory.iterdir()}
+    original_open = cache.os.open
+
+    def readonly_open(path, flags, *args, **kwargs):
+        assert not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND)
+        return original_open(path, flags, *args, **kwargs)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("lookup must not validate, create directories, write receipts or acquire locks")
+
+    monkeypatch.setattr(cache.os, "open", readonly_open)
+    for name in ("_cache_directory", "_lock", "_write", "get_or_validate"):
+        monkeypatch.setattr(cache, name, forbidden)
+    monkeypatch.setattr(cache.os, "mkdir", forbidden)
+    monkeypatch.setattr(cache.fcntl, "flock", forbidden)
+    assert cache.lookup_cached(kind, data, spec, **options) == success()
+    after = {path.name: (path.read_bytes(), path.stat().st_mtime_ns, path.stat().st_ctime_ns)
+             for path in directory.iterdir()}
+    assert after == before
+
+
+def test_lookup_missing_cache_never_creates_directory_or_falls_back(source, monkeypatch):
+    data, spec = source
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("a cache miss must remain a read-only miss")
+
+    monkeypatch.setattr(cache.os, "mkdir", forbidden)
+    monkeypatch.setattr(cache, "get_or_validate", forbidden)
+    assert cache.lookup_cached("source", data, spec) is None
+    assert not Path(spec["validation_cache_dir"]).exists()
+    assert cache.lookup_cached("source", data, {**spec, "validation_cache_dir": None}) is None
+
+
+@pytest.mark.parametrize("bad", [b"not JSON", b"[]", b'{"evidence":{}}'])
+def test_lookup_corrupt_receipt_is_a_miss_without_repair(source, bad):
+    data, spec = source
+    cache.get_or_validate("source", data, spec, success)
+    receipt = next(Path(spec["validation_cache_dir"]).glob("*.json"))
+    receipt.write_bytes(bad)
+    assert cache.lookup_cached("source", data, spec) is None
+    assert receipt.read_bytes() == bad
+
+
+@pytest.mark.parametrize("unsafe", ["directory-mode", "receipt-mode", "directory-link", "receipt-link", "receipt-hardlink"])
+def test_lookup_unsafe_cache_cannot_authorize_reuse_or_change_files(source, tmp_path, unsafe):
+    data, spec = source
+    cache.get_or_validate("source", data, spec, success)
+    directory = Path(spec["validation_cache_dir"])
+    receipt = next(directory.glob("*.json"))
+    original = receipt.read_bytes()
+    if unsafe == "directory-mode":
+        directory.chmod(0o755)
+    elif unsafe == "receipt-mode":
+        receipt.chmod(0o644)
+    elif unsafe == "directory-link":
+        real = tmp_path / "moved-receipts"
+        directory.rename(real)
+        directory.symlink_to(real, target_is_directory=True)
+    elif unsafe == "receipt-link":
+        real = tmp_path / "moved-receipt.json"
+        receipt.rename(real)
+        receipt.symlink_to(real)
+    else:
+        os.link(receipt, tmp_path / "another-receipt.json")
+    assert cache.lookup_cached("source", data, spec) is None
+    assert receipt.read_bytes() == original
+
+
+@pytest.mark.parametrize("relative", ["meta/episodes.jsonl", "data/episode.parquet", "videos/camera.mp4"])
+def test_lookup_changed_source_requires_new_evidence_without_validation(source, relative):
+    data, spec = source
+    cache.get_or_validate("source", data, spec, success)
+    path = Path(data["path"]) / relative
+    path.write_bytes(path.read_bytes() + b"changed")
+    assert cache.lookup_cached("source", data, spec) is None
+
+
+def test_lookup_rechecks_fresh_source_after_reading_receipt(source, monkeypatch):
+    data, spec = source
+    cache.get_or_validate("source", data, spec, success)
+    original = cache._read
+
+    def read(*args):
+        result = original(*args)
+        (Path(data["path"]) / "data/episode.parquet").write_bytes(b"changed-during-lookup")
+        return result
+
+    monkeypatch.setattr(cache, "_read", read)
+    assert cache.lookup_cached("source", data, spec) is None
+
+
+def test_lookup_rechecks_callable_context_after_reading_receipt(source, monkeypatch):
+    data, spec = source
+    runtime = {"tolerance_s": 1e-4}
+    cache.get_or_validate("timestamps", data, spec, success, context=lambda: runtime)
+    original = cache._read
+
+    def read(*args):
+        result = original(*args)
+        runtime["tolerance_s"] = 1e-3
+        return result
+
+    monkeypatch.setattr(cache, "_read", read)
+    assert cache.lookup_cached("timestamps", data, spec, context=lambda: runtime) is None
+
+
+def test_required_timestamps_reuses_registration_context_without_scanning_rows(source, monkeypatch):
+    data, spec = source
+    runtime = {"source_sha256": "actual-runtime"}
+    tolerance = 1e-4
+    monkeypatch.setattr(dataset_timestamps, "_runtime", lambda: (runtime, tolerance))
+    registered = deepcopy(spec)
+    registered["registered_profile"] = registered["inputs"]["dataset"].pop("dataset_profile")
+    cache.get_or_validate("timestamps", data, registered, success,
+                          context={"runtime": runtime, "tolerance_s": tolerance})
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("training must not scan timestamps or refresh registration evidence")
+
+    monkeypatch.setattr(dataset_timestamps, "_inspect_dataset_timestamps", forbidden)
+    monkeypatch.setattr(cache, "get_or_validate", forbidden)
+    assert dataset_timestamps.require_cached_dataset_timestamps(data, spec) == success()
+
+
+@pytest.mark.parametrize("missing", ["directory", "receipt", "cache-disabled", "source-changed", "tolerance-changed"])
+def test_required_timestamps_missing_or_stale_evidence_directs_to_base_validation(source, monkeypatch, missing):
+    data, spec = source
+    runtime = {"tolerance_s": 1e-4}
+    monkeypatch.setattr(dataset_timestamps, "_runtime", lambda: ({"source_sha256": "actual-runtime"}, runtime["tolerance_s"]))
+    if missing != "directory":
+        cache.get_or_validate("timestamps", data, spec, success,
+                              context={"runtime": {"source_sha256": "actual-runtime"}, "tolerance_s": runtime["tolerance_s"]})
+    if missing == "receipt":
+        next(Path(spec["validation_cache_dir"]).glob("*.json")).unlink()
+    elif missing == "cache-disabled":
+        spec["validation_cache_dir"] = None
+    elif missing == "source-changed":
+        (Path(data["path"]) / "videos/camera.mp4").write_bytes(b"changed")
+    elif missing == "tolerance-changed":
+        runtime["tolerance_s"] = 1e-3
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("training must not scan timestamps or refresh registration evidence")
+
+    monkeypatch.setattr(dataset_timestamps, "_inspect_dataset_timestamps", forbidden)
+    monkeypatch.setattr(cache, "get_or_validate", forbidden)
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED.*请先.*基础校验"):
+        dataset_timestamps.require_cached_dataset_timestamps(data, spec)
+
+
 def test_cross_process_requests_share_one_full_validation(source, tmp_path):
     data, spec = source
     request = tmp_path / "request.json"
@@ -342,7 +500,7 @@ def test_public_timestamp_check_shares_registration_receipt_and_binds_actual_tol
     assert len(calls) == 2
 
 
-def test_inspect_training_config_preserves_complete_plan_across_cold_and_hit(source, tmp_path, monkeypatch):
+def test_inspect_training_config_requires_registration_then_reuses_without_loading(source, tmp_path, monkeypatch):
     data, cache_spec = source
     norm_path = data["norm_path"]
     code = Path(cache_spec["code_dir"])
@@ -361,21 +519,24 @@ def test_inspect_training_config_preserves_complete_plan_across_cold_and_hit(sou
             "inputs": {"dataset": {"id": "dataset", "path": data["path"], "dataset_profile": {"fps": 20}},
                        "norm": {"id": "norm", "path": norm_path},
                        "model": {"id": "model", "path": str(model_path)}}}
-    calls = {"timestamps": 0, "samples": 0}
-
+    from vla_adapters.submission_validation import require_cached_dataset_source
+    timestamp_receipt = {"schema_version": 1, "status": "verified", "checked_rows": 3,
+                         "checked_episodes": base_data["episodes"], "effective_fps": base_data["effective_fps"],
+                         "metadata_sha256": base_data["metadata_sha256"], "data_manifest_digest": base_data["data_manifest_digest"]}
+    source_receipt = {"schema_version": 1, "status": "verified", "path": data["path"],
+                      "raw_samples": {"selection": "first_middle_last", "checked_samples": 3,
+                                      "sample_indices": [0, 1, 2], "samples": [
+                                          {"index": i, "fields": {"state": {"shape": [2], "dtype": "float32"}}}
+                                          for i in (0, 1, 2)]}}
     def timestamps(data, spec):
-        def validate():
-            calls["timestamps"] += 1
-            return {"schema_version": 1, "status": "verified", "checked_rows": 3}
-        return cache.get_or_validate("timestamps", data, spec, validate)
-
-    def samples(*args):
-        calls["samples"] += 1
-        return success()
+        receipt = cache.lookup_cached("timestamps", data, spec)
+        if receipt is None:
+            raise ValueError("DATASET_BASE_VALIDATION_REQUIRED")
+        return receipt
 
     monkeypatch.setattr(training_plan, "dataset_contract", lambda *a, **kw: deepcopy(base_data))
-    monkeypatch.setattr(training_plan, "inspect_dataset_timestamps", timestamps)
-    monkeypatch.setattr(training_plan, "inspect_composed_samples_isolated", samples)
+    monkeypatch.setattr(training_plan, "require_cached_dataset_timestamps", timestamps)
+    monkeypatch.setattr(training_plan, "require_cached_dataset_source", require_cached_dataset_source)
     monkeypatch.setattr(training_plan, "norm_contract", lambda *a: {
         "norm_path": norm_path, "norm_sha256": hashlib.sha256(Path(norm_path).read_bytes()).hexdigest()})
     monkeypatch.setattr(training_plan, "inspect_stage", lambda *a: None)
@@ -386,10 +547,22 @@ def test_inspect_training_config_preserves_complete_plan_across_cold_and_hit(sou
     monkeypatch.setattr(training_plan, "inspect_training_cache", lambda *a: {
         "datasets_cache": "/same-cache", "builders": [{"path": data["path"]}]})
     monkeypatch.setattr(training_plan, "resolve_registered_fps", lambda *a: {})
-    uncached_spec = {**spec, "validation_cache_dir": None}
-    plain = training_plan.inspect_training_config(config, uncached_spec, checks=[])
-    cold = training_plan.inspect_training_config(config, spec, checks=[])
-    warm = training_plan.inspect_training_config(config, spec, checks=[])
-    assert plain == cold == warm and fingerprint(plain) == fingerprint(warm)
-    assert calls == {"timestamps": 2, "samples": 2}
-    assert "cache_hit" not in json.dumps(warm)
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED"):
+        training_plan.inspect_training_config(config, spec, checks=[])
+    # Only registration can execute the validators and persist their receipts.
+    cache.get_or_validate("timestamps", base_data, spec, lambda: timestamp_receipt)
+    cache.get_or_validate("source", base_data, spec, lambda: source_receipt, context={"scope": "dataset_source"})
+    before = {p.name: (p.stat().st_mtime_ns, p.read_bytes())
+              for p in Path(spec["validation_cache_dir"]).iterdir()}
+    monkeypatch.setattr(cache, "get_or_validate", lambda *a, **kw: pytest.fail("submission cannot validate or repair caches"))
+    first = training_plan.inspect_training_config(config, spec, checks=[])
+    again = training_plan.inspect_training_config(config, spec, checks=[])
+    assert first == again and fingerprint(first) == fingerprint(again)
+    assert first["data_validation_mode"] == "registered_source"
+    assert "sample_probe" not in first["datasets"][0]
+    after = {p.name: (p.stat().st_mtime_ns, p.read_bytes())
+             for p in Path(spec["validation_cache_dir"]).iterdir()}
+    assert before == after
+    (Path(data["path"]) / "videos/camera.mp4").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED"):
+        training_plan.inspect_training_config(config, spec, checks=[])
