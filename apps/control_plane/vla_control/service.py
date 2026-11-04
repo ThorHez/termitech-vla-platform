@@ -20,6 +20,7 @@ from vla_protocol.training_gpu_policy import (TRAINING_SHARED_GPU_CAPABILITY,
 from .common import APIError, INPUT_KINDS, TERMINAL, absolute_path, digest, now, require_path, snapshot_identity, uid, under_root, valid_snapshot
 from .models import Allocation, Asset, Attempt, Command, Event, Node, Preview, Profile, Run
 from .norm_outputs import norm_outputs_error, reconcile_norm_outputs
+from .model_norm_outputs import bind_model_norm_outputs, model_norm_outputs_error
 from .scheduler import enqueue, resolve_inputs
 
 
@@ -769,7 +770,7 @@ def validated_output(node: Node, attempt: Attempt, run: Run, output) -> dict | N
     return {"kind": kind, "name": name, "path": path, "version": version, "metadata": metadata}
 
 
-def register_outputs(session, node: Node, attempt: Attempt, outputs: list[dict]) -> None:
+def register_outputs(session, node: Node, attempt: Attempt, outputs: list[dict], *, bind_model_norms=False) -> None:
     """Reuse an execution's checkpoint asset across scans, restarts and completion."""
     from .model_names import model_output_name
     run = session.get(Run, attempt.run_id)
@@ -794,6 +795,8 @@ def register_outputs(session, node: Node, attempt: Attempt, outputs: list[dict])
             if asset.state == "UNAVAILABLE":
                 asset.state = "READY"
                 asset.metadata_json = {**asset.metadata_json, "availability": "available"}
+    if bind_model_norms:
+        bind_model_norm_outputs(session, node=node, attempt=attempt, outputs=outputs, existing=existing)
 
 
 def mark_removed_outputs(session, node: Node, attempt: Attempt, paths, timestamp: str) -> bool:
@@ -807,6 +810,15 @@ def mark_removed_outputs(session, node: Node, attempt: Attempt, paths, timestamp
                 Asset.node_id == node.id, Asset.kind == "MODEL", Asset.path.in_(valid_paths))):
             asset.state = "UNAVAILABLE"
             asset.metadata_json = {**asset.metadata_json, "availability": "removed", "removed_at": timestamp}
+            # The model's embedded statistics disappear with this checkpoint.
+            # Never alter unrelated input/default norms or another attempt's
+            # assets even if a historical FK was populated incorrectly.
+            norm = session.get(Asset, asset.norm_asset_id) if asset.norm_asset_id else None
+            if (norm is not None and norm.kind == "NORM" and norm.node_id == node.id
+                    and norm.origin_attempt_id == attempt.id and norm.state != "ARCHIVED"
+                    and PurePosixPath(norm.path) == PurePosixPath(asset.path) / "assets/shared/norm_stats.json"):
+                norm.state = "UNAVAILABLE"
+                norm.metadata_json = {**norm.metadata_json, "availability": "removed", "removed_at": timestamp}
             changed = True
     return changed
 
@@ -917,6 +929,8 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
                     failure = {"code": "OUTPUT_INVALID", "message": "Output manifest has an invalid kind or local path"}
                     break
                 output_rows.append(row)
+            if failure is None:
+                failure = model_norm_outputs_error(output_rows)
         if attempt.code_snapshot is None:
             failure = {"code": "CODE_VERSION_UNAVAILABLE", "message": "No execution code snapshot was recorded"}
     if attempt.error:
@@ -926,7 +940,7 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
         if not isinstance(failure, dict):
             failure = {"code": "TRAINING_FAILED", "message": str(failure or "Runner reported a failed execution")}
     if final_state == "SUCCEEDED":
-        register_outputs(session, node, attempt, output_rows)
+        register_outputs(session, node, attempt, output_rows, bind_model_norms=True)
     attempt.state = run.state = final_state
     attempt.exit_code = exit_code
     attempt.error = run.error = failure

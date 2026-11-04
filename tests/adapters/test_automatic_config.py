@@ -126,7 +126,7 @@ def test_auto_builder_uses_real_model_and_independent_factories_with_per_dataset
     base = build_automatic_base(spec, module, loaders)
     config = resolve_config(base, spec, module, loaders)
     assert not config.model.pi05 and config.model.action_horizon == 16 and config.model.action_dim == 32
-    assert config.data.use_merged_norm_stats is False
+    assert config.data.use_merged_norm_stats is True and config.data.auto_shared_norm is True
     assert config.data.state_pad_dim == 32 and config.data.weights == [1, 20, 50]
     assert [child.repo_id for child in config.data.datasets] == [spec["inputs"][f"dataset_{i}"]["path"] for i in range(3)]
     assert [child.assets.assets_dir for child in config.data.datasets] == [str(Path(spec["inputs"][f"norm_{i}"]["path"]).parent) for i in range(3)]

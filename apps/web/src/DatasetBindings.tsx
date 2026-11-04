@@ -211,7 +211,7 @@ export function DatasetBindings({
       <p className="field-hint">
         本次训练只使用这里选择的已登记资产；配方中的目录仅作源码参考。
         {bindings.length > 1
-          ? '多数据集推荐使用一份共享归一化参数，按全部源数据与本次混采权重重新统计。'
+          ? '多数据集训练会在启动前按全部源数据与本次混采权重自动计算一份共享 norm_stats，所有数据集使用同一份统计。下方已登记参数保留为来源参考。'
           : '选择数据集后自动带出已绑定的归一化参数，也可手动更换。'}
         新增数据集会复制第 1 组的处理配置与混采权重；共享归一化时也会保留同一份参数。
       </p>
@@ -225,10 +225,10 @@ export function DatasetBindings({
       </p>
       {normalizationMode === 'legacy' && (
         <div className="inline-note" role="status">
-          <strong>逐组归一化</strong>
+          <strong>启动时自动计算共享归一化参数</strong>
           <span>
-            每组可使用数据集已绑定的参数，也可手动更换。切换后会清空这些归一化选择，请重新选择一份共享参数。
-            多源统计应按原始样本及混采权重重新计算，不能平均或合并旧 norm 文件。
+            每组已绑定的参数继续保留，训练脚本会从全部原始数值样本重新统计，不平均旧 norm 文件。
+            生成的共享参数会随模型保存并自动关联到模型资产。
           </span>
           {!readOnly && (
             <button
@@ -236,7 +236,7 @@ export function DatasetBindings({
               className="button outline small"
               onClick={() => onChange(bindSharedNormalization(bindings, ''))}
             >
-              切换为共享归一化
+              统一选择参考参数
             </button>
           )}
         </div>
@@ -244,13 +244,13 @@ export function DatasetBindings({
       {sharedNormalization && (
         <div className="form-grid">
           <Field
-            label="共享归一化参数"
+            label="共用的已登记参数（来源参考）"
             required
             hint={
               sharedNorm?.path ||
               (norms.length
-                ? '为所有数据集选择同一份按本次数据与混采权重重新统计的参数。'
-                : '请先在「数据与模型」登记当前机器的共享归一化参数。')
+                ? '保留所有数据集的归一化资产来源；训练启动时重新计算本次共享统计。'
+                : '请先在「数据与模型」登记当前机器的归一化参数。')
             }
           >
             {readOnly ? (
@@ -273,8 +273,8 @@ export function DatasetBindings({
             )}
           </Field>
           <p className="field-hint">
-            所有数据集共用此参数。新增或更换数据集、修改混采权重或处理布局后需要重新统计；
-            预检会核对统计来源，单源参数不能冒充多源统计。此处只选择已有参数，不会启动全量统计任务。
+            这里选择已登记参数，不会启动全量统计任务。确认开始训练后，脚本按本次数据、处理配置和混采权重生成共享统计，
+            不会把单源参数作为多源训练的最终统计。
           </p>
         </div>
       )}
@@ -588,14 +588,23 @@ export function DatasetBindingSummary({
   assets,
   profiles,
   normalizationOverride,
+  automaticSharedNormalization = false,
 }: {
   bindings: DatasetBinding[];
   assets: Asset[];
   profiles?: Record<string, DatasetProfile> | null;
   normalizationOverride?: TrainingNormalizationMethod;
+  automaticSharedNormalization?: boolean;
 }) {
   return (
     <div className="dataset-binding-summary">
+      {automaticSharedNormalization && bindings.length > 1 && (
+        <p className="field-hint">
+          多数据集训练启动前自动计算共享
+          norm_stats，并随模型保存和绑定。下方归一化资产为登记来源参考；
+          实际训练统一使用本次全部数据和混采权重计算的统计。
+        </p>
+      )}
       {normalizationOverride && (
         <p className="field-hint">
           本次训练统一使用：{trainingNormalizationLabel(normalizationOverride)}。

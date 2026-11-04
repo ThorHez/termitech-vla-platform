@@ -242,8 +242,8 @@ try {
       bindings: [binding('cloth-a', 'norm-cloth-a'), binding('cloth-b', 'norm-cloth-b')],
       slots: [], assets: assets(), node: resources().nodes[0], showProcessing: false, onChange() {},
     }));
-    assert.match(grouped, /逐组归一化/);
-    assert.match(grouped, /每组可使用数据集已绑定的参数，也可手动更换/);
+    assert.match(grouped, /启动时自动计算共享归一化参数/);
+    assert.match(grouped, /每组已绑定的参数继续保留/);
     assert.doesNotMatch(grouped, /逐组归一化（旧配置）|已保留草稿或模板中原有的逐组选择/);
   });
 } finally {

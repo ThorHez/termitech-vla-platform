@@ -64,20 +64,29 @@ def shared_training(training):
     return base, spec, module, loaders, norm, document
 
 
-def test_distinct_norm_assets_disable_old_quantile_merger_and_preserve_recipe(training):
+def explicit_shared_config(base, spec, module, loaders):
+    """Exercise the explicit shared-file verifier, independently of new defaults."""
+    config = resolve_config(base, spec, module, loaders)
+    config.data = dataclasses.replace(config.data, auto_shared_norm=False, use_merged_norm_stats=True,
+                                     shared_norm_stats_path=spec["inputs"]["norm_0"]["path"])
+    return config
+
+
+def test_distinct_norm_assets_request_raw_sample_shared_statistics_and_preserve_recipe(training):
     base, spec, module, loaders = training
     original = copy.deepcopy(base)
     config = resolve_config(base, spec, module, loaders)
-    assert config.data.use_merged_norm_stats is False
+    assert config.data.use_merged_norm_stats is True and config.data.auto_shared_norm is True
     assert base == original and base.data.use_merged_norm_stats is True
     plan = inspect_training_config(config, spec, checks=[])
-    assert plan["normalization"] == {"mode": "per_dataset"}
+    assert plan["normalization"]["mode"] == "auto_shared"
+    assert all(data["norm_usage"] == "reference_only" for data in plan["datasets"])
     assert len({row["norm_path"] for row in plan["datasets"]}) == 3
 
 
 def test_same_shared_asset_uses_one_validated_file_and_freezes_provenance(training):
     base, spec, module, loaders, norm, document = shared_training(training)
-    config = resolve_config(base, spec, module, loaders)
+    config = explicit_shared_config(base, spec, module, loaders)
     assert config.data.use_merged_norm_stats is True
     assert config.data.shared_norm_stats_path == str(norm)
     assert len({child.assets.assets_dir for child in config.data.datasets}) == 1
@@ -91,15 +100,18 @@ def test_same_shared_asset_uses_one_validated_file_and_freezes_provenance(traini
 
 def test_shared_selection_requires_new_runtime_field_and_validator(training):
     base, spec, module, loaders, _, _ = shared_training(training)
-    base.data = Multi(**{field.name: getattr(base.data, field.name) for field in dataclasses.fields(Multi)})
-    module.MultiDataConfigFactory = Multi
+    current = base.data
+    legacy = dataclasses.make_dataclass("LegacyMulti", [(field.name, field.type, field) for field in dataclasses.fields(Multi)
+                                                       if field.name not in {"auto_shared_norm", "shared_norm_stats_path"}])
+    base.data = legacy(**{field.name: getattr(base.data, field.name) for field in dataclasses.fields(legacy)})
+    module.MultiDataConfigFactory = legacy
     with pytest.raises(ValueError, match="SHARED_NORM_UNSUPPORTED.*升级"):
         resolve_config(base, spec, module, loaders)
-    base.data = SharedMulti(**{field.name: getattr(base.data, field.name) for field in dataclasses.fields(Multi)})
+    base.data = SharedMulti(**{field.name: getattr(current, field.name) for field in dataclasses.fields(Multi)})
     module.MultiDataConfigFactory = SharedMulti
     (Path(spec["code_dir"]) / "src/openpi/training/shared_norm.py").unlink()
     with pytest.raises(ValueError, match="SHARED_NORM_UNSUPPORTED.*升级"):
-        inspect_training_config(resolve_config(base, spec, module, loaders), spec, checks=[])
+        inspect_training_config(explicit_shared_config(base, spec, module, loaders), spec, checks=[])
 
 
 @pytest.mark.parametrize("change", ["weight", "metadata", "parquet", "source", "processor"])
@@ -123,12 +135,12 @@ def test_changed_generation_inputs_cannot_reuse_shared_statistics(training, chan
         item = base.data.datasets[0]
         base.data.datasets[0] = ChangedFactory(item.repo_id, item.assets)
     with pytest.raises(ValueError, match="SHARED_NORM_INVALID"):
-        inspect_training_config(resolve_config(base, spec, module, loaders), spec, checks=[])
+        inspect_training_config(explicit_shared_config(base, spec, module, loaders), spec, checks=[])
 
 
 def test_shared_file_drift_after_preflight_is_rejected_before_training(training, monkeypatch):
     base, spec, module, loaders, norm, document = shared_training(training)
-    config = resolve_config(base, spec, module, loaders)
+    config = explicit_shared_config(base, spec, module, loaders)
     frozen = inspect_training_config(config, spec, checks=[])
     spec["expected_plan_digest"] = fingerprint(frozen)
     document["norm_stats"]["state"]["mean"][0] = 0.25
@@ -148,7 +160,7 @@ def test_legacy_or_incomplete_statistics_cannot_claim_full_shared_provenance(tra
     else: document["norm_stats"]["actions"]["std"][0] = -1
     norm.write_text(json.dumps(document))
     with pytest.raises(ValueError, match="SHARED_NORM_INVALID|NORM_FORMAT"):
-        inspect_training_config(resolve_config(base, spec, module, loaders), spec, checks=[])
+        inspect_training_config(explicit_shared_config(base, spec, module, loaders), spec, checks=[])
 
 
 def test_same_width_different_layout_cannot_share_statistics(training):

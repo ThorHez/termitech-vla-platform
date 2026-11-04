@@ -481,6 +481,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise APIError(409, "ASSET_IN_USE", "An active training run still references this asset")
             if active_asset_transfers(session, asset_id=asset_id):
                 raise APIError(409, "ASSET_IN_USE", "资产正在同步，请等待完成或先取消同步")
+            if asset.kind == "NORM" and session.scalar(select(Asset.id).where(
+                    Asset.kind == "MODEL", Asset.norm_asset_id == asset.id, Asset.state != "ARCHIVED").limit(1)):
+                raise APIError(409, "MODEL_NORM_IN_USE", "此 norm_stats 与模型训练结果绑定，请先归档关联模型")
             invalidate_validation(session, asset)
             asset.state = "ARCHIVED"
             return asset_dict(asset)

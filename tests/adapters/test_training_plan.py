@@ -32,6 +32,8 @@ class Multi(Data):
     weights: list = dataclasses.field(default_factory=lambda: [1.0, 20.0, 50.0])
     state_pad_dim: int = 32
     use_merged_norm_stats: bool = True
+    shared_norm_stats_path: str | None = None
+    auto_shared_norm: bool = False
 
 
 @dataclasses.dataclass
@@ -65,6 +67,13 @@ def training(tmp_path, monkeypatch):
         "effective_fps": data.get("effective_fps"), "data_manifest_digest": data["data_manifest_digest"]})
     monkeypatch.setattr(training_plan, "inspect_composed_samples_isolated", lambda factory, config, spec, data: {
         "schema_version": 1, "status": "verified" if "composition" in data else "not_applicable"})
+    # The generic fixture has no real OpenPI processors. Its tests exercise
+    # adapter plan assembly; metadata-only startup planning has dedicated
+    # actual-helper tests in test_auto_training_normalization.py.
+    monkeypatch.setattr(training_plan, "auto_shared_norm_contract", lambda config, spec: {
+        "mode": "auto_shared", "method": "weighted_raw_samples", "coverage": "full",
+        "output_path": "<runtime_output_dir>/normalization/norm_stats.json", "output_relative_path": "normalization/norm_stats.json",
+        "fingerprint": "0" * 64, "status": "pending_training_start", "source_norm_assets": "reference_only"})
     cache = str(tmp_path / "training-cache")
     monkeypatch.setattr(training_plan, "inspect_training_cache", lambda datasets, spec: {
         "datasets_cache": cache, "paths": {"HF_DATASETS_CACHE": cache},
@@ -119,7 +128,8 @@ def test_multi_binds_all_selected_assets_and_routes_actual_entry(training):
     config = resolve_config(base, spec, module, loaders)
     assert config.data.datasets[:2] == base.data.datasets[:2]
     assert config.data.weights == [1., 20., 50.]
-    assert config.data.state_pad_dim == 32 and config.data.use_merged_norm_stats is False
+    assert config.data.state_pad_dim == 32 and config.data.use_merged_norm_stats is True
+    assert config.data.auto_shared_norm is True and config.data.shared_norm_stats_path is None
     assert config.data.datasets[2].repo_id == spec["inputs"]["dataset_2"]["path"]
     assert base == original
     checks = []
@@ -229,6 +239,10 @@ def test_contract_rejects_invalid_secondary_assets_and_entry(training, case, err
         config = resolve_config(base, spec, module, loaders)
         if case == "weights":
             config.data.weights = [1., 2.]
+        elif case == "nonfinite_norm":
+            # Invalid statistics still block a mode that actually consumes
+            # them; automatic mode measures new statistics from raw samples.
+            config.data = dataclasses.replace(config.data, auto_shared_norm=False, use_merged_norm_stats=False)
         inspect_training_config(config, spec, checks=[])
 
 
@@ -312,7 +326,7 @@ def test_required_norm_arrays_cannot_be_null(training, field):
     document["norm_stats"]["state"][field] = None
     norm.write_text(json.dumps(document))
     with pytest.raises(ValueError, match="NORM_FORMAT"):
-        inspect_training_config(resolve_config(base, spec, module, loaders), spec, checks=[])
+        training_plan.norm_contract(base.data.datasets[0], spec)
 
 
 def test_video_assets_must_exist_and_are_in_frozen_plan(training):
@@ -412,15 +426,34 @@ def main(config):
     root = Path(config.checkpoint_base_dir).parent
     (root / "selected-script-ran").write_text(Marker("selected entry").value)
     (config.checkpoint_dir / "7" / "params").mkdir(parents=True)
+    norm = config.checkpoint_dir / "7/assets/shared/norm_stats.json"
+    norm.parent.mkdir(parents=True)
+    norm.write_text(Path(config.data.shared_norm_stats_path).read_text())
 ''')
     spec["entrypoint"] = "scripts/selected_multi.py"
     config = resolve_config(base, spec, module, loaders)
     monkeypatch.setattr(Config, "checkpoint_dir", property(lambda c: Path(c.checkpoint_base_dir) / "platform"), raising=False)
     spec["expected_plan_digest"] = fingerprint(inspect_training_config(config, spec, checks=[]))
     monkeypatch.setattr(openpi_entry, "prepare_config", lambda s: (config, None))
+    startup_calls = []
+    def prepare_normalization(actual):
+        assert not (Path(spec["output_dir"]) / "selected-script-ran").exists()
+        startup_calls.append(actual)
+        target = Path(spec["output_dir"]) / "normalization/norm_stats.json"
+        target.parent.mkdir(parents=True)
+        document = json.loads(Path(spec["inputs"]["norm_0"]["path"]).read_text())
+        document["shared_normalization"] = {"method": "weighted_raw_samples"}
+        target.write_text(json.dumps(document))
+        return dataclasses.replace(actual, data=dataclasses.replace(actual.data, shared_norm_stats_path=str(target)))
+    monkeypatch.setitem(sys.modules, "openpi.training.training_normalization", SimpleNamespace(
+        prepare_training_normalization=prepare_normalization))
     monkeypatch.setitem(sys.modules, "wandb", SimpleNamespace(log=None))
     monkeypatch.setattr(sys, "argv", ["openpi_entry", "--spec-json", json.dumps(spec)])
     openpi_entry.main()
+    assert startup_calls == [config]
+    effective = json.loads((Path(spec["output_dir"]) / "effective_training.json").read_text())
+    assert effective["runtime_normalization"]["checkpoint_asset_id"] == "shared"
+    assert effective["execution_plan_digest"] == spec["expected_plan_digest"]
     output = Path(spec["output_dir"])
     assert (output / "selected-script-ran").read_text() == "selected entry"
     effective = json.loads((output / "effective_training.json").read_text())

@@ -214,7 +214,25 @@ def inspect_composed_samples(factory, config, spec, dataset_evidence):
             _fail("训练代码缺少真实样本检查接口，请更新 OpenPI 项目后重新预检", "DATASET_SAMPLE_CHECK_UNAVAILABLE")
         hook_source = _source(hook, spec)
         _remaining(deadline)
-        data_config = hook(config.assets_dirs, config.model)
+        container = getattr(config, "data", None)
+        children = getattr(container, "datasets", None)
+        reference_only = (getattr(container, "auto_shared_norm", False) is True
+                          and isinstance(children, (list, tuple)) and len(children) > 1)
+        if reference_only:
+            try:
+                parameters = inspect.signature(hook).parameters
+                if "load_norm_stats" not in parameters:
+                    raise TypeError("missing explicit statistics loading switch")
+                inspect.signature(hook).bind(config.assets_dirs, config.model, load_norm_stats=False)
+            except (TypeError, ValueError) as exc:
+                _fail("训练代码的样本接口不能跳过参考归一化统计，请升级 OpenPI 后重新预检",
+                      "DATASET_SAMPLE_CHECK_UNAVAILABLE")
+            data_config = hook(config.assets_dirs, config.model, load_norm_stats=False)
+            if getattr(data_config, "norm_stats", None) is not None:
+                _fail("样本接口仍加载了不会用于本次训练的参考归一化统计，请升级 OpenPI 后重新预检",
+                      "DATASET_SAMPLE_CHECK_UNAVAILABLE")
+        else:
+            data_config = hook(config.assets_dirs, config.model)
         _remaining(deadline)
         if not Path(data_config.repo_id).is_absolute() or Path(data_config.repo_id).resolve(strict=True) != expected:
             _fail("native 样本配置改变了登记的数据集路径")

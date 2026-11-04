@@ -2932,6 +2932,7 @@ function RunWizardContent({
             <div className="preflight-dataset-bindings">
               <h3>本次数据集绑定</h3>
               <DatasetBindingSummary
+                automaticSharedNormalization
                 normalizationOverride={(preview?.request || request).normalization_method}
                 bindings={preview?.request?.dataset_bindings || request.dataset_bindings}
                 assets={assets.data || []}

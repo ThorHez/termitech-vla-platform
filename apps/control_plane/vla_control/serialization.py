@@ -62,7 +62,7 @@ def asset_dict(asset):
             "path": asset.path, "version": asset.version, "state": asset.state,
             "metadata": {key: value for key, value in (asset.metadata_json or {}).items() if key != INTERNAL_KEY},
             **({"validation": validation_dict(asset)} if asset.kind == "DATASET" else {}), "created_at": asset.created_at,
-            "norm_asset_id": asset.norm_asset_id if asset.kind == "DATASET" else None,
+            "norm_asset_id": asset.norm_asset_id if asset.kind in {"DATASET", "MODEL"} else None,
             "origin_attempt_id": asset.origin_attempt_id}
 
 

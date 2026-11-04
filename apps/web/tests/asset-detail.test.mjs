@@ -214,6 +214,17 @@ try {
     }
   });
 
+  await test('model details show the checkpoint-bound norm without dataset mutation controls', () => {
+    const model = { ...dataset, kind: 'MODEL', name: 'Folding model', metadata: {} };
+    const html = render(model, node, 'admin', [model, norm]);
+    assert.match(html, /模型训练归一化参数/);
+    assert.match(html, /随此模型 checkpoint 保存，供推理使用/);
+    assert.ok(html.includes(norm.path));
+    assert.ok(html.includes(norm.name));
+    assert.equal(button(html, normAction), undefined);
+    assert.equal(button(html, /数据特征/), undefined);
+  });
+
   await test('missing machine and dataset metadata do not prevent inspecting an asset', () => {
     const html = render({ ...dataset, metadata: undefined, norm_asset_id: null }, null);
     assert.ok(html.includes(dataset.path));

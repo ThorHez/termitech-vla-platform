@@ -1,6 +1,8 @@
 """Decoded-sample checks execute real NumPy composition, without model imports."""
 
 from copy import deepcopy
+import ast
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -220,6 +222,80 @@ def test_missing_native_hook_is_a_hard_unavailable_error(setup, monkeypatch):
     monkeypatch.delattr(type(setup.factory), "processing_sample_config")
     with pytest.raises(ValueError, match="DATASET_SAMPLE_CHECK_UNAVAILABLE"):
         inspect_sample(setup)
+
+
+@pytest.fixture
+def reference_stats_hook(setup, monkeypatch):
+    """Run the actual OpenPI sample/base methods with the existing real transforms."""
+    source = ROOT / "third_party/openpi-umi/src/openpi/training/config.py"
+    copied = Path(setup.spec["code_dir"]) / "actual_sample_config.py"
+    copied.write_bytes(source.read_bytes())
+    tree = ast.parse(copied.read_text())
+    methods = []
+    for class_name, method_name in (("ComposableDataConfig", "processing_sample_config"),
+                                    ("DataConfigFactory", "create_base_config")):
+        owner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        methods.append(next(node for node in owner.body if isinstance(node, ast.FunctionDef) and node.name == method_name))
+    body = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                           *methods], type_ignores=[])
+    namespace = {"pathlib": SimpleNamespace(Path=Path), "dataclasses": dataclasses,
+                 "epath": SimpleNamespace(Path=Path), "tyro": SimpleNamespace(MISSING=object()),
+                 "ModelType": SimpleNamespace(PI0="pi0")}
+    exec(compile(ast.fix_missing_locations(body), str(copied), "exec"), namespace)
+
+    @dataclasses.dataclass
+    class Base:
+        repo_id: str
+        asset_id: str = "."
+        norm_stats: object = None
+        use_quantile_norm: bool = True
+
+    factory = setup.factory
+    factory.assets = SimpleNamespace(assets_dir=str(Path(setup.spec["code_dir"]) / "old-norm"), asset_id=".")
+    factory.base_config = Base(factory.repo_id)
+    setup.config.model.model_type = "pi05"
+    old = Path(factory.assets.assets_dir) / "norm_stats.json"
+    old.parent.mkdir(); old.write_text('{"old_reference_is_not_a_statistics_document":true}')
+    reads = []
+    def load_norm(directory, asset_id):
+        reads.append(str(directory))
+        return json.loads((Path(directory) / asset_id / "norm_stats.json").read_text())["norm_stats"]
+    factory._load_norm_stats = load_norm
+    monkeypatch.setattr(type(factory), "processing_sample_config", namespace["processing_sample_config"])
+    monkeypatch.setattr(type(factory), "create_base_config", namespace["create_base_config"], raising=False)
+    composed = ModuleType("openpi.training.composed_processing")
+    def compose(actual_factory, assets_dirs, model, *, include_model_transforms, load_norm_stats=True):
+        assert include_model_transforms is False
+        base = actual_factory.create_base_config(assets_dirs, model, load_norm_stats=load_norm_stats)
+        setup.data_config.norm_stats = base.norm_stats
+        return setup.data_config
+    composed.compose_data_config = compose
+    monkeypatch.setitem(sys.modules, composed.__name__, composed)
+    return reads
+
+
+def test_automatic_shared_sample_probe_skips_old_norm_loading_but_keeps_real_transforms(setup, reference_stats_hook):
+    setup.config.data = SimpleNamespace(auto_shared_norm=True, datasets=[setup.factory, setup.factory])
+    result = inspect_sample(setup)
+    assert result["status"] == "verified" and result["checked_samples"] == 3
+    assert reference_stats_hook == []
+    assert setup.runtime.dataset.indices == [0, 3, 6]
+    assert result["samples"][0]["output"]["actions"]["shape"] == [16, 10]
+    assert result["samples"][0]["output"]["image"][SLOT]["shape"] == [7, 11, 3]
+
+
+def test_legacy_sample_probe_still_loads_and_rejects_invalid_consumed_norm(setup, reference_stats_hook):
+    with pytest.raises(ValueError, match="DATASET_SAMPLE_INVALID"):
+        inspect_sample(setup)
+    assert len(reference_stats_hook) == 1
+    assert setup.runtime.dataset.indices == []
+
+
+def test_automatic_sample_probe_requires_new_skip_loading_interface_before_any_decode(setup):
+    setup.config.data = SimpleNamespace(auto_shared_norm=True, datasets=[setup.factory, setup.factory])
+    with pytest.raises(ValueError, match="DATASET_SAMPLE_CHECK_UNAVAILABLE.*升级"):
+        inspect_sample(setup)
+    assert setup.factory.hook_calls == [] and setup.runtime.dataset.indices == []
 
 
 def test_native_hook_cannot_include_or_execute_model_transforms(setup):

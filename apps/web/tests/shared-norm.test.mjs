@@ -104,9 +104,9 @@ try {
     const html = render([row('data-a', 'shared-norm'), row('data-b', 'shared-norm')]);
     assert.equal([...html.matchAll(/<option value="shared-norm"/g)].length, 1);
     assert.match(html, /value="shared-norm" selected=""/);
-    assert.match(html, /共享归一化参数/);
+    assert.match(html, /共用的已登记参数（来源参考）/);
     assert.doesNotMatch(html, /归一化参数 [12]/);
-    assert.match(html, /单源参数不能冒充多源统计/);
+    assert.match(html, /不会把单源参数作为多源训练的最终统计/);
     assert.match(html, /不会启动全量统计任务/);
     assert.match(html, /每条样本的重复权重；实际来源占比还取决于样本数/);
     assert.match(html, /权重占比约/);
@@ -132,8 +132,9 @@ try {
     const restored = codec.decodeTrainingDraft(JSON.parse(JSON.stringify(codec.encodeTrainingDraft(original))));
     assert.deepEqual(restored, original);
     const html = render(restored.request.dataset_bindings);
-    assert.match(html, /逐组归一化/);
-    assert.match(html, /切换为共享归一化/);
+    assert.match(html, /启动时自动计算共享归一化参数/);
+    assert.match(html, /随模型保存并自动关联到模型资产/);
+    assert.match(html, /统一选择参考参数/);
     assert.match(html, /value="norm-a" selected=""/); assert.match(html, /value="norm-b" selected=""/);
     assert.match(html, /归一化参数 1/); assert.match(html, /归一化参数 2/);
     assert.deepEqual(restored.request.dataset_bindings, original.request.dataset_bindings);
@@ -150,10 +151,10 @@ try {
     assert.match(single, /每条样本的重复权重；实际来源占比还取决于样本数/);
     assert.doesNotMatch(single, /共享归一化参数|逐组归一化（旧配置）/);
     const shared = render([row('data-a', 'shared-norm'), row('data-b', 'shared-norm')], { readOnly: true });
-    assert.match(shared, /共享归一化参数/); assert.match(shared, /shared-norm/);
+    assert.match(shared, /共用的已登记参数（来源参考）/); assert.match(shared, /shared-norm/);
     assert.doesNotMatch(shared, /<select\b|添加数据集|切换为共享归一化/);
     const legacy = render([row('data-a', 'norm-a'), row('data-b', 'norm-b')], { readOnly: true });
-    assert.match(legacy, /逐组归一化/); assert.doesNotMatch(legacy, /切换为共享归一化/);
+    assert.match(legacy, /启动时自动计算共享归一化参数/); assert.doesNotMatch(legacy, /统一选择参考参数/);
   });
 } finally {
   await server.close();

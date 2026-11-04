@@ -48,14 +48,16 @@ export function AssetDetail({
   const transferable = can('assets.transfer') && !archived;
   const canSaveTemplate = can('dataset-templates.write') && !archived;
   const dataset = asset.kind === 'DATASET';
+  const model = asset.kind === 'MODEL';
   const profile = dataset ? readDatasetProfile(asset.metadata?.dataset_profile) : undefined;
   const templateProfile = dataset
     ? datasetFormatProfile(asset.metadata?.dataset_profile)
     : undefined;
-  const norm = dataset ? boundDatasetNorm(asset, assets) : undefined;
-  const normError = dataset
-    ? datasetNormSelectionError(asset.node_id, asset.norm_asset_id, assets)
-    : undefined;
+  const norm = dataset || model ? boundDatasetNorm(asset, assets) : undefined;
+  const normError =
+    dataset || model
+      ? datasetNormSelectionError(asset.node_id, asset.norm_asset_id, assets)
+      : undefined;
   const syncReason = unavailable
     ? '源资产当前不可用，请先确认源文件。'
     : node?.status !== 'ONLINE'
@@ -223,9 +225,10 @@ export function AssetDetail({
           )}
         </section>
       )}
-      {dataset && (
+      {(dataset || (model && asset.norm_asset_id)) && (
         <section className="asset-detail-section">
-          <h4>归一化参数 · norm_stats</h4>
+          <h4>{model ? '模型训练归一化参数 · norm_stats' : '归一化参数 · norm_stats'}</h4>
+          {model && <p className="asset-detail-muted">随此模型 checkpoint 保存，供推理使用。</p>}
           {asset.norm_asset_id ? (
             <>
               <p>

@@ -330,6 +330,10 @@ def test_fps_warning_does_not_hide_subsequent_normalization_failure(training):
     declared = profile();declared['fps'] = 60
     spec['inputs']['dataset_0']['dataset_profile'] = declared
     config = resolve_config(base, spec, module, loaders)
+    # Exercise a normalization mode that consumes the selected NORM; the
+    # automatic shared mode intentionally treats source NORMs as references.
+    config.data.auto_shared_norm = False
+    config.data.use_merged_norm_stats = False
     (path/'norm_stats.json').write_text('{"norm_stats":{"state":{},"actions":{}}}')
     checks = []
     with pytest.raises(ValueError, match='NORM_FORMAT'):

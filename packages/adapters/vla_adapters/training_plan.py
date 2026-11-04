@@ -339,7 +339,8 @@ def check_composed_mixture(data_factory, datasets, *, shared_validated=False):
     if not compositions or not hasattr(data_factory, "datasets"):
         return
     if (getattr(data_factory, "use_merged_norm_stats", None) is not False
-            and not (shared_validated and getattr(data_factory, "shared_norm_stats_path", None))):
+            and not (shared_validated and (getattr(data_factory, "shared_norm_stats_path", None)
+                                           or getattr(data_factory, "auto_shared_norm", False)))):
         raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 组合数据集必须分别使用所绑定的归一化统计，不能跨布局合并")
     target = getattr(data_factory, "state_pad_dim", None)
     for composition in compositions:
@@ -348,6 +349,18 @@ def check_composed_mixture(data_factory, datasets, *, shared_validated=False):
         if (type(target) is not int or target < actual or
                 not composition["pi05"] and target != composition["action_dim"]):
             raise ValueError(f"COMPOSITION_STATE_PADDING_INVALID: 配方 data.state_pad_dim={target} 与组合输出状态宽度 {actual} 不兼容；Pi05 至少需要 {actual}，Pi0 必须等于模型 action_dim")
+
+
+def reference_norm_contract(factory, spec):
+    """Freeze an unused source asset without claiming its formula will run."""
+    assets = factory.assets
+    asset_dir = assets.get("assets_dir") if isinstance(assets, dict) else getattr(assets, "assets_dir", None)
+    asset_id = assets.get("asset_id") if isinstance(assets, dict) else getattr(assets, "asset_id", None)
+    if not asset_dir or not isinstance(asset_id, str):
+        raise ValueError("NORM_MISSING: 数据集参考归一化资产缺少明确的本机目录")
+    path = local_path(Path(asset_dir) / asset_id / "norm_stats.json", spec)
+    _, sha = read_json(path, spec)
+    return {"norm_path": str(path), "norm_sha256": sha}
 
 
 def norm_contract(factory, spec, *, normalization_method=None):
@@ -433,6 +446,50 @@ def shared_norm_contract(data_factory, factories, datasets, spec):
     metadata = validate(document, factories, list(data_factory.weights))
     return {"mode": "shared", "shared": {"path": str(norm), "sha256": sha, "metadata": metadata,
             "validator": {"path": "src/openpi/training/shared_norm.py", "sha256": digest}}}
+
+
+def auto_shared_norm_contract(config, spec):
+    """Freeze the read-only startup plan; do not compute statistics in preflight."""
+    code = local_path(spec["code_dir"], spec)
+    relative = "src/openpi/training/training_normalization.py"
+    source = code / relative
+    if not source.is_file():
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 训练代码缺少自动共享归一化入口，请升级 openpi-umi 后重新预检")
+    source = local_path(source, spec)
+    if not source.is_relative_to(code):
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化源码不属于所选 OpenPI 项目")
+    module = importlib.import_module("openpi.training.training_normalization")
+    if Path(getattr(module, "__file__", "")).resolve() != source:
+        raise ValueError("MODULE_OUTSIDE_CODE_DIR: 自动共享归一化模块来自登记代码目录之外")
+    plan = getattr(module, "planned_training_normalization", None)
+    prepare = getattr(module, "prepare_training_normalization", None)
+    if not callable(plan) or not callable(prepare):
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化缺少只读计划或训练接口，请升级 openpi-umi 后重新预检")
+    implementations = {}
+    for name in (relative, "src/openpi/training/shared_norm.py", "src/openpi/training/numeric_stats.py",
+                 "src/openpi/training/composed_processing.py", "src/openpi/shared/weighted_stats.py"):
+        candidate = local_path(code / name, spec)
+        if not candidate.is_relative_to(code):
+            raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化实现路径超出 OpenPI 项目")
+        implementations[name] = hashlib.sha256(read_entrypoint(candidate)).hexdigest()
+    result = plan(config)
+    if (not isinstance(result, dict) or result.get("mode") != "auto_shared"
+            or result.get("method") != "weighted_raw_samples"
+            or result.get("coverage") != "full"
+            or re.fullmatch(r"[a-f0-9]{64}", str(result.get("fingerprint", ""))) is None
+            or not isinstance(result.get("sources"), list)
+            or len(result["sources"]) != len(config.data.datasets)):
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化计划不完整，不能退回逐数据集统计")
+    # The destination is intentionally absent before training; resolve its
+    # existing task ancestor without requiring a generated statistics file.
+    output = Path(result.get("output_path", ""))
+    task_output = Path(spec["output_dir"]).resolve()
+    if not output.is_absolute() or not output.resolve().is_relative_to(task_output):
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化输出必须位于本次训练独立目录")
+    relative_output = output.resolve().relative_to(task_output).as_posix()
+    return {**result, "output_path": "<runtime_output_dir>/" + relative_output,
+            "output_relative_path": relative_output, "implementation_sha256": implementations,
+            "status": "pending_training_start", "source_norm_assets": "reference_only"}
 
 
 def model_contract(spec):
@@ -529,13 +586,16 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             checks.append({"name": "dataset_timestamps", "ok": False, "message": str(exc)[:2000]})
             raise
     passed("dataset_timestamps", "已按本次生效 FPS 和训练加载器容差，逐帧核对所有数据集的真实时间戳")
+    automatic_norm = multi and getattr(config.data, "auto_shared_norm", False) is True and len(factories) > 1
     for data, factory in zip(datasets, factories):
-        data.update(norm_contract(factory, spec, **({"normalization_method": effective_method}
-                                                  if effective_method is not None else {})))
+        data.update(reference_norm_contract(factory, spec) if automatic_norm else
+                    norm_contract(factory, spec, **({"normalization_method": effective_method}
+                                                   if effective_method is not None else {})))
         if effective_method is not None:
             data["normalization_method"] = effective_method
-    normalization = shared_norm_contract(config.data, factories, datasets, spec) if multi else {"mode": "per_dataset"}
-    check_composed_mixture(config.data, datasets, shared_validated=normalization["mode"] == "shared")
+    normalization = (auto_shared_norm_contract(config, spec) if automatic_norm else
+                     shared_norm_contract(config.data, factories, datasets, spec) if multi else {"mode": "per_dataset"})
+    check_composed_mixture(config.data, datasets, shared_validated=normalization["mode"] in {"shared", "auto_shared"})
     for i, (data, (dataset_role, norm_role)) in enumerate(zip(datasets, roles)):
         norm = local_path(spec["inputs"][norm_role]["path"], spec)
         data["norm_asset_path"] = str(norm)
@@ -544,13 +604,17 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             raise ValueError("DATASET_BINDINGS_INVALID: 实际训练的数据与归一化参数配对不一致")
         data["dataset_asset_id"] = spec["inputs"][dataset_role].get("id")
         data["norm_asset_id"] = spec["inputs"][norm_role].get("id")
+        if automatic_norm:
+            data["norm_usage"] = "reference_only"
+            data["effective_norm_path"] = normalization["output_path"]
         binding = bindings[i] if bindings is not None else {"recipe_index": 0}
         if "processor" in binding:
             data["processor"] = validate_processor_instance(factories[i], binding["processor"])
             data["processor_identity"] = processor_identity(factories[i], spec["code_dir"], binding["processor"]["name"])
         else:
             data["recipe_index"] = binding["recipe_index"]
-    passed("norm_contract", "所有数据集归一化统计可读，数值有限且维度一致")
+    passed("norm_contract", ("已核对参考统计；训练启动前将按本次数据与权重完整计算一份共享统计，所有数据集统一使用"
+                             if automatic_norm else "所有数据集归一化统计可读，数值有限且维度一致"))
     sampled = 0
     for index, (data, factory) in enumerate(zip(datasets, factories)):
         try:
@@ -584,7 +648,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
                              and hashlib.sha256(source.read_bytes()).hexdigest() == data["composition"]["source"]["sha256"])
                 if "video_manifest_digest" in data:
                     unchanged = unchanged and file_manifest(path / "videos", spec)[2] == data["video_manifest_digest"]
-                current_norm = norm_contract(factory, spec)
+                current_norm = reference_norm_contract(factory, spec) if automatic_norm else norm_contract(factory, spec)
                 unchanged = unchanged and current_norm == {key: data[key] for key in current_norm}
                 if not unchanged:
                     raise ValueError("DATASET_SAMPLE_INVALID: 样本检查期间数据、归一化参数或处理源码已改变，请重新预检")
@@ -632,6 +696,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),
+            **({"auto_shared_norm": True} if automatic_norm else {}),
             "normalization": normalization,
             "model": model, "storage": storage_estimate(config, model, reference), "training_cache": cache,
             "evidence_scope": "metadata hashes, file path/size/mtime manifests, all source timestamp/episode rows, and bounded decoded samples for composable processing; model tensors and training steps are not loaded"}

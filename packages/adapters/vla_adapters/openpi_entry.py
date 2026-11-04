@@ -30,7 +30,7 @@ if __package__:
     from .recap_runtime import apply_stage, stage_request
     from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                   validate_runtime_parameter_relations)
-    from .training_plan import fingerprint, inspect_training_config, local_path, require_lerobot_source, training_entrypoint
+    from .training_plan import fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
 else:
     from automatic_config import build_automatic_base, normalize_auto_config
     from cache_contract import configure_cache
@@ -42,7 +42,7 @@ else:
     from recap_runtime import apply_stage, stage_request
     from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                  validate_runtime_parameter_relations)
-    from training_plan import fingerprint, inspect_training_config, local_path, require_lerobot_source, training_entrypoint
+    from training_plan import fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
 
 
 def resolve_config(base, spec, config_module, weight_loaders):
@@ -93,7 +93,15 @@ def resolve_config(base, spec, config_module, weight_loaders):
             updates = {key: value for key, value in {"repo_id": str(dataset), "asset_id": ".", "norm_stats": None}.items()
                        if key in {field.name for field in dataclasses.fields(base_config)}}
             changes["base_config"] = dataclasses.replace(base_config, **updates)
-        return dataclasses.replace(factory, **changes)
+        bound = dataclasses.replace(factory, **changes)
+        # The numeric statistics reader does not construct LeRobot. Carry the
+        # same registered timebase explicitly instead of consulting info.json
+        # again and silently changing action-chunk sampling.
+        profile = inputs[dataset_role].get("dataset_profile")
+        fps = profile.get("fps") if isinstance(profile, dict) else None
+        if fps is not None:
+            object.__setattr__(bound, "_norm_effective_fps", fps)
+        return bound
 
     def selected_factory(row, index):
         dataset_role, norm_role = f"dataset_{index}", f"norm_{index}"
@@ -134,16 +142,18 @@ def resolve_config(base, spec, config_module, weight_loaders):
         fields = {field.name for field in dataclasses.fields(base.data)}
         if "use_merged_norm_stats" not in fields:
             raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 多数据集容器必须支持显式归一化选择，请升级训练代码")
-        norm_files = [local_path(paths[pair][1] / "norm_stats.json", spec) for pair in pairs]
-        shared = len(bindings) > 1 and len(set(norm_files)) == 1
-        if shared:
-            if "shared_norm_stats_path" not in fields:
-                raise ValueError("SHARED_NORM_UNSUPPORTED: 当前训练代码不支持原始样本共享归一化，请升级 openpi-umi 后重新预检")
-            updates.update(use_merged_norm_stats=True, shared_norm_stats_path=str(norm_files[0]))
+        if len(bindings) > 1:
+            if not {"auto_shared_norm", "shared_norm_stats_path"} <= fields:
+                raise ValueError("SHARED_NORM_UNSUPPORTED: 当前训练代码不支持训练前自动计算共享归一化，请升级 openpi-umi 后重新预检")
+            # A repeated selection can just be the first source's inherited
+            # NORM, not a verified mixture. Compute the current distribution
+            # even when all selected reference paths happen to be identical.
+            updates.update(auto_shared_norm=True, use_merged_norm_stats=True, shared_norm_stats_path=None)
         else:
-            # Existing per-source assets remain supported. Never invoke the old
-            # merger, which averages already-computed source quantiles.
+            # A one-child multi container still uses its selected source stats.
             updates["use_merged_norm_stats"] = False
+            if "auto_shared_norm" in fields:
+                updates["auto_shared_norm"] = False
             if "shared_norm_stats_path" in fields:
                 updates["shared_norm_stats_path"] = None
         data = dataclasses.replace(base.data, **updates)
@@ -301,6 +311,31 @@ def training_module(entry, code, source_sha256, *, module_name="vla_registered_o
             sys.modules[name] = previous
 
 
+def checkpoint_norm_descriptor(checkpoint, spec):
+    """Expose the effective checkpoint statistic, never a source reference NORM."""
+    source = Path(checkpoint) / "assets/shared/norm_stats.json"
+    if not source.exists():
+        return None
+    if any(path.is_symlink() for path in (source, source.parent, source.parent.parent)):
+        raise ValueError("OUTPUT_INVALID: checkpoint 归一化统计不能通过符号链接引用外部文件")
+    source = local_path(source, spec)
+    if not source.is_relative_to(Path(checkpoint).resolve() / "assets"):
+        raise ValueError("OUTPUT_INVALID: 模型归一化统计必须保存在该 checkpoint 的 assets 目录内")
+    document, digest = read_json(source, spec)
+    stats = document.get("norm_stats")
+    provenance = document.get("shared_normalization")
+    if (not isinstance(stats, dict) or any(not isinstance(stats.get(key), dict) for key in ("state", "actions"))
+            or not isinstance(provenance, dict) or provenance.get("method") != "weighted_raw_samples"):
+        raise ValueError("OUTPUT_INVALID: checkpoint 共享归一化统计缺少实际 state/actions 或来源证明")
+    result = {"path": str(source), "sha256": digest, "shared": True}
+    method = document.get("normalization_method")
+    if method is not None:
+        if method not in {"quantile", "minmax", "zscore"}:
+            raise ValueError("OUTPUT_INVALID: checkpoint 归一化方式无效")
+        result["normalization_method"] = method
+    return result
+
+
 def _run_spec(spec, *, validate_only=False, fps_runtime=None):
     checks = []
     if validate_only:
@@ -340,6 +375,23 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
     effective["inputs"] = spec["inputs"]
     effective["execution_plan"] = plan
     effective["execution_plan_digest"] = fingerprint(plan)
+    logging.basicConfig(level=logging.INFO)
+    if plan.get("normalization", {}).get("mode") == "auto_shared":
+        print("训练准备：完整读取全部数据集的数值字段，按本次混采权重计算共享 norm_stats；不平均旧统计，不解码图像。", flush=True)
+        helper = importlib.import_module("openpi.training.training_normalization")
+        config = helper.prepare_training_normalization(config)
+        actual_value = getattr(config.data, "shared_norm_stats_path", None)
+        if not isinstance(actual_value, (str, Path)) or not str(actual_value):
+            raise ValueError("SHARED_NORM_INVALID: 训练准备未返回共享统计路径")
+        actual_path = Path(actual_value)
+        if (getattr(config.data, "use_merged_norm_stats", None) is not True
+                or actual_path.resolve() != (output / plan["normalization"]["output_relative_path"]).resolve()):
+            raise ValueError("SHARED_NORM_INVALID: 训练准备未绑定计划中的共享统计，不能退回逐数据集统计")
+        _, digest = read_json(actual_path, spec)
+        effective["runtime_normalization"] = {"mode": "shared", "norm_path": str(actual_path),
+            "norm_sha256": digest, "checkpoint_asset_id": "shared",
+            "planned_fingerprint": plan["normalization"]["fingerprint"]}
+        effective["actual_config"] = configuration_snapshot(config)["configuration"]
     (output / "effective_training.json").write_text(json.dumps(effective, indent=2, ensure_ascii=False))
 
     def log_metrics(values, step=None, **kwargs):
@@ -349,7 +401,6 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
         print("VLA_EVENT:" + json.dumps({"type": "METRIC", "data": {
             **metrics, "step": step, "total_steps": config.num_train_steps}}), flush=True)
 
-    logging.basicConfig(level=logging.INFO)
     with training_module(entry, spec["code_dir"], plan["entrypoint_sha256"]) as module:
         try:
             inspect.signature(module.main).bind(config)
@@ -375,6 +426,11 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
                 "path": str(last), "version": last.name,
                 "metadata": {"format": "openpi-orbax", "recipe": spec["recipe"],
                              "step": int(last.name), "evaluated": False}}
+    norm = checkpoint_norm_descriptor(last, spec)
+    if plan.get("normalization", {}).get("mode") == "auto_shared" and norm is None:
+        raise RuntimeError("OUTPUT_MISSING: 自动共享训练的 checkpoint 缺少实际使用的共享 norm_stats，不能登记未绑定模型")
+    if norm is not None:
+        artifact["metadata"]["norm_stats"] = norm
     (output / "artifacts.json").write_text(json.dumps([artifact], ensure_ascii=False, indent=2))
 
 
