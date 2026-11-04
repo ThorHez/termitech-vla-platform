@@ -53,18 +53,21 @@ export function ResourceTrendChart({
   title,
   history,
   series,
+  compact = false,
 }: {
   title: string;
   history: ResourceHistoryResponse;
   series: ChartSeries[];
+  compact?: boolean;
 }) {
   const labelId = useId();
   const [selected, setSelected] = useState<number | null>(null);
   const start = Date.parse(history.start);
   const duration = Math.max(1, Date.parse(history.end) - start);
+  const canvasWidth = compact ? 560 : 800;
   const left = 43,
     top = 15,
-    width = 730,
+    width = canvasWidth - 70,
     height = 152;
   const x = (timestamp: string) =>
     left + Math.max(0, Math.min(1, (Date.parse(timestamp) - start) / duration)) * width;
@@ -87,7 +90,7 @@ export function ResourceTrendChart({
       {known ? (
         <>
           <svg
-            viewBox="0 0 800 205"
+            viewBox={`0 0 ${canvasWidth} 205`}
             role="img"
             tabIndex={0}
             aria-labelledby={`${labelId}-title ${labelId}-desc`}
@@ -95,7 +98,10 @@ export function ResourceTrendChart({
               const bounds = event.currentTarget.getBoundingClientRect();
               const fraction = Math.max(
                 0,
-                Math.min(1, (((event.clientX - bounds.left) / bounds.width) * 800 - left) / width),
+                Math.min(
+                  1,
+                  (((event.clientX - bounds.left) / bounds.width) * canvasWidth - left) / width,
+                ),
               );
               setSelected(nearestPointIndex(history.points, start + fraction * duration));
             }}
@@ -140,7 +146,7 @@ export function ResourceTrendChart({
                 </text>
               </g>
             ))}
-            {[0, 0.25, 0.5, 0.75, 1].map((fraction) => (
+            {(compact ? [0, 0.5, 1] : [0, 0.25, 0.5, 0.75, 1]).map((fraction) => (
               <text
                 key={fraction}
                 x={left + width * fraction}
@@ -230,18 +236,117 @@ export function ResourceTrendChart({
   );
 }
 
+export function GpuHistoryCharts({
+  history,
+  gpuIds,
+  selectGpus,
+}: {
+  history: ResourceHistoryResponse;
+  gpuIds: string[] | null;
+  selectGpus: (uuids: string[] | null) => void;
+}) {
+  const gpus = historicalGpus(history.points);
+  const selected = gpus.filter((gpu) => gpuIds === null || gpuIds.includes(gpu.uuid));
+  return (
+    <>
+      <div className="resource-history-gpu-heading">
+        <h3>GPU 资源占用</h3>
+        {!!gpus.length && (
+          <div className="resource-history-gpu-actions">
+            <span>
+              已选 {selected.length} / {gpus.length} 张
+            </span>
+            <button type="button" className="text-link" onClick={() => selectGpus(null)}>
+              全选
+            </button>
+            <button type="button" className="text-link" onClick={() => selectGpus([])}>
+              清空
+            </button>
+          </div>
+        )}
+      </div>
+      {!!gpus.length && (
+        <fieldset className="resource-history-gpu-picker">
+          <legend>选择 GPU（可多选）</legend>
+          <div className="resource-history-gpu-options">
+            {gpus.map((gpu) => {
+              const checked = gpuIds === null || gpuIds.includes(gpu.uuid);
+              return (
+                <label key={gpu.uuid} className={checked ? 'selected' : ''}>
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => {
+                      const current = gpuIds ?? gpus.map((item) => item.uuid);
+                      selectGpus(
+                        checked
+                          ? current.filter((uuid) => uuid !== gpu.uuid)
+                          : [...current, gpu.uuid],
+                      );
+                    }}
+                  />
+                  <span>
+                    <strong>{gpu.name}</strong>
+                    <code>{gpu.uuid}</code>
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </fieldset>
+      )}
+      {selected.length ? (
+        <div className={`resource-history-gpu-grid${selected.length === 1 ? ' single' : ''}`}>
+          {selected.map((gpu) => (
+            <ResourceTrendChart
+              key={gpu.uuid}
+              title={`${gpu.name} · ${gpu.uuid}`}
+              history={history}
+              compact={selected.length > 1}
+              series={[
+                {
+                  label: 'GPU 利用率',
+                  color: palette.gpu,
+                  values: seriesValues(
+                    history.points,
+                    (point) => point.gpus.find((item) => item.uuid === gpu.uuid)?.utilization_pct,
+                  ),
+                },
+                {
+                  label: '显存占用',
+                  color: palette.vram,
+                  values: seriesValues(
+                    history.points,
+                    (point) => point.gpus.find((item) => item.uuid === gpu.uuid)?.memory_percent,
+                  ),
+                },
+              ]}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="resource-chart-unavailable">
+          {gpus.length
+            ? '未选择 GPU，请勾选要查看的显卡或点击全选。'
+            : '此时段暂无 GPU 历史指标，未知值保留为空。'}
+        </div>
+      )}
+    </>
+  );
+}
+
 function HistoryContent({
   nodeId,
   window,
   status,
-  gpuId,
-  selectGpu,
+  gpuIds,
+  selectGpus,
 }: {
   nodeId: string;
   window: HistoryWindow;
   status: string;
-  gpuId: string;
-  selectGpu: (uuid: string) => void;
+  gpuIds: string[] | null;
+  selectGpus: (uuids: string[] | null) => void;
 }) {
   const history = useApi<ResourceHistoryResponse>(
     `/nodes/${encodeURIComponent(nodeId)}/resource-history?window=${window}`,
@@ -249,8 +354,6 @@ function HistoryContent({
   );
   const data =
     history.data?.node_id === nodeId && history.data.window === window ? history.data : undefined;
-  const gpus = historicalGpus(data?.points || []);
-  const selectedGpu = gpus.find((gpu) => gpu.uuid === gpuId) || gpus[0];
   const systemSeries = data
     ? [
         {
@@ -324,56 +427,7 @@ function HistoryContent({
             })}
           </div>
           <ResourceTrendChart title="整机资源占用" history={data} series={systemSeries} />
-          <div className="resource-history-gpu-heading">
-            <h3>GPU 资源占用</h3>
-            {!!gpus.length && (
-              <label>
-                选择 GPU
-                <select
-                  aria-label="历史指标 GPU"
-                  value={selectedGpu?.uuid || ''}
-                  onChange={(event) => selectGpu(event.target.value)}
-                >
-                  {gpus.map((gpu) => (
-                    <option key={gpu.uuid} value={gpu.uuid}>
-                      {gpu.name} · {gpu.uuid}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-          </div>
-          {selectedGpu ? (
-            <ResourceTrendChart
-              key={selectedGpu.uuid}
-              title={`${selectedGpu.name} · ${selectedGpu.uuid}`}
-              history={data}
-              series={[
-                {
-                  label: 'GPU 利用率',
-                  color: palette.gpu,
-                  values: seriesValues(
-                    data.points,
-                    (point) =>
-                      point.gpus.find((gpu) => gpu.uuid === selectedGpu.uuid)?.utilization_pct,
-                  ),
-                },
-                {
-                  label: '显存占用',
-                  color: palette.vram,
-                  values: seriesValues(
-                    data.points,
-                    (point) =>
-                      point.gpus.find((gpu) => gpu.uuid === selectedGpu.uuid)?.memory_percent,
-                  ),
-                },
-              ]}
-            />
-          ) : (
-            <div className="resource-chart-unavailable">
-              此时段暂无 GPU 历史指标，未知值保留为空。
-            </div>
-          )}
+          <GpuHistoryCharts history={data} gpuIds={gpuIds} selectGpus={selectGpus} />
           <p className="resource-history-note">
             保存近 {data.retention_days} 天记录，最多每 {data.sample_interval_seconds} 秒采样一次。
             当前按{' '}
@@ -391,7 +445,10 @@ function HistoryContent({
 
 export function ResourceHistory({ nodeId, status }: { nodeId: string; status: string }) {
   const [window, setWindow] = useState<HistoryWindow>('24h');
-  const [gpuId, setGpuId] = useState('');
+  const [gpuSelection, setGpuSelection] = useState<{
+    nodeId: string;
+    uuids: string[] | null;
+  } | null>(null);
   return (
     <Panel
       className="resource-history"
@@ -418,8 +475,8 @@ export function ResourceHistory({ nodeId, status }: { nodeId: string; status: st
         nodeId={nodeId}
         window={window}
         status={status}
-        gpuId={gpuId}
-        selectGpu={setGpuId}
+        gpuIds={gpuSelection?.nodeId === nodeId ? gpuSelection.uuids : null}
+        selectGpus={(uuids) => setGpuSelection({ nodeId, uuids })}
       />
     </Panel>
   );
