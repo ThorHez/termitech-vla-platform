@@ -1,5 +1,14 @@
-import { useEffect, useRef, useState } from 'react';
-import { Database, Plus, Trash2 } from 'lucide-react';
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import { flushSync } from 'react-dom';
+import { ChevronDown, Database, Plus, Trash2 } from 'lucide-react';
 import { Field } from './components';
 import {
   DataProcessorCatalogStatus,
@@ -16,6 +25,10 @@ import {
 } from './normStats';
 import type { Asset, Node, NormDataset, Profile } from './types';
 import type { ImageLayoutEdits } from './imageLayout';
+import {
+  createDatasetBindingDisclosure,
+  datasetBindingDisclosureReducer,
+} from './datasetBindingDisclosure';
 
 export function NormDatasetEditor({
   rows,
@@ -42,6 +55,32 @@ export function NormDatasetEditor({
   onValidityChange?: (valid: boolean) => void;
   readOnly?: boolean;
 }) {
+  const disclosureId = useId();
+  const [disclosure, dispatchDisclosure] = useReducer(
+    datasetBindingDisclosureReducer,
+    rows.length,
+    createDatasetBindingDisclosure,
+  );
+  const lastDatasetSelect = useRef<HTMLSelectElement>(null);
+  const pendingDatasetFocus = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    const index = pendingDatasetFocus.current;
+    const select = lastDatasetSelect.current;
+    if (
+      index === null ||
+      index !== rows.length - 1 ||
+      !disclosure.expanded.includes(index) ||
+      !select
+    )
+      return;
+    pendingDatasetFocus.current = null;
+    (select.closest('.field') || select).scrollIntoView({
+      block: 'start',
+      inline: 'nearest',
+      behavior: 'instant',
+    });
+    select.focus({ preventScroll: true });
+  }, [rows.length, disclosure.expanded]);
   const validate = !readOnly || !!onValidityChange;
   const catalog = useDataProcessorCatalog(
     validate ? node : undefined,
@@ -58,6 +97,15 @@ export function NormDatasetEditor({
   );
   const [validity, setValidity] = useState<Record<string, boolean>>({});
   const scope = JSON.stringify([node?.id, profile?.id, profile?.code_dir, recipe, automatic]);
+  const disclosureScope = useRef(scope);
+  useEffect(() => {
+    if (disclosureScope.current !== scope) {
+      disclosureScope.current = scope;
+      pendingDatasetFocus.current = null;
+      dispatchDisclosure({ type: 'sync', count: 0 });
+    }
+    dispatchDisclosure({ type: 'sync', count: rows.length });
+  }, [scope, rows.length]);
   const tokens = rows.map((row) =>
     JSON.stringify([
       scope,
@@ -104,22 +152,62 @@ export function NormDatasetEditor({
       {rows.map((row, index) => {
         const asset = datasets.find((item) => item.id === row.dataset_asset_id);
         const token = tokens[index];
+        const parameterErrors = row.processor
+          ? processorParameterErrors(
+              row.processor,
+              entries.find((entry) => entry.name === row.processor!.name),
+              {},
+              'norm',
+            )
+          : [];
+        const processingIncomplete =
+          normDatasetErrors(
+            [{ ...row, dataset_asset_id: row.dataset_asset_id || 'pending' }],
+            automatic,
+          ).length > 0 ||
+          (row.processor && validity[token] === false) ||
+          parameterErrors.length > 0;
+        const processingPending =
+          !!row.processor && validity[token] === undefined && !processingIncomplete;
+        const issues = [
+          !asset ? (row.dataset_asset_id ? '原数据集暂不可用，请重新选择' : '请选择数据集') : '',
+          row.dataset_asset_id &&
+          rows.some(
+            (other, position) =>
+              position !== index && other.dataset_asset_id === row.dataset_asset_id,
+          )
+            ? '数据集已重复选择'
+            : '',
+          processingIncomplete ? '处理配置待完善，请展开检查' : '',
+        ].filter(Boolean);
+        const processingLabel = row.processor
+          ? row.processor.name === 'ComposableDataConfig'
+            ? '自定义字段组合'
+            : row.processor.name
+          : automatic
+            ? '待配置'
+            : `配方数据项 ${Number.isFinite(row.recipe_index) ? row.recipe_index! + 1 : '待填写'}`;
         return (
-          <article className="dataset-binding" key={`${scope}:${index}`}>
-            <div className="dataset-binding-title">
-              <strong>数据集 {index + 1}</strong>
-              {!readOnly && (
-                <button
-                  type="button"
-                  className="icon-button"
-                  aria-label={`移除统计数据集 ${index + 1}`}
-                  disabled={rows.length <= 1}
-                  onClick={() => onChange(rows.filter((_, position) => position !== index))}
-                >
-                  <Trash2 size={15} />
-                </button>
-              )}
-            </div>
+          <NormDatasetCard
+            key={`${scope}:${index}`}
+            index={index}
+            dataset={asset}
+            processingLabel={processingLabel}
+            processingPending={processingPending}
+            issues={issues}
+            expanded={disclosure.expanded.includes(index)}
+            contentId={`${disclosureId}-norm-dataset-${index}`}
+            readOnly={readOnly}
+            removable={rows.length > 1}
+            onToggle={(position) => dispatchDisclosure({ type: 'toggle', index: position })}
+            onRemove={(position) => {
+              dispatchDisclosure({ type: 'remove', index: position });
+              onChange(rows.filter((_, current) => current !== position));
+            }}
+            onInvalid={(position) =>
+              flushSync(() => dispatchDisclosure({ type: 'open', index: position }))
+            }
+          >
             {readOnly ? (
               <>
                 <strong>{asset?.name || row.dataset_asset_id || '尚未选择'}</strong>
@@ -135,6 +223,7 @@ export function NormDatasetEditor({
                 hint="只选择本机原始数据；输出保存到各自独立目录。"
               >
                 <select
+                  ref={index === rows.length - 1 ? lastDatasetSelect : undefined}
                   value={row.dataset_asset_id}
                   required
                   onChange={(event) =>
@@ -222,7 +311,7 @@ export function NormDatasetEditor({
                 )
               }
             />
-          </article>
+          </NormDatasetCard>
         );
       })}
       {!readOnly && (
@@ -230,13 +319,103 @@ export function NormDatasetEditor({
           type="button"
           className="button outline small"
           disabled={rows.length >= 64}
-          onClick={() => onChange(appendNormDataset(rows, automatic))}
+          onClick={() => {
+            pendingDatasetFocus.current = rows.length;
+            dispatchDisclosure({ type: 'append' });
+            onChange(appendNormDataset(rows, automatic));
+          }}
         >
           <Plus size={14} />
           添加待统计数据集
         </button>
       )}
     </section>
+  );
+}
+
+export function NormDatasetCard({
+  index,
+  dataset,
+  processingLabel,
+  processingPending,
+  issues,
+  expanded,
+  contentId,
+  readOnly,
+  removable,
+  onToggle,
+  onRemove,
+  onInvalid,
+  children,
+}: {
+  index: number;
+  dataset?: Asset;
+  processingLabel: string;
+  processingPending: boolean;
+  issues: readonly string[];
+  expanded: boolean;
+  contentId: string;
+  readOnly: boolean;
+  removable: boolean;
+  onToggle: (index: number) => void;
+  onRemove: (index: number) => void;
+  onInvalid: (index: number) => void;
+  children: ReactNode;
+}) {
+  return (
+    <article className="dataset-binding">
+      <div className="dataset-binding-title">
+        {readOnly ? (
+          <strong>数据集 {index + 1}</strong>
+        ) : (
+          <button
+            type="button"
+            className="dataset-binding-toggle"
+            aria-expanded={expanded}
+            aria-controls={contentId}
+            onClick={() => onToggle(index)}
+          >
+            <ChevronDown size={15} className={expanded ? '' : 'collapsed'} />
+            <strong>数据集 {index + 1}</strong>
+            <span>{expanded ? '收起配置' : '展开配置'}</span>
+          </button>
+        )}
+        {!readOnly && (
+          <button
+            type="button"
+            className="icon-button"
+            aria-label={`移除统计数据集 ${index + 1}`}
+            disabled={!removable}
+            onClick={() => onRemove(index)}
+          >
+            <Trash2 size={15} />
+          </button>
+        )}
+      </div>
+      {!readOnly && (
+        <div className="dataset-binding-overview">
+          <strong>{dataset ? `${dataset.name} · ${dataset.version}` : '尚未选择数据集'}</strong>
+          <span>处理方案：{processingLabel}</span>
+          <span
+            className={`dataset-binding-status${issues.length ? ' error' : processingPending ? ' pending' : ''}`}
+          >
+            {issues.length
+              ? issues.join('；')
+              : processingPending
+                ? '处理配置校验中'
+                : '本组配置已填写'}
+          </span>
+        </div>
+      )}
+      <div
+        className="dataset-binding-content"
+        id={contentId}
+        hidden={!readOnly && !expanded}
+        onInvalidCapture={() => onInvalid(index)}
+      >
+        {children}
+      </div>
+    </article>
   );
 }
 
