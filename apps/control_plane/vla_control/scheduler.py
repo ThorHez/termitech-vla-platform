@@ -6,6 +6,8 @@ import secrets
 import time
 
 from sqlalchemy import select
+from vla_protocol.training_gpu_policy import (TRAINING_SHARED_GPU_CAPABILITY,
+    normalize_training_gpu_policy, training_gpu_error)
 
 from .common import ACTIVE, now, offset_time, uid
 from .db import Database
@@ -28,14 +30,7 @@ logger = logging.getLogger(__name__)
 
 def gpu_available(gpu: dict) -> bool:
     """Unknown process telemetry is not proof that a device is available."""
-    if gpu.get("processes") != []:
-        return False
-    utilization = gpu.get("utilization_pct")
-    memory = gpu.get("memory_used_mb")
-    total = gpu.get("memory_total_mb")
-    if utilization is None or memory is None or total is None:
-        return False
-    return utilization <= 5 and memory <= max(128, total * 0.02)
+    return training_gpu_error(gpu) is None
 
 
 def enqueue(session, node_id: str, kind: str, payload: dict) -> Command:
@@ -102,9 +97,25 @@ def tick(db: Database, settings: Settings) -> int:
             reserved = {row.gpu_uuid for row in session.scalars(select(Allocation).where(Allocation.node_id == node_id))}
             reserved.update(row.gpu_uuid for row in session.scalars(select(PolicyDeployment).where(
                 PolicyDeployment.node_id == node_id, PolicyDeployment.state.in_(RESOURCE_STATES))) if row.gpu_uuid)
-            free = [gpu["uuid"] for gpu in node.gpus if gpu["uuid"] not in reserved and gpu_available(gpu)]
+            available = [gpu for gpu in node.gpus if gpu["uuid"] not in reserved]
             user_reservations = reservation_owners(session, node_id)
             for run in queued:
+                try:
+                    policy = normalize_training_gpu_policy(run.code_expectation.get("training_gpu_policy"))
+                except (ValueError, TypeError):
+                    run.queue_reason = "TRAINING_GPU_POLICY_INVALID"
+                    continue
+                if policy is not None:
+                    capabilities = (node.metrics or {}).get("capabilities")
+                    if (run.template_id not in {"openpi-sft", "recap"} or run.gpu_count <= 0
+                            or not isinstance(capabilities, list)
+                            or TRAINING_SHARED_GPU_CAPABILITY not in capabilities):
+                        run.queue_reason = "TRAINING_SHARED_GPU_UNSUPPORTED"
+                        continue
+                    if run.requested_gpu_uuids is None:
+                        run.queue_reason = "REQUESTED_GPU_INVALID"
+                        continue
+                free = [gpu["uuid"] for gpu in available if training_gpu_error(gpu, policy) is None]
                 eligible = [uuid for uuid in free if uuid not in user_reservations
                             or user_reservations[uuid] == run.owner_user_id]
                 # A user's own reservation should leave the shared pool free
@@ -158,6 +169,7 @@ def tick(db: Database, settings: Settings) -> int:
                     "inputs": resolve_inputs(session, run), "parameters": run.parameters,
                     "gpu_uuids": chosen, "code_expectation": run.code_expectation,
                     "entrypoint": run.code_expectation.get("requested_entrypoint"),
+                    **({"training_gpu_policy": policy} if policy is not None else {}),
                     **({"auto_config": run.code_expectation["auto_config"]} if run.code_expectation.get("auto_config") is not None else {}),
                     **({"normalization_method": run.code_expectation["normalization_method"]} if run.code_expectation.get("normalization_method") is not None else {}),
                     **({"confirmed_config_sha256": run.code_expectation["confirmed_config_sha256"]} if run.code_expectation.get("confirmed_config_sha256") else {}),
@@ -168,7 +180,7 @@ def tick(db: Database, settings: Settings) -> int:
                     **({"recipe_definition": run.code_expectation["recipe_definition"], "node_id": node_id} if run.code_expectation.get("recipe_definition") else {}),
                 })
                 run.state, run.queue_reason, run.updated_at = "STARTING", None, now()
-                free = [uuid for uuid in free if uuid not in set(chosen)]
+                available = [gpu for gpu in available if gpu["uuid"] not in set(chosen)]
                 dispatched += 1
     with db.write() as session:
         expire_path_queries(session)

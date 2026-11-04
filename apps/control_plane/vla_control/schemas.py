@@ -198,11 +198,23 @@ class PreviewInput(InputModel):
     parameters: dict = Field(default_factory=dict)
     gpu_count: int = Field(default=1, ge=0, le=256, strict=True)
     requested_gpu_uuids: list[str] | None = Field(default=None, min_length=1, max_length=256)
+    training_gpu_policy: dict | None = None
+
+    @field_validator("training_gpu_policy", mode="before")
+    @classmethod
+    def normalize_training_gpu_policy(cls, value):
+        from vla_protocol.training_gpu_policy import normalize_training_gpu_policy
+        return normalize_training_gpu_policy(value)
 
     @model_validator(mode="after")
     def validate_requested_gpus(self):
         from .gpu_selection import requested_gpu_uuids
         self.requested_gpu_uuids = requested_gpu_uuids(self.requested_gpu_uuids, self.gpu_count)
+        if self.training_gpu_policy is not None:
+            if self.template_id not in {"openpi-sft", "recap"} or self.gpu_count <= 0:
+                raise ValueError("TRAINING_GPU_POLICY_UNSUPPORTED: 共享显存仅支持 OpenPI GPU 训练")
+            if self.requested_gpu_uuids is None:
+                raise ValueError("TRAINING_GPU_SELECTION_REQUIRED: 共享训练必须明确选择具体 GPU")
         return self
 
     @field_validator("auto_config")

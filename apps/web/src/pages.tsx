@@ -403,6 +403,11 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
     used = gpu.memory_used_mb;
   const unknown =
     gpu.processes == null || gpu.utilization_pct == null || total == null || used == null;
+  const partiallyUsed =
+    !unknown &&
+    !!gpu.processes?.length &&
+    typeof gpu.memory_free_mb === 'number' &&
+    gpu.memory_free_mb > 1024;
   return (
     <div className="gpu-card">
       <div className="gpu-card-title">
@@ -419,7 +424,9 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
                 ? '占用未知'
                 : gpuIdle(gpu)
                   ? '空闲'
-                  : '资源占用'}
+                  : partiallyUsed
+                    ? '部分占用'
+                    : '资源占用'}
         </span>
       </div>
       <div className="gpu-measures">
@@ -439,6 +446,11 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
             value={used != null && total ? (used / total) * 100 : undefined}
             tone="blue"
           />
+          {typeof gpu.memory_free_mb === 'number' && (
+            <small className="field-hint">
+              实际剩余 {(gpu.memory_free_mb / 1024).toFixed(1)} GiB
+            </small>
+          )}
         </div>
       </div>
       <div className="gpu-meta">

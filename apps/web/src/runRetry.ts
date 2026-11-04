@@ -6,6 +6,7 @@ import {
 import { TRAINING_TEMPLATE_PROCESSING_MARKER } from './trainingTemplate';
 import { validRequestedGpuList } from './trainingGpuSelection';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
+import { validTrainingGpuPolicy } from './trainingGpuPolicy';
 import type {
   AutoTrainingConfig,
   DatasetBinding,
@@ -113,6 +114,16 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
     )
       throw new Error('原训练指定 GPU 配置无效，请手动重新选择。');
     request.requested_gpu_uuids = [...requestedGpus];
+  }
+  const gpuPolicy = setting('training_gpu_policy');
+  if (gpuPolicy != null) {
+    if (
+      !validTrainingGpuPolicy(gpuPolicy) ||
+      !request.requested_gpu_uuids?.length ||
+      !['openpi-sft', 'recap'].includes(request.template_id)
+    )
+      throw new Error('原训练共享显存配置无效，请重新选择 GPU 使用模式。');
+    request.training_gpu_policy = { ...gpuPolicy };
   }
   const rawNormDatasets = setting('norm_datasets');
   const rawBindings = setting('dataset_bindings');

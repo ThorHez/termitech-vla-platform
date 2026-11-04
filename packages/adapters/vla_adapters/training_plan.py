@@ -618,6 +618,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "generated_config": generated_training_config(config, spec, entrypoint=entry),
             **({"auto_config": normalize_auto_config(spec["auto_config"])} if spec.get("auto_config") is not None else {}),
             **({"normalization_method": requested_method} if requested_method is not None else {}),
+            **({"training_gpu_policy": spec["training_gpu_policy"]} if spec.get("training_gpu_policy") is not None else {}),
             **({"training_stage": stage, "stage_config": stage_config, "recap_stage_contract": stage_contract}
                if stage is not None else {}),
             **({"dataset_bindings": bindings} if bindings is not None else {}),

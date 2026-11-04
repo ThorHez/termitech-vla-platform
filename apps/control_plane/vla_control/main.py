@@ -548,6 +548,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             enqueue(session, node.id, "PREFLIGHT", {"preview_id": preview.id, "profile_id": body.profile_id,
                 "template_id": body.template_id, "recipe": data["recipe"], "inputs": resolve_inputs(session, data),
                 "parameters": parameters, "gpu_count": body.gpu_count, "entrypoint": data.get("entrypoint"),
+                **({"requested_gpu_uuids": data["requested_gpu_uuids"]} if data.get("requested_gpu_uuids") is not None else {}),
+                **({"training_gpu_policy": data["training_gpu_policy"]} if data.get("training_gpu_policy") is not None else {}),
                 **({"auto_config": data["auto_config"]} if data.get("auto_config") is not None else {}),
                 **({"normalization_method": data["normalization_method"]} if data.get("normalization_method") is not None else {}),
                 **({"training_stage": data["training_stage"], "stage_config": data["stage_config"]} if data.get("training_stage") is not None else {}),
@@ -635,7 +637,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             created = now()
-            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "norm_datasets", "training_stage", "stage_config", "dataset_profiles", "auto_config", "normalization_method"}}
+            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "norm_datasets", "training_stage", "stage_config", "dataset_profiles", "auto_config", "normalization_method", "training_gpu_policy"}}
             expectation = {key: deepcopy(value) for key, value in preview.code_snapshot.items() if key != "dataset_profiles"}
             if data["template_id"] in {"openpi-sft", "recap", "openpi-norm"}:
                 expectation["confirmed_config_sha256"] = body.confirmed_config_sha256
@@ -644,6 +646,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expectation["dataset_profiles"] = deepcopy(data["dataset_profiles"])
             if data.get("requested_gpu_uuids") is not None:
                 expectation["requested_gpu_uuids"] = deepcopy(data["requested_gpu_uuids"])
+            if data.get("training_gpu_policy") is not None:
+                expectation["training_gpu_policy"] = deepcopy(data["training_gpu_policy"])
             if data["template_id"] == "openpi-norm":
                 from .norm_outputs import BINDING_EXPECTATIONS, freeze_norm_bindings
                 expectation[BINDING_EXPECTATIONS] = freeze_norm_bindings(session, data["inputs"], node.id)

@@ -214,13 +214,27 @@ class Idempotency(Base):
 
 
 class TrainingDraft(Base):
-    """One private unfinished wizard configuration per human account.
+    """Legacy account-wide wizard configuration retained for older clients.
 
     Cleared drafts retain their revision so delayed saves cannot recreate them.
     No preview, acceptance or execution state is stored here.
     """
     __tablename__ = "training_drafts"
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    content: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    revision: Mapped[int] = mapped_column(BigInteger, default=1)
+    updated_at: Mapped[str] = mapped_column(String(40))
+
+
+class TrainingTemplateDraft(Base):
+    """Private unfinished configuration and CAS revision for one template.
+
+    A tombstone remains after clearing or submitting so a delayed save cannot
+    recreate the draft. The legacy account-wide draft is never overwritten.
+    """
+    __tablename__ = "training_template_drafts"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    template_id: Mapped[str] = mapped_column(String(100), primary_key=True)
     content: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     revision: Mapped[int] = mapped_column(BigInteger, default=1)
     updated_at: Mapped[str] = mapped_column(String(40))

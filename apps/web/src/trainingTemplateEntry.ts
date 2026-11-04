@@ -9,6 +9,7 @@ import {
 } from './trainingResourceRecommendations';
 import { DEFAULT_AUTO_CONFIG } from './trainingConfiguration';
 import { DEFAULT_TRAINING_NORMALIZATION_METHOD } from './trainingNormalization';
+import { trainingDatasetNormId } from './datasetBindingHelpers';
 import type { TrainingDraftSnapshot } from './trainingDraft';
 import type {
   Asset,
@@ -101,7 +102,7 @@ export function trainingTemplateEntry(
         };
       return {
         dataset_asset_id: row.dataset_asset_id,
-        norm_asset_id: row.norm_asset_id ?? dataset?.norm_asset_id ?? '',
+        norm_asset_id: row.norm_asset_id || trainingDatasetNormId(dataset, resources.assets),
         weight: row.weight ?? 1,
         processor,
       };

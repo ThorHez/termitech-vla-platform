@@ -1,7 +1,27 @@
-import type { DatasetBinding, RecipeDatasetSlot, RecipeDetail } from './types';
+import { datasetNormCandidates, datasetNormSelectionError } from './datasetNormAssets';
+import type { Asset, DatasetBinding, RecipeDatasetSlot, RecipeDetail } from './types';
 
 export function normalizedAssetPath(path: string) {
   return path.replace(/\/+$/u, '').replace(/\/\.\//gu, '/');
+}
+
+/** A registered binding is authoritative, including when it needs repairing. */
+export function trainingDatasetNormId(
+  dataset: Asset | undefined,
+  assets: readonly Asset[],
+): string {
+  if (!dataset || dataset.kind !== 'DATASET') return '';
+  const candidates = [...assets];
+  if (dataset.norm_asset_id)
+    return datasetNormSelectionError(dataset.node_id, dataset.norm_asset_id, candidates)
+      ? ''
+      : dataset.norm_asset_id;
+  if (!dataset.path) return '';
+  const prefix = `${normalizedAssetPath(dataset.path)}/`;
+  const matching = datasetNormCandidates(dataset.node_id, candidates).filter((asset) =>
+    normalizedAssetPath(asset.path).startsWith(prefix),
+  );
+  return matching.length === 1 ? matching[0].id : '';
 }
 
 export function recipeDatasetSlots(detail: RecipeDetail): RecipeDatasetSlot[] {
@@ -99,6 +119,34 @@ export function selectDatasetBinding(
       : { ...selected, recipe_index: recipeIndex ?? defaultRecipeIndex };
   }
   return { ...selected, recipe_index: defaultRecipeIndex };
+}
+
+/** Apply defaults only on a dataset selection, never over a subsequent norm edit. */
+export function selectTrainingDatasetBinding(
+  bindings: DatasetBinding[],
+  index: number,
+  datasetAssetId: string,
+  assets: readonly Asset[],
+  defaultRecipeIndex = 0,
+  preserveProcessing = false,
+): DatasetBinding[] {
+  const dataset = assets.find((asset) => asset.id === datasetAssetId && asset.kind === 'DATASET');
+  const sharedNormId =
+    datasetNormalizationMode(bindings) === 'shared' ? sharedNormalizationAssetId(bindings) : '';
+  return bindings.map((binding, row) =>
+    row !== index
+      ? binding
+      : selectDatasetBinding(
+          binding,
+          {
+            dataset_asset_id: datasetAssetId,
+            norm_asset_id: trainingDatasetNormId(dataset, assets),
+          },
+          defaultRecipeIndex,
+          preserveProcessing,
+          sharedNormId || undefined,
+        ),
+  );
 }
 
 export function datasetInputLabel(role: string) {

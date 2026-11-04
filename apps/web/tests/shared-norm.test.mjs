@@ -109,7 +109,9 @@ try {
     assert.match(html, /单源参数不能冒充多源统计/);
     assert.match(html, /不会启动全量统计任务/);
     assert.match(html, /每条样本的重复权重；实际来源占比还取决于样本数/);
-    assert.match(html, /权重占比（未考虑样本数）约/);
+    assert.match(html, /权重占比约/);
+    assert.match(html, /样本数占比/);
+    assert.match(html, /预计采样占比/);
     assert.doesNotMatch(html, /采样比例约/);
     assert.match(html, /数据集 1/); assert.match(html, /数据集 2/);
   });
@@ -130,7 +132,7 @@ try {
     const restored = codec.decodeTrainingDraft(JSON.parse(JSON.stringify(codec.encodeTrainingDraft(original))));
     assert.deepEqual(restored, original);
     const html = render(restored.request.dataset_bindings);
-    assert.match(html, /逐组归一化（旧配置）/);
+    assert.match(html, /逐组归一化/);
     assert.match(html, /切换为共享归一化/);
     assert.match(html, /value="norm-a" selected=""/); assert.match(html, /value="norm-b" selected=""/);
     assert.match(html, /归一化参数 1/); assert.match(html, /归一化参数 2/);
@@ -151,7 +153,7 @@ try {
     assert.match(shared, /共享归一化参数/); assert.match(shared, /shared-norm/);
     assert.doesNotMatch(shared, /<select\b|添加数据集|切换为共享归一化/);
     const legacy = render([row('data-a', 'norm-a'), row('data-b', 'norm-b')], { readOnly: true });
-    assert.match(legacy, /逐组归一化（旧配置）/); assert.doesNotMatch(legacy, /切换为共享归一化/);
+    assert.match(legacy, /逐组归一化/); assert.doesNotMatch(legacy, /切换为共享归一化/);
   });
 } finally {
   await server.close();

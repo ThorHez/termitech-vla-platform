@@ -6,10 +6,12 @@ import {
   appendDatasetBinding,
   bindSharedNormalization,
   datasetNormalizationMode,
-  normalizedAssetPath,
-  selectDatasetBinding,
+  selectTrainingDatasetBinding,
   sharedNormalizationAssetId,
 } from './datasetBindingHelpers';
+import { datasetNormCandidates, datasetNormSelectionError } from './datasetNormAssets';
+import { datasetSamplingShares, samplingPercentText } from './datasetSampling';
+import { useDatasetSampleCounts } from './useDatasetSampleCounts';
 import {
   DataProcessorCatalogStatus,
   processorParameterErrors,
@@ -100,13 +102,13 @@ export function DatasetBindings({
     dispatchDisclosure({ type: 'sync', count: bindings.length });
   }, [bindings.length]);
   const datasets = assets.filter((asset) => asset.kind === 'DATASET');
-  const norms = assets.filter(
-    (asset) =>
-      asset.kind === 'NORM' &&
-      (!node || asset.node_id === node.id) &&
-      asset.state !== 'ARCHIVED' &&
-      asset.state !== 'UNAVAILABLE',
-  );
+  const norms = node
+    ? datasetNormCandidates(node.id, assets)
+    : assets.filter(
+        (asset) =>
+          asset.kind === 'NORM' &&
+          !['ARCHIVED', 'UNAVAILABLE'].includes(asset.status || asset.state || ''),
+      );
   const normalizationMode = datasetNormalizationMode(bindings);
   const sharedNormalization = normalizationMode === 'shared';
   const sharedNormId = sharedNormalizationAssetId(bindings);
@@ -190,10 +192,8 @@ export function DatasetBindings({
   useEffect(() => {
     validityRef.current?.(valid);
   }, [valid, onValidityChange]);
-  const totalWeight = bindings.reduce(
-    (sum, binding) => sum + (Number.isFinite(binding.weight) ? binding.weight : 0),
-    0,
-  );
+  const sampleCounts = useDatasetSampleCounts(bindings, assets, node);
+  const samplingShares = datasetSamplingShares(bindings, sampleCounts.counts);
   const update = (
     index: number,
     value: Partial<Pick<DatasetBinding, 'dataset_asset_id' | 'norm_asset_id' | 'weight'>>,
@@ -212,14 +212,22 @@ export function DatasetBindings({
         本次训练只使用这里选择的已登记资产；配方中的目录仅作源码参考。
         {bindings.length > 1
           ? '多数据集推荐使用一份共享归一化参数，按全部源数据与本次混采权重重新统计。'
-          : '请选择此数据集对应的归一化参数。'}
+          : '选择数据集后自动带出已绑定的归一化参数，也可手动更换。'}
         新增数据集会复制第 1 组的处理配置与混采权重；共享归一化时也会保留同一份参数。
+      </p>
+      <p className="field-hint">
+        权重占比 = 本组权重 ÷ 总权重；样本数占比 = 本组帧数 ÷ 总帧数；预计采样占比 = 本组帧数 × 权重
+        ÷ 全部加权帧数。预计值适用于标准多数据集采样，实际批次会波动；自定义采样器以训练实现为准。
+        样本数来自当前元信息或最近一次有效登记校验，不乘动作预测长度。
+        <button type="button" className="text-link" onClick={sampleCounts.refresh}>
+          重新读取样本数
+        </button>
       </p>
       {normalizationMode === 'legacy' && (
         <div className="inline-note" role="status">
-          <strong>逐组归一化（旧配置）</strong>
+          <strong>逐组归一化</strong>
           <span>
-            已保留草稿或模板中原有的逐组选择。切换后会清空这些归一化选择，请重新选择一份共享参数。
+            每组可使用数据集已绑定的参数，也可手动更换。切换后会清空这些归一化选择，请重新选择一份共享参数。
             多源统计应按原始样本及混采权重重新计算，不能平均或合并旧 norm 文件。
           </span>
           {!readOnly && (
@@ -279,10 +287,14 @@ export function DatasetBindings({
       {bindings.map((binding, index) => {
         const dataset = datasets.find((asset) => asset.id === binding.dataset_asset_id);
         const norm = norms.find((asset) => asset.id === binding.norm_asset_id);
-        const share =
-          totalWeight > 0 && Number.isFinite(binding.weight)
-            ? (100 * binding.weight) / totalWeight
-            : undefined;
+        const share = samplingShares[index];
+        const sampleCount = sampleCounts.counts[binding.dataset_asset_id];
+        const sampleLabel =
+          share.sampleCount === undefined
+            ? sampleCount?.status === 'loading'
+              ? '读取中'
+              : '未获取'
+            : `${share.sampleCount.toLocaleString('zh-CN')} 帧`;
         const expanded = disclosure.expanded.includes(index);
         const contentId = `${disclosureId}-dataset-${index}`;
         const selectionIssues = [
@@ -355,9 +367,21 @@ export function DatasetBindings({
               <span>归一化：{norm ? `${norm.name} · ${norm.version}` : '未选择'}</span>
               <span>
                 混采权重：{Number.isFinite(binding.weight) ? binding.weight : '未填写'}
-                {share !== undefined && binding.weight > 0
-                  ? ` · 权重占比（未考虑样本数）约 ${share.toFixed(2)}%`
-                  : ''}
+                {' · 权重占比' + samplingPercentText(share.weightPercent, share.weightIssue)}
+              </span>
+              <span
+                title={
+                  sampleCount?.status === 'ready'
+                    ? `来源：${sampleCount.source === 'validation' ? '最近有效登记校验' : 'meta/info.json'}${sampleCount.checkedAt ? ` · ${sampleCount.checkedAt}` : ''}`
+                    : undefined
+                }
+              >
+                样本数：{sampleLabel}
+                {' · 样本数占比' + samplingPercentText(share.samplePercent, share.sampleIssue)}
+              </span>
+              <span>
+                预计采样占比：{samplingPercentText(share.samplingPercent, share.samplingIssue)}
+                {sampleCount?.message && ` · ${sampleCount.message}`}
               </span>
               <span>处理方案：{processingLabel}</span>
               <span
@@ -401,24 +425,15 @@ export function DatasetBindings({
                       required
                       value={binding.dataset_asset_id}
                       onChange={(event) => {
-                        const selected = datasets.find((asset) => asset.id === event.target.value);
-                        const matching = selected
-                          ? norms.filter((asset) =>
-                              normalizedAssetPath(asset.path).startsWith(
-                                `${normalizedAssetPath(selected.path)}/`,
-                              ),
-                            )
-                          : [];
-                        const next = selectDatasetBinding(
-                          binding,
-                          {
-                            dataset_asset_id: event.target.value,
-                            norm_asset_id: matching.length === 1 ? matching[0].id : '',
-                          },
+                        const nextBindings = selectTrainingDatasetBinding(
+                          bindings,
+                          index,
+                          event.target.value,
+                          assets,
                           processingChoices[0].recipe_index,
                           preserveProcessingOnDatasetChange,
-                          sharedNormalization ? sharedNormId : undefined,
                         );
+                        const next = nextBindings[index];
                         setProcessingModes((previous) => {
                           const modes = { ...previous };
                           const selectedMode = !binding.dataset_asset_id
@@ -429,7 +444,7 @@ export function DatasetBindings({
                           else delete modes[nextKey];
                           return modes;
                         });
-                        onChange(bindings.map((value, row) => (row === index ? next : value)));
+                        onChange(nextBindings);
                       }}
                     >
                       <option value="">选择数据集</option>
@@ -445,7 +460,16 @@ export function DatasetBindings({
                       label={`归一化参数 ${index + 1}`}
                       required
                       hint={
-                        norm?.path ||
+                        (dataset?.norm_asset_id &&
+                          !binding.norm_asset_id &&
+                          datasetNormSelectionError(
+                            dataset.node_id,
+                            dataset.norm_asset_id,
+                            assets,
+                          )) ||
+                        (norm
+                          ? `${norm.path}${dataset?.norm_asset_id === norm.id ? ' · 已从数据集绑定带出，可手动更换。' : ''}`
+                          : '') ||
                         (norms.length
                           ? '选择此数据集对应的归一化参数。'
                           : '请先在「数据与模型」登记当前机器的归一化参数。')
@@ -470,9 +494,9 @@ export function DatasetBindings({
                     required
                     hint={
                       '每条样本的重复权重；实际来源占比还取决于样本数。' +
-                      (share === undefined
-                        ? '请输入大于 0 的权重。'
-                        : `当前权重占比（未考虑样本数）约 ${share.toFixed(2)}%`)
+                      `当前权重占比${samplingPercentText(share.weightPercent, share.weightIssue)}；` +
+                      `样本数 ${sampleLabel}，样本数占比${samplingPercentText(share.samplePercent, share.sampleIssue)}；` +
+                      `预计采样占比${samplingPercentText(share.samplingPercent, share.samplingIssue)}。`
                     }
                   >
                     <input

@@ -25,6 +25,8 @@ try {
     assets: [
       { id: 'cloth', node_id: '169', kind: 'DATASET', name: 'Cloth', norm_asset_id: 'cloth-norm' },
       { id: 'cloth-two', node_id: '169', kind: 'DATASET', name: 'Cloth two', norm_asset_id: 'cloth-norm-two' },
+      { id: 'cloth-norm', node_id: '169', kind: 'NORM', name: 'Cloth norm' },
+      { id: 'cloth-norm-two', node_id: '169', kind: 'NORM', name: 'Cloth two norm' },
     ],
   };
   const templates = {

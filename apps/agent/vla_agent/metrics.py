@@ -165,6 +165,36 @@ def check_gpus(requested: list[str], *, inventory: tuple[list[dict], dict] | Non
             raise AgentError("GPU_BUSY", f"GPU has an existing process: {uuid}")
 
 
+def check_training_gpus(requested: list[str], policy, *, inventory=None):
+    """Explicit training coexistence, without relaxing legacy/inference checks."""
+    from copy import deepcopy
+    from vla_protocol.training_gpu_policy import normalize_training_gpu_policy, training_gpu_error
+
+    try:
+        policy = normalize_training_gpu_policy(policy)
+    except (TypeError, ValueError) as exc:
+        raise AgentError("TRAINING_GPU_POLICY_INVALID", str(exc)) from exc
+    if policy is None:
+        check_gpus(requested, inventory=inventory)
+        return None
+    if (not isinstance(requested, list) or not requested or len(set(requested)) != len(requested)):
+        raise AgentError("TRAINING_GPU_POLICY_INVALID", "共享训练必须指定互不重复的 GPU")
+    rows, availability = inventory if inventory is not None else gpu_inventory()
+    if availability.get("available") is not True:
+        raise AgentError("GPU_TELEMETRY_UNAVAILABLE", "无法通过 NVML 核验共享训练显存")
+    by_uuid = {row.get("uuid"): row for row in rows}
+    selected = []
+    for uuid in requested:
+        row = by_uuid.get(uuid)
+        if row is None:
+            raise AgentError("GPU_UNAVAILABLE", f"所选共享训练 GPU 不存在：{uuid}")
+        error = training_gpu_error(row, policy)
+        if error:
+            raise AgentError(error["code"], error["message"])
+        selected.append(deepcopy(row))
+    return selected
+
+
 def check_deployment_gpu(uuid: str, mode="exclusive", memory_mb=None, *, inventory=None):
     """Inference admission is separate from the training Runner's exclusivity."""
     from vla_protocol.gpu_policy import gpu_deployment_error, normalize_gpu_policy

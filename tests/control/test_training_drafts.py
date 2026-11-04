@@ -10,7 +10,7 @@ from sqlalchemy import select
 from vla_control.auth_models import User, UserSession
 from vla_control.common import offset_time
 from vla_control.main import create_app
-from vla_control.models import TrainingDraft
+from vla_control.models import TrainingDraft, TrainingTemplateDraft
 from vla_control.settings import Settings
 from vla_control.training_drafts import MAX_CONTENT_BYTES, MAX_DEPTH, MAX_NODES
 
@@ -40,12 +40,154 @@ def login(client, username):
     return response.json()
 
 
-def save(client, content, revision=0):
-    return client.put(PATH, json={"expected_revision": revision, "content": content})
+def save(client, content, revision=0, template_id=None):
+    params = {} if template_id is None else {"template_id": template_id}
+    return client.put(PATH, params=params, json={"expected_revision": revision, "content": content})
 
 
-def clear(client, revision):
-    return client.request("DELETE", PATH, json={"expected_revision": revision})
+def clear(client, revision, template_id=None):
+    params = {} if template_id is None else {"template_id": template_id}
+    return client.request("DELETE", PATH, params=params, json={"expected_revision": revision})
+
+
+def test_templates_have_independent_drafts_revisions_and_clear_tombstones(drafts):
+    app, client = drafts
+    user_id = login(client, "alice")["user"]["id"]
+    contents = {
+        "openpi-sft": {"request": {"template_id": "openpi-sft", "name": "my training",
+            "parameters": {"batch_size": 8}, "dataset_bindings": [{"dataset_asset_id": "training-data"}]}},
+        "openpi-norm": {"request": {"template_id": "openpi-norm", "name": "my normalization",
+            "parameters": {"num_batches": None}, "norm_datasets": [{"dataset_asset_id": "norm-data"}]}},
+    }
+    for template_id, content in contents.items():
+        empty = client.get(PATH, params={"template_id": template_id})
+        assert empty.json() == {"content": None, "revision": 0, "updated_at": None, "template_id": template_id}
+        saved = save(client, content, template_id=template_id)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["revision"] == 1
+        assert saved.json()["template_id"] == template_id
+        assert client.get(PATH, params={"template_id": template_id}).json() == saved.json()
+    changed = {"request": {"template_id": "openpi-sft", "name": "edited training"}}
+    assert save(client, changed, 1, "openpi-sft").json()["revision"] == 2
+    assert save(client, contents["openpi-sft"], 1, "openpi-sft").status_code == 409
+    assert clear(client, 1, "openpi-sft").status_code == 409
+    cleared = clear(client, 2, "openpi-sft")
+    assert cleared.status_code == 200
+    assert cleared.json()["template_id"] == "openpi-sft"
+    assert cleared.json()["content"] is None and cleared.json()["revision"] == 3
+    assert save(client, changed, 2, "openpi-sft").status_code == 409
+    other = client.get(PATH, params={"template_id": "openpi-norm"}).json()
+    assert other["content"] == contents["openpi-norm"] and other["revision"] == 1
+    assert client.get(PATH).json()["revision"] == 0
+    with app.state.db.read() as session:
+        assert session.get(TrainingTemplateDraft, (user_id, "openpi-sft")).content is None
+        assert session.get(TrainingTemplateDraft, (user_id, "openpi-norm")).content == contents["openpi-norm"]
+        assert session.get(TrainingDraft, user_id) is None
+    login(client, "alice")
+    assert client.get(PATH, params={"template_id": "openpi-norm"}).json() == other
+    assert clear(client, 0, "smoke").json()["revision"] == 1
+    assert save(client, {"request": {"template_id": "smoke"}}, 0, "smoke").status_code == 409
+
+
+def test_scoped_drafts_remain_private_and_reject_mismatched_template_content(drafts):
+    _, client = drafts
+    alice_id = login(client, "alice")["user"]["id"]
+    content = {"request": {"template_id": "openpi-sft", "name": "Alice private training"}}
+    assert save(client, content, template_id="openpi-sft").status_code == 200
+    assert save(client, content, template_id="openpi-norm").status_code == 422
+    assert save(client, {}, template_id="openpi-norm").status_code == 422
+    assert client.get(PATH, params={"template_id": "openpi-norm"}).json()["revision"] == 0
+    login(client, "bob")
+    assert client.get(PATH, params={"template_id": "openpi-sft", "user_id": alice_id}).json()["revision"] == 0
+    content["request"]["name"] = "Bob private training"
+    assert save(client, content, template_id="openpi-sft").status_code == 200
+    assert clear(client, 1, "openpi-sft").status_code == 200
+    assert client.get(PATH, params={"template_id": "openpi-sft"},
+                      headers={"X-Training-Draft-User": alice_id}).status_code == 403
+    login(client, "alice")
+    restored = client.get(PATH, params={"template_id": "openpi-sft"}).json()
+    assert restored["content"]["request"]["name"] == "Alice private training" and restored["revision"] == 1
+
+
+@pytest.mark.parametrize("same_template", [True, False])
+def test_concurrent_scoped_saves_conflict_only_for_the_same_template(drafts, same_template):
+    app, client = drafts
+    authentication = login(client, "alice")
+    cookies = dict(client.cookies)
+    barrier = Barrier(2)
+    template_ids = ["openpi-sft", "openpi-sft" if same_template else "openpi-norm"]
+    def worker(entry):
+        index, template_id = entry
+        with TestClient(app) as other:
+            other.cookies.update(cookies)
+            other.headers["X-CSRF-Token"] = authentication["csrf_token"]
+            barrier.wait(timeout=5)
+            return save(other, {"request": {"template_id": template_id, "name": str(index)}},
+                        template_id=template_id)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(worker, enumerate(template_ids)))
+    assert sorted(response.status_code for response in responses) == ([200, 409] if same_template else [200, 200])
+    for index, template_id in enumerate(template_ids):
+        current = client.get(PATH, params={"template_id": template_id}).json()
+        assert current["revision"] == 1
+        assert current["content"]["request"]["name"] in ({"0", "1"} if same_template else {str(index)})
+
+
+@pytest.mark.parametrize("template_id", ["", " ", "x" * 101, "invalid\nname", " leading", "trailing "])
+def test_invalid_template_scope_is_rejected_for_every_operation(drafts, template_id):
+    _, client = drafts
+    login(client, "alice")
+    assert client.get(PATH, params={"template_id": template_id}).status_code == 422
+    assert save(client, {"request": {"template_id": template_id}}, template_id=template_id).status_code == 422
+    assert clear(client, 0, template_id).status_code == 422
+
+
+def test_duplicate_template_scope_is_rejected(drafts):
+    _, client = drafts
+    login(client, "alice")
+    assert client.get(PATH, params=[("template_id", "openpi-sft"), ("template_id", "openpi-norm")]).status_code == 422
+
+
+def test_upgrade_preserves_legacy_draft_and_sessions_and_never_repopulates_cleared_scope(drafts):
+    app, client = drafts
+    alice_id = login(client, "alice")["user"]["id"]
+    content = {"schema_version": 1, "request": {"template_id": "openpi-sft", "name": "unfinished old training"},
+               "special_values": [{"path": ["request", "parameters", "batch_size"], "value": "nan"}]}
+    assert save(client, content).status_code == 200
+    with app.state.db.write() as session:
+        row = session.get(TrainingDraft, alice_id)
+        row.revision = 7
+    before = client.get(PATH).json()
+    # An existing deployment has only the old table. The additive upgrade must
+    # create its replacement without dropping users, sessions or legacy data.
+    TrainingTemplateDraft.__table__.drop(app.state.db.engine)
+    app.state.db.initialize()
+    assert client.get("/api/v1/auth/me").status_code == 200
+    assert client.get(PATH).json() == before
+    assert client.get(PATH, params={"template_id": "openpi-sft"}).json() == {**before, "template_id": "openpi-sft"}
+    assert client.get(PATH, params={"template_id": "openpi-norm"}).json()["revision"] == 0
+    replacement = {"request": {"template_id": "openpi-sft", "name": "current training"}}
+    assert save(client, replacement, 7, "openpi-sft").json()["revision"] == 8
+    assert client.get(PATH).json() == before
+    assert clear(client, 8, "openpi-sft").json()["revision"] == 9
+    assert save(client, replacement, 7).json()["revision"] == 8
+    app.state.db.initialize()
+    app.state.db.initialize()
+    scoped = client.get(PATH, params={"template_id": "openpi-sft"}).json()
+    assert scoped["content"] is None and scoped["revision"] == 9
+    legacy = client.get(PATH).json()
+    assert legacy["content"] == replacement and legacy["revision"] == 8
+
+
+def test_upgrade_does_not_guess_template_for_unidentified_legacy_draft(drafts):
+    app, client = drafts
+    login(client, "alice")
+    content = {"request": {"name": "no template identity"}}
+    assert save(client, content).status_code == 200
+    app.state.db.initialize()
+    assert client.get(PATH).json()["content"] == content
+    for template_id in ("openpi-sft", "openpi-norm", "smoke"):
+        assert client.get(PATH, params={"template_id": template_id}).json()["revision"] == 0
 
 
 def test_partial_drafts_are_private_durable_data_not_training_requests(drafts):

@@ -14,6 +14,8 @@ from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_adapters.runtime_options import normalize_normalization_method, validate_generated_normalization_method
 from vla_protocol import canonical_digest
 from vla_protocol.config_preview import validate_generated_config
+from vla_protocol.training_gpu_policy import (TRAINING_SHARED_GPU_CAPABILITY,
+    normalize_training_gpu_policy, training_gpu_error)
 
 from .common import APIError, INPUT_KINDS, TERMINAL, absolute_path, digest, now, require_path, snapshot_identity, uid, under_root, valid_snapshot
 from .models import Allocation, Asset, Attempt, Command, Event, Node, Preview, Profile, Run
@@ -145,6 +147,21 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
         data.pop("requested_gpu_uuids", None)
     else:
         data["requested_gpu_uuids"] = selected
+    try:
+        training_gpu_policy = normalize_training_gpu_policy(data.get("training_gpu_policy"))
+    except ValueError as exc:
+        raise APIError(422, "TRAINING_GPU_POLICY_INVALID", str(exc)) from exc
+    if training_gpu_policy is None:
+        data.pop("training_gpu_policy", None)
+    else:
+        if template["id"] not in {"openpi-sft", "recap"} or data["gpu_count"] <= 0:
+            raise APIError(422, "TRAINING_GPU_POLICY_UNSUPPORTED", "共享显存仅支持 OpenPI GPU 训练")
+        if selected is None:
+            raise APIError(422, "TRAINING_GPU_SELECTION_REQUIRED", "共享训练必须明确选择具体 GPU")
+        capabilities = (node.metrics or {}).get("capabilities")
+        if not isinstance(capabilities, list) or TRAINING_SHARED_GPU_CAPABILITY not in capabilities:
+            raise APIError(409, "AGENT_TRAINING_SHARED_GPU_UNSUPPORTED", "请先升级支持训练显存共享的 Agent，再执行共享训练预检")
+        data["training_gpu_policy"] = training_gpu_policy
     try:
         parameters = validate_parameters(template["id"], {**recipe_parameters(data.get("recipe_definition")), **data["parameters"]})
         from vla_adapters.runtime_options import validate_runtime_parameter_relations
@@ -335,6 +352,20 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
         return norm_preflight_error(session, request, snapshot, checks)
     if request["template_id"] not in {"openpi-sft", "recap"}:
         return None
+    policy = request.get("training_gpu_policy")
+    if not isinstance(snapshot, dict) or snapshot.get("training_gpu_policy") != policy:
+        if policy is not None or isinstance(snapshot, dict) and snapshot.get("training_gpu_policy") is not None:
+            return {"code": "TRAINING_GPU_POLICY_MISMATCH", "message": "Agent 未确认本次训练的 GPU 使用模式及显存预算，请重新预检"}
+    if policy is not None:
+        evidence = snapshot.get("training_gpu_check")
+        selected = request.get("requested_gpu_uuids")
+        devices = evidence.get("devices") if isinstance(evidence, dict) else None
+        if (not isinstance(evidence, dict) or evidence.get("policy") != policy
+                or evidence.get("gpu_uuids") != selected or not isinstance(selected, list)
+                or not isinstance(devices, list) or len(devices) != len(selected)
+                or [row.get("uuid") if isinstance(row, dict) else None for row in devices] != selected
+                or any(training_gpu_error(row, policy) is not None for row in devices)):
+            return {"code": "AGENT_TRAINING_GPU_CHECK_INCOMPLETE", "message": "Agent 未核验指定显卡的进程及剩余显存预算，请更新 Agent 后重新预检"}
     from .storage_configurations import snapshot_error as storage_snapshot_error
     storage_error = storage_snapshot_error(session, request["node_id"],
         snapshot.get("automatic_preflight") if isinstance(snapshot, dict) else None)
@@ -370,6 +401,8 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
     expected = {"recipe": request["recipe"], "recipe_definition_digest": definition["digest"] if definition else None,
                 "requested_inputs": {role: value["path"] for role, value in resolved_inputs.items()},
                 "parameters": request["parameters"], "gpu_count": request["gpu_count"]}
+    if policy is not None or "training_gpu_policy" in plan:
+        expected["training_gpu_policy"] = policy
     if request.get("entrypoint") is not None or "requested_entrypoint" in plan:
         expected["requested_entrypoint"] = request.get("entrypoint")
     if request.get("dataset_bindings") is not None or "dataset_bindings" in plan:

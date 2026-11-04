@@ -42,6 +42,7 @@ import { deployableOutputs, sourceDeploymentBlocker } from './policyDeployment';
 import { TrainingMetrics } from './TrainingMetrics';
 import { retryableRun } from './runRetry';
 import { requestedGpuSummary } from './trainingGpuSelection';
+import { trainingGpuPolicySummary } from './trainingGpuPolicy';
 import { RunDeleteAction } from './RunDeleteAction';
 import { RunGpuReservationNotice } from './GpuReservations';
 import { TrainingEnvironmentDetails } from './TrainingEnvironment';
@@ -56,6 +57,9 @@ const queueReasonLabels: Record<string, string> = {
   REQUESTED_GPU_UNAVAILABLE: '指定 GPU 正在使用、已预约或状态尚未确认，等待所选设备可用',
   REQUESTED_GPU_MISSING: '部分指定 GPU 尚未上报，等待设备恢复；不会自动替换其他卡',
   REQUESTED_GPU_INVALID: '指定 GPU 配置无效，请重新配置并预检',
+  TRAINING_SHARED_GPU_UNSUPPORTED:
+    '当前 Agent 不支持共享显存训练，请更新 Agent 或改用独占模式后重新预检',
+  TRAINING_GPU_POLICY_INVALID: '共享显存配置无效，请检查每卡预算并重新预检',
 };
 
 export function RunQueueReason({ reason }: { reason?: string | null }) {
@@ -245,6 +249,11 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                   GPU 配额
                 </span>
                 <strong>{run.gpu_count ?? '—'} 张</strong>
+                <small>
+                  {trainingGpuPolicySummary(
+                    run.training_gpu_policy || run.code_expectation?.training_gpu_policy,
+                  )}
+                </small>
                 <small title={run.requested_gpu_uuids?.join('\n')}>
                   {run.requested_gpu_uuids?.length
                     ? `指定：${requestedGpuSummary(run.requested_gpu_uuids, node)}`

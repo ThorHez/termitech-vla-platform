@@ -19,13 +19,14 @@ from vla_protocol.config_preview import validate_generated_config
 
 from .artifacts import ArtifactMonitor
 from .config import load_config
-from .metrics import check_gpus, process_metrics
+from .metrics import check_gpus, check_training_gpus, process_metrics
 from .output_isolation import validate_output_isolation
 from .preflight import validate_local_inputs
 from .safety import AgentError, allowed_path, identity_matches, process_identity, safe_identifier, signal_owned_group
 from .snapshots import capture_code, compare_code
 from .state import State, TERMINAL_STATES
 from .training_validation import prepare_launch, validate_training
+from .training_gpu import shared_training_environment, training_gpu_evidence, validate_training_gpu_policy
 
 
 def verified_outputs(output_dir: Path, smoke: bool, *, template_id: str | None = None,
@@ -151,6 +152,7 @@ def execute(config: dict, attempt_id: str) -> int:
             return 0
         output = allowed_path(attempt["output_dir"], [config["output_root"]], must_exist=False)
         profile, inputs = validate_local_inputs(config, payload)
+        policy = validate_training_gpu_policy(payload, profile, require_frozen=True)
         if profile.get("adapter") != "smoke":
             expectation = payload.get("code_expectation", {})
             generated = expectation.get("automatic_preflight", {}).get("plan", {}).get("generated_config")
@@ -165,7 +167,7 @@ def execute(config: dict, attempt_id: str) -> int:
                 raise AgentError("CONFIG_CONFIRMATION_MISMATCH", "启动命令与用户确认的 config 不一致，请重新预检并确认")
         validate_output_isolation(config, profile["code_dir"], inputs, str(output))
         output.mkdir(parents=True, exist_ok=False)
-        start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
+        start_snapshot = capture_code(profile, config["roots"], output / "provenance", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
         compare_code(payload["code_expectation"], start_snapshot, compare_automatic=False)
         for uuid in sorted(payload.get("gpu_uuids", [])):
             # GPU UUIDs never become path components directly.
@@ -179,22 +181,30 @@ def execute(config: dict, attempt_id: str) -> int:
             gpu_locks.append(gpu_lock)
         from .resource_guard import require_gpu_access
         require_gpu_access(config, payload.get("gpu_uuids", []))
+        if policy is not None:
+            check_training_gpus(payload["gpu_uuids"], policy)
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), str(output),
-                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
+                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
         allowed_path(launch["cwd"], config["roots"])
         if profile.get("adapter") != "smoke":
             if not isinstance(payload["code_expectation"].get("automatic_preflight"), dict):
                 raise AgentError("AUTOMATIC_PREFLIGHT_REQUIRED", "正式训练缺少 Agent 自动预检记录，请重新执行预检")
             launch = prepare_launch(launch, config, payload.get("inputs", {}))
             automatic = validate_training(config, launch, launch_checks, assigned=payload.get("gpu_uuids", []))
-            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
+            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
             compare_code(start_snapshot, current, compare_automatic=False)
             start_snapshot["automatic_preflight"] = automatic
             compare_code(payload["code_expectation"], start_snapshot)
             launch = prepare_launch(launch, config, payload.get("inputs", {}), expected_plan_digest=automatic["plan_digest"])
             (output / "provenance" / "code-snapshot.json").write_text(json.dumps(start_snapshot, indent=2))
         # Recheck assigned devices after the CPU probe, just before spawning.
-        check_gpus(payload.get("gpu_uuids", []))
+        devices = None
+        if policy is None:
+            check_gpus(payload.get("gpu_uuids", []))
+        else:
+            devices = check_training_gpus(payload["gpu_uuids"], policy)
+            start_snapshot["training_gpu_check"] = training_gpu_evidence(policy, payload["gpu_uuids"], devices)
+            (output / "provenance" / "code-snapshot.json").write_text(json.dumps(start_snapshot, indent=2))
         require_gpu_access(config, payload.get("gpu_uuids", []))
         if state.attempt(attempt_id)["cancel_requested"] or interrupted:
             state.emit(attempt_id, "CANCELLED", {"exit_code": None, "process_started": False})
@@ -204,6 +214,7 @@ def execute(config: dict, attempt_id: str) -> int:
         environment.update({**launch.get("env", {}), "PYTHONUNBUFFERED": "1"})
         from .storage_configuration import cache_environment
         environment.update(cache_environment(config))
+        environment = shared_training_environment(environment, policy, devices)
         child = subprocess.Popen(launch["argv"], cwd=launch["cwd"], env=environment,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL, start_new_session=True)
@@ -289,7 +300,7 @@ def execute(config: dict, attempt_id: str) -> int:
             artifact_monitor.close()
         code_changed = False
         try:
-            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
+            end_snapshot = capture_code(profile, config["roots"], output / "provenance" / "end", recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
             if "automatic_preflight" in start_snapshot:
                 end_snapshot["automatic_preflight"] = start_snapshot["automatic_preflight"]
                 (output / "provenance" / "end" / "code-snapshot.json").write_text(json.dumps(end_snapshot, indent=2))

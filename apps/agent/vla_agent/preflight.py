@@ -13,6 +13,8 @@ from .runtime_checks import validate_runtime
 from .safety import AgentError, allowed_path
 from .snapshots import capture_code, compare_code
 from .training_validation import prepare_launch, validate_training
+from .metrics import check_training_gpus
+from .training_gpu import requested_training_gpus, training_gpu_evidence, validate_training_gpu_policy
 
 
 def validate_local_inputs(config: dict, payload: dict) -> tuple[dict, dict]:
@@ -51,6 +53,7 @@ def validate_local_inputs(config: dict, payload: dict) -> tuple[dict, dict]:
     except ValueError as exc:
         raise AgentError("RUNTIME_UNAVAILABLE", str(exc)) from exc
     validate_runtime(profile, config["roots"])
+    validate_training_gpu_policy(payload, profile)
     inputs = {}
     for role, asset in payload.get("inputs", {}).items():
         path = allowed_path(asset["path"], config["roots"])
@@ -79,25 +82,39 @@ def _run_preflight(config: dict, payload: dict) -> dict:
             if payload.get("gpu_count", 0) > len(known - blocked):
                 raise AgentError("GPU_RESERVED_BY_PRODUCTION", "正式环境的预约或分配使测试可用显卡不足，请调整 GPU 数量后重试")
         profile, inputs = validate_local_inputs(config, payload)
+        policy = validate_training_gpu_policy(payload, profile)
+        selected = requested_training_gpus(payload) if policy is not None else None
+        if policy is not None:
+            from .resource_guard import require_gpu_access
+            require_gpu_access(config, selected)
+            check_training_gpus(selected, policy)
         checks.append({"name": "runtime", "ok": True, "message": "Training Python executable and adapter environment are available"})
         checks.append({"name": "local_paths", "ok": True, "message": "Input assets and code exist inside configured roots"})
-        snapshot = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
+        snapshot = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
         if not snapshot["complete"]:
             raise AgentError("CODE_VERSION_UNAVAILABLE", "Incomplete code snapshot: " + "; ".join(snapshot["missing"]))
         checks.append({"name": "code_version", "ok": True, "message": snapshot["commit_sha"]})
         output = str(Path(config["output_root"]) / "preflight-placeholder")
         count = payload.get("gpu_count", 0)
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), output,
-                              [f"preflight-gpu-{i}" for i in range(count)], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
+                              [f"preflight-gpu-{i}" for i in range(count)], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
         checks.append({"name": "adapter", "ok": True, "message": "Template and trusted runtime configuration validated"})
         if profile.get("adapter") != "smoke":
             launch = prepare_launch(launch, config, payload.get("inputs", {}))
             automatic = validate_training(config, launch, checks)
             # A CPU probe imports registered code. Capture again so concurrent
             # edits cannot turn its result into authorization for different code.
-            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}))
+            current = capture_code(profile, config["roots"], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
             compare_code(snapshot, current)
             snapshot["automatic_preflight"] = automatic
+        if policy is not None:
+            from .resource_guard import require_gpu_access
+            require_gpu_access(config, selected)
+            devices = check_training_gpus(selected, policy)
+            snapshot["training_gpu_check"] = training_gpu_evidence(policy, selected, devices)
+            snapshot["requested_gpu_uuids"] = list(selected)
+            checks.append({"name": "training_gpu", "ok": True,
+                           "message": "已核对所选 GPU 的实际剩余显存、每卡训练预算及余量；启动时会重新检查"})
         return {"code_snapshot": snapshot, "checks": checks}
     except Exception as exc:
         error = exc.as_dict() if isinstance(exc, AgentError) else {"code": "PREFLIGHT_FAILED", "message": str(exc)}

@@ -58,6 +58,7 @@ export interface DatasetSourceValidation {
   error?: { code: string; message: string } | null;
   checks?: { name: string; ok: boolean; message?: string }[];
   source_fingerprint?: unknown;
+  timestamp_contract?: { status?: string; checked_rows?: number } | null;
 }
 export interface Asset {
   id: string;
@@ -481,6 +482,7 @@ export interface GeneratedTrainingConfig {
   sha256: string;
 }
 export interface CodeSnapshot {
+  training_gpu_policy?: TrainingGpuPolicy | null;
   runtime_profile?: {
     id?: string;
     name?: string;
@@ -531,6 +533,7 @@ export interface Attempt {
   code_changed_during_run?: boolean;
 }
 export interface Run {
+  training_gpu_policy?: TrainingGpuPolicy | null;
   normalization_method?: TrainingNormalizationMethod | null;
   owner_user_id?: string | null;
   auto_config?: AutoTrainingConfig | null;
@@ -580,7 +583,12 @@ export interface Alert {
   run_id?: string;
   created_at?: string;
 }
+export interface TrainingGpuPolicy {
+  mode: 'shared';
+  memory_mb: number;
+}
 export interface RunRequest {
+  training_gpu_policy?: TrainingGpuPolicy;
   normalization_method?: TrainingNormalizationMethod;
   auto_config?: AutoTrainingConfig;
   training_stage?: TrainingStage;

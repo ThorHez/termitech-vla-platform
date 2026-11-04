@@ -1,4 +1,4 @@
-"""Bounded, account-owned wizard drafts, independent of training acceptance."""
+"""Bounded account/template-owned drafts, independent of training acceptance."""
 
 import json
 import math
@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from .common import APIError, now
-from .models import TrainingDraft
+from .models import TrainingDraft, TrainingTemplateDraft
 from .account_lifecycle import lock_execution_guard, training_execution_authorized
 from .resource_authorization import require_active_actor
 
@@ -30,6 +30,20 @@ _FORBIDDEN = {
 
 def _invalid(message="训练草稿必须为受限 JSON 配置"):
     return APIError(422, "TRAINING_DRAFT_INVALID", message)
+
+
+def valid_template_id(value):
+    return (type(value) is str and 0 < len(value) <= 100 and value.strip() == value
+            and not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value))
+
+
+def _template_scope(request):
+    if "template_id" not in request.query_params:
+        return None
+    values = request.query_params.getlist("template_id")
+    if len(values) != 1 or not valid_template_id(values[0]):
+        raise _invalid("训练草稿的模板标识无效")
+    return values[0]
 
 
 def bounded_content(value):
@@ -97,8 +111,10 @@ def _conflict():
     return APIError(409, "TRAINING_DRAFT_CONFLICT", "训练草稿已在其他窗口更新，请重新读取后再保存")
 
 
-def mutate_draft(db, user_id, expected_revision, content, request=None):
+def mutate_draft(db, user_id, expected_revision, content, request=None, template_id=None):
     stamp = now()
+    model = TrainingDraft if template_id is None else TrainingTemplateDraft
+    key = user_id if template_id is None else (user_id, template_id)
     try:
         with db.write() as session:
             if request is not None:
@@ -107,16 +123,19 @@ def mutate_draft(db, user_id, expected_revision, content, request=None):
                 lock_execution_guard(session)
                 if not training_execution_authorized(session, user_id):
                     raise APIError(401, "UNAUTHORIZED", "登录账户已不可用")
-            existing = session.get(TrainingDraft, user_id)
+            existing = session.get(model, key)
             if existing is None:
                 if expected_revision != 0:
                     raise _conflict()
-                session.add(TrainingDraft(user_id=user_id, revision=1, content=content, updated_at=stamp))
+                session.add(model(user_id=user_id, revision=1, content=content, updated_at=stamp,
+                                  **({"template_id": template_id} if template_id is not None else {})))
                 session.flush()
             else:
-                result = session.execute(update(TrainingDraft).where(
-                    TrainingDraft.user_id == user_id,
-                    TrainingDraft.revision == expected_revision,
+                conditions = [model.user_id == user_id, model.revision == expected_revision]
+                if template_id is not None:
+                    conditions.append(model.template_id == template_id)
+                result = session.execute(update(model).where(
+                    *conditions,
                 ).values(content=content, revision=expected_revision + 1, updated_at=stamp))
                 if result.rowcount != 1:
                     raise _conflict()
@@ -139,23 +158,36 @@ def register_routes(app, dependencies, db, auth):
             raise APIError(403, "TRAINING_DRAFT_USER_CHANGED", "登录账户已改变，未保存到其他账户的训练草稿")
         return principal.user_id
 
-    def response(value):
+    def response(value, template_id=None):
+        if template_id is not None:
+            # The client verifies this before writing: an older control plane
+            # silently ignores the query and still exposes one shared draft.
+            value = {**value, "template_id": template_id}
         return JSONResponse(value, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/training-draft", dependencies=dependencies)
     def read(request: Request):
         user_id = owner(request)
+        template_id = _template_scope(request)
         with db.read() as session:
-            return response(_representation(session.get(TrainingDraft, user_id)))
+            model = TrainingDraft if template_id is None else TrainingTemplateDraft
+            key = user_id if template_id is None else (user_id, template_id)
+            return response(_representation(session.get(model, key)), template_id)
 
     @app.put("/api/v1/training-draft", dependencies=dependencies)
     async def save(request: Request):
         user_id = owner(request)
+        template_id = _template_scope(request)
         revision, content = await _body(request, save=True)
-        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, content, request))
+        if template_id is not None:
+            payload = content.get("request")
+            if type(payload) is not dict or payload.get("template_id") != template_id:
+                raise _invalid("草稿配置的模板与当前模板不一致")
+        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, content, request, template_id), template_id)
 
     @app.delete("/api/v1/training-draft", dependencies=dependencies)
     async def clear(request: Request):
         user_id = owner(request)
+        template_id = _template_scope(request)
         revision, _ = await _body(request, save=False)
-        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, None, request))
+        return response(await run_in_threadpool(mutate_draft, db, user_id, revision, None, request, template_id), template_id)

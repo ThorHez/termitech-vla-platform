@@ -20,6 +20,7 @@ from pathlib import Path
 import psutil
 
 from vla_protocol.agent_release import installed_agent_release
+from vla_protocol.training_gpu_policy import TRAINING_SHARED_GPU_CAPABILITY
 
 from .artifacts import ArtifactMonitor
 from .config import load_config
@@ -37,7 +38,7 @@ from .state import State, TERMINAL_STATES, utc_now
 LOG = logging.getLogger("vla_agent")
 CAPABILITIES = ["PATH_SUGGEST", "RECIPE_SUGGEST", "RECIPE_DETAIL", "DATA_PROCESSORS", "DATASET_INSPECT", "DATASET_VALIDATE",
                 "DATASET_TIMESTAMP_PREFLIGHT_V1",
-                "DATASET_SAMPLE_PREFLIGHT_V1",
+                "DATASET_SAMPLE_PREFLIGHT_V1", TRAINING_SHARED_GPU_CAPABILITY,
                 "RECIPE_WRITE", "PROFILE_REBIND", "PROFILE_ADD", "STORAGE_CONFIGURE", "PREFLIGHT", "START", "CANCEL",
                 "POLICY_DEPLOY_START", "POLICY_DEPLOY_STATUS", "POLICY_DEPLOY_STOP", "POLICY_DEPLOY_TEST",
                 "POLICY_DEPLOY_PORTABLE_V1", "POLICY_DEPLOY_SHARED_GPU_V1", "POLICY_CHECKPOINT_SOURCE_WARNING_V1",
@@ -250,6 +251,8 @@ class Agent:
                         profile = next((item for item in self.config["profiles"] if item["id"] == payload.get("profile_id")), None)
                         if profile is None:
                             raise AgentError("PROFILE_UNAVAILABLE", "START requires a configured training environment")
+                        from .training_gpu import validate_training_gpu_policy
+                        validate_training_gpu_policy(payload, profile, require_frozen=True)
                         with checkout_lock(self.config, profile["code_dir"], require_git=profile.get("adapter") == "openpi-sft"):
                             runtime = None
                             if self.training_runtime and self.state.attempt(attempt_id) is None:

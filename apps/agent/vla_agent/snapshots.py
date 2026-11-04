@@ -57,7 +57,8 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
                  recipe_definition: dict | None = None, entrypoint: str | None = None,
                  dataset_bindings: list[dict] | None = None, training_stage: str | None = None,
                  stage_config: dict | None = None, auto_config: dict | None = None,
-                 normalization_method: str | None = None, norm_datasets: list[dict] | None = None) -> dict:
+                 normalization_method: str | None = None, norm_datasets: list[dict] | None = None,
+                 training_gpu_policy: dict | None = None) -> dict:
     root = allowed_path(profile["code_dir"], roots)
     from vla_adapters.dataset_bindings import normalize_dataset_bindings
     from vla_adapters.norm_datasets import normalize_norm_datasets
@@ -65,6 +66,11 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
     from vla_adapters.recap import validate_training_stage
     from vla_adapters.automatic_config import normalize_auto_config
     from vla_adapters.runtime_options import normalize_normalization_method
+    from vla_protocol.training_gpu_policy import normalize_training_gpu_policy
+    try:
+        training_gpu_policy = normalize_training_gpu_policy(training_gpu_policy)
+    except (TypeError, ValueError) as exc:
+        raise AgentError("TRAINING_GPU_POLICY_INVALID", str(exc)) from exc
     try:
         normalization_method = normalize_normalization_method(normalization_method, template_id=profile.get("adapter"))
     except ValueError as exc:
@@ -227,6 +233,8 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         runtime["auto_config"] = auto_config
     if normalization_method is not None:
         runtime["normalization_method"] = normalization_method
+    if training_gpu_policy is not None:
+        runtime["training_gpu_policy"] = training_gpu_policy
     if training_stage is not None:
         runtime.update(training_stage=training_stage, stage_config=stage_config)
     if recipe_definition is not None:
@@ -269,6 +277,8 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
         snapshot["auto_config"] = auto_config
     if normalization_method is not None:
         snapshot["normalization_method"] = normalization_method
+    if training_gpu_policy is not None:
+        snapshot["training_gpu_policy"] = training_gpu_policy
     if training_stage is not None:
         snapshot.update(training_stage=training_stage, stage_config=stage_config)
     if evidence_dir is not None:
@@ -293,7 +303,7 @@ def capture_code(profile: dict, roots: list[str], evidence_dir: Path | None = No
 def compare_code(expected: dict, actual: dict, *, compare_automatic: bool = True):
     if not expected.get("complete") or not actual.get("complete"):
         raise AgentError("CODE_VERSION_UNAVAILABLE", "Code snapshot is incomplete; repeat preflight after resolving missing evidence")
-    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "norm_datasets", "training_stage", "stage_config", "auto_config", "normalization_method")
+    fields = ("commit_sha", "code_dir", "repository_root", "dirty", "changes_digest", "untracked_digest", "module_origin", "submodules", "runtime_digest", "requested_entrypoint", "requested_entrypoint_sha256", "dataset_bindings", "norm_datasets", "training_stage", "stage_config", "auto_config", "normalization_method", "training_gpu_policy")
     changed = [field for field in fields if expected.get(field) != actual.get(field)]
     if changed:
         raise AgentError("CODE_CHANGED_SINCE_PREFLIGHT", "Code changed after preflight: " + ", ".join(changed))

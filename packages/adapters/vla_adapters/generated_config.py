@@ -184,6 +184,8 @@ def generated_training_config(config, spec, *, entrypoint=None):
     frozen = {key: spec[key] for key in keys if key in spec}
     if spec.get("normalization_method") is not None:
         frozen["normalization_method"] = spec["normalization_method"]
+    if spec.get("training_gpu_policy") is not None:
+        frozen["training_gpu_policy"] = spec["training_gpu_policy"]
     automatic = normalize_auto_config(spec.get("auto_config"))
     if automatic is not None:
         frozen["auto_config"] = automatic

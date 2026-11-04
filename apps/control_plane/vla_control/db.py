@@ -166,6 +166,24 @@ class Database:
                     revision=max(row["revision"] for row in duplicates) + 1))
             connection.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS uq_training_templates_user_name "
                                        "ON training_templates (user_id, name)")
+            # Split the old account-wide draft only into its exact template.
+            # Keep the original row for older clients and preserve its revision
+            # for queued browser saves. Existing scoped rows, including cleared
+            # tombstones, always win on subsequent restarts.
+            from .models import TrainingDraft, TrainingTemplateDraft
+            from .training_drafts import valid_template_id
+            scoped = TrainingTemplateDraft.__table__
+            existing_drafts = set(connection.execute(select(scoped.c.user_id, scoped.c.template_id)))
+            for row in connection.execute(select(TrainingDraft.__table__)).mappings():
+                content = row["content"]
+                payload = content.get("request") if type(content) is dict else None
+                template_id = payload.get("template_id") if type(payload) is dict else None
+                key = (row["user_id"], template_id) if valid_template_id(template_id) else None
+                if key is not None and key not in existing_drafts:
+                    connection.execute(scoped.insert().values(
+                        user_id=row["user_id"], template_id=template_id, content=content,
+                        revision=row["revision"], updated_at=row["updated_at"]))
+                    existing_drafts.add(key)
             from .deployment_records import backfill_deployment_records
             backfill_deployment_records(connection)
             from .model_names import backfill_model_names

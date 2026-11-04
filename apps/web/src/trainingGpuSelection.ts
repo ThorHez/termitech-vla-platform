@@ -1,4 +1,9 @@
 import type { Gpu, Node, RunRequest } from './types';
+import {
+  sharedTrainingGpuError,
+  supportsSharedTraining,
+  validTrainingGpuPolicy,
+} from './trainingGpuPolicy';
 
 export function validRequestedGpuList(value: unknown): value is string[] {
   return (
@@ -13,12 +18,17 @@ export function validRequestedGpuList(value: unknown): value is string[] {
 }
 
 export function requestedGpuError(
-  request: Pick<RunRequest, 'requested_gpu_uuids' | 'gpu_count'>,
-  node?: Pick<Node, 'gpus'>,
+  request: Pick<RunRequest, 'requested_gpu_uuids' | 'gpu_count' | 'training_gpu_policy'>,
+  node?: Pick<Node, 'gpus'> & Partial<Pick<Node, 'metrics'>>,
   minimum = 1,
   userId?: string,
 ): string | undefined {
   const selected = request.requested_gpu_uuids;
+  if (request.training_gpu_policy) {
+    if (!validTrainingGpuPolicy(request.training_gpu_policy)) return '请填写有效的每卡显存预算。';
+    if (!supportsSharedTraining(node)) return '当前 Agent 尚不支持共享显存训练，请先更新 Agent。';
+    if (!selected?.length) return '共享显存模式需要明确勾选要使用的 GPU。';
+  }
   if (selected === undefined) return undefined;
   if (!validRequestedGpuList(selected)) return '指定 GPU 列表无效，请重新选择。';
   if (!selected.length) return '请至少选择一张具体 GPU，或切换为自动分配。';
@@ -34,6 +44,13 @@ export function requestedGpuError(
       if (reservationError) return reservationError;
     }
   }
+  if (request.training_gpu_policy) {
+    for (const gpu of node?.gpus || []) {
+      if (!selected.includes(gpu.uuid)) continue;
+      const issue = sharedTrainingGpuError(gpu, request.training_gpu_policy);
+      if (issue) return issue;
+    }
+  }
   return undefined;
 }
 
@@ -47,8 +64,16 @@ export function gpuReservationError(gpu: Gpu, userId?: string): string | undefin
 export function gpuSelectionState(
   gpu: Gpu,
   userId?: string,
-): 'available' | 'busy' | 'unknown' | 'reserved' {
+  policy?: RunRequest['training_gpu_policy'],
+): 'available' | 'busy' | 'unknown' | 'reserved' | 'shareable' | 'insufficient' {
   if (gpuReservationError(gpu, userId)) return 'reserved';
+  if (policy) {
+    const issue = sharedTrainingGpuError(gpu, policy);
+    if (!issue) return 'shareable';
+    if (gpu.reserved_by || gpu.processes?.some((process) => process.ownership === 'platform'))
+      return 'busy';
+    return issue.startsWith('剩余') ? 'insufficient' : 'unknown';
+  }
   if (gpu.reserved_by || (Array.isArray(gpu.processes) && gpu.processes.length > 0)) return 'busy';
   if (
     !Array.isArray(gpu.processes) ||

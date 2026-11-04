@@ -1,32 +1,30 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
+import type { TrainingDraftSnapshot } from './trainingDraft';
 import {
-  decodeTrainingDraft,
-  encodeTrainingDraft,
-  type TrainingDraftSnapshot,
-} from './trainingDraft';
+  clearTrainingDraftPending,
+  decodeScopedTrainingDraft,
+  encodeScopedTrainingDraft,
+  readTrainingDraftPending,
+  requireTrainingDraftScope,
+  trainingDraftPath,
+  writeTrainingDraftPending,
+  type StoredTrainingDraft,
+} from './trainingDraftScope';
 
 interface DraftResponse {
+  template_id?: string;
   content: Record<string, unknown> | null;
   revision: number;
   updated_at: string | null;
 }
-interface LocalPending {
-  user_id: string;
-  revision: number;
-  content: Record<string, unknown>;
-  writer_id?: string;
-}
 type DraftStatus = 'loading' | 'idle' | 'pending' | 'saving' | 'saved' | 'error' | 'conflict';
 
-// Only an unsynchronised form checkpoint is kept locally. Server ownership is
-// always determined by the authenticated account, never by this storage key.
-const pendingKey = (userId: string) => `termitech.training-draft.pending.v1:${userId}`;
 const signature = (content: unknown) => JSON.stringify(content);
 const message = (error: unknown) =>
   error instanceof Error ? error.message : '训练草稿暂未保存，请重试。';
 
-export function useTrainingDraft(userId: string) {
+export function useTrainingDraft(userId: string, templateId: string) {
   const [loaded, setLoaded] = useState(false);
   const [initialSnapshot, setInitialSnapshot] = useState<TrainingDraftSnapshot>();
   const [generation, setGeneration] = useState(0);
@@ -39,13 +37,14 @@ export function useTrainingDraft(userId: string) {
   const committed = useRef<string | undefined>(undefined);
   const dirty = useRef(false);
   const knownServer = useRef(false);
+  const scopeVerified = useRef(false);
   const conflict = useRef(false);
   const active = useRef(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const saving = useRef<Promise<void> | undefined>(undefined);
   const changing = useRef(false);
   const writerId = useRef(crypto.randomUUID());
-  const adoptedPending = useRef<LocalPending | undefined>(undefined);
+  const adoptedPending = useRef<StoredTrainingDraft | undefined>(undefined);
   const flushRef = useRef<() => Promise<void>>(async () => {});
   const ownerHeaders = useCallback(() => ({ 'X-Training-Draft-User': userId }), [userId]);
   const stopTimer = useCallback(() => {
@@ -54,62 +53,62 @@ export function useTrainingDraft(userId: string) {
   }, []);
   const clearLocal = useCallback(() => {
     try {
-      const raw = localStorage.getItem(pendingKey(userId));
-      if (!raw) return;
-      const current = JSON.parse(raw) as LocalPending;
-      if (
-        current.writer_id !== writerId.current &&
-        signature(current) !== signature(adoptedPending.current)
-      )
-        return;
-      localStorage.removeItem(pendingKey(userId));
+      clearTrainingDraftPending(
+        localStorage,
+        userId,
+        templateId,
+        writerId.current,
+        adoptedPending.current,
+      );
     } catch {
       // Saving to the server remains available when browser storage is disabled.
     }
-  }, [userId]);
+  }, [userId, templateId]);
   const checkpoint = useCallback(() => {
     if (!dirty.current || !snapshotRef.current) return;
-    const content = encodeTrainingDraft(snapshotRef.current);
+    const content = encodeScopedTrainingDraft(snapshotRef.current, templateId);
     try {
-      localStorage.setItem(
-        pendingKey(userId),
-        JSON.stringify({
-          user_id: userId,
+      writeTrainingDraftPending(
+        localStorage,
+        userId,
+        templateId,
+        {
           revision: revision.current,
           writer_id: writerId.current,
           content,
-        }),
+        },
+        adoptedPending.current,
       );
     } catch {
       // The visible server save state remains authoritative.
     }
     return content;
-  }, [userId]);
-  const readLocal = useCallback((): LocalPending | undefined => {
+  }, [userId, templateId]);
+  const readLocal = useCallback((): StoredTrainingDraft | undefined => {
     try {
-      const value = JSON.parse(localStorage.getItem(pendingKey(userId)) || 'null') as LocalPending;
-      if (
-        value?.user_id === userId &&
-        Number.isSafeInteger(value.revision) &&
-        value.revision >= 0 &&
-        decodeTrainingDraft(value.content)
-      )
-        return value;
+      return readTrainingDraftPending(localStorage, userId, templateId);
     } catch {
       // Malformed or incompatible checkpoints are never applied to the form.
     }
     return undefined;
-  }, [userId]);
+  }, [userId, templateId]);
   const request = useCallback(
-    (options: RequestInit = {}) =>
-      api<DraftResponse>('/training-draft', {
+    async (options: RequestInit = {}) => {
+      if ((options.method || 'GET').toUpperCase() !== 'GET' && !scopeVerified.current)
+        throw new Error('请先成功读取当前模板的独立草稿，再保存或清空。');
+      const result = await api<DraftResponse>(trainingDraftPath(templateId), {
         ...options,
         headers: { ...ownerHeaders(), ...options.headers },
         signal: options.signal
           ? AbortSignal.any([options.signal, AbortSignal.timeout(5000)])
           : AbortSignal.timeout(5000),
-      }),
-    [ownerHeaders],
+      });
+      scopeVerified.current = false;
+      requireTrainingDraftScope(result, templateId);
+      scopeVerified.current = true;
+      return result;
+    },
+    [ownerHeaders, templateId],
   );
   const schedule = useCallback(() => {
     stopTimer();
@@ -147,7 +146,10 @@ export function useTrainingDraft(userId: string) {
         if (!active.current) return;
         setUpdatedAt(result.updated_at || undefined);
         setHasContent(true);
-        if (snapshotRef.current && signature(encodeTrainingDraft(snapshotRef.current)) === sent) {
+        if (
+          snapshotRef.current &&
+          signature(encodeScopedTrainingDraft(snapshotRef.current, templateId)) === sent
+        ) {
           dirty.current = false;
           clearLocal();
           setStatus('saved');
@@ -175,14 +177,15 @@ export function useTrainingDraft(userId: string) {
       saving.current = undefined;
     }
     if (dirty.current && !conflict.current) schedule();
-  }, [checkpoint, clearLocal, request, schedule, stopTimer]);
+  }, [checkpoint, clearLocal, request, schedule, stopTimer, templateId]);
   flushRef.current = flush;
 
   useEffect(() => {
     active.current = true;
     const controller = new AbortController();
-    const local = readLocal();
-    adoptedPending.current = local;
+    const pending = readLocal();
+    const local = pending?.value;
+    adoptedPending.current = pending;
     void request({ signal: controller.signal })
       .then((result) => {
         if (!active.current || controller.signal.aborted) return;
@@ -190,14 +193,16 @@ export function useTrainingDraft(userId: string) {
         knownServer.current = true;
         committed.current = signature(result.content);
         setUpdatedAt(result.updated_at || undefined);
-        const server = result.content ? decodeTrainingDraft(result.content) : undefined;
+        const server = result.content
+          ? decodeScopedTrainingDraft(result.content, templateId)
+          : undefined;
         if (result.content && !server) {
           conflict.current = true;
           setStatus('conflict');
           setError('服务端草稿格式暂不兼容，原草稿已保留；可清空后重新配置。');
         } else if (local && signature(local.content) !== signature(result.content)) {
-          setInitialSnapshot(decodeTrainingDraft(local.content));
-          snapshotRef.current = decodeTrainingDraft(local.content);
+          setInitialSnapshot(decodeScopedTrainingDraft(local.content, templateId));
+          snapshotRef.current = decodeScopedTrainingDraft(local.content, templateId);
           dirty.current = true;
           if (local.revision === result.revision) {
             setStatus('pending');
@@ -217,7 +222,7 @@ export function useTrainingDraft(userId: string) {
       })
       .catch((cause) => {
         if (controller.signal.aborted || !active.current) return;
-        const restored = local ? decodeTrainingDraft(local.content) : undefined;
+        const restored = local ? decodeScopedTrainingDraft(local.content, templateId) : undefined;
         revision.current = local?.revision || 0;
         setInitialSnapshot(restored);
         snapshotRef.current = restored;
@@ -241,7 +246,7 @@ export function useTrainingDraft(userId: string) {
       stopTimer();
       window.removeEventListener('pagehide', onPageHide);
     };
-  }, [checkpoint, clearLocal, readLocal, request, schedule, stopTimer]);
+  }, [checkpoint, clearLocal, readLocal, request, schedule, stopTimer, templateId]);
 
   const markEdited = useCallback(() => {
     dirty.current = true;
@@ -298,7 +303,9 @@ export function useTrainingDraft(userId: string) {
     try {
       if (saving.current) await saving.current.catch(() => {});
       const result = await request();
-      const restored = result.content ? decodeTrainingDraft(result.content) : undefined;
+      const restored = result.content
+        ? decodeScopedTrainingDraft(result.content, templateId)
+        : undefined;
       if (result.content && !restored) throw new Error('服务端草稿格式暂不兼容。');
       revision.current = result.revision;
       committed.current = signature(result.content);
@@ -315,7 +322,7 @@ export function useTrainingDraft(userId: string) {
     } finally {
       changing.current = false;
     }
-  }, [clearLocal, request, stopTimer]);
+  }, [clearLocal, request, stopTimer, templateId]);
   const saveCurrent = useCallback(async () => {
     stopTimer();
     if (saving.current) await saving.current.catch(() => {});
@@ -329,6 +336,7 @@ export function useTrainingDraft(userId: string) {
   }, [request, stopTimer]);
   const replace = useCallback(
     async (snapshot: TrainingDraftSnapshot) => {
+      const content = encodeScopedTrainingDraft(snapshot, templateId);
       // Save pending edits first; replacement is atomic and respects other devices.
       await flushRef.current();
       stopTimer();
@@ -336,13 +344,12 @@ export function useTrainingDraft(userId: string) {
         throw new Error('请先同步当前草稿或处理版本冲突，再套用训练模板。');
       changing.current = true;
       try {
-        const content = encodeTrainingDraft(snapshot);
         const result = await request({
           method: 'PUT',
           body: JSON.stringify({ expected_revision: revision.current, content }),
         });
         if (!active.current) return;
-        const restored = decodeTrainingDraft(result.content);
+        const restored = decodeScopedTrainingDraft(result.content, templateId);
         if (!restored) throw new Error('套用后的训练草稿格式无效。');
         revision.current = result.revision;
         committed.current = signature(result.content);
@@ -368,17 +375,19 @@ export function useTrainingDraft(userId: string) {
         changing.current = false;
       }
     },
-    [clearLocal, request, stopTimer],
+    [clearLocal, request, stopTimer, templateId],
   );
   const retry = useCallback(async () => {
-    if (knownServer.current && !conflict.current) return flushRef.current();
+    if (knownServer.current && scopeVerified.current && !conflict.current)
+      return flushRef.current();
     const result = await request();
     if (!dirty.current) return reload();
     knownServer.current = true;
     if (
       result.content &&
       snapshotRef.current &&
-      signature(result.content) !== signature(encodeTrainingDraft(snapshotRef.current))
+      signature(result.content) !==
+        signature(encodeScopedTrainingDraft(snapshotRef.current, templateId))
     ) {
       conflict.current = true;
       setStatus('conflict');
@@ -389,7 +398,7 @@ export function useTrainingDraft(userId: string) {
     committed.current = signature(result.content);
     conflict.current = false;
     return flushRef.current();
-  }, [reload, request]);
+  }, [reload, request, templateId]);
   const finished = useCallback(async () => {
     stopTimer();
     changing.current = true;
@@ -410,12 +419,14 @@ export function useTrainingDraft(userId: string) {
     try {
       const local = readLocal();
       return (
-        !!local && signature(local.content) === signature(encodeTrainingDraft(snapshotRef.current))
+        !!local &&
+        signature(local.value.content) ===
+          signature(encodeScopedTrainingDraft(snapshotRef.current, templateId))
       );
     } catch {
       return false;
     }
-  }, [readLocal]);
+  }, [readLocal, templateId]);
   return {
     loaded,
     initialSnapshot,

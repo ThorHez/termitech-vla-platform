@@ -147,7 +147,9 @@ try {
     assert.match(html, /ActualRegisteredProcessor/u);
     assert.match(html, /75(?:\.0+)?%/u);
     assert.match(html, /25(?:\.0+)?%/u);
-    assert.match(html, /权重占比（未考虑样本数）约/u);
+    assert.match(html, /权重占比约/u);
+    assert.match(html, /样本数占比/u);
+    assert.match(html, /预计采样占比/u);
     assert.doesNotMatch(html, /采样比例约/u);
   });
 

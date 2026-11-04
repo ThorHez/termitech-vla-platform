@@ -37,7 +37,6 @@ import { newDatasetBindings } from './datasetBindingHelpers';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { PreflightChecks } from './PreflightChecks';
 import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft';
-import { trainingTemplateEntry } from './trainingTemplateEntry';
 import type { ImageLayoutEdits } from './imageLayout';
 import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
 import { retryTrainingSnapshot, sameTrainingConfiguration } from './runRetry';
@@ -49,6 +48,7 @@ import {
   withTrainingNormalizationMethod,
 } from './trainingNormalization';
 import { requestedGpuError, requestedGpuSummary } from './trainingGpuSelection';
+import { trainingGpuPolicySummary } from './trainingGpuPolicy';
 import {
   applyTrainingTemplate,
   TRAINING_TEMPLATE_PROCESSING_MARKER,
@@ -153,12 +153,52 @@ export default function RunWizard(props: RunWizardProps) {
         正在读取当前用户身份…
       </Modal>
     );
-  return <TrainingDraftWizard key={user.id} {...props} userId={user.id} />;
+  return (
+    <TrainingDraftWorkspace
+      key={JSON.stringify([user.id, props.initialTemplate, props.sourceRun?.id])}
+      {...props}
+      userId={user.id}
+    />
+  );
 }
 
-function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
+function TrainingDraftWorkspace(props: RunWizardProps & { userId: string }) {
+  const [selection, setSelection] = useState(() => ({
+    templateId: props.sourceRun?.template_id || props.initialTemplate || 'openpi-sft',
+    sourceRun: props.sourceRun,
+    personalTemplate: undefined as TrainingTemplateRecord | undefined,
+  }));
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  return (
+    <TrainingDraftWizard
+      key={selection.templateId}
+      {...props}
+      initialTemplate={selection.templateId}
+      sourceRun={selection.sourceRun}
+      personalTemplate={selection.personalTemplate}
+      selectTemplate={(templateId, personalTemplate) => {
+        if (mounted.current) setSelection({ templateId, sourceRun: undefined, personalTemplate });
+      }}
+    />
+  );
+}
+
+function TrainingDraftWizard(
+  props: RunWizardProps & {
+    userId: string;
+    initialTemplate: string;
+    personalTemplate?: TrainingTemplateRecord;
+    selectTemplate: (templateId: string, personalTemplate?: TrainingTemplateRecord) => void;
+  },
+) {
   const data = useData();
-  const draft = useTrainingDraft(props.userId);
+  const draft = useTrainingDraft(props.userId, props.initialTemplate);
   const [templateNotice, setTemplateNotice] = useState<{ name: string; issues: string[] }>();
   const consumedSourceRun = useRef<string | undefined>(undefined);
   const sourceImportInFlight = useRef(false);
@@ -169,69 +209,46 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
     error?: Error;
   }>();
   const [sourceNotice, setSourceNotice] = useState<string>();
-  const initialTemplateSelection = useRef<string | undefined>(undefined);
-  const [consumedInitialTemplate, setConsumedInitialTemplate] = useState<string>();
-  const [entryTemplateAction, setEntryTemplateAction] = useState<{
+  const consumedPersonalTemplate = useRef(false);
+  const [personalTemplateAction, setPersonalTemplateAction] = useState<{
     state: 'loading' | 'error';
-    snapshot: TrainingDraftSnapshot;
-    template: Template;
+    record: TrainingTemplateRecord;
     error?: Error;
   }>();
   const savedRevisionId = draft.initialSnapshot?.request.recipe_revision_id;
   const resources = [data.nodes, data.profiles, data.assets, data.templates];
   const resourceError = resources.find((resource) => resource.error)?.error;
   const ready = resources.every((resource) => resource.data !== undefined);
-  const loadEntryTemplate = useCallback(
-    async (snapshot: TrainingDraftSnapshot, template: Template) => {
-      setEntryTemplateAction({ state: 'loading', snapshot, template });
+  const loadPersonalTemplate = useCallback(
+    async (record: TrainingTemplateRecord) => {
+      setPersonalTemplateAction({ state: 'loading', record });
       try {
-        const selected = trainingTemplateEntry(snapshot, template, {
+        const applied = applyTrainingTemplate(record, {
           assets: data.assets.data || [],
           profiles: data.profiles.data || [],
           nodes: data.nodes.data || [],
         });
-        if (selected) await draft.replace(selected);
-        setEntryTemplateAction(undefined);
+        applied.snapshot.request.name = `${record.name} 训练`;
+        await draft.replace(applied.snapshot);
+        setTemplateNotice({ name: record.name, issues: applied.issues });
+        setPersonalTemplateAction(undefined);
       } catch (cause) {
-        setEntryTemplateAction({
+        setPersonalTemplateAction({
           state: 'error',
-          snapshot,
-          template,
+          record,
           error: cause instanceof Error ? cause : new Error(String(cause)),
         });
+        throw cause;
       }
     },
     [draft.replace, data.assets.data, data.profiles.data, data.nodes.data],
   );
   useEffect(() => {
-    if (
-      props.sourceRun ||
-      !props.initialTemplate ||
-      !draft.loaded ||
-      !ready ||
-      initialTemplateSelection.current === props.initialTemplate
-    )
+    if (!props.personalTemplate || !draft.loaded || !ready || consumedPersonalTemplate.current)
       return;
-    initialTemplateSelection.current = props.initialTemplate;
-    setConsumedInitialTemplate(props.initialTemplate);
-    const selected = data.templates.data?.find(
-      (item) => item.id === props.initialTemplate && item.status === 'AVAILABLE',
-    );
-    if (!selected) return;
-    if (draft.initialSnapshot && draft.initialSnapshot.request.template_id !== selected.id)
-      void loadEntryTemplate(draft.initialSnapshot, selected);
-  }, [
-    props.sourceRun,
-    props.initialTemplate,
-    draft.loaded,
-    ready,
-    draft.initialSnapshot,
-    data.templates.data,
-    data.assets.data,
-    data.profiles.data,
-    data.nodes.data,
-    loadEntryTemplate,
-  ]);
+    consumedPersonalTemplate.current = true;
+    void loadPersonalTemplate(props.personalTemplate).catch(() => {});
+  }, [props.personalTemplate, draft.loaded, ready, loadPersonalTemplate]);
   const loadSource = useCallback(
     async (snapshot: TrainingDraftSnapshot) => {
       if (sourceImportInFlight.current) return;
@@ -319,7 +336,7 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
         {importing ? (
           <p className="training-draft-loading">
             <LoaderCircle size={16} className="spin" />
-            正在载入配置并保存到当前账号草稿…
+            正在载入配置并保存到当前训练模板的草稿…
           </p>
         ) : sourceImport?.state === 'error' ? (
           <ErrorNotice
@@ -329,7 +346,7 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
           />
         ) : (
           <>
-            <p>当前账号已有未完成的训练草稿。载入下面的配置会替换它，请确认后继续。</p>
+            <p>当前训练模板已有未完成的草稿。载入下面的配置会替换它，请确认后继续。</p>
             <dl className="detail-list">
               <div>
                 <dt>将被替换的草稿</dt>
@@ -375,17 +392,13 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
       </Modal>
     );
   }
-  if (
-    !props.sourceRun &&
-    ((props.initialTemplate && consumedInitialTemplate !== props.initialTemplate) ||
-      entryTemplateAction)
-  )
+  if ((props.personalTemplate && !consumedPersonalTemplate.current) || personalTemplateAction)
     return (
       <Modal
-        title={entryTemplateAction?.template.name || '载入模板'}
+        title={personalTemplateAction?.record.name || '载入模板'}
         close={props.close}
         footer={
-          entryTemplateAction?.state === 'error' ? (
+          personalTemplateAction?.state === 'error' ? (
             <>
               <button type="button" className="button outline" onClick={props.close}>
                 关闭
@@ -394,7 +407,7 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
                 type="button"
                 className="button primary"
                 onClick={() =>
-                  void loadEntryTemplate(entryTemplateAction.snapshot, entryTemplateAction.template)
+                  void loadPersonalTemplate(personalTemplateAction.record).catch(() => {})
                 }
               >
                 重试载入模板
@@ -403,11 +416,11 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
           ) : undefined
         }
       >
-        {entryTemplateAction?.state === 'error' ? (
+        {personalTemplateAction?.state === 'error' ? (
           <ErrorNotice
             title="模板未载入"
-            error={entryTemplateAction.error}
-            hint="原草稿已保留，请先处理草稿同步问题或版本冲突，再重新载入模板。"
+            error={personalTemplateAction.error}
+            hint="该训练方式的草稿已保留。关闭后重新打开，可先处理草稿同步问题或版本冲突。"
           />
         ) : (
           <p className="training-draft-loading">
@@ -426,15 +439,23 @@ function TrainingDraftWizard(props: RunWizardProps & { userId: string }) {
       userId={props.userId}
       templateNotice={templateNotice}
       sourceRunNotice={sourceNotice}
+      onSelectTemplate={async (templateId) => {
+        if (!templateId || templateId === props.initialTemplate) return;
+        await draft.flush();
+        props.selectTemplate(templateId);
+      }}
       onApplyTemplate={async (record) => {
         const applied = applyTrainingTemplate(record, {
           nodes: data.nodes.data || [],
           profiles: data.profiles.data || [],
           assets: data.assets.data || [],
         });
-        applied.snapshot.request.name = `${record.name} 训练`;
-        await draft.replace(applied.snapshot);
-        setTemplateNotice({ name: record.name, issues: applied.issues });
+        if (applied.snapshot.request.template_id === props.initialTemplate)
+          await loadPersonalTemplate(record);
+        else {
+          await draft.flush();
+          props.selectTemplate(applied.snapshot.request.template_id, record);
+        }
       }}
     />
   );
@@ -475,6 +496,7 @@ function RunWizardContent({
   userId,
   templateNotice,
   onApplyTemplate,
+  onSelectTemplate,
   sourceRunNotice,
 }: RunWizardProps & {
   initialDraft?: TrainingDraftSnapshot;
@@ -483,6 +505,7 @@ function RunWizardContent({
   userId: string;
   templateNotice?: { name: string; issues: string[] };
   onApplyTemplate: (record: TrainingTemplateRecord) => Promise<void>;
+  onSelectTemplate: (templateId: string) => Promise<void>;
   sourceRunNotice?: string;
 }) {
   const { nodes, assets, profiles, templates, refresh } = useData();
@@ -924,6 +947,7 @@ function RunWizardContent({
           : undefined,
       normalization_method: local ? value.normalization_method : undefined,
       requested_gpu_uuids: isNorm ? undefined : value.requested_gpu_uuids,
+      training_gpu_policy: local ? value.training_gpu_policy : undefined,
       inputs: local ? value.inputs : {},
       dataset_bindings: local ? value.dataset_bindings || newDatasetBindings([]) : undefined,
       norm_datasets: isNorm ? value.norm_datasets || [newNormDataset(!advancedRecipe)] : undefined,
@@ -1101,7 +1125,11 @@ function RunWizardContent({
         ...previous,
         [key]: value,
         ...(key === 'node_id' && value !== previous.node_id
-          ? { requested_gpu_uuids: undefined, gpu_count: Math.max(minGpus, previous.gpu_count) }
+          ? {
+              requested_gpu_uuids: undefined,
+              training_gpu_policy: undefined,
+              gpu_count: Math.max(minGpus, previous.gpu_count),
+            }
           : {}),
       };
       return key === 'normalization_method'
@@ -1109,7 +1137,9 @@ function RunWizardContent({
         : next;
     });
   };
-  const updateGpuSelection = (selection: Pick<RunRequest, 'gpu_count' | 'requested_gpu_uuids'>) => {
+  const updateGpuSelection = (
+    selection: Pick<RunRequest, 'gpu_count' | 'requested_gpu_uuids' | 'training_gpu_policy'>,
+  ) => {
     draftSession.markEdited();
     setConfirmedConfigSha256(undefined);
     setPreviewId('');
@@ -1330,6 +1360,7 @@ function RunWizardContent({
               parameters: request.parameters,
               gpu_count: request.gpu_count,
               requested_gpu_uuids: request.requested_gpu_uuids,
+              training_gpu_policy: hasLocalTraining ? request.training_gpu_policy : undefined,
               auto_config: automaticMode ? request.auto_config : undefined,
               ...(hasLocalTraining && request.normalization_method
                 ? { normalization_method: request.normalization_method }
@@ -1385,7 +1416,7 @@ function RunWizardContent({
   };
   const draftStatusText = {
     loading: '正在读取草稿…',
-    idle: '填写后自动保存到当前账号',
+    idle: '填写后自动保存到当前模板草稿',
     pending: '有修改，正在等待自动保存…',
     saving: '正在保存草稿…',
     saved: `草稿已保存${draftSession.updatedAt ? ` · ${new Date(draftSession.updatedAt).toLocaleTimeString()}` : ''}`,
@@ -1557,8 +1588,8 @@ function RunWizardContent({
           <strong>{draftStatusText}</strong>
           <span>
             {initialDraft
-              ? '已恢复未完成配置；请重新核对资源并预检。'
-              : '草稿按账号隔离，可跨浏览器、跨设备恢复。'}
+              ? '已恢复当前模板的未完成配置；请重新核对资源并预检。'
+              : '每个训练模板独立保存草稿，可在同一账号跨浏览器、跨设备恢复。'}
           </span>
         </div>
         <div className="training-draft-actions">
@@ -1581,7 +1612,7 @@ function RunWizardContent({
             disabled={busy || draftActionBusy || draftSession.status === 'saving'}
             onClick={() => setConfirmClearDraft(true)}
           >
-            清空草稿
+            清空当前模板草稿
           </button>
         </div>
         {draftSession.error && (
@@ -1611,7 +1642,7 @@ function RunWizardContent({
         )}
         {confirmClearDraft && (
           <div className="training-draft-choice" role="alert">
-            <span>清空草稿会移除已保存内容，并重新开始当前配置。</span>
+            <span>清空会移除当前训练模板的草稿，并重新开始当前配置。</span>
             <button
               type="button"
               className="button outline small"
@@ -1946,7 +1977,9 @@ function RunWizardContent({
                       type="checkbox"
                       checked={request.template_id === 'smoke'}
                       onChange={(event) =>
-                        update('template_id', event.target.checked ? 'smoke' : 'openpi-sft')
+                        void draftAction(() =>
+                          onSelectTemplate(event.target.checked ? 'smoke' : 'openpi-sft'),
+                        )
                       }
                     />
                     <span>仅进行平台链路测试（使用合成数据，不产生 VLA 模型）</span>
@@ -2017,30 +2050,7 @@ function RunWizardContent({
                 <select
                   required
                   value={request.template_id}
-                  onChange={(event) => {
-                    setRecipeDatasets([]);
-                    setRecipeDefaults({});
-                    setStageRecipeInfo(undefined);
-                    setStageRecipeDefaults({});
-                    setSelectedRecipeRevision(undefined);
-                    setRecipeDirty(false);
-                    setRecipeReading(false);
-                    entrypointEdited.current = false;
-                    editedParameters.current =
-                      event.target.value === 'openpi-norm'
-                        ? resourceRecommendationTracking(editedParameters.current)
-                        : new Set();
-                    editedStageParameters.current.clear();
-                    setRequest((value) => ({
-                      ...value,
-                      template_id: event.target.value,
-                      training_stage: undefined,
-                      stage_config: undefined,
-                      recipe_revision_id: undefined,
-                      recipe:
-                        event.target.value === 'smoke' ? 'smoke' : advancedRecipe ? '' : undefined,
-                    }));
-                  }}
+                  onChange={(event) => void draftAction(() => onSelectTemplate(event.target.value))}
                 >
                   <option value="">选择模板</option>
                   {templates.data?.map((item) => (
@@ -2685,6 +2695,7 @@ function RunWizardContent({
                           request={request}
                           node={node}
                           minimum={minGpus}
+                          allowShared={hasLocalTraining}
                           onChange={updateGpuSelection}
                         />
                       )}
@@ -2891,6 +2902,8 @@ function RunWizardContent({
               <dt>申请 GPU</dt>
               <dd>
                 {request.gpu_count} 张 · {requestedGpuSummary(request.requested_gpu_uuids, node)}
+                <br />
+                {trainingGpuPolicySummary((preview?.request || request).training_gpu_policy)}
               </dd>
             </div>
             {hasLocalTraining && (

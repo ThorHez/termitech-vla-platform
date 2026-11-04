@@ -110,9 +110,14 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
                  dataset_bindings: list[dict] | None = None,
                  training_stage: str | None = None, stage_config: dict | None = None,
                  auto_config: dict | None = None, normalization_method: str | None = None,
-                 norm_datasets: list[dict] | None = None) -> dict:
+                 norm_datasets: list[dict] | None = None, training_gpu_policy: dict | None = None) -> dict:
     """Build argv; Agent preflight and launch recheck validate the selected recipe."""
     from .recipe_definitions import recipe_parameters, resolve_definition
+    from vla_protocol.training_gpu_policy import normalize_training_gpu_policy
+    training_gpu_policy = normalize_training_gpu_policy(training_gpu_policy)
+    if training_gpu_policy is not None and (template_id not in {"openpi-sft", "recap"}
+            or profile.get("adapter") != "openpi-sft" or not gpu_uuids):
+        raise ValueError("TRAINING_GPU_POLICY_INVALID: 共享显存仅支持申请 GPU 的 OpenPI 训练")
     parameters = validate_parameters(template_id, {**recipe_parameters(recipe_definition), **parameters})
     normalization_method = normalize_normalization_method(normalization_method, template_id=template_id)
     norm_datasets = normalize_norm_datasets(norm_datasets)
@@ -185,6 +190,8 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
         wrapper = Path(__file__).with_name("openpi_entry.py").resolve()
         spec = {"code_dir": str(code_dir), "recipe": recipe, "inputs": inputs,
                 "parameters": parameters, "output_dir": str(output), "gpu_count": len(gpu_uuids)}
+        if training_gpu_policy is not None:
+            spec["training_gpu_policy"] = training_gpu_policy
         if template_id == "recap":
             spec.update({"template_id": "recap", "training_stage": training_stage, "stage_config": stage_config})
         if dataset_bindings is not None:

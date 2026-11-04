@@ -349,11 +349,15 @@
   font-size: 10px;
   color: var(--text-secondary, #52686b);
 }
-.training-gpu-state.available {
+.training-gpu-state.available,
+.training-gpu-state.shareable {
   color: var(--text-success, #168669);
 }
 .training-gpu-state.busy {
   color: var(--text-warning, #8a5f10);
+}
+.training-gpu-state.insufficient {
+  color: var(--text-danger, #b3413c);
 }
 .training-gpu-state.unknown {
   color: var(--text-secondary, #52686b);

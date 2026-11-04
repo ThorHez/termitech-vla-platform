@@ -21,6 +21,7 @@ from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_adapters.runtime_options import validate_generated_normalization_method
 from vla_protocol import canonical_digest
 from vla_protocol.config_preview import validate_generated_config
+from vla_protocol.training_gpu_policy import normalize_training_gpu_policy
 
 from .metrics import gpu_inventory
 from .output_isolation import validate_output_isolation
@@ -268,6 +269,9 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
             raise ValueError("resolved execution plan does not match automatic configuration")
         if plan.get("normalization_method") != spec.get("normalization_method"):
             raise ValueError("resolved execution plan does not match normalization_method")
+        gpu_policy = normalize_training_gpu_policy(spec.get("training_gpu_policy"))
+        if spec.get("training_gpu_policy") != gpu_policy or plan.get("training_gpu_policy") != gpu_policy:
+            raise ValueError("resolved execution plan does not match training_gpu_policy")
         validate_generated_normalization_method(plan.get("generated_config"), spec.get("normalization_method"))
         _validate_training_cache(plan, config["roots"])
         if configured_cache and any(plan["training_cache"]["paths"].get(key) != value
