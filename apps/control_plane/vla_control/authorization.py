@@ -51,7 +51,7 @@ _allow("platform.read", "GET",
 _allow("assets.write", "POST", "/assets", "/assets/{asset_id}/archive")
 _allow("assets.query", "POST", "/nodes/{node_id}/path-suggestions")
 _allow("assets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
-_allow("assets.write", "POST", "/assets/{asset_id}/validations")
+_allow("assets.write", "POST", "/assets/{asset_id}/validations", "/assets/{asset_id}/validation/cancel")
 _allow("platform.read", "GET", "/assets/{asset_id}/validation")
 _allow("platform.read", "GET", "/assets/{asset_id}/statistics")
 _allow("dataset-templates.write", "GET", "/dataset-format-templates", "/dataset-format-templates/{template_id}")

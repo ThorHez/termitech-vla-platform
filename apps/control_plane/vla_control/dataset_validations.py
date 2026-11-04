@@ -33,6 +33,7 @@ ERRORS = {
     "DATASET_VALIDATION_EXPIRED": "后台校验请求已过期，请重新校验",
     "DATASET_VALIDATION_INVALID_RESULT": "Agent 返回的校验结果无效，请重新校验",
     "DATASET_VALIDATION_FAILED": "数据源校验未通过，请查看具体检查项",
+    "DATASET_VALIDATION_CANCELLED": "基础校验已取消；任务尚未下发，数据集和训练均保留",
 }
 
 
@@ -159,6 +160,39 @@ def validation_execution_authorized(session, command, *, allow_legacy=False):
                 and asset.kind == "DATASET" and command.actor_user_id == actor
                 and isinstance(provenance, dict) and provenance.get("transfer_id") == transfer.id
                 and task_execution_authorized(session, transfer.owner_user_id, actor, allow_legacy=allow_legacy))
+
+
+def cancel_pending_validation(session, asset):
+    """Cancel only this asset's proven undelivered validation command.
+
+    The authenticated route holds AuthGuard, also held by command delivery, so
+    delivered_at cannot change between this check and commit. Keep Asset before
+    Command ordering consistent with validation acknowledgement and asset edits.
+    """
+    stored = (asset.metadata_json or {}).get(INTERNAL_KEY)
+    command = session.scalar(select(Command).where(Command.id == stored.get("id"))
+        .with_for_update().execution_options(populate_existing=True)) if isinstance(stored, dict) and stored.get("id") else None
+    matching = (command is not None and command.type == COMMAND and command.node_id == asset.node_id
+                and isinstance(command.payload, dict) and command.payload.get("asset_id") == asset.id
+                and command.payload.get("input_digest") == stored.get("input_digest"))
+    if not matching:
+        raise APIError(409, "DATASET_VALIDATION_NOT_PENDING", "本数据集没有可取消的当前基础校验任务")
+    if command.delivered_at is not None:
+        raise APIError(409, "DATASET_VALIDATION_ALREADY_DELIVERED",
+                       "基础校验任务已下发，不能确认执行进程已停止；请等待校验完成后再升级 Agent")
+    error = command.result.get("error") if isinstance(command.result, dict) else None
+    if (stored.get("status") == "CANCELLED" and command.status == "REJECTED"
+            and isinstance(error, dict) and error.get("code") == "DATASET_VALIDATION_CANCELLED"):
+        return deepcopy(stored)
+    if stored.get("status") != "PENDING" or command.status != "PENDING":
+        raise APIError(409, "DATASET_VALIDATION_NOT_PENDING", "本数据集没有可取消的当前基础校验任务")
+    stamp = now()
+    error = _error("DATASET_VALIDATION_CANCELLED")
+    report = {**stored, "status": "CANCELLED", "error": deepcopy(error), "completed_at": stamp}
+    _write(asset, report)
+    command.status, command.result, command.acknowledged_at = "REJECTED", {"error": error, "checks": []}, stamp
+    session.flush()
+    return deepcopy(report)
 
 
 def _reuse_pending_validation(session, asset, previous):
@@ -409,3 +443,9 @@ def register_routes(app, admin, db, settings):
     def get(asset_id: str):
         with db.read() as session:
             return validation_dict(required(session, asset_id), session)
+
+    @app.post("/api/v1/assets/{asset_id}/validation/cancel", dependencies=admin)
+    def cancel(asset_id: str, request: Request):
+        with db.write() as session:
+            require_active_actor(session, request, "assets.write")
+            return cancel_pending_validation(session, required(session, asset_id, lock=True))

@@ -87,7 +87,11 @@ export function DatasetValidation({
         检查数据源元信息、文件结构、时间戳与有限原始样本。相机映射、状态拼接等训练组合配置仍需在训练向导中校验。
       </p>
       {report?.requested_at && <p>最近提交：{date(report.requested_at)}</p>}
-      {completed && <p>最近完成：{date(completed)}</p>}
+      {completed && (
+        <p>
+          {report?.status === 'CANCELLED' ? '最近取消' : '最近完成'}：{date(completed)}
+        </p>
+      )}
       {report?.profile_id && (
         <p>
           校验环境：
@@ -97,6 +101,7 @@ export function DatasetValidation({
       {report?.status === 'PENDING' && (
         <p role="status">已提交后台校验，等待 Agent 返回结果；可关闭此窗口。</p>
       )}
+      {report?.status === 'CANCELLED' && <p role="status">本次基础校验已取消，可重新提交。</p>}
       {report?.status === 'STALE' && (
         <p className="dataset-validation-warning">数据或配置已变化，请重新校验后使用最新结果。</p>
       )}

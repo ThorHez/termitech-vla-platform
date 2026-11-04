@@ -77,6 +77,7 @@ try {
       PENDING: '待校验 / 后台校验中',
       SUCCEEDED: '基础校验通过',
       FAILED: '基础校验失败',
+      CANCELLED: '基础校验已取消',
       STALE: '需重验',
       BLOCKED: '暂无法校验',
     };
@@ -131,6 +132,27 @@ try {
     assert.match(panel(null), /尚未校验/);
   });
 
+  await test('cancelled validation is neutral, retains its receipt and permits an authorized retry', () => {
+    const cancelled = report('CANCELLED');
+    assert.deepEqual(helpers.datasetValidationPresentation(cancelled), {
+      state: 'CANCELLED',
+      label: '基础校验已取消',
+    });
+    const html = panel(cancelled);
+    assert.match(html, /基础校验已取消/);
+    assert.match(html, /本次基础校验已取消，可重新提交/);
+    assert.match(html, /最近取消/);
+    assert.match(html, /校验环境：OpenPI 环境/);
+    assert.doesNotMatch(html, /最近完成|等待 Agent 返回结果|已有后台校验任务/);
+    assert.doesNotMatch(mutationButton(html).attributes, /disabled/);
+    assert.equal(mutationButton(panel(cancelled, { writable: false })), undefined);
+    assert.match(panel(cancelled, { writable: false }), /基础校验已取消/);
+    assert.match(
+      mutationButton(panel(cancelled, { node: { ...node, status: 'OFFLINE' } })).attributes,
+      /disabled/,
+    );
+  });
+
   await test('validation environment selection excludes foreign, container and inactive profiles', () => {
     const profiles = [
       profile,
@@ -166,6 +188,9 @@ try {
     assert.equal(helpers.currentDatasetValidation(old, complete, pending), complete);
     const stale = { ...complete, status: 'STALE' };
     assert.equal(helpers.currentDatasetValidation(stale, complete, pending), stale);
+    const cancelled = { ...pending, status: 'CANCELLED' };
+    assert.equal(helpers.currentDatasetValidation(old, cancelled, pending), cancelled);
+    assert.equal(helpers.currentDatasetValidation(cancelled, pending), cancelled);
     assert.equal(helpers.currentDatasetValidation(old, null), undefined);
   });
 

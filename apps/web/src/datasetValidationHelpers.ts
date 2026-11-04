@@ -11,6 +11,8 @@ export function datasetValidationPresentation(report?: DatasetSourceValidation |
       return { state: 'VALID', label: '基础校验通过' };
     case 'FAILED':
       return { state: 'FAILED', label: '基础校验失败' };
+    case 'CANCELLED':
+      return { state: 'CANCELLED', label: '基础校验已取消' };
     case 'STALE':
       return { state: 'UNKNOWN', label: '需重验' };
     case 'BLOCKED':

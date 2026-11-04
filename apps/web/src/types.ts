@@ -48,7 +48,7 @@ export interface Node {
 }
 export interface DatasetSourceValidation {
   id?: string | null;
-  status: 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'STALE' | 'BLOCKED';
+  status: 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'CANCELLED' | 'STALE' | 'BLOCKED';
   scope: 'dataset_source';
   profile_id?: string | null;
   requested_at?: string | null;
