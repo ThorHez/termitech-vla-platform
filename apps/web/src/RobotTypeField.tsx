@@ -7,6 +7,8 @@ const choices = [
   'ARX5',
   'UMI',
   'ALOHA',
+  'ROKAE',
+  'AGIBOT G2',
   'Franka',
   'UR5',
   'Piper',
