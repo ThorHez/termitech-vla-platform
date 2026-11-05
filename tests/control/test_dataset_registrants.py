@@ -1,4 +1,4 @@
-"""Only a verified new registration establishes a dataset's registrant."""
+"""Only a verified manual registration establishes an asset's registrant."""
 
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -12,10 +12,28 @@ from vla_control.db import Database
 from vla_control.models import Asset
 
 from .conftest import ADMIN
-from .test_asset_transfers import create as create_copy, fixture, run_copy
+from .test_asset_transfers import create as create_copy, fixture, result_for, run_copy
+from .test_dataset_archive_permissions import registered
 from .test_dataset_batches import PASSWORD, assets, batch, operator_batch, scan, submit
 from .test_dataset_norm_migration import _legacy_table, _snapshot
+from .test_multiuser_task_permissions import team  # noqa: F401
 from .test_resource_ownership import accounts, login
+
+
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_single_manual_registration_persists_actual_registrar_for_every_supported_kind(team, kind):
+    platform, _, users, clients = team
+    asset = registered(team, "alice", kind=kind)
+    database = Database(platform.settings.database_url)
+    try:
+        database.initialize()
+        with database.read() as session:
+            row = session.get(Asset, asset["id"])
+            assert row.kind == kind and row.registered_by_user_id == users["alice"]["id"]
+    finally:
+        database.close()
+    listed = next(row for row in clients["bob"].get("/api/v1/assets").json() if row["id"] == asset["id"])
+    assert listed["registered_by_user_id"] == users["alice"]["id"]
 
 
 def test_additive_registrant_migration_preserves_history_and_never_infers_authorship(platform):
@@ -138,15 +156,20 @@ def test_other_accounts_batch_skip_and_original_replay_never_transfer_registrant
     assert assets(batch) == before
 
 
-def test_copy_output_does_not_inherit_dataset_registrant_or_transfer_task_owner(fixture, monkeypatch):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_copy_output_does_not_inherit_asset_registrant_or_transfer_task_owner(fixture, monkeypatch, kind):
     platform, _, _, _, source, _ = fixture
     users = accounts(platform)
     with platform.app.state.db.write() as session:
-        session.get(Asset, source["id"]).registered_by_user_id = users["alice"]
+        row = session.get(Asset, source["id"])
+        row.kind, row.registered_by_user_id = kind, users["alice"]
+        if kind == "NORM":
+            row.path = "/machine/norms/norm_stats.json"
     login(platform, "alice")
     response = create_copy(fixture)
     assert response.status_code == 202, response.text
-    finished = run_copy(fixture, response.json()["id"], monkeypatch)
+    finished = run_copy(fixture, response.json()["id"], monkeypatch,
+        transfer=lambda *args, **kwargs: result_for(args, kwargs, file_name="norm_stats.json" if kind == "NORM" else None))
     assert finished["state"] == "SUCCEEDED" and finished["owner_user_id"] == users["alice"]
     listed = {row["id"]: row for row in platform.client.get("/api/v1/assets").json()}
     assert listed[source["id"]]["registered_by_user_id"] == users["alice"]

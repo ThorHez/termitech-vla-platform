@@ -75,7 +75,8 @@ def test_roles_cannot_call_restricted_routes_directly(secured, role):
     _, client = secured
     account(client, role)
     allowed = {"platform.read"} if role == "viewer" else {
-        "platform.read", "training.write", "datasets.register", "datasets.archive", "assets.query", "assets.transfer", "dataset-templates.write", "recipes.query"}
+        "platform.read", "training.write", "assets.register", "assets.archive", "datasets.register", "datasets.archive",
+        "assets.query", "assets.transfer", "dataset-templates.write", "recipes.query"}
     for (method, path), permission in PERMISSIONS.items():
         if permission not in allowed:
             result = client.request(method, concrete(path), json={} if method != "GET" else None)
@@ -87,7 +88,8 @@ def test_operator_training_asset_recipe_requests_reach_validation(secured):
     _, client = secured
     account(client, "operator")
     for (method, path), permission in PERMISSIONS.items():
-        if permission in {"training.write", "datasets.register", "datasets.archive", "assets.query", "assets.transfer", "dataset-templates.write", "recipes.query"}:
+        if permission in {"training.write", "assets.register", "assets.archive", "datasets.register", "datasets.archive",
+                          "assets.query", "assets.transfer", "dataset-templates.write", "recipes.query"}:
             result = client.request(method, concrete(path), json={})
             if (method, path) == ("GET", "/api/v1/training-draft"):
                 assert result.status_code == 200

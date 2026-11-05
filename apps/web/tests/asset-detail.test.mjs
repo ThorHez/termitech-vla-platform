@@ -86,6 +86,8 @@ try {
               role === 'admin'
                 ? [
                     'assets.write',
+                    'assets.register',
+                    'assets.archive',
                     'datasets.register',
                     'datasets.archive',
                     'assets.transfer',
@@ -93,6 +95,8 @@ try {
                   ].includes(permission)
                 : role === 'operator' &&
                   [
+                    'assets.register',
+                    'assets.archive',
                     'datasets.register',
                     'datasets.archive',
                     'assets.transfer',

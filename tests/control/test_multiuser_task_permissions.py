@@ -98,11 +98,12 @@ def test_same_idempotency_key_is_independent_per_account_and_replays_own_run(tea
 
 
 @pytest.mark.parametrize("name", ["alice", "bob", "reader"])
-def test_existing_public_assets_and_recipes_are_admin_managed(team, name):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_existing_public_assets_and_recipes_are_admin_managed(team, name, kind):
     _, node, _, clients = team
     admin = clients["team-admin"]
     asset = admin.post("/api/v1/assets", json={"node_id": node["node_id"], "name": "public dataset",
-        "kind": "DATASET", "path": "/machine/datasets/public", "version": "v1", "metadata": {}})
+        "kind": kind, "path": "/machine/assets/public", "version": "v1", "metadata": {}})
     assert asset.status_code == 201, asset.text
     identifier = asset.json()["id"]
     assert asset.json()["registered_by_user_id"] == team[2]["team-admin"]["id"]

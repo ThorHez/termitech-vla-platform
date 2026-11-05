@@ -28,6 +28,8 @@ try {
       'machines.manage',
       'training.write',
       'assets.write',
+      'assets.register',
+      'assets.archive',
       'datasets.register',
       'datasets.archive',
       'assets.transfer',
@@ -38,6 +40,8 @@ try {
     ],
     operator: [
       'training.write',
+      'assets.register',
+      'assets.archive',
       'datasets.register',
       'datasets.archive',
       'assets.query',
@@ -80,15 +84,14 @@ try {
     }
   });
 
-  await test('operators can register datasets while viewers keep a shared readonly catalog', () => {
+  await test('operators can register all asset types while viewers keep a shared readonly catalog', () => {
     for (const role of ['admin', 'operator'])
       assert.match(render(role, AssetsPage), />我的格式模板</);
     assert.doesNotMatch(render('viewer', AssetsPage), />我的格式模板</);
     assert.match(render('admin', AssetsPage), />登记资产</);
     assert.match(render('admin', AssetsPage), />批量登记数据集</);
-    assert.match(render('operator', AssetsPage), />登记数据集</);
+    assert.match(render('operator', AssetsPage), />登记资产</);
     assert.match(render('operator', AssetsPage), />批量登记数据集</);
-    assert.doesNotMatch(render('operator', AssetsPage), />登记资产</);
     for (const role of ['admin', 'operator']) {
       assert.match(render(role, RunsPage, { createRun() {} }), />新建训练</);
       assert.match(render(role, OverviewPage, { createRun() {} }), />新建训练</);
@@ -101,11 +104,11 @@ try {
     assert.match(render('viewer', RunsPage, { createRun() {} }), /训练任务/);
   });
 
-  await test('dataset registration renders complete initial configuration without granting model registration or existing edits', () => {
+  await test('operator registration offers all three asset types and complete dataset configuration without existing edits', () => {
     const operator = render('operator', RegisterAsset, { close() {} });
-    assert.match(operator, /登记数据集/);
-    assert.match(operator, /<option value="DATASET"/);
-    assert.doesNotMatch(operator, /<option value="MODEL"|<option value="NORM"/);
+    assert.match(operator, /登记资产/);
+    for (const kind of ['DATASET', 'MODEL', 'NORM'])
+      assert.match(operator, new RegExp(`<option value="${kind}"`));
     assert.match(operator, /机器人类型|机器人/);
     assert.match(operator, /任务描述/);
     assert.match(operator, /选择格式模板/);
@@ -127,6 +130,38 @@ try {
       render('operator', DatasetNormBindingDialog, { asset: dataset, close() {} }),
       /无法修改绑定/,
     );
+  });
+
+  await test('single registration requires the common asset permission while batch keeps its dataset scope', () => {
+    const single = {
+      user: { id: 'single', role: 'operator' },
+      can: (permission) => permission === 'assets.register',
+    };
+    const element = (Component, auth, withData = true) =>
+      renderToStaticMarkup(
+        React.createElement(
+          AuthContext.Provider,
+          { value: auth },
+          withData
+            ? React.createElement(
+                DataProvider,
+                { enabled: false },
+                React.createElement(Component, { close() {} }),
+              )
+            : React.createElement(Component, { close() {} }),
+        ),
+      );
+    const form = element(RegisterAsset, single);
+    for (const kind of ['DATASET', 'NORM', 'MODEL'])
+      assert.match(form, new RegExp(`<option value="${kind}"`));
+    const page = element(AssetsPage, single);
+    assert.match(page, />登记资产</);
+    assert.doesNotMatch(page, />批量登记数据集</);
+    const legacy = { ...single, can: (permission) => permission === 'datasets.register' };
+    assert.match(element(RegisterAsset, legacy, false), /权限不足/);
+    assert.doesNotMatch(element(RegisterAsset, legacy, false), /<form/);
+    assert.match(element(AssetsPage, legacy), />批量登记数据集</);
+    assert.doesNotMatch(element(AssetsPage, legacy), />登记资产</);
   });
 
   await test('privileged dialogs reject direct mounts before business resources are accessed', () => {

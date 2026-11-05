@@ -1,4 +1,4 @@
-"""Dataset creators may archive their own datasets, but cannot edit shared assets."""
+"""Manual asset registrants may archive their assets, but cannot edit shared settings."""
 
 import pytest
 from sqlalchemy import delete, func, select
@@ -23,23 +23,26 @@ def counts(platform):
 
 @pytest.mark.parametrize("name", ["team-admin", "alice", "reader"])
 @pytest.mark.parametrize("kind", ["DATASET", "MODEL", "NORM"])
-def test_registration_is_granted_only_for_the_allowed_role_and_asset_kind(team, name, kind):
-    platform, node, _, clients = team
+def test_registration_is_granted_for_all_supported_kinds_to_admin_and_operator(team, name, kind):
+    platform, node, users, clients = team
     before = counts(platform)
     response = clients[name].post("/api/v1/assets", json=body(node, kind=kind))
-    allowed = name == "team-admin" or name == "alice" and kind == "DATASET"
+    allowed = name in {"team-admin", "alice"}
     assert response.status_code == (201 if allowed else 403), response.text
     if allowed:
         assert response.json()["kind"] == kind
+        assert response.json()["registered_by_user_id"] == users[name]["id"]
         assert counts(platform)[0] == before[0] + 1
     else:
         assert counts(platform) == before
 
 
 @pytest.mark.parametrize("creator", ["alice", "team-admin"])
-def test_operator_can_archive_only_own_registered_datasets_and_cannot_edit_existing_assets(team, creator):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_operator_can_archive_only_own_registered_assets_and_cannot_edit_existing_assets(team, creator, kind):
     _, node, _, clients = team
-    created = clients[creator].post("/api/v1/assets", json=body(node, metadata={"dataset_profile": profile()}))
+    metadata = {"dataset_profile": profile()} if kind == "DATASET" else {}
+    created = clients[creator].post("/api/v1/assets", json=body(node, kind=kind, metadata=metadata))
     assert created.status_code == 201, created.text
     asset = created.json()
     root = f"/api/v1/assets/{asset['id']}"
@@ -86,11 +89,13 @@ def test_operator_initial_norm_path_may_register_only_the_new_datasets_binding(t
     assert len(assets) == before + 2
     norm = next(row for row in assets if row["id"] == created.json()["norm_asset_id"])
     assert norm["kind"] == "NORM" and norm["path"] == "/machine/norms/new"
+    assert norm["registered_by_user_id"] is None
     assert clients["alice"].post(f"/api/v1/assets/{norm['id']}/archive").status_code == 403
 
 
 @pytest.mark.parametrize("change", ["disabled", "viewer", "logout", "idle", "expired", "password-change"])
-def test_registration_rechecks_original_session_before_any_asset_or_norm_write(team, monkeypatch, change):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_registration_rechecks_original_session_before_any_asset_or_norm_write(team, monkeypatch, change, kind):
     platform, node, users, clients = team
     identifier = users["alice"]["id"]
     original = platform.app.state.auth.require
@@ -121,7 +126,8 @@ def test_registration_rechecks_original_session_before_any_asset_or_norm_write(t
 
     before = counts(platform)
     monkeypatch.setattr(platform.app.state.auth, "require", revoke_after_admission)
-    response = clients["alice"].post("/api/v1/assets", json=body(node, norm_path="/machine/norms/new"))
+    declaration = {"norm_path": "/machine/norms/new"} if kind == "DATASET" else {}
+    response = clients["alice"].post("/api/v1/assets", json=body(node, kind=kind, **declaration))
     assert changed and response.status_code in {401, 403}, response.text
     assert counts(platform) == before
 

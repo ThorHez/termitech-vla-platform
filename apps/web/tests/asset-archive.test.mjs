@@ -24,8 +24,8 @@ const asset = {
 };
 const user = (role = 'operator', id = 'alice') => ({ id, role, username: id, display_name: id });
 const grants = {
-  admin: ['assets.write', 'datasets.archive'],
-  operator: ['datasets.archive'],
+  admin: ['assets.write', 'assets.archive', 'datasets.archive'],
+  operator: ['assets.archive', 'datasets.archive'],
   viewer: [],
 };
 const context = (account = user(), permissions = grants[account?.role] || []) => ({
@@ -58,11 +58,14 @@ try {
   const allowed = (account, selected, permissions) =>
     canArchiveAsset(account, selected, context(account, permissions).can);
 
-  await test('only the server-recorded manual dataset registrant receives the operator archive grant', () => {
-    assert.equal(allowed(user(), asset), true);
-    for (const registered_by_user_id of [undefined, null, '', 'bob'])
-      assert.equal(allowed(user(), { ...asset, registered_by_user_id }), false);
-    for (const kind of ['MODEL', 'NORM']) assert.equal(allowed(user(), { ...asset, kind }), false);
+  await test('only the server-recorded manual registrant receives the operator archive grant for the three supported kinds', () => {
+    for (const kind of ['DATASET', 'NORM', 'MODEL']) {
+      assert.equal(allowed(user(), { ...asset, kind }), true);
+      for (const registered_by_user_id of [undefined, null, '', 'bob'])
+        assert.equal(allowed(user(), { ...asset, kind, registered_by_user_id }), false);
+    }
+    for (const kind of ['UNKNOWN', '', 'dataset', 'toString'])
+      assert.equal(allowed(user(), { ...asset, kind }), false);
     assert.equal(
       allowed(user(), {
         ...asset,
@@ -77,12 +80,13 @@ try {
     );
   });
 
-  await test('permission alone, missing identity and viewer role cannot claim a dataset', () => {
+  await test('permission alone, legacy dataset scope, missing identity and viewer role cannot claim an asset', () => {
     assert.equal(allowed(user(), asset, ['datasets.register']), false);
-    assert.equal(allowed(user('viewer'), asset, ['datasets.archive']), false);
-    assert.equal(allowed(user('admin'), asset, ['datasets.archive']), false);
-    assert.equal(allowed(undefined, asset, ['assets.write', 'datasets.archive']), false);
-    assert.equal(allowed(user('operator', ''), asset, ['datasets.archive']), false);
+    assert.equal(allowed(user(), asset, ['datasets.archive']), false);
+    assert.equal(allowed(user('viewer'), asset, ['assets.archive']), false);
+    assert.equal(allowed(user('admin'), asset, ['assets.archive']), false);
+    assert.equal(allowed(undefined, asset, ['assets.write', 'assets.archive']), false);
+    assert.equal(allowed(user('operator', ''), asset, ['assets.archive']), false);
   });
 
   await test('administrators retain history and all asset kinds, while archived records have no delete action', () => {
@@ -107,14 +111,36 @@ try {
       sync() {},
       remove() {},
     };
-    const html = render(AssetDetail, props);
-    assert.match(html, /删除登记/);
-    assert.doesNotMatch(html, /编辑数据特征|补录数据特征|绑定 norm_stats|发起校验|重新校验/);
-    for (const registered_by_user_id of [null, 'bob'])
+    for (const kind of ['DATASET', 'NORM', 'MODEL']) {
+      const html = render(AssetDetail, { ...props, asset: { ...asset, kind } });
+      assert.match(html, /删除登记/);
+      assert.doesNotMatch(html, /编辑数据特征|补录数据特征|绑定 norm_stats|发起校验|重新校验/);
+      for (const registered_by_user_id of [null, 'bob'])
+        assert.doesNotMatch(
+          render(AssetDetail, { ...props, asset: { ...asset, kind, registered_by_user_id } }),
+          />删除登记</,
+        );
       assert.doesNotMatch(
-        render(AssetDetail, { ...props, asset: { ...asset, registered_by_user_id } }),
+        render(AssetDetail, {
+          ...props,
+          asset: {
+            ...asset,
+            kind,
+            registered_by_user_id: null,
+            metadata: { registered_by_user_id: 'alice' },
+          },
+        }),
         />删除登记</,
       );
+      assert.doesNotMatch(
+        render(AssetDetail, { ...props, asset: { ...asset, kind } }, context(user('viewer'))),
+        />删除登记</,
+      );
+    }
+    assert.doesNotMatch(
+      render(AssetDetail, { ...props, asset: { ...asset, kind: 'UNKNOWN' } }),
+      />删除登记</,
+    );
     assert.doesNotMatch(render(AssetDetail, props, context(user('viewer'))), />删除登记</);
   });
 
@@ -142,25 +168,27 @@ try {
   });
 
   await test('a same-session confirmation archives only the requested registration and completes once', async () => {
-    transport.setSessionCsrf('alice-session', 'alice');
-    const archive = createAssetArchiveOperation();
     let request,
       completed = 0;
     globalThis.fetch = async (url, options) => {
       request = { url, options };
       return new Response('{}', { status: 200 });
     };
-    await archive('dataset/specific', {
-      isActive: () => true,
-      signal: new AbortController().signal,
-      onArchived: () => completed++,
-    });
-    assert.equal(request.url, '/api/v1/assets/dataset%2Fspecific/archive');
-    assert.equal(request.options.method, 'POST');
-    assert.equal(request.options.headers.get('X-Operation-User'), 'alice');
-    assert.equal(request.options.headers.get('X-CSRF-Token'), 'alice-session');
-    assert.equal(request.options.body, '{}');
-    assert.equal(completed, 1);
+    for (const kind of ['DATASET', 'NORM', 'MODEL']) {
+      transport.setSessionCsrf('alice-session', 'alice');
+      const archive = createAssetArchiveOperation();
+      await archive(`${kind}/specific`, {
+        isActive: () => allowed(user(), { ...asset, kind }),
+        signal: new AbortController().signal,
+        onArchived: () => completed++,
+      });
+      assert.equal(request.url, `/api/v1/assets/${kind}%2Fspecific/archive`);
+      assert.equal(request.options.method, 'POST');
+      assert.equal(request.options.headers.get('X-Operation-User'), 'alice');
+      assert.equal(request.options.headers.get('X-CSRF-Token'), 'alice-session');
+      assert.equal(request.options.body, '{}');
+    }
+    assert.equal(completed, 3);
   });
 
   await test('an old confirmation cannot send a request using a replacement account session', async () => {

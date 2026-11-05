@@ -48,8 +48,8 @@ _allow("platform.read", "GET",
        "/recipe-writebacks/{operation_id}",
        "/run-previews/{preview_id}", "/runs", "/runs/{run_id}",
        "/runs/{run_id}/events", "/runs/{run_id}/logs", "/runs/{run_id}/metrics", "/alerts")
-_allow("datasets.register", "POST", "/assets")
-_allow("datasets.archive", "POST", "/assets/{asset_id}/archive")
+_allow("assets.register", "POST", "/assets")
+_allow("assets.archive", "POST", "/assets/{asset_id}/archive")
 _allow("assets.query", "POST", "/nodes/{node_id}/path-suggestions")
 _allow("assets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
 _allow("assets.write", "POST", "/assets/{asset_id}/validations", "/assets/{asset_id}/validation/cancel")

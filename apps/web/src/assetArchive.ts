@@ -11,8 +11,8 @@ export function canArchiveAsset(
   return (
     can('assets.write') ||
     (user.role === 'operator' &&
-      can('datasets.archive') &&
-      asset.kind === 'DATASET' &&
+      can('assets.archive') &&
+      ['DATASET', 'NORM', 'MODEL'].includes(asset.kind) &&
       asset.registered_by_user_id === user.id)
   );
 }

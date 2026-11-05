@@ -1,4 +1,4 @@
-"""Archiving a dataset requires its persisted registrar, without deleting files."""
+"""Archiving a manually registered asset requires its registrar and retains files."""
 
 from copy import deepcopy
 
@@ -23,8 +23,7 @@ def registered(team, creator="alice", **changes):
     response = clients[creator].post("/api/v1/assets", json=body(node, **changes))
     assert response.status_code == 201, response.text
     value = response.json()
-    if value["kind"] == "DATASET":
-        assert value["registered_by_user_id"] == users[creator]["id"]
+    assert value["registered_by_user_id"] == users[creator]["id"]
     return value
 
 
@@ -42,9 +41,10 @@ def snapshot(platform, identifier):
 
 
 @pytest.mark.parametrize("owner", ["alice", "bob", None])
-def test_persisted_registrar_allows_only_own_dataset_and_admin_can_handle_history(team, owner):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_persisted_registrar_allows_only_own_asset_and_admin_can_handle_history(team, owner, kind):
     platform, _, users, clients = team
-    asset = registered(team, owner or "team-admin")
+    asset = registered(team, owner or "team-admin", kind=kind)
     if owner is None:
         # A historical row has no proof of its registrar, even if somebody's
         # identity happens to appear in old imported JSON metadata.
@@ -74,10 +74,11 @@ def test_persisted_registrar_allows_only_own_dataset_and_admin_can_handle_histor
 
 
 @pytest.mark.parametrize("creator", ["alice", "bob"])
-def test_json_metadata_cannot_replace_the_server_recorded_registrar(team, creator):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_json_metadata_cannot_replace_the_server_recorded_registrar(team, creator, kind):
     platform, _, users, clients = team
     forged = users["bob" if creator == "alice" else "alice"]["id"]
-    asset = registered(team, creator, metadata={"registered_by_user_id": forged,
+    asset = registered(team, creator, kind=kind, metadata={"registered_by_user_id": forged,
         "owner_user_id": forged, "registration": {"actor_user_id": forged}})
     assert asset["metadata"]["registered_by_user_id"] == forged
     assert snapshot(platform, asset["id"])["registered_by_user_id"] == users[creator]["id"]
@@ -86,25 +87,24 @@ def test_json_metadata_cannot_replace_the_server_recorded_registrar(team, creato
     assert snapshot(platform, asset["id"])["state"] == ("ARCHIVED" if creator == "alice" else "REGISTERED")
 
 
-def test_client_cannot_select_a_registrar_in_the_creation_request(team):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_client_cannot_select_a_registrar_in_the_creation_request(team, kind):
     platform, node, users, clients = team
     with platform.app.state.db.read() as session:
         before = session.scalar(select(func.count()).select_from(Asset))
     response = clients["bob"].post("/api/v1/assets",
-        json=body(node, registered_by_user_id=users["alice"]["id"]))
+        json=body(node, kind=kind, registered_by_user_id=users["alice"]["id"]))
     assert response.status_code == 422, response.text
     with platform.app.state.db.read() as session:
         assert session.scalar(select(func.count()).select_from(Asset)) == before
 
 
-@pytest.mark.parametrize("kind", ["MODEL", "NORM"])
-def test_even_a_matching_registrar_does_not_grant_operator_non_dataset_archive_rights(team, kind):
+def test_even_a_matching_registrar_does_not_grant_operator_unknown_kind_archive_rights(team):
     platform, _, users, clients = team
-    asset = registered(team, "team-admin", kind=kind)
-    # Cover kind independently from the registrar equality check. Legacy or
-    # internal records must not convert a dataset-only right into catalogue edit.
+    asset = registered(team, "alice")
+    # Unknown historical kinds must not broaden the three supported kinds.
     with platform.app.state.db.write() as session:
-        session.get(Asset, asset["id"]).registered_by_user_id = users["alice"]["id"]
+        session.get(Asset, asset["id"]).kind = "UNKNOWN"
     before = snapshot(platform, asset["id"])
     denied = clients["alice"].post(archive_path(asset))
     assert denied.status_code == 403 and denied.json()["error"]["code"] == "RESOURCE_ACCESS_DENIED"
@@ -112,9 +112,10 @@ def test_even_a_matching_registrar_does_not_grant_operator_non_dataset_archive_r
     assert clients["team-admin"].post(archive_path(asset)).status_code == 200
 
 
-def test_own_dataset_referenced_by_an_active_training_run_cannot_be_archived(team):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_own_asset_referenced_by_an_active_training_run_cannot_be_archived(team, kind):
     platform, node, users, clients = team
-    asset = registered(team)
+    asset = registered(team, kind=kind)
     with platform.app.state.db.write() as session:
         run = Run(id=uid(), name="active reference", owner_user_id=users["alice"]["id"],
             node_id=node["node_id"], profile_id="default", template_id="smoke", state="QUEUED",
@@ -133,12 +134,13 @@ def test_own_dataset_referenced_by_an_active_training_run_cannot_be_archived(tea
     assert clients["alice"].post(archive_path(asset)).status_code == 200
 
 
-def test_own_dataset_being_synchronized_cannot_be_archived_until_copy_is_cancelled(fixture):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_own_asset_being_synchronized_cannot_be_archived_until_copy_is_cancelled(fixture, kind):
     platform, _, source, *_ = fixture
     users = accounts(platform)
     login(platform, "alice")
-    response = platform.client.post("/api/v1/assets", json=body(source,
-        path="/machine/data/alice-owned", metadata={"dataset_profile": profile()}))
+    response = platform.client.post("/api/v1/assets", json=body(source, kind=kind,
+        path="/machine/data/alice-owned", metadata={"dataset_profile": profile()} if kind == "DATASET" else {}))
     assert response.status_code == 201, response.text
     asset = response.json()
     assert asset["registered_by_user_id"] == users["alice"]
@@ -153,9 +155,10 @@ def test_own_dataset_being_synchronized_cannot_be_archived_until_copy_is_cancell
 
 
 @pytest.mark.parametrize("change", ["disabled", "viewer", "logout", "idle", "expired", "password-change"])
-def test_archive_rechecks_original_session_after_dependency_without_mutating_asset(team, monkeypatch, change):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_archive_rechecks_original_session_after_dependency_without_mutating_asset(team, monkeypatch, change, kind):
     platform, _, users, clients = team
-    asset = registered(team)
+    asset = registered(team, kind=kind)
     path = archive_path(asset)
     before = snapshot(platform, asset["id"])
     identifier = users["alice"]["id"]
@@ -190,9 +193,10 @@ def test_archive_rechecks_original_session_after_dependency_without_mutating_ass
 
 
 @pytest.mark.parametrize("failure", ["csrf", "account-switched", "viewer"])
-def test_archive_retains_csrf_and_current_account_assertion(team, failure):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_archive_retains_csrf_and_current_account_assertion(team, failure, kind):
     platform, _, users, clients = team
-    asset = registered(team, "bob")
+    asset = registered(team, "bob", kind=kind)
     before = snapshot(platform, asset["id"])
     client, headers = clients["bob"], {}
     if failure == "csrf":
@@ -206,7 +210,8 @@ def test_archive_retains_csrf_and_current_account_assertion(team, failure):
     assert snapshot(platform, asset["id"]) == before
 
 
-def test_archiving_own_dataset_preserves_physical_files(team, tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
+def test_archiving_own_asset_preserves_physical_files(team, tmp_path, monkeypatch, kind):
     platform, _, users, clients = team
     data = tmp_path / "registered-dataset"
     data.mkdir()
@@ -218,7 +223,8 @@ def test_archiving_own_dataset_preserves_physical_files(team, tmp_path, monkeypa
             "code_dir": str(tmp_path / "code"), "python": "/usr/bin/python3", "adapter": "smoke", "recipe": "smoke"}]})
     assert response.status_code == 201, response.text
     node = response.json()
-    created = clients["alice"].post("/api/v1/assets", json=body(node, path=str(data)))
+    created = clients["alice"].post("/api/v1/assets", json=body(node, kind=kind,
+        path=str(sample if kind == "NORM" else data)))
     assert created.status_code == 201, created.text
     asset = created.json()
     monkeypatch.setattr(platform.app.state.remote_manager, "_remote", lambda *_: pytest.fail("Catalogue archive must not open SSH"))

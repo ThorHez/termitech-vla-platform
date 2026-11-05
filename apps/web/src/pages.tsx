@@ -1051,6 +1051,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const canTransferAssets = can('assets.transfer');
   const canWriteAssets = can('assets.write');
   const canRegisterDatasets = can('datasets.register');
+  const canRegisterAssets = can('assets.register');
   const selectionOwner = user?.id || '';
   const archiveAsset =
     archiving?.owner === selectionOwner
@@ -1092,10 +1093,11 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
     setBindingDataset(undefined);
   }, [canWriteAssets]);
   useEffect(() => {
-    if (canRegisterDatasets) return;
-    setRegister(false);
-    setBatchRegister(false);
+    if (!canRegisterDatasets) setBatchRegister(false);
   }, [canRegisterDatasets]);
+  useEffect(() => {
+    if (!canRegisterAssets) setRegister(false);
+  }, [canRegisterAssets]);
   useEffect(() => {
     if (!canTransferAssets) setSyncAsset(undefined);
     if (!can('dataset-templates.write')) {
@@ -1285,25 +1287,25 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
               </button>
             )}
             {canRegisterDatasets && (
-              <>
-                <button
-                  type="button"
-                  className="button outline"
-                  disabled={!enabled || !nodes.data?.length}
-                  onClick={() => setBatchRegister(true)}
-                >
-                  <Database size={17} />
-                  批量登记数据集
-                </button>
-                <button
-                  className="button primary"
-                  disabled={!enabled || !nodes.data?.length}
-                  onClick={() => setRegister(true)}
-                >
-                  <Plus size={17} />
-                  {canWriteAssets ? '登记资产' : '登记数据集'}
-                </button>
-              </>
+              <button
+                type="button"
+                className="button outline"
+                disabled={!enabled || !nodes.data?.length}
+                onClick={() => setBatchRegister(true)}
+              >
+                <Database size={17} />
+                批量登记数据集
+              </button>
+            )}
+            {canRegisterAssets && (
+              <button
+                className="button primary"
+                disabled={!enabled || !nodes.data?.length}
+                onClick={() => setRegister(true)}
+              >
+                <Plus size={17} />
+                登记资产
+              </button>
             )}
           </>
         }
@@ -1474,19 +1476,17 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             description={
               query || nodeId || kind !== 'ALL'
                 ? '调整搜索条件，或登记新的本地资产。'
-                : canWriteAssets
-                  ? '登记已有数据集和模型的本机路径。预检时，Agent 会验证它们是否可用。'
-                  : '登记已有数据集的本机路径。预检时，Agent 会验证它们是否可用。'
+                : '登记已有数据集、归一化参数和模型的本机路径。预检时，Agent 会验证它们是否可用。'
             }
             action={
-              canRegisterDatasets && (
+              canRegisterAssets && (
                 <button
                   className="button outline small"
                   disabled={!enabled || !nodes.data?.length}
                   onClick={() => setRegister(true)}
                 >
                   <Plus size={15} />
-                  {canWriteAssets ? '登记资产' : '登记数据集'}
+                  登记资产
                 </button>
               )
             }
@@ -1584,7 +1584,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       {canRegisterDatasets && batchRegister && (
         <BatchDatasetRegistration initialNode={nodeId} close={() => setBatchRegister(false)} />
       )}
-      {canRegisterDatasets && register && (
+      {canRegisterAssets && register && (
         <RegisterAsset
           key={`${selectionOwner}:${nodeId}`}
           initialNode={nodeId}
@@ -1643,21 +1643,13 @@ function DatasetAssetFeatures({ asset }: { asset: Asset }) {
 
 export function RegisterAsset(props: { close: () => void; initialNode?: string }) {
   const { can, user } = useAuth();
-  if (!can('datasets.register') || !user?.id)
+  if (!can('assets.register') || !user?.id)
     return (
       <Modal title="权限不足" close={props.close}>
-        登记数据集需要具有数据集登记权限的个人账户。
+        登记资产需要具有资产登记权限的个人账户。
       </Modal>
     );
-  const allowOtherKinds = can('assets.write');
-  return (
-    <RegisterAssetContent
-      key={`${user.id}:${allowOtherKinds}`}
-      owner={user.id}
-      allowOtherKinds={allowOtherKinds}
-      {...props}
-    />
-  );
+  return <RegisterAssetContent key={user.id} owner={user.id} {...props} />;
 }
 
 function assetNameFromPath(path: string) {
@@ -1675,12 +1667,10 @@ function RegisterAssetContent({
   close,
   initialNode,
   owner,
-  allowOtherKinds,
 }: {
   close: () => void;
   initialNode?: string;
   owner: string;
-  allowOtherKinds: boolean;
 }) {
   const { user, can } = useAuth();
   const { nodes, assets, refresh } = useData();
@@ -1690,7 +1680,7 @@ function RegisterAssetContent({
   const current = useRef({ owner, allowed: true });
   current.current = {
     owner: user?.id || '',
-    allowed: can('datasets.register') && allowOtherKinds === can('assets.write'),
+    allowed: can('assets.register'),
   };
   const active = () =>
     mounted.current && current.current.owner === owner && current.current.allowed;
@@ -1724,7 +1714,7 @@ function RegisterAssetContent({
       ? datasetNormInputError(form.node_id, normAssetId, normPath, assets.data || [])
       : undefined;
   const set = (key: keyof typeof form, value: string) => {
-    if (key === 'kind' && (!assetKinds[value] || (!allowOtherKinds && value !== 'DATASET'))) return;
+    if (key === 'kind' && !Object.hasOwn(assetKinds, value)) return;
     if (key === 'name') nameEdited.current = true;
     const fillName = key === 'path' && !nameEdited.current;
     setForm((previous) => ({
@@ -1741,7 +1731,7 @@ function RegisterAssetContent({
   const showDatasetConfig = form.kind === 'DATASET' && !deferProfile;
   return (
     <Modal
-      title={allowOtherKinds ? '登记本地资产' : '登记数据集'}
+      title="登记资产"
       wide
       className={`asset-register-modal ${showDatasetConfig ? '' : 'asset-register-simple'}`}
       subtitle={
@@ -1770,7 +1760,7 @@ function RegisterAssetContent({
             disabled={busy || profileErrors.length > 0 || Boolean(normError)}
           >
             {busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}
-            {allowOtherKinds ? '登记资产' : '登记数据集'}
+            登记资产
           </button>
         </>
       }
@@ -1783,7 +1773,7 @@ function RegisterAssetContent({
           if (
             pending.current ||
             !active() ||
-            (!allowOtherKinds && form.kind !== 'DATASET') ||
+            !Object.hasOwn(assetKinds, form.kind) ||
             profileErrors.length > 0 ||
             normError
           )
@@ -1838,13 +1828,11 @@ function RegisterAssetContent({
                 value={form.kind}
                 onChange={(event) => set('kind', event.target.value)}
               >
-                {Object.entries(assetKinds)
-                  .filter(([value]) => allowOtherKinds || value === 'DATASET')
-                  .map(([value, label]) => (
-                    <option value={value} key={value}>
-                      {label}
-                    </option>
-                  ))}
+                {Object.entries(assetKinds).map(([value, label]) => (
+                  <option value={value} key={value}>
+                    {label}
+                  </option>
+                ))}
               </select>
             </Field>
             <Field label="资产版本" required>

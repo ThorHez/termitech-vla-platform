@@ -432,11 +432,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/assets", dependencies=admin, status_code=201)
     def create_asset(body: schemas.AssetInput, request: Request):
         with db.write() as session:
-            # Registration is narrower than managing the shared catalogue.
-            # Operators may add datasets, while MODEL/NORM registration and
-            # edits to existing shared asset settings still require assets.write.
-            require_active_actor(session, request,
-                                 "datasets.register" if body.kind == "DATASET" else "assets.write")
+            # Manual registration does not grant edits to existing shared assets.
+            require_active_actor(session, request, "assets.register")
             node = get_required(session, Node, body.node_id, "Node")
             require_path(body.path, node.roots)
             if body.kind == "NORM":
@@ -460,7 +457,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             asset = Asset(id=uid(), node_id=node.id, name=body.name, kind=body.kind, path=body.path,
                           version=body.version, metadata_json=body.metadata, state="REGISTERED", created_at=now(),
                           norm_asset_id=norm_asset_id,
-                          registered_by_user_id=request_owner(request) if body.kind == "DATASET" else None)
+                          registered_by_user_id=request_owner(request))
             session.add(asset)
             session.flush()
             queue_validation(session, asset, heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds,
@@ -476,15 +473,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.post("/api/v1/assets/{asset_id}/archive", dependencies=admin)
     def archive_asset(asset_id: str, request: Request):
         with db.write() as session:
-            require_active_actor(session, request, "datasets.archive")
+            require_active_actor(session, request, "assets.archive")
             asset = session.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
             if asset is None:
                 raise APIError(404, "NOT_FOUND", "Asset not found")
             if request.state.principal.role != "admin" and (
-                    asset.kind != "DATASET" or asset.registered_by_user_id is None
+                    asset.kind not in {"DATASET", "MODEL", "NORM"} or asset.registered_by_user_id is None
                     or asset.registered_by_user_id != request_owner(request)):
-                raise APIError(403, "RESOURCE_ACCESS_DENIED", "只能删除自己登记的数据集")
+                raise APIError(403, "RESOURCE_ACCESS_DENIED", "只能删除自己登记的资产")
             session.scalar(select(Node).where(Node.id == asset.node_id).with_for_update())
+            from .assets_usage import require_no_active_checkpoint_reference
+            require_no_active_checkpoint_reference(session, asset)
             active_run = session.scalar(select(RunInput.run_id).join(Run, RunInput.run_id == Run.id).where(RunInput.asset_id == asset_id, Run.state.not_in(TERMINAL)).limit(1))
             if active_run:
                 raise APIError(409, "ASSET_IN_USE", "An active training run still references this asset")
