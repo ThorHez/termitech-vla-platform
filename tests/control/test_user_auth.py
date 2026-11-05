@@ -319,7 +319,10 @@ def test_audit_redacts_request_body_query_and_unapproved_details(identity):
     response = client.get("/api/v1/audit")
     assert response.status_code == 200
     assert PASSWORD not in response.text and "private-token" not in response.text and "do-not-copy" not in response.text
-    assert response.json()[0]["details"] == {"permission": "training.write", "code": "FORBIDDEN"}
+    details = response.json()[0]["details"]
+    assert details["permission"] == "training.write" and details["code"] == "FORBIDDEN"
+    assert not {"password", "token", "body", "query"} & details.keys()
+    assert details["operation_label"] and details["category"]
     assert any(row["action"] == "auth.login" for row in response.json())
 
 

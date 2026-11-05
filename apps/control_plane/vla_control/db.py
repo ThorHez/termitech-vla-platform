@@ -60,6 +60,13 @@ class Database:
             # create_all skips indexes on existing tables, so upgrade those too.
             connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_events_attempt_type_seq "
                                        "ON events (attempt_id, type, seq)")
+            # create_all does not add indexes to an existing audit table.
+            # Stable cursor order and per-account history must use the same
+            # indexes after an additive upgrade without touching old records.
+            connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_audit_events_created_id "
+                                       "ON audit_events (created_at, id)")
+            connection.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_audit_events_actor_created_id "
+                                       "ON audit_events (actor_id, created_at, id)")
             columns = {column["name"] for column in inspect(connection).get_columns("user_sessions")}
             missing = {"last_activity_at", "reauthenticated_at"} - columns
             for column in sorted(missing):

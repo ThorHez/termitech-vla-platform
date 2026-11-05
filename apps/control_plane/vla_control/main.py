@@ -54,6 +54,7 @@ from .scheduler import enqueue, gpu_available, resolve_inputs, tick
 from .serialization import asset_dict, node_dict, preview_dict, profile_dict, run_dict
 from .service import apply_ack, automatic_preflight_error, config_confirmation_error, get_required, ingest_events, sync_profiles, validate_request
 from .settings import Settings
+from .operation_audit import OperationAuditMiddleware, prime_context
 from .transport_security import TransportSecurityMiddleware, uvicorn_options
 from .training_drafts import register_routes as register_training_draft_routes
 from .training_templates import register_routes as register_training_template_routes
@@ -130,7 +131,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
         permission = permission_for(request.method, route_path)
         if permission is not None:
-            return auth.require(request, permission)
+            principal = auth.require(request, permission)
+            prime_context(db, request)
+            return principal
 
     app = FastAPI(title="Termitech VLA Control Plane", version="0.1.0", lifespan=lifespan,
                   dependencies=[Depends(require_human)])
@@ -145,29 +148,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.auth = auth
 
     @app.middleware("http")
-    async def human_request_audit(request: Request, call_next):
-        status = 500
-        try:
-            response = await call_next(request)
-            status = response.status_code
-            if request_route_path(request).startswith("/api/v1/"):
-                response.headers["Cache-Control"] = "no-store"
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["X-Frame-Options"] = "DENY"
-            response.headers["Referrer-Policy"] = "same-origin"
-            response.headers["Content-Security-Policy"] = "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-            return response
-        finally:
-            route_path = request_route_path(request)
-            if (route_path.startswith("/api/v1/")
-                    and (not route_path.startswith("/api/v1/auth/") or status >= 400)
-                    and request.method not in {"GET", "HEAD", "OPTIONS"}):
-                # Do not capture request bodies, query strings, passwords, Agent
-                # credentials or SSH secrets in the audit trail.
-                from starlette.concurrency import run_in_threadpool
-                await run_in_threadpool(auth.audit, request, "api.mutation", status)
+    async def human_response_headers(request: Request, call_next):
+        response = await call_next(request)
+        if request_route_path(request).startswith("/api/v1/"):
+            response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+        return response
 
     app.add_middleware(TransportSecurityMiddleware, settings=settings)
+    app.add_middleware(OperationAuditMiddleware, auth=auth)
     register_auth_routes(app, auth)
 
     @app.exception_handler(APIError)

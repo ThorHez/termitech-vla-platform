@@ -1,28 +1,20 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { KeyRound, LoaderCircle, Plus, ShieldCheck, UserRound, Users } from 'lucide-react';
 import { api, date, post, useApi } from './api';
 import { roleDescriptions, roleLabels, useAuth } from './auth';
 import type { User, UserRole } from './auth';
 import { ErrorNotice, Field, Loading, Modal, PageHeading, Panel } from './components';
-
-export interface AuditEntry {
-  id: string;
-  created_at: string;
-  actor_id: string | null;
-  actor_username: string | null;
-  action: string;
-  method: string;
-  path: string;
-  status: number;
-  details?: Record<string, unknown> | null;
-  remote_addr?: string | null;
-}
+import { AuditLog } from './AuditLog';
+import type { AuditActorSelection } from './AuditLog';
+export type { AuditEntry } from './auditLogPresentation';
 
 export function UserManagement() {
   const { can, user: currentUser, refresh: refreshSession } = useAuth();
   const users = useApi<User[]>(can('users.manage') ? '/users' : null, 0);
   const [editor, setEditor] = useState<User | 'new'>();
   const [reset, setReset] = useState<User>();
+  const [auditActor, setAuditActor] = useState<AuditActorSelection>();
+  const auditRef = useRef<HTMLDivElement>(null);
   if (!can('users.manage')) return <PermissionDenied />;
   return (
     <>
@@ -89,6 +81,25 @@ export function UserManagement() {
                           <KeyRound size={13} />
                           重置密码
                         </button>
+                        {can('audit.read') && currentUser?.role === 'admin' && (
+                          <button
+                            className="button ghost small"
+                            type="button"
+                            onClick={() => {
+                              setAuditActor((previous) => ({
+                                actorId: entry.id,
+                                revision: (previous?.revision || 0) + 1,
+                              }));
+                              auditRef.current?.scrollIntoView({
+                                behavior: 'smooth',
+                                block: 'start',
+                              });
+                            }}
+                            aria-label={`查看 ${entry.username} 的操作记录`}
+                          >
+                            操作记录
+                          </button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -120,7 +131,9 @@ export function UserManagement() {
           }}
         />
       )}
-      <AuditLog />
+      <div ref={auditRef}>
+        <AuditLog users={users.data || []} actorSelection={auditActor} />
+      </div>
     </>
   );
 }
@@ -330,66 +343,6 @@ function ResetPassword({
         </div>
       </form>
     </Modal>
-  );
-}
-
-function AuditLog() {
-  const { can } = useAuth();
-  const audit = useApi<AuditEntry[]>(can('audit.read') ? '/audit?limit=100' : null, 15000);
-  if (!can('audit.read')) return null;
-  return (
-    <Panel
-      className="audit-panel"
-      title="操作审计"
-      subtitle="最近 100 条记录，记录登录、用户管理与业务修改的结果。"
-    >
-      <ErrorNotice error={audit.error} retry={audit.refresh} />
-      {audit.loading && !audit.data ? (
-        <Loading />
-      ) : (
-        <div className="auth-table-scroll">
-          <table className="auth-table">
-            <thead>
-              <tr>
-                <th>时间</th>
-                <th>用户</th>
-                <th>操作</th>
-                <th>结果</th>
-              </tr>
-            </thead>
-            <tbody>
-              {audit.data?.length ? (
-                audit.data.map((entry) => (
-                  <tr key={entry.id}>
-                    <td className="nowrap">{date(entry.created_at)}</td>
-                    <td>{entry.actor_username || '未登录'}</td>
-                    <td>
-                      <strong>{entry.action}</strong>
-                      <small>
-                        <code>
-                          {entry.method} {entry.path}
-                        </code>
-                      </small>
-                    </td>
-                    <td>
-                      <span className={`badge ${entry.status < 400 ? 'green' : 'amber'}`}>
-                        {entry.status < 400 ? '成功' : '拒绝 / 失败'} · {entry.status}
-                      </span>
-                    </td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={4} className="muted">
-                    暂无审计记录
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </Panel>
   );
 }
 

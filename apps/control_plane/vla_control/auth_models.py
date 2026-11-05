@@ -1,6 +1,6 @@
 """Additive human identity tables, separate from node enrollment credentials."""
 
-from sqlalchemy import Boolean, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -47,6 +47,10 @@ class LoginThrottle(Base):
 
 class AuditEvent(Base):
     __tablename__ = "audit_events"
+    __table_args__ = (
+        Index("ix_audit_events_created_id", "created_at", "id"),
+        Index("ix_audit_events_actor_created_id", "actor_id", "created_at", "id"),
+    )
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     created_at: Mapped[str] = mapped_column(String(40), index=True)
     actor_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

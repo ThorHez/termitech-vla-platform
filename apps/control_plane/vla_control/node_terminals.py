@@ -374,9 +374,11 @@ class NodeTerminalManager:
 
     async def websocket(self, websocket: WebSocket, terminal_id: str):
         accepted, record, pending, claimed, tasks = False, None, None, False, []
+        identified, opened, failure_status = False, False, 502
         reason = "TERMINAL_CLOSED"
         try:
             self._check_handshake(websocket)
+            identified = True
             principal = await asyncio.to_thread(self._principal, websocket)
             # Reject unknown/replayed IDs before allocating a browser socket.
             with self._lock:
@@ -395,10 +397,10 @@ class NodeTerminalManager:
             cols, rows = _dimensions(message["cols"], message["rows"])
             record = self._consume(terminal_id, message["ticket"], principal)
             await asyncio.wait_for(asyncio.to_thread(self._connect, record, cols, rows), 35)
-            await self._send(websocket, {"type": "ready"})
+            opened = True
             await asyncio.to_thread(self.auth.audit, websocket, "terminal.open", 200,
-                                    {"permission": "machines.manage", "node_id": record.node_id,
-                                     "terminal_id": record.id, "ssh_username": record.identity[3]})
+                                    {"node_id": record.node_id, "terminal_id": record.id})
+            await self._send(websocket, {"type": "ready"})
             queue = asyncio.Queue(maxsize=OUTPUT_QUEUE)
             tasks = [asyncio.create_task(self._input(websocket, record)),
                      asyncio.create_task(self._output(record, queue)),
@@ -414,7 +416,7 @@ class NodeTerminalManager:
                 if any(task is not tasks[1] for task in done):
                     break
         except APIError as exc:
-            reason = exc.code
+            reason, failure_status = exc.code, exc.status
             if accepted:
                 with suppress(Exception):
                     await self._send(websocket, {"type": "error", "code": exc.code, "message": exc.message})
@@ -424,9 +426,9 @@ class NodeTerminalManager:
                 with suppress(Exception):
                     await self._send(websocket, {"type": "error", "code": exc.code, "message": exc.message})
         except (WebSocketDisconnect, asyncio.CancelledError):
-            reason = "TERMINAL_DISCONNECTED"
+            reason, failure_status = "TERMINAL_DISCONNECTED", 499
         except (TimeoutError, socket.timeout):
-            reason = "TERMINAL_TIMEOUT"
+            reason, failure_status = "TERMINAL_TIMEOUT", 504
             if accepted:
                 with suppress(Exception):
                     await self._send(websocket, {"type": "error", "code": reason, "message": "终端连接超时或接收过慢，请重新打开"})
@@ -455,11 +457,18 @@ class NodeTerminalManager:
                         await self._send(websocket, {"type": "closed", "code": reason})
                 with suppress(Exception):
                     await asyncio.wait_for(websocket.close(code=1000 if accepted else 1008), SEND_TIMEOUT)
-                if record is not None:
+                principal = getattr(websocket.state, "principal", None) if identified else None
+                if (principal is not None and not principal.legacy and principal.session_id):
+                    selected = record or pending
+                    details = {"terminal_id": terminal_id}
+                    if selected is not None and selected.user_id == principal.user_id:
+                        details["node_id"] = selected.node_id
+                    if not opened:
+                        details["code"] = reason
                     with suppress(Exception):
-                        await asyncio.wait_for(asyncio.to_thread(self.auth.audit, websocket, "terminal.close", 200,
-                                                {"code": reason, "node_id": record.node_id,
-                                                 "terminal_id": record.id, "ssh_username": record.identity[3]}), SEND_TIMEOUT)
+                        await asyncio.wait_for(asyncio.to_thread(self.auth.audit, websocket,
+                            "terminal.close" if opened else "terminal.open_failed", 200 if opened else failure_status,
+                            {**details, "code": reason}), SEND_TIMEOUT)
 
     def close(self):
         with self._lock:

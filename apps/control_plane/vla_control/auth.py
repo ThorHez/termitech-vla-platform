@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, event, func, select
 
 from .auth_models import AuditEvent, AuthGuard, LoginThrottle, User, UserSession
 from .authorization import SENSITIVE_ROUTES, request_route_path
@@ -42,7 +42,65 @@ PASSWORD_MAX = 256
 THROTTLE_WINDOW = 900
 THROTTLE_ROWS = 10000
 _AUDIT_FIELDS = {"target_user_id", "target_username", "role", "enabled", "permission", "code", "count",
-                 "node_id", "terminal_id", "ssh_username", "reason"}
+                 "node_id", "terminal_id", "ssh_username", "reason", "operation_label", "category",
+                 "target_type", "target_id", "target_name", "error_code", "request_id", "duration_ms",
+                 "asset_kind", "counts", "template_id", "created_count", "skipped_count", "related_ids",
+                 "attempted_username"}
+_AUDIT_COUNT_FIELDS = {"created", "skipped", "selected", "total", "updated", "deleted", "failed",
+                       "succeeded", "accepted", "denied", "affected", "registered", "cancelled", "items",
+                       "created_count", "skipped_count", "count", "gpu_count"}
+
+
+def sanitize_audit_details(details):
+    """Project trusted metadata into bounded fields; never copy arbitrary JSON."""
+    if not isinstance(details, dict):
+        return {}
+    clean = {}
+    for key, value in details.items():
+        if key not in _AUDIT_FIELDS:
+            continue
+        if key == "attempted_username":
+            if isinstance(value, str) and USERNAME.fullmatch(value):
+                clean[key] = value
+        elif key == "counts":
+            if isinstance(value, dict):
+                clean[key] = {name: count for name, count in value.items() if name in _AUDIT_COUNT_FIELDS
+                              and type(count) is int and 0 <= count <= 2**31 - 1}
+        elif key in {"duration_ms", "created_count", "skipped_count"}:
+            if type(value) is int and 0 <= value <= 2**31 - 1:
+                clean[key] = value
+        elif value is None or isinstance(value, (str, bool, int)):
+            clean[key] = ("".join(character if ord(character) >= 32 and not 127 <= ord(character) <= 159 else " "
+                                  for character in value)[:200] if isinstance(value, str) else value)
+    return clean
+
+
+def _audit_commit_marker(session, request, identifier):
+    """Only a committed explicit event may suppress HTTP fallback auditing."""
+    pending = session.info.setdefault("operation_audit_pending", [])
+    pending.append((request, identifier, session.get_nested_transaction() or session.get_transaction()))
+    if session.info.get("operation_audit_listeners"):
+        return
+    session.info["operation_audit_listeners"] = True
+
+    def committed(current):
+        if current.in_nested_transaction():
+            return
+        for original, event_id, _ in current.info.pop("operation_audit_pending", []):
+            original.state.audit_recorded_id = event_id
+
+    def rolled_back(current, transaction):
+        def belongs_to(original):
+            while original is not None:
+                if original is transaction:
+                    return True
+                original = original.parent
+            return False
+        current.info["operation_audit_pending"] = [entry for entry in current.info.get("operation_audit_pending", [])
+                                                   if not belongs_to(entry[2])]
+
+    event.listen(session, "after_commit", committed)
+    event.listen(session, "after_soft_rollback", rolled_back)
 
 
 def normalize_username(value: str) -> str:
@@ -208,15 +266,20 @@ class AuthManager:
 
     def _audit(self, session, request: Request | None, action: str, status: int, details: dict | None = None,
                actor_id: str | None = None, actor_username: str | None = None) -> None:
+        from .operation_audit import context_details
         principal = getattr(request.state, "principal", None) if request else None
-        clean = {key: value for key, value in (details or {}).items()
-                 if key in _AUDIT_FIELDS and (value is None or isinstance(value, (str, bool, int)))}
-        clean = {key: value[:200] if isinstance(value, str) else value for key, value in clean.items()}
-        session.add(AuditEvent(id=uid(), created_at=now(), actor_id=actor_id or (principal.user_id if principal else None),
+        clean = sanitize_audit_details(context_details(request, action, details))
+        path = request_route_path(request) if request else "local-console"
+        if request is not None and request.scope.get("type") == "http" and request.scope.get("route") is None:
+            path = "/api/v1/<unmatched>" if path.startswith("/api/v1/") else "<unmatched>"
+        identifier = uid()
+        session.add(AuditEvent(id=identifier, created_at=now(), actor_id=actor_id or (principal.user_id if principal else None),
                                actor_username=actor_username or (principal.username if principal else None),
                                action=action[:120], method=getattr(request, "method", "WS") if request else "CLI",
-                               path=request.url.path[:600] if request else "local-console", status=status, details=clean,
+                               path=path[:600], status=status, details=clean,
                                remote_addr=(request.client.host[:100] if request and request.client else "local")))
+        if request is not None:
+            _audit_commit_marker(session, request, identifier)
 
     def audit(self, request: Request | None, action: str, status: int, details: dict | None = None) -> None:
         """Record request metadata only; passwords, tokens, bodies and queries are never copied."""
@@ -362,7 +425,8 @@ class AuthManager:
             session.execute(delete(LoginThrottle).where(LoginThrottle.expires_at <= stamp))
             if not valid:
                 self._record_failure(session, keys)
-                self._audit(session, request, "auth.login_failed", 401)
+                details = {"attempted_username": username} if USERNAME.fullmatch(username) else None
+                self._audit(session, request, "auth.login_failed", 401, details)
                 failure = APIError(401, "INVALID_CREDENTIALS", "用户名或密码不正确")
             else:
                 session.execute(delete(LoginThrottle).where(LoginThrottle.key == keys[0]))
@@ -607,6 +671,20 @@ def register_auth_routes(app: FastAPI, manager: AuthManager) -> None:
         manager.require(request, "audit.read")
         with manager.db.read() as session:
             rows = session.scalars(select(AuditEvent).order_by(AuditEvent.created_at.desc(), AuditEvent.id.desc()).limit(limit)).all()
-            return [{field: getattr(row, field) for field in (
-                "id", "created_at", "actor_id", "actor_username", "action", "method", "path", "status", "details", "remote_addr")}
-                    for row in rows]
+            from .audit_queries import event_dict
+            return [event_dict(row, include_outcome=False) for row in rows]
+
+    @app.get("/api/v1/audit/events")
+    def audit_events(request: Request, limit: int = Query(default=50, ge=1, le=200),
+                     cursor: str | None = Query(default=None, max_length=1024),
+                     actor_id: str | None = Query(default=None, max_length=36),
+                     action: str | None = Query(default=None, max_length=120),
+                     outcome: str | None = Query(default=None, max_length=20),
+                     from_time: str | None = Query(default=None, max_length=64),
+                     to_time: str | None = Query(default=None, max_length=64),
+                     q: str | None = Query(default=None, max_length=100)):
+        manager.require(request, "audit.read")
+        from .audit_queries import query_events
+        with manager.db.read() as session:
+            return query_events(session, manager.settings, limit=limit, cursor=cursor, actor_id=actor_id,
+                action=action, outcome=outcome, from_time=from_time, to_time=to_time, q=q)

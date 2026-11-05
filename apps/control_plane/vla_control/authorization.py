@@ -115,7 +115,7 @@ _allow("machines.manage", "PATCH", "/nodes/{node_id}")
 _allow("users.manage", "GET", "/users")
 _allow("users.manage", "POST", "/users", "/users/{user_id}/reset-password")
 _allow("users.manage", "PATCH", "/users/{user_id}")
-_allow("audit.read", "GET", "/audit")
+_allow("audit.read", "GET", "/audit", "/audit/events")
 
 # Reauthentication supplements role authorization and never replaces it.
 # Directory suggestions and ordinary training/asset writes do not grant

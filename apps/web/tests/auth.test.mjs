@@ -80,16 +80,21 @@ try {
   await test('user administration fails closed without users.manage permission', () => {
     const html = render(UserManagement, state(['platform.read', 'training.write']));
     assert.match(html, /没有访问权限/);
-    assert.doesNotMatch(html, /新建用户|用户列表|操作审计/);
+    assert.doesNotMatch(html, /新建用户|用户列表|操作记录/);
   });
 
   await test('admin view discloses role boundaries and separate Agent credentials', () => {
-    const html = render(UserManagement, state(['users.manage', 'audit.read']));
+    const html = render(
+      UserManagement,
+      state(['users.manage', 'audit.read'], {
+        user: { id: 'admin', role: 'admin', username: 'admin', display_name: '管理员' },
+      }),
+    );
     assert.match(html, /新建用户/);
     assert.match(html, /只读用户/);
     assert.match(html, /操作员/);
     assert.match(html, /机器 Agent 使用独立凭据/);
-    assert.match(html, /操作审计/);
+    assert.match(html, /操作记录/);
   });
 
   await test('transport uses same-origin cookies and memory CSRF without bearer credentials', async () => {
