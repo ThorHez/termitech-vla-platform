@@ -360,7 +360,10 @@ def _remote_json(remote, payload, cancelled, timeout=3600, *, script=None, max_b
                     buffer.extend(chunk)
                     if len(buffer)>max_bytes:
                         raise TransferError("TRANSFER_MANIFEST_LIMIT", "Remote verification result exceeded its limit")
-            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+            # SSH may deliver the process exit status before the remaining
+            # stdout/stderr. A temporarily empty receive buffer is not EOF.
+            if ((channel.eof_received or channel.closed) and channel.exit_status_ready()
+                    and not channel.recv_ready() and not channel.recv_stderr_ready()):
                 status=channel.recv_exit_status()
                 if status:
                     raise TransferError("TRANSFER_REMOTE_FAILED", "Remote checkpoint verification process failed")

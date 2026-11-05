@@ -76,6 +76,14 @@ class LocalChannel:
     def recv_exit_status(self):
         return self.process.wait(timeout=2)
 
+    @property
+    def eof_received(self):
+        return self.stdout_eof and self.stderr_eof
+
+    @property
+    def closed(self):
+        return self.eof_received and self.process.poll() is not None
+
     def close(self):
         if self.process is None:
             return
