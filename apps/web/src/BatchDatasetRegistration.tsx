@@ -32,10 +32,10 @@ export function BatchDatasetRegistration({
   close: () => void;
 }) {
   const { user, can } = useAuth();
-  if (!can('assets.write') || !user?.id)
+  if (!can('datasets.register') || !user?.id)
     return (
       <Modal title="批量登记数据集" close={close}>
-        <p>请使用具有资产编辑权限的个人账户登录后，批量登记数据集。</p>
+        <p>请使用具有数据集登记权限的个人账户登录后，批量登记数据集。</p>
       </Modal>
     );
   return (
@@ -79,7 +79,7 @@ function BatchDatasetRegistrationContent({
   const pending = useRef(false);
   const scope = datasetScanScope(nodeId, path, recursive, maxDepth);
   const current = useRef({ scope, owner, allowed: true });
-  current.current = { scope, owner: user?.id || '', allowed: can('assets.write') };
+  current.current = { scope, owner: user?.id || '', allowed: can('datasets.register') };
   const node = nodes.data?.find((item) => item.id === nodeId);
   const selected = rows.filter((row) => row.selected);
   const eligible = rows.filter((row) => !row.entry.error && !row.existingAssetId);
@@ -286,14 +286,20 @@ function BatchDatasetRegistrationContent({
           <h3>
             已登记 {result.created.length} 个数据集，跳过 {result.skipped.length} 个已有登记
           </h3>
-          <p>资产已登记，基础校验在后台执行，可在资产列表与详情查看结果。训练组合配置仍需在训练向导中校验。</p>
+          <p>
+            资产已登记，基础校验在后台执行，可在资产列表与详情查看结果。训练组合配置仍需在训练向导中校验。
+          </p>
           <ul>
             {result.created.map((asset) => (
               <li key={asset.id}>
                 <Database size={14} />
                 <span>{asset.name}</span>
                 <code>{asset.path}</code>
-                <DatasetValidationBadge validation={(assets.data?.find((current) => current.id === asset.id) || asset).validation} />
+                <DatasetValidationBadge
+                  validation={
+                    (assets.data?.find((current) => current.id === asset.id) || asset).validation
+                  }
+                />
               </li>
             ))}
           </ul>
@@ -665,7 +671,7 @@ function BatchDatasetRegistrationContent({
                       disabled={Boolean(busy)}
                       onChange={(event) => setMetadataOnly(event.target.checked)}
                     />
-                    仅登记路径，稍后补录数据集特征
+                    仅登记路径，稍后由管理员补录数据集特征
                   </label>
                   {!metadataOnly && (
                     <details className="batch-dataset-profile-review">

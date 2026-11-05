@@ -131,7 +131,7 @@ def _owner_exists(session, user_id, *, lock=False):
     user = session.scalar(query.execution_options(populate_existing=True))
     if user is None or not user.enabled:
         raise APIError(401, "UNAUTHORIZED", "登录账户已不可用")
-    if user.must_change_password or "assets.write" not in ROLE_PERMISSIONS.get(user.role, frozenset()):
+    if user.must_change_password or "datasets.register" not in ROLE_PERMISSIONS.get(user.role, frozenset()):
         raise APIError(403, "FORBIDDEN", "当前账户没有资产登记权限")
 
 
@@ -293,7 +293,7 @@ class DatasetBatchManager:
         path = _path(body.path)
         with self.db.write() as session:
             if request is not None:
-                require_active_actor(session, request, "assets.write")
+                require_active_actor(session, request, "datasets.register")
             else:
                 lock_execution_guard(session)
             _owner_exists(session, user_id, lock=True)
@@ -411,7 +411,7 @@ class DatasetBatchManager:
         request_digest = digest({"node_id": node_id, "scan_id": scan_id, "request": data})
         with self.db.write() as session:
             if request is not None:
-                require_active_actor(session, request, "assets.write")
+                require_active_actor(session, request, "datasets.register")
             else:
                 lock_execution_guard(session)
             _owner_exists(session, user_id, lock=True)
@@ -474,11 +474,11 @@ class DatasetBatchManager:
                 norm_id = norms[canonical_norm_path(entry.norm_path)] if entry.norm_path is not None else entry.norm_asset_id
                 asset = Asset(id=uid(), node_id=node_id, name=entry.name, kind="DATASET", path=path,
                               version=entry.version, state="REGISTERED", metadata_json=metadata,
-                              norm_asset_id=norm_id, created_at=now())
+                              norm_asset_id=norm_id, registered_by_user_id=user_id, created_at=now())
                 session.add(asset)
                 session.flush()
                 queue_validation(session, asset, heartbeat_timeout_seconds=self.settings.heartbeat_timeout_seconds,
-                                 actor_request=request)
+                                 actor_request=request, source_registration=True)
                 created.append(asset_dict(asset))
             result = {"scan_id": scan.id, "idempotency_key": body.idempotency_key, "created": created,
                       "skipped": skipped, "created_count": len(created), "skipped_count": len(skipped)}
@@ -513,7 +513,7 @@ async def _body(request, model):
 
 def register_routes(app, dependencies, manager):
     def owner(request):
-        principal = manager.auth.require(request, "assets.write")
+        principal = manager.auth.require(request, "datasets.register")
         if principal.legacy or not principal.session_id:
             raise APIError(403, "DATASET_BATCH_ACCOUNT_REQUIRED", "请使用个人账户登录后批量登记数据集")
         for name in ("x-dataset-scan-user", "x-dataset-batch-user"):

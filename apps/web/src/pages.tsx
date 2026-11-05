@@ -29,7 +29,7 @@ import {
   Trash2,
   Workflow,
 } from 'lucide-react';
-import { date, displayNumber, navigate, post, useApi } from './api';
+import { createOperationClient, date, displayNumber, navigate, useApi } from './api';
 import { useAuth } from './auth';
 import {
   Back,
@@ -69,6 +69,8 @@ import {
   DatasetNormSummary,
 } from './DatasetNormBinding';
 import { AssetDetail } from './AssetDetail';
+import { AssetArchiveDialog } from './AssetArchiveDialog';
+import { canArchiveAsset } from './assetArchive';
 import { catalogAssetGroups } from './modelAssetGroups';
 import { AssetGroupRows } from './AssetGroupRows';
 import { datasetCatalogAssets, groupDatasetNormAssets } from './datasetAssetGroups';
@@ -1028,7 +1030,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
     ids: [],
   });
   const [batchSyncOwner, setBatchSyncOwner] = useState('');
-  const [archiving, setArchiving] = useState<Asset>();
+  const [archiving, setArchiving] = useState<{ asset: Asset; owner: string }>();
   const [editingProfile, setEditingProfile] = useState<Asset>();
   const [bindingDataset, setBindingDataset] = useState<Asset>();
   const [templateAsset, setTemplateAsset] = useState<Asset>();
@@ -1039,8 +1041,6 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const [backgroundSync, setBackgroundSync] = useState<AssetTransfer>();
   const [assetPage, setAssetPage] = useState({ filters: '', page: 1 });
   const assetTableRef = useRef<HTMLDivElement>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<Error>();
   const [showArchived, setShowArchived] = useState(false);
   const catalogProjection = useMemo(
     () => datasetCatalogAssets(assets.data || [], showArchived),
@@ -1050,7 +1050,19 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const selectableCatalogAssets = catalogProjection.selectionAssets;
   const canTransferAssets = can('assets.transfer');
   const canWriteAssets = can('assets.write');
+  const canRegisterDatasets = can('datasets.register');
   const selectionOwner = user?.id || '';
+  const archiveAsset =
+    archiving?.owner === selectionOwner
+      ? assets.data?.find((asset) => asset.id === archiving.asset.id) || archiving.asset
+      : undefined;
+  const openArchive = (asset: Asset) => {
+    if (user?.id && canArchiveAsset(user, asset, can)) setArchiving({ asset, owner: user.id });
+  };
+  useEffect(() => {
+    if (archiving && (!archiveAsset || !canArchiveAsset(user, archiveAsset, can)))
+      setArchiving(undefined);
+  }, [archiving, archiveAsset, user, can]);
   const filterKey = JSON.stringify([selectionOwner, kind, nodeId, query, showArchived]);
   useEffect(() => {
     setAssetPage((previous) =>
@@ -1076,11 +1088,14 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   }, [selectionOwner, canTransferAssets, selectableCatalogAssets, nodes.data, batchSyncOwner]);
   useEffect(() => {
     if (canWriteAssets) return;
-    setBatchRegister(false);
     setEditingProfile(undefined);
     setBindingDataset(undefined);
-    setArchiving(undefined);
   }, [canWriteAssets]);
+  useEffect(() => {
+    if (canRegisterDatasets) return;
+    setRegister(false);
+    setBatchRegister(false);
+  }, [canRegisterDatasets]);
   useEffect(() => {
     if (!canTransferAssets) setSyncAsset(undefined);
     if (!can('dataset-templates.write')) {
@@ -1237,16 +1252,13 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         </div>
       </td>
       <td>
-        {can('assets.write') && (asset.status || asset.state) !== 'ARCHIVED' && (
+        {canArchiveAsset(user, asset, can) && (
           <button
             type="button"
             className="icon-button"
             aria-label={`删除登记 ${asset.name}`}
             title="删除登记"
-            onClick={() => {
-              setError(undefined);
-              setArchiving(asset);
-            }}
+            onClick={() => openArchive(asset)}
           >
             <Trash2 size={16} />
           </button>
@@ -1272,7 +1284,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                 我的格式模板
               </button>
             )}
-            {can('assets.write') && (
+            {canRegisterDatasets && (
               <>
                 <button
                   type="button"
@@ -1289,7 +1301,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                   onClick={() => setRegister(true)}
                 >
                   <Plus size={17} />
-                  登记资产
+                  {canWriteAssets ? '登记资产' : '登记数据集'}
                 </button>
               </>
             )}
@@ -1398,7 +1410,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       {kind === 'NORM' && (
         <p className="field-hint">已绑定的 norm_stats 可展开对应数据集查看，此处仅列独立项。</p>
       )}
-      <ErrorNotice error={assets.error || error} retry={assets.refresh} />
+      <ErrorNotice error={assets.error} retry={assets.refresh} />
       <div className="panel">
         {assets.loading && enabled && !assets.data ? (
           <Loading />
@@ -1462,17 +1474,19 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             description={
               query || nodeId || kind !== 'ALL'
                 ? '调整搜索条件，或登记新的本地资产。'
-                : '登记已有数据集和模型的本机路径。预检时，Agent 会验证它们是否可用。'
+                : canWriteAssets
+                  ? '登记已有数据集和模型的本机路径。预检时，Agent 会验证它们是否可用。'
+                  : '登记已有数据集的本机路径。预检时，Agent 会验证它们是否可用。'
             }
             action={
-              can('assets.write') && (
+              canRegisterDatasets && (
                 <button
                   className="button outline small"
                   disabled={!enabled || !nodes.data?.length}
                   onClick={() => setRegister(true)}
                 >
                   <Plus size={15} />
-                  登记资产
+                  {canWriteAssets ? '登记资产' : '登记数据集'}
                 </button>
               )
             }
@@ -1517,7 +1531,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         !syncAsset &&
         !editingProfile &&
         !bindingDataset &&
-        !archiving &&
+        !archiveAsset &&
         !templateAsset && (
           <AssetDetail
             asset={detailAsset}
@@ -1542,10 +1556,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             editProfile={() => setEditingProfile(detailAsset)}
             sync={() => setSyncAsset(detailAsset)}
             saveTemplate={() => setTemplateAsset(detailAsset)}
-            remove={() => {
-              setError(undefined);
-              setArchiving(detailAsset);
-            }}
+            remove={() => openArchive(detailAsset)}
           />
         )}
       {can('assets.transfer') && syncAsset && (
@@ -1570,11 +1581,15 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           }}
         />
       )}
-      {can('assets.write') && batchRegister && (
+      {canRegisterDatasets && batchRegister && (
         <BatchDatasetRegistration initialNode={nodeId} close={() => setBatchRegister(false)} />
       )}
-      {can('assets.write') && register && (
-        <RegisterAsset key={nodeId} initialNode={nodeId} close={() => setRegister(false)} />
+      {canRegisterDatasets && register && (
+        <RegisterAsset
+          key={`${selectionOwner}:${nodeId}`}
+          initialNode={nodeId}
+          close={() => setRegister(false)}
+        />
       )}
       {can('assets.write') && editingProfile && (
         <DatasetProfileEditor asset={editingProfile} close={() => setEditingProfile(undefined)} />
@@ -1596,51 +1611,17 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
           close={() => setTemplateAsset(undefined)}
         />
       )}
-      {can('assets.write') && archiving && (
-        <Modal
-          title="删除资产登记"
-          close={() => {
-            if (!busy) setArchiving(undefined);
+      {archiveAsset && archiving && canArchiveAsset(user, archiveAsset, can) && (
+        <AssetArchiveDialog
+          asset={archiveAsset}
+          ownerUserId={archiving.owner}
+          close={() => setArchiving(undefined)}
+          onArchived={() => {
+            setArchiving(undefined);
+            setDetailId(undefined);
+            refresh();
           }}
-          footer={
-            <>
-              <button
-                className="button outline"
-                disabled={busy}
-                onClick={() => setArchiving(undefined)}
-              >
-                取消
-              </button>
-              <button
-                className="button danger"
-                disabled={busy}
-                onClick={async () => {
-                  if (!can('assets.write')) return;
-                  setBusy(true);
-                  setError(undefined);
-                  try {
-                    await post(`/assets/${archiving.id}/archive`);
-                    setArchiving(undefined);
-                    setDetailId(undefined);
-                    refresh();
-                  } catch (err) {
-                    setError(err as Error);
-                  } finally {
-                    setBusy(false);
-                  }
-                }}
-              >
-                {busy && <LoaderCircle size={16} className="spin" />}确认删除登记
-              </button>
-            </>
-          }
-        >
-          <p>
-            删除「{archiving.name}
-            」的资产登记，将其从新训练的可选资产中移除。历史训练关联和本机文件会继续保留。
-          </p>
-          {error && <ErrorNotice error={error} />}
-        </Modal>
+        />
       )}
     </>
   );
@@ -1660,15 +1641,23 @@ function DatasetAssetFeatures({ asset }: { asset: Asset }) {
   );
 }
 
-function RegisterAsset(props: { close: () => void; initialNode?: string }) {
-  const { can } = useAuth();
-  if (!can('assets.write'))
+export function RegisterAsset(props: { close: () => void; initialNode?: string }) {
+  const { can, user } = useAuth();
+  if (!can('datasets.register') || !user?.id)
     return (
       <Modal title="权限不足" close={props.close}>
-        登记公共资产需要管理员权限。
+        登记数据集需要具有数据集登记权限的个人账户。
       </Modal>
     );
-  return <RegisterAssetContent {...props} />;
+  const allowOtherKinds = can('assets.write');
+  return (
+    <RegisterAssetContent
+      key={`${user.id}:${allowOtherKinds}`}
+      owner={user.id}
+      allowOtherKinds={allowOtherKinds}
+      {...props}
+    />
+  );
 }
 
 function assetNameFromPath(path: string) {
@@ -1682,8 +1671,36 @@ function assetNameFromPath(path: string) {
   return name;
 }
 
-function RegisterAssetContent({ close, initialNode }: { close: () => void; initialNode?: string }) {
+function RegisterAssetContent({
+  close,
+  initialNode,
+  owner,
+  allowOtherKinds,
+}: {
+  close: () => void;
+  initialNode?: string;
+  owner: string;
+  allowOtherKinds: boolean;
+}) {
+  const { user, can } = useAuth();
   const { nodes, assets, refresh } = useData();
+  const client = useRef(createOperationClient());
+  const operation = useRef<AbortController | undefined>(undefined);
+  const mounted = useRef(true);
+  const current = useRef({ owner, allowed: true });
+  current.current = {
+    owner: user?.id || '',
+    allowed: can('datasets.register') && allowOtherKinds === can('assets.write'),
+  };
+  const active = () =>
+    mounted.current && current.current.owner === owner && current.current.allowed;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      operation.current?.abort();
+    };
+  }, []);
   const [normAssetId, setNormAssetId] = useState('');
   const [normPath, setNormPath] = useState('');
   const [form, setForm] = useState({
@@ -1707,6 +1724,7 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
       ? datasetNormInputError(form.node_id, normAssetId, normPath, assets.data || [])
       : undefined;
   const set = (key: keyof typeof form, value: string) => {
+    if (key === 'kind' && (!assetKinds[value] || (!allowOtherKinds && value !== 'DATASET'))) return;
     if (key === 'name') nameEdited.current = true;
     const fillName = key === 'path' && !nameEdited.current;
     setForm((previous) => ({
@@ -1723,7 +1741,7 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
   const showDatasetConfig = form.kind === 'DATASET' && !deferProfile;
   return (
     <Modal
-      title="登记本地资产"
+      title={allowOtherKinds ? '登记本地资产' : '登记数据集'}
       wide
       className={`asset-register-modal ${showDatasetConfig ? '' : 'asset-register-simple'}`}
       subtitle={
@@ -1751,7 +1769,8 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
             type="submit"
             disabled={busy || profileErrors.length > 0 || Boolean(normError)}
           >
-            {busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}登记资产
+            {busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}
+            {allowOtherKinds ? '登记资产' : '登记数据集'}
           </button>
         </>
       }
@@ -1761,28 +1780,42 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
         className={`asset-registration-layout ${showDatasetConfig ? 'with-dataset-config' : ''}`}
         onSubmit={async (event) => {
           event.preventDefault();
-          if (pending.current || profileErrors.length > 0 || normError) return;
+          if (
+            pending.current ||
+            !active() ||
+            (!allowOtherKinds && form.kind !== 'DATASET') ||
+            profileErrors.length > 0 ||
+            normError
+          )
+            return;
+          const abort = new AbortController();
+          operation.current = abort;
           pending.current = true;
           setBusy(true);
           setError(undefined);
           try {
-            await post('/assets', {
-              ...form,
-              ...(form.kind === 'DATASET'
-                ? datasetNormBindingPayload(normAssetId, normPath)
-                : { norm_asset_id: null }),
-              metadata:
-                form.kind === 'DATASET' && !deferProfile
-                  ? { dataset_profile: normalizedDatasetProfile(datasetProfile) }
-                  : {},
-            });
+            await client.current.post(
+              '/assets',
+              {
+                ...form,
+                ...(form.kind === 'DATASET'
+                  ? datasetNormBindingPayload(normAssetId, normPath)
+                  : { norm_asset_id: null }),
+                metadata:
+                  form.kind === 'DATASET' && !deferProfile
+                    ? { dataset_profile: normalizedDatasetProfile(datasetProfile) }
+                    : {},
+              },
+              { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(20000)]) },
+            );
+            if (!active() || abort.signal.aborted) return;
             refresh();
             close();
           } catch (err) {
-            setError(err as Error);
+            if (active() && !abort.signal.aborted) setError(err as Error);
           } finally {
             pending.current = false;
-            setBusy(false);
+            if (active()) setBusy(false);
           }
         }}
       >
@@ -1805,11 +1838,13 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
                 value={form.kind}
                 onChange={(event) => set('kind', event.target.value)}
               >
-                {Object.entries(assetKinds).map(([value, label]) => (
-                  <option value={value} key={value}>
-                    {label}
-                  </option>
-                ))}
+                {Object.entries(assetKinds)
+                  .filter(([value]) => allowOtherKinds || value === 'DATASET')
+                  .map(([value, label]) => (
+                    <option value={value} key={value}>
+                      {label}
+                    </option>
+                  ))}
               </select>
             </Field>
             <Field label="资产版本" required>
@@ -1890,7 +1925,7 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
               </label>
               {deferProfile ? (
                 <p className="field-hint">
-                  仍可登记路径。补录后，新建训练会使用这些特征匹配处理器。
+                  仍可登记路径；之后补录已有数据集特征需要管理员。补录后，新建训练会使用这些特征匹配处理器。
                 </p>
               ) : (
                 <>

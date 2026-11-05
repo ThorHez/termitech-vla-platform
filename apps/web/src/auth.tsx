@@ -40,7 +40,8 @@ export const roleLabels: Record<UserRole, string> = {
 };
 export const roleDescriptions: Record<UserRole, string> = {
   admin: '管理用户、机器、公共资产与配方，管理全部任务和历史记录，并查看审计。',
-  operator: '使用公共资产与配方，创建训练、同步和部署；只管理自己的任务及个人模板。',
+  operator:
+    '登记数据集并删除自己登记的数据集，使用公共资产与配方，创建训练、同步和部署；只管理自己的任务及个人模板，已有公共资产编辑由管理员负责。',
   viewer: '查看共享的训练、日志、资产、部署与资源状态。',
 };
 interface AuthState {

@@ -20,6 +20,12 @@ def manual(platform):
     users["remaining-admin"] = platform.app.state.auth.create_user("remaining-admin", PASSWORD, "admin")["id"]
     login(platform, "owner-admin")
     asset = register(platform, node)
+    initial = asset["validation"]
+    assert any(item["id"] == initial["id"] for item in platform.commands(node))
+    assert ack(platform, node, initial, result(asset)).status_code == 200
+    explicit = create(platform, asset)
+    assert explicit.status_code == 202, explicit.text
+    asset["validation"] = explicit.json()
     return node, users, asset
 
 
@@ -28,7 +34,7 @@ def command(platform, identifier):
         return session.get(Command, identifier)
 
 
-def test_registration_and_explicit_revalidation_bind_admin_and_reuse_normal_pending(platform):
+def test_explicit_revalidation_binds_admin_and_reuses_normal_pending(platform):
     node, users, asset = manual(platform)
     report = asset["validation"]
     original = command(platform, report["id"])
@@ -138,7 +144,8 @@ def test_batch_registration_auto_validations_bind_original_admin(batch):
             report = asset["validation"]
             queued = session.get(Command, report["id"])
             assert report["status"] == "PENDING"
-            assert queued.actor_user_id == authenticated["user"]["id"] and queued.required_permission == "assets.write"
+            assert queued.actor_user_id == authenticated["user"]["id"] and queued.required_permission == "datasets.register"
+            assert queued.payload["source_registration"] is True
 
 
 def copied(fixture, monkeypatch, *, admin_intervention=False):

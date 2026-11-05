@@ -62,6 +62,7 @@ export interface DatasetSourceValidation {
 }
 export interface Asset {
   id: string;
+  registered_by_user_id?: string | null;
   name: string;
   kind: string;
   node_id: string;

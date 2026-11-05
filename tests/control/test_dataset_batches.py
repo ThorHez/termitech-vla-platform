@@ -77,6 +77,19 @@ def batch(tmp_path):
         yield app, client, manager, node_id, connection_id, auth, remotes
 
 
+@pytest.fixture
+def operator_batch(batch):
+    app, client, manager, node_id, connection_id, _, remotes = batch
+    app.state.auth.create_user("batch-operator", PASSWORD, "operator")
+    client.cookies.clear()
+    response = client.post("/api/v1/auth/login", json={"username": "batch-operator", "password": PASSWORD})
+    assert response.status_code == 200, response.text
+    authenticated = response.json()
+    client.headers.update({"X-CSRF-Token": authenticated["csrf_token"],
+                           "X-Dataset-Scan-User": authenticated["user"]["id"]})
+    return app, client, manager, node_id, connection_id, authenticated, remotes
+
+
 def base(fixture):
     return f"/api/v1/nodes/{fixture[3]}/dataset-scans"
 
@@ -126,6 +139,7 @@ def test_batch_registers_selected_datasets_and_preserves_source_horizon_and_prof
     assert {a["path"] for a in result["created"]} == {"/machine/datasets/first", "/machine/datasets/nested/second"}
     for asset in result["created"]:
         assert asset["kind"] == "DATASET" and asset["state"] == "REGISTERED" and asset["node_id"] == batch[3]
+        assert asset["registered_by_user_id"] == batch[5]["user"]["id"]
         label = asset["metadata"]["dataset_profile"]["field_annotations"][0]
         assert label["representation"] == "composite" and label["horizon"] == 16
         assert asset["metadata"]["batch_registration"]["metadata_only"] is True
@@ -335,7 +349,7 @@ def test_foreign_owner_and_scan_user_switch_fail_closed(batch):
     assert changed.status_code == 403
 
 
-@pytest.mark.parametrize("role,status", [("viewer", 403), ("operator", 403), ("admin", 202)])
+@pytest.mark.parametrize("role,status", [("viewer", 403), ("operator", 202), ("admin", 202)])
 def test_scan_permission_and_csrf_are_enforced(batch, role, status):
     batch[0].state.auth.create_user("role-" + role, PASSWORD, role)
     with TestClient(batch[0], base_url="http://testserver") as client:
@@ -345,6 +359,95 @@ def test_scan_permission_and_csrf_are_enforced(batch, role, status):
         response = client.post(base(batch), json=payload, headers={"X-CSRF-Token": login["csrf_token"]})
         assert response.status_code == status, response.text
         assert client.post(base(batch), json=payload, headers={"X-CSRF-Token": login["csrf_token"], "Origin": "https://foreign.invalid"}).status_code == 403
+
+
+def test_operator_can_scan_and_register_new_datasets_with_initial_norm_but_cannot_modify_assets(operator_batch):
+    app, client, _, _, _, authenticated, _ = operator_batch
+    assert "datasets.register" in authenticated["permissions"] and "assets.write" not in authenticated["permissions"]
+    value = scan(operator_batch)
+    entries = [{"path": "/machine/datasets/first", "name": "operator dataset", "version": "v1",
+                "profile": deepcopy(PROFILE), "norm_path": "/machine/norms/first.json"}]
+    csrf = client.headers.pop("X-CSRF-Token")
+    denied = submit(operator_batch, value, entries=entries)
+    assert denied.status_code == 403 and assets(operator_batch) == []
+    client.headers["X-CSRF-Token"] = csrf
+    response = submit(operator_batch, value, entries=entries)
+    assert response.status_code == 200, response.text
+    created = response.json()["created"][0]
+    before = assets(operator_batch)
+    assert len(before) == 2 and {row["kind"] for row in before} == {"DATASET", "NORM"}
+    assert created["norm_asset_id"] == next(row["id"] for row in before if row["kind"] == "NORM")
+    assert all(created["metadata"]["dataset_profile"][key] == value for key, value in PROFILE.items())
+    for method, path, body in (
+        ("PATCH", "/dataset-profile", {"profile": deepcopy(PROFILE)}),
+        ("PUT", "/norm-binding", {"norm_asset_id": None}),
+        ("POST", "/validations", {}),
+        ("POST", "/validation/cancel", {}),
+    ):
+        denied = client.request(method, "/api/v1/assets/" + created["id"] + path, json=body)
+        assert denied.status_code == 403, (method, path, denied.text)
+    assert assets(operator_batch) == before
+    with app.state.db.read() as session:
+        assert session.get(DatasetScan, value["id"]).user_id == authenticated["user"]["id"]
+    archived = client.post("/api/v1/assets/" + created["id"] + "/archive")
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["registered_by_user_id"] == authenticated["user"]["id"]
+    assert archived.json()["state"] == "ARCHIVED"
+
+
+def test_operator_repeat_registration_preserves_existing_asset_and_does_not_create_unused_norm(operator_batch):
+    value = scan(operator_batch)
+    first = submit(operator_batch, value)
+    assert first.status_code == 200, first.text
+    before = assets(operator_batch)
+    response = submit(operator_batch, value, entries=[
+        {"path": "/machine/datasets/first", "name": "attempted replacement", "version": "other",
+         "profile": {**deepcopy(PROFILE), "task_description": "Changed"},
+         "norm_path": "/machine/norms/unused.json"}])
+    assert response.status_code == 200, response.text
+    assert response.json()["created_count"] == 0 and response.json()["skipped_count"] == 1
+    assert assets(operator_batch) == before
+
+
+@pytest.mark.parametrize("phase", ["queued", "result"])
+def test_operator_scan_worker_rechecks_registration_rights_before_ssh_and_before_saving_results(operator_batch, monkeypatch, phase):
+    app, _, manager, _, _, authenticated, remotes = operator_batch
+    value = scan(operator_batch, ready=False)
+    user_id = authenticated["user"]["id"]
+    if phase == "queued":
+        app.state.auth.update_user(None, user_id, {"role": "viewer"})
+        monkeypatch.setattr(manager.remote_manager, "_remote", lambda *_: pytest.fail("Revoked scan must not open SSH"))
+    else:
+        original = manager.scanner
+
+        def revoke_before_results(*args, **kwargs):
+            result = original(*args, **kwargs)
+            app.state.auth.update_user(None, user_id, {"role": "viewer"})
+            return result
+
+        monkeypatch.setattr(manager, "scanner", revoke_before_results)
+    manager._run(value["id"])
+    with app.state.db.read() as session:
+        row = session.get(DatasetScan, value["id"])
+        assert row.state == "FAILED" and row.error["code"] == "FORBIDDEN" and row.result is None
+        assert session.scalar(select(func.count()).select_from(Asset)) == 0
+    assert len(remotes) == (0 if phase == "queued" else 1)
+    assert all(remote.closed for remote in remotes)
+
+
+def test_accepted_scan_remains_authorized_when_admin_becomes_operator(batch):
+    app, client, manager, _, _, authenticated, _ = batch
+    app.state.auth.create_user("remaining-admin", PASSWORD, "admin")
+    value = scan(batch, ready=False)
+    app.state.auth.update_user(None, authenticated["user"]["id"], {"role": "operator"})
+    manager._run(value["id"])
+    with app.state.db.read() as session:
+        assert session.get(DatasetScan, value["id"]).state == "READY"
+    response = client.post("/api/v1/auth/login", json={"username": "batch-admin", "password": PASSWORD})
+    assert response.status_code == 200, response.text
+    client.headers["X-CSRF-Token"] = response.json()["csrf_token"]
+    assert client.get(base(batch) + "/" + value["id"]).status_code == 200
+    assert submit(batch, value).status_code == 200
 
 
 @pytest.mark.parametrize("payload", [{"path": "/"}, {"path": "/machine/../outside"}, {"path": "relative"},

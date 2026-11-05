@@ -36,7 +36,7 @@ function PersonalDatasetFormatsContent({ close }: { close: () => void }) {
     >
       <p className="field-hint">
         模板仅当前账号可见。载入模板只填写下方个人草稿；修改后可覆盖同名模板，或换一个名称保存副本。
-        此窗口不会登记或修改公共数据集，公共数据集的格式维护由管理员完成。
+        此窗口仅管理个人模板，可在新数据集登记时套用；已有公共数据集的格式维护由管理员完成。
       </p>
       <DatasetFormatTemplates value={profile} onApply={setProfile} personalDraft />
       <section aria-label="个人格式草稿">

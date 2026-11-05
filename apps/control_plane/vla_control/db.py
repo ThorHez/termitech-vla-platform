@@ -83,6 +83,12 @@ class Database:
             asset_columns = {column["name"] for column in inspect(connection).get_columns("assets")}
             if "norm_asset_id" not in asset_columns:
                 connection.exec_driver_sql("ALTER TABLE assets ADD COLUMN norm_asset_id VARCHAR(36) REFERENCES assets(id) ON DELETE RESTRICT")
+            if "registered_by_user_id" not in asset_columns:
+                # Only an authenticated registration can establish this fact.
+                # Historical assets, including copied/generated datasets, stay
+                # NULL rather than inheriting an unrelated task author.
+                connection.exec_driver_sql("ALTER TABLE assets ADD COLUMN registered_by_user_id "
+                                           "VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
             transfer_columns = {column["name"] for column in inspect(connection).get_columns("asset_transfers")}
             if "deleted_at" not in transfer_columns:
                 connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN deleted_at VARCHAR(40)")

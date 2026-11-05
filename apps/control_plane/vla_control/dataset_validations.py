@@ -130,20 +130,44 @@ def reject_undelivered_validation(session, command, error):
 
 
 def validation_execution_authorized(session, command, *, allow_legacy=False):
-    """Authorize explicit admin work or a proven successful copy's own output.
+    """Authorize explicit admin work or the exact output of registration/copy.
 
-    A transfer cannot grant explicit validation rights to an operator. Derived
-    validation is constrained to that transfer's exact target asset, node and
-    execution actor, including the current admin capability for intervention.
+    Neither registration nor transfer grants explicit validation rights. Each
+    registration receipt binds its new asset and original actor; copy checks
+    bind the transfer's output and current admin capability for intervention.
     """
     if command.type != COMMAND:
         return False
     source_id = command.payload.get("source_transfer_id")
-    permission = "assets.transfer" if source_id is not None else "assets.write"
+    registration = command.payload.get("source_registration")
+    if ((registration is not None and registration is not True)
+            or (source_id is not None and registration is not None)):
+        return False
+    permission = ("assets.transfer" if source_id is not None else
+                  "datasets.register" if registration is True else "assets.write")
     legacy = command.actor_user_id is None and command.required_permission is None
     if (command.required_permission != permission and not legacy
             or not execution_permission_authorized(session, command.actor_user_id, permission, allow_legacy=allow_legacy)):
         return False
+    if registration is True:
+        asset = session.get(Asset, command.payload.get("asset_id"))
+        if asset is None or asset.kind != "DATASET" or asset.state in {"ARCHIVED", "UNAVAILABLE"}:
+            return False
+        stored = (asset.metadata_json or {}).get(INTERNAL_KEY)
+        if not isinstance(stored, dict):
+            return False
+        receipt = stored.get("registration")
+        node, profile = _context(session, asset, command.payload.get("profile_id"))
+        return bool(isinstance(receipt, dict) and node is not None and profile is not None
+                    and stored.get("status") == "PENDING" and stored.get("id") == command.id
+                    and stored.get("profile_id") == command.payload.get("profile_id")
+                    and stored.get("input_digest") == command.payload.get("input_digest")
+                    and receipt == {"asset_id": asset.id, "node_id": asset.node_id, "path": asset.path,
+                                    "created_at": asset.created_at, "actor_user_id": command.actor_user_id,
+                                    "input_digest": command.payload.get("input_digest")}
+                    and command.node_id == asset.node_id and command.payload.get("path") == asset.path
+                    and command.payload.get("registered_profile") == _metadata(asset).get("dataset_profile")
+                    and input_digest(asset, profile, node) == command.payload.get("input_digest"))
     if source_id is None:
         return True
     if not isinstance(source_id, str) or not source_id:
@@ -213,9 +237,11 @@ def _reuse_pending_validation(session, asset, previous):
 
 
 def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_seconds=90, actor_request=None,
-                     actor_user_id=None, source_transfer_id=None):
+                     actor_user_id=None, source_transfer_id=None, source_registration=False):
     if asset.kind != "DATASET":
         return None
+    if source_registration and source_transfer_id is not None:
+        raise ValueError("dataset validation must have exactly one source")
     node = session.get(Node, asset.node_id)
     if node is None:
         raise APIError(404, "NOT_FOUND", "机器不存在")
@@ -227,7 +253,9 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
     chosen = next((item for item in choices if item.id == profile_id), None) if profile_id else (choices[0] if len(choices) == 1 else None)
     if profile_id and chosen is None:
         raise APIError(422, "DATASET_VALIDATION_PROFILE_UNAVAILABLE", "请选择本机有效的原生 OpenPI 校验环境")
-    previous = validation_dict(asset, session)
+    # A new registration receives its own server-written receipt. Never reuse
+    # or invalidate a command referenced by supplied/imported internal metadata.
+    previous = None if source_registration else validation_dict(asset, session)
     if (previous and previous.get("status") == "PENDING" and chosen is not None
             and previous.get("profile_id") == chosen.id and previous.get("input_digest") == input_digest(asset, chosen, node)
             and _reuse_pending_validation(session, asset, previous)):
@@ -256,7 +284,12 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
             command.payload = {**command.payload, "source_transfer_id": source_transfer_id}
             command.actor_user_id, command.required_permission = actor_user_id, "assets.transfer"
         else:
-            bind_command_actor(command, actor_request, "assets.write")
+            bind_command_actor(command, actor_request, "datasets.register" if source_registration else "assets.write")
+        if source_registration:
+            command.payload = {**command.payload, "source_registration": True}
+            report["registration"] = {"asset_id": asset.id, "node_id": asset.node_id, "path": asset.path,
+                                      "created_at": asset.created_at, "actor_user_id": command.actor_user_id,
+                                      "input_digest": report["input_digest"]}
         session.add(command)
         report["id"] = command.id
     _write(asset, report)

@@ -119,13 +119,18 @@ try {
   await test('viewer and legacy contexts cannot directly mount the private batch workflow', () => {
     for (const auth of [{ can: () => false }, { can: () => true }]) {
       const html = renderToStaticMarkup(React.createElement(AuthContext.Provider, { value: auth }, React.createElement(BatchDatasetRegistration, { close() {} })));
-      assert.match(html, /具有资产编辑权限的个人账户/);
+      assert.match(html, /具有数据集登记权限的个人账户/);
       assert.doesNotMatch(html, /扫描数据集/);
     }
   });
-  await test('personal asset writers see only the scan stage before results are reviewed', () => {
-    const html = renderToStaticMarkup(React.createElement(AuthContext.Provider, { value: { user: { id: 'operator' }, can: (p) => p === 'assets.write' } }, React.createElement(DataProvider, { enabled: false }, React.createElement(BatchDatasetRegistration, { close() {} }))));
+  await test('dataset registrars see the scan stage without public asset edit permission', () => {
+    const html = renderToStaticMarkup(React.createElement(AuthContext.Provider, { value: { user: { id: 'operator' }, can: (p) => p === 'datasets.register' } }, React.createElement(DataProvider, { enabled: false }, React.createElement(BatchDatasetRegistration, { close() {} }))));
     assert.match(html, /批量登记数据集/); assert.match(html, /数据集父目录/); assert.match(html, /扫描数据集/);
     assert.doesNotMatch(html, /登记 0 个数据集/);
+  });
+  await test('asset edit permission alone does not bypass the dataset registration gate', () => {
+    const html = renderToStaticMarkup(React.createElement(AuthContext.Provider, { value: { user: { id: 'custom-writer' }, can: (p) => p === 'assets.write' } }, React.createElement(BatchDatasetRegistration, { close() {} })));
+    assert.match(html, /具有数据集登记权限的个人账户/);
+    assert.doesNotMatch(html, /扫描数据集/);
   });
 } finally { await server.close(); }

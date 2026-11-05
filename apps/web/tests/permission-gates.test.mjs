@@ -15,8 +15,10 @@ const server = await createServer({
 try {
   const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
   const { DataProvider } = await server.ssrLoadModule('/src/data.tsx');
-  const { NodesPage, NodePage, AssetsPage, OverviewPage, RunsPage } =
+  const { NodesPage, NodePage, AssetsPage, OverviewPage, RunsPage, RegisterAsset } =
     await server.ssrLoadModule('/src/pages.tsx');
+  const { DatasetProfileEditor } = await server.ssrLoadModule('/src/DatasetProfileForm.tsx');
+  const { DatasetNormBindingDialog } = await server.ssrLoadModule('/src/DatasetNormBinding.tsx');
   const { NodeManagement } = await server.ssrLoadModule('/src/NodeManagement.tsx');
   const { NodeOnboarding } = await server.ssrLoadModule('/src/NodeOnboarding.tsx');
   const { default: RunWizard } = await server.ssrLoadModule('/src/RunWizard.tsx');
@@ -26,6 +28,8 @@ try {
       'machines.manage',
       'training.write',
       'assets.write',
+      'datasets.register',
+      'datasets.archive',
       'assets.transfer',
       'dataset-templates.write',
       'recipes.query',
@@ -34,6 +38,8 @@ try {
     ],
     operator: [
       'training.write',
+      'datasets.register',
+      'datasets.archive',
       'assets.query',
       'assets.transfer',
       'dataset-templates.write',
@@ -42,6 +48,7 @@ try {
     viewer: [],
   };
   const auth = (role) => ({
+    user: { id: role, role, username: role, display_name: role },
     permissions: grants[role],
     loading: false,
     expired: false,
@@ -73,21 +80,53 @@ try {
     }
   });
 
-  await test('only administrators register public assets while operators can create personal training', () => {
+  await test('operators can register datasets while viewers keep a shared readonly catalog', () => {
     for (const role of ['admin', 'operator'])
       assert.match(render(role, AssetsPage), />我的格式模板</);
     assert.doesNotMatch(render('viewer', AssetsPage), />我的格式模板</);
     assert.match(render('admin', AssetsPage), />登记资产</);
+    assert.match(render('admin', AssetsPage), />批量登记数据集</);
+    assert.match(render('operator', AssetsPage), />登记数据集</);
+    assert.match(render('operator', AssetsPage), />批量登记数据集</);
     assert.doesNotMatch(render('operator', AssetsPage), />登记资产</);
     for (const role of ['admin', 'operator']) {
       assert.match(render(role, RunsPage, { createRun() {} }), />新建训练</);
       assert.match(render(role, OverviewPage, { createRun() {} }), />新建训练</);
     }
     assert.doesNotMatch(render('viewer', AssetsPage), />登记资产</);
+    assert.doesNotMatch(render('viewer', AssetsPage), />登记数据集<|>批量登记数据集</);
     assert.doesNotMatch(render('viewer', RunsPage, { createRun() {} }), />新建训练</);
     assert.doesNotMatch(render('viewer', OverviewPage, { createRun() {} }), />新建训练</);
     assert.match(render('viewer', AssetsPage), /数据与模型/);
     assert.match(render('viewer', RunsPage, { createRun() {} }), /训练任务/);
+  });
+
+  await test('dataset registration renders complete initial configuration without granting model registration or existing edits', () => {
+    const operator = render('operator', RegisterAsset, { close() {} });
+    assert.match(operator, /登记数据集/);
+    assert.match(operator, /<option value="DATASET"/);
+    assert.doesNotMatch(operator, /<option value="MODEL"|<option value="NORM"/);
+    assert.match(operator, /机器人类型|机器人/);
+    assert.match(operator, /任务描述/);
+    assert.match(operator, /选择格式模板/);
+    assert.match(operator, /norm_stats/);
+    assert.match(operator, /稍后补录数据集特征/);
+    assert.doesNotMatch(operator, /确认删除登记|保存数据特征/);
+    const admin = render('admin', RegisterAsset, { close() {} });
+    for (const kind of ['DATASET', 'MODEL', 'NORM'])
+      assert.match(admin, new RegExp(`<option value="${kind}"`));
+    const denied = render('viewer', RegisterAsset, { close() {} }, false);
+    assert.match(denied, /权限不足/);
+    assert.doesNotMatch(denied, /<form|所在机器|资产类型/);
+    const dataset = { id: 'dataset', node_id: 'node', kind: 'DATASET', state: 'REGISTERED' };
+    assert.match(
+      render('operator', DatasetProfileEditor, { asset: dataset, close() {} }, false),
+      /管理员权限/,
+    );
+    assert.match(
+      render('operator', DatasetNormBindingDialog, { asset: dataset, close() {} }),
+      /无法修改绑定/,
+    );
   });
 
   await test('privileged dialogs reject direct mounts before business resources are accessed', () => {

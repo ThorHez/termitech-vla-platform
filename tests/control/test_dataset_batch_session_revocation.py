@@ -12,8 +12,9 @@ from .test_dataset_batch_security import base, body, counts, login, ready, secur
 
 @pytest.mark.parametrize("operation", ["scan", "register"])
 @pytest.mark.parametrize("change", ["disabled", "demoted", "logout", "idle", "expired"])
-def test_batch_worker_rechecks_original_session_after_final_http_authorization(secured, monkeypatch, operation, change):
-    authentication = login(secured)
+@pytest.mark.parametrize("username", ["batch-owner", "batch-operator"])
+def test_batch_worker_rechecks_original_session_after_final_http_authorization(secured, monkeypatch, operation, change, username):
+    authentication = login(secured, username)
     user_id = authentication["user"]["id"]
     scan = ready(secured) if operation == "register" else None
     before = counts(secured)
@@ -24,7 +25,7 @@ def test_batch_worker_rechecks_original_session_after_final_http_authorization(s
         invoked.append(True)
         if change in {"disabled", "demoted"}:
             app.state.auth.update_user(None, user_id,
-                {"enabled": False} if change == "disabled" else {"role": "operator"})
+                {"enabled": False} if change == "disabled" else {"role": "viewer"})
         else:
             with app.state.db.write() as session:
                 if change == "logout":

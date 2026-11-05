@@ -25,7 +25,8 @@ def secured(platform):
     node = platform.register()
     connection = bind_ssh(platform, node, "192.0.2.41")
     platform.app.state.dataset_batch_manager._launch = lambda _id: None
-    for name, role in (("batch-owner", "admin"), ("batch-admin", "admin"), ("batch-reader", "viewer")):
+    for name, role in (("batch-owner", "admin"), ("batch-admin", "admin"),
+                       ("batch-operator", "operator"), ("batch-reader", "viewer")):
         platform.app.state.auth.create_user(name, PASSWORD, role)
     client = TestClient(platform.app, base_url="https://testserver")
     yield platform, client, node, connection
@@ -93,6 +94,8 @@ def test_scan_requires_cookie_account_csrf_and_asset_permission(secured):
     assert client.post(base(secured), json={"path": PARENT}, headers={"Origin": "https://foreign.example"}).status_code == 403
     login(secured, "batch-reader")
     assert client.post(base(secured), json={"path": PARENT}).status_code == 403
+    assert client.get(base(secured) + "/unknown-scan").status_code == 403
+    assert client.post(base(secured) + "/unknown-scan/register", json=body()).status_code == 403
     assert counts(secured)["dataset_scans"] == 0
 
 
@@ -107,11 +110,12 @@ def test_even_a_valid_bootstrap_bearer_cannot_own_a_private_scan(platform):
 
 
 @pytest.mark.parametrize("method", ["GET", "REGISTER"])
-def test_admin_cannot_read_or_register_another_accounts_scan(secured, method):
+@pytest.mark.parametrize("username", ["batch-admin", "batch-operator"])
+def test_another_authorized_account_cannot_read_or_register_private_scan(secured, method, username):
     login(secured)
     scan = ready(secured)
     before = counts(secured)
-    login(secured, "batch-admin")
+    login(secured, username)
     response = (secured[1].get(base(secured) + "/" + scan["id"]) if method == "GET"
                 else register(secured, scan, body()))
     assert response.status_code == 404

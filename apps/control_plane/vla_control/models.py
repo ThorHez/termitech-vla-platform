@@ -80,6 +80,7 @@ class Asset(Base):
     state: Mapped[str] = mapped_column(String(32), default="REGISTERED")
     metadata_json: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[str] = mapped_column(String(40))
+    registered_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"), nullable=True)
     origin_attempt_id: Mapped[str | None] = mapped_column(String(36), index=True)
     norm_asset_id: Mapped[str | None] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), nullable=True)
 

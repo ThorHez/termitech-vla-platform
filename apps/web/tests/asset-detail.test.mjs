@@ -81,13 +81,23 @@ try {
         AuthContext.Provider,
         {
           value: {
+            user: { id: role, role },
             can: (permission) =>
               role === 'admin'
-                ? ['assets.write', 'assets.transfer', 'dataset-templates.write'].includes(
-                    permission,
-                  )
+                ? [
+                    'assets.write',
+                    'datasets.register',
+                    'datasets.archive',
+                    'assets.transfer',
+                    'dataset-templates.write',
+                  ].includes(permission)
                 : role === 'operator' &&
-                  ['assets.transfer', 'dataset-templates.write'].includes(permission),
+                  [
+                    'datasets.register',
+                    'datasets.archive',
+                    'assets.transfer',
+                    'dataset-templates.write',
+                  ].includes(permission),
           },
         },
         React.createElement(AssetDetail, {
@@ -154,7 +164,7 @@ try {
     }
   });
 
-  await test('administrators can maintain public datasets while operators can only synchronize them', () => {
+  await test('dataset registration permission does not grant operators existing public asset editing or deletion', () => {
     for (const role of ['admin']) {
       const html = render(dataset, node, role);
       for (const label of [normAction, /数据特征/, /同步到其他机器/, /删除/]) {

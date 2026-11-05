@@ -1,6 +1,7 @@
 import { ArrowRightLeft, Link2, Pencil, Save, Server, Trash2 } from 'lucide-react';
 import { date } from './api';
 import { useAuth } from './auth';
+import { canArchiveAsset } from './assetArchive';
 import { Badge, Modal } from './components';
 import { assetKinds } from './data';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
@@ -40,7 +41,7 @@ export function AssetDetail({
   datasetChoices?: Asset[];
   selectDataset?: (id: string) => void;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const state = asset.status || asset.state || 'REGISTERED';
   const archived = state === 'ARCHIVED';
   const unavailable = state === 'UNAVAILABLE';
@@ -71,7 +72,7 @@ export function AssetDetail({
       className="asset-detail-modal"
       footer={
         <>
-          {writable && (
+          {canArchiveAsset(user, asset, can) && (
             <button type="button" className="button danger asset-detail-remove" onClick={remove}>
               <Trash2 size={15} />
               删除登记

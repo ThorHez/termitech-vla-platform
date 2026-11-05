@@ -73,7 +73,9 @@ def test_registration_queues_one_dataset_scoped_command_and_safe_ack_updates_onl
     assert INTERNAL_KEY not in asset["metadata"]
     command = platform.commands(node)[0]
     assert command["id"] == report["id"] and command["type"] == "DATASET_VALIDATE"
-    assert set(command["payload"]) == {"asset_id", "path", "profile_id", "registered_profile", "input_digest", "expires_at"}
+    assert set(command["payload"]) == {"asset_id", "path", "profile_id", "registered_profile", "input_digest", "expires_at",
+                                      "source_registration"}
+    assert command["payload"]["source_registration"] is True
     assert command["payload"]["asset_id"] == asset["id"] and command["payload"]["input_digest"] == report["input_digest"]
     assert command["payload"]["registered_profile"] == asset["metadata"]["dataset_profile"]
     assert create(platform, asset).json()["id"] == report["id"]
