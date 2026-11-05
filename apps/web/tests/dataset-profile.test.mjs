@@ -73,6 +73,59 @@ try {
     assert.match(render(DatasetProfileForm, { value: empty, onChange() {} }), /aria-label="移除视觉输入 1"[^>]*disabled=""/);
   });
 
+  await test('camera fields show source shapes, resolution and only unambiguous channel layouts', () => {
+    const source = structuredClone(profile);
+    const features = [
+      { key: source.cameras[0].key, dtype: 'video', shape: [3, 480, 640] },
+      { key: source.cameras[1].key, dtype: 'image', shape: [720, 1280, 3] },
+      { key: source.cameras[2].key, dtype: 'float32', shape: [240, 320] },
+    ];
+    const before = structuredClone(source);
+    const html = render(DatasetProfileForm, { value: source, features, compact: true, onChange() {} });
+    for (const text of ['[3, 480, 640]', '[720, 1280, 3]', '[240, 320]', '宽 640 × 高 480 · 3 通道 · CHW', '宽 1280 × 高 720 · 3 通道 · HWC', '宽 320 × 高 240 · 二维深度图'])
+      assert.ok(html.includes(text), text);
+    assert.deepEqual(source, before);
+    assert.deepEqual(normalizedDatasetProfile(source).cameras, before.cameras);
+    assert.deepEqual(datasetProfileErrors(source), []);
+  });
+
+  await test('image sequences retain the full raw shape and ambiguous layouts do not invent resolution', () => {
+    const source = { ...profile, cameras: profile.cameras.slice(0, 1) };
+    const renderShape = (shape) => render(DatasetProfileForm, {
+      value: source,
+      features: [{ key: source.cameras[0].key, dtype: 'image', shape }],
+      onChange() {},
+    });
+    const history = renderShape([2, 3, 480, 640]);
+    assert.match(history, /\[2, 3, 480, 640\]/);
+    assert.match(history, /宽 640 × 高 480 · 3 通道 · CHW/);
+    assert.match(history, /首轴长度 2/);
+    const ambiguous = renderShape([3, 240, 3]);
+    assert.match(ambiguous, /\[3, 240, 3\]/);
+    assert.match(ambiguous, /布局待确认/);
+    assert.doesNotMatch(ambiguous, /宽 \d+ × 高/);
+  });
+
+  await test('missing image metadata is visible and never borrowed from another camera or template', () => {
+    const source = { ...profile, cameras: profile.cameras.slice(0, 1) };
+    const unknown = render(DatasetProfileForm, { value: source, onChange() {} });
+    assert.match(unknown, /待读取数据集元数据/);
+    const missing = render(DatasetProfileForm, {
+      value: source,
+      features: [{ key: 'another.camera', dtype: 'image', shape: [3, 1024, 2048] }],
+      onChange() {},
+    });
+    assert.match(missing, /当前元数据中未找到该字段/);
+    assert.doesNotMatch(missing, /1024|2048/);
+    const invalid = render(DatasetProfileForm, {
+      value: source,
+      features: [{ key: source.cameras[0].key, dtype: 'image', shape: [] }],
+      onChange() {},
+    });
+    assert.match(invalid, /元数据未提供有效形状/);
+    assert.doesNotMatch(invalid, /宽 \d+ × 高/);
+  });
+
   await test('robot and task metadata are normalized without mutating the saved source', () => {
     const draft = { ...profile, robot_type: '  ARX5  ', task_description: '  折叠衣物\n 放入盒子。  ', cameras: [{ name: ' 腕部 ', key: ' observation.image ', kind: 'rgb' }] };
     assert.deepEqual(datasetProfileErrors(draft), []);

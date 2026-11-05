@@ -33,6 +33,11 @@ export function useDatasetInspectionDraft(
     };
   const latest = useRef({ value, onChange });
   latest.current = { value, onChange };
+  const currentScope = useRef<string | undefined>(undefined);
+  const [featureMetadata, setFeatureMetadata] = useState<{
+    scope: string;
+    features: DatasetInspectionDTO['features'];
+  }>();
   const manualChange = useCallback((next: DatasetProfile) => {
     recordInspectionEdits(state.current!, latest.current.value, next);
     latest.current.value = next;
@@ -47,6 +52,11 @@ export function useDatasetInspectionDraft(
     latest.current.onChange(next);
   }, []);
   const apply = useCallback((inspection: DatasetInspectionDTO) => {
+    if (currentScope.current !== undefined)
+      setFeatureMetadata({
+        scope: currentScope.current,
+        features: structuredClone(inspection.features),
+      });
     const merged = mergeDatasetInspection(latest.current.value, inspection, state.current!);
     if (JSON.stringify(merged.profile) !== JSON.stringify(latest.current.value)) {
       latest.current.value = merged.profile;
@@ -54,9 +64,12 @@ export function useDatasetInspectionDraft(
     }
     return merged;
   }, []);
-  const currentScope = useRef<string | undefined>(undefined);
+  const clearFeatures = useCallback((scope: string) => {
+    setFeatureMetadata((previous) => (previous?.scope === scope ? undefined : previous));
+  }, []);
   const resetScope = useCallback((scope: string) => {
     if (currentScope.current !== undefined && currentScope.current !== scope) {
+      setFeatureMetadata(undefined);
       const next = clearAutomaticInspectionDefaults(latest.current.value, state.current!);
       if (JSON.stringify(next) !== JSON.stringify(latest.current.value)) {
         latest.current.value = next;
@@ -65,7 +78,9 @@ export function useDatasetInspectionDraft(
     }
     currentScope.current = scope;
   }, []);
-  return { manualChange, touch, applyTemplate, apply, resetScope };
+  const featuresFor = (nodeId: string | undefined, path: string) =>
+    featureMetadata?.scope === inspectionScope(nodeId, path) ? featureMetadata.features : undefined;
+  return { manualChange, touch, applyTemplate, apply, resetScope, clearFeatures, featuresFor };
 }
 
 function failure(error: unknown) {
@@ -150,6 +165,7 @@ export function DatasetInspection({
       abort = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     if (ready && node) {
+      latest.current.draft.clearFeatures(scope);
       setView({ scope, loading: true });
       timer = setTimeout(() => {
         const active = () =>
@@ -196,7 +212,10 @@ export function DatasetInspection({
               kept: merged.kept,
             });
           } catch (error) {
-            if (active()) setView({ scope, error: failure(error) });
+            if (active()) {
+              latest.current.draft.clearFeatures(scope);
+              setView({ scope, error: failure(error) });
+            }
           }
         })();
       }, 800);

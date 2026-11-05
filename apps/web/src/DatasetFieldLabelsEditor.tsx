@@ -1,16 +1,70 @@
 import { Plus, Trash2 } from 'lucide-react';
 import { sourceActionHorizon, type DatasetFieldAnnotation } from './datasetFieldAnnotations';
+import type { ImageLayoutFeature } from './imageLayout';
 import './dataset-field-annotations.css';
+
+function FieldSourceMetadata({
+  row,
+  features,
+  index,
+}: {
+  row: DatasetFieldAnnotation;
+  features?: readonly ImageLayoutFeature[];
+  index: number;
+}) {
+  const feature = features?.find((item) => item.key === row.key);
+  if (features !== undefined && !feature)
+    return (
+      <div className="dataset-field-source-metadata" aria-label={`字段原始信息 ${index + 1}`}>
+        <span>
+          {row.key
+            ? '当前元数据中未找到此字段，无法显示原始形状与维度。'
+            : '选择字段后显示原始形状与维度。'}
+        </span>
+      </div>
+    );
+  const shape = feature ? feature.shape : row.shape;
+  const dtype = feature ? feature.dtype : row.dtype;
+  const knownShape =
+    Array.isArray(shape) &&
+    shape.length > 0 &&
+    shape.every((size) => Number.isSafeInteger(size) && size > 0);
+  const width = knownShape ? shape[shape.length - 1] : undefined;
+  const horizon = row.role === 'action' && knownShape ? sourceActionHorizon(shape) : undefined;
+  const dimension =
+    width === undefined
+      ? `${row.role === 'action' ? '动作' : '状态'}维度：未读取`
+      : row.role === 'action' && horizon !== undefined
+        ? `动作维度：${width} 维/步 · 原有 ${horizon} 步`
+        : row.role === 'state' && shape?.length === 1
+          ? `状态维度：${width} 维`
+          : `${row.role === 'action' ? '动作' : '状态'}末轴宽度：${width} 维`;
+  return (
+    <div className="dataset-field-source-metadata" aria-label={`字段原始信息 ${index + 1}`}>
+      <span>
+        原始形状：<code>{knownShape ? `[${shape.join(', ')}]` : '未读取'}</code>
+        {' · '}
+        {dtype || '类型未读取'}
+      </span>
+      <strong>{dimension}</strong>
+      <span className="dataset-field-source-origin">
+        {feature ? '来源：当前数据集元数据' : '来源：字段标签记录'}
+      </span>
+    </div>
+  );
+}
 
 export function DatasetFieldLabelsEditor({
   value = [],
   featureKeys = [],
+  features,
   disabled = false,
   onChange,
   onFieldEdit,
 }: {
   value?: DatasetFieldAnnotation[];
   featureKeys?: string[];
+  features?: readonly ImageLayoutFeature[];
   disabled?: boolean;
   onChange: (value: DatasetFieldAnnotation[]) => void;
   onFieldEdit?: (path: string) => void;
@@ -62,7 +116,7 @@ export function DatasetFieldLabelsEditor({
           <table>
             <thead>
               <tr>
-                <th>真实字段 / 原始形状</th>
+                <th>真实字段 / 原始形状与维度</th>
                 <th>用途</th>
                 <th>表示</th>
                 <th>数值方式</th>
@@ -131,10 +185,7 @@ export function DatasetFieldLabelsEditor({
                         }}
                       />
                     )}
-                    <span className="field-hint">
-                      {row.dtype || '形状待读取'}
-                      {row.shape ? ` [${row.shape.join(', ')}]` : ''}
-                    </span>
+                    <FieldSourceMetadata row={row} features={features} index={index} />
                   </td>
                   <td>
                     <select

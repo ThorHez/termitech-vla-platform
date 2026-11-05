@@ -44,6 +44,26 @@
   height: 30px;
 }
 
+.dataset-field-source-metadata {
+  display: grid;
+  gap: 3px;
+  margin-top: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.dataset-field-source-metadata strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.dataset-field-source-metadata code {
+  font-size: inherit;
+}
+.dataset-field-source-origin {
+  font-size: 10px;
+}
+
 .dataset-field-labels-table .sr-only {
   position: absolute;
   width: 1px;

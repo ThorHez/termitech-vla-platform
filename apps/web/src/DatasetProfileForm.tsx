@@ -14,6 +14,7 @@ import {
 import { RobotTypeField } from './RobotTypeField';
 import { DatasetInspection, useDatasetInspectionDraft } from './DatasetInspection';
 import { DatasetFormatTemplates } from './DatasetFormatTemplates';
+import { inferImageLayout, type ImageLayoutFeature } from './imageLayout';
 import {
   composedProcessingErrors,
   normalizeComposedProcessing,
@@ -271,10 +272,58 @@ export function applyComposedProcessing(
   };
 }
 
+function DatasetCameraShape({
+  camera,
+  features,
+}: {
+  camera: DatasetCamera;
+  features?: readonly ImageLayoutFeature[];
+}) {
+  const matches = features?.filter((feature) => feature.key.trim() === camera.key.trim());
+  const feature = matches?.length === 1 ? matches[0] : undefined;
+  if (!feature)
+    return (
+      <span className="dataset-camera-shape">
+        图像形状：{features ? '当前元数据中未找到该字段' : '待读取数据集元数据'}
+      </span>
+    );
+  const validShape =
+    feature.shape.length > 0 &&
+    feature.shape.every((size) => Number.isSafeInteger(size) && size > 0);
+  const inferred = inferImageLayout(features, camera.key, camera.kind);
+  const frame = inferred.frameShape;
+  const dimensions =
+    frame && inferred.layout
+      ? inferred.layout === 'chw'
+        ? `宽 ${frame[2]} × 高 ${frame[1]} · ${frame[0]} 通道 · CHW`
+        : `宽 ${frame[1]} × 高 ${frame[0]} · ${frame[2]} 通道 · HWC`
+      : frame && inferred.depthWithoutChannel
+        ? `宽 ${frame[1]} × 高 ${frame[0]} · 二维深度图`
+        : undefined;
+  return (
+    <span className="dataset-camera-shape" title="来源：当前数据集元数据">
+      <span>
+        图像原始形状：
+        <code>{validShape ? `[${feature.shape.join(', ')}]` : '元数据未提供有效形状'}</code>
+        {feature.dtype && ` · ${feature.dtype}`}
+      </span>
+      {dimensions ? (
+        <span>
+          {dimensions}
+          {inferred.requiresTimeIndex && ` · 首轴长度 ${feature.shape[0]}`}
+        </span>
+      ) : (
+        validShape && <span>布局待确认，保留原始形状。</span>
+      )}
+    </span>
+  );
+}
+
 export function DatasetProfileForm({
   value,
   onChange,
   onFieldEdit,
+  features,
   disabled = false,
   compact = false,
   showTaskDescription = true,
@@ -282,6 +331,7 @@ export function DatasetProfileForm({
   value: DatasetProfile;
   onChange: (value: DatasetProfile) => void;
   onFieldEdit?: (path: string) => void;
+  features?: readonly ImageLayoutFeature[];
   disabled?: boolean;
   compact?: boolean;
   showTaskDescription?: boolean;
@@ -422,6 +472,7 @@ export function DatasetProfileForm({
                 title="填写数据文件中的完整键名；相机数量相同，字段映射也可能不同。"
                 onChange={(event) => camera(index, { key: event.target.value })}
               />
+              <DatasetCameraShape camera={item} features={features} />
             </Field>
           </div>
         ))}
@@ -441,6 +492,7 @@ export function DatasetProfileForm({
       <DatasetFieldLabelsEditor
         value={value.field_annotations}
         featureKeys={value.feature_keys}
+        features={features}
         disabled={disabled}
         onFieldEdit={onFieldEdit}
         onChange={(field_annotations) => onChange({ ...value, field_annotations })}
@@ -556,6 +608,7 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
         />
         <DatasetProfileForm
           value={value}
+          features={inspectionDraft.featuresFor(asset.node_id, asset.path)}
           onChange={inspectionDraft.manualChange}
           onFieldEdit={inspectionDraft.touch}
           disabled={busy}

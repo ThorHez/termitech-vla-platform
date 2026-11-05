@@ -54,6 +54,21 @@
   margin-top: 8px;
 }
 
+.dataset-camera-shape {
+  display: grid;
+  gap: 2px;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.dataset-camera-shape code {
+  color: var(--text);
+  font-weight: 600;
+}
+
 .dataset-profile-advanced {
   border-top: 1px solid var(--border);
   margin-top: 16px;
@@ -172,7 +187,7 @@
   display: grid;
   grid-template-columns: minmax(0, 0.85fr) 104px minmax(0, 1.8fr) 26px;
   gap: 8px;
-  align-items: end;
+  align-items: start;
   margin-top: 7px;
   padding: 0;
   border: 0;
@@ -182,8 +197,8 @@
 .dataset-profile-form.compact .dataset-profile-camera > .dataset-profile-section-title {
   grid-column: 4;
   grid-row: 1;
-  align-self: end;
-  margin-bottom: 1px;
+  align-self: start;
+  margin-top: 18px;
 }
 
 .dataset-profile-form.compact .dataset-profile-camera > .dataset-profile-section-title > strong {

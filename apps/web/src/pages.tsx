@@ -1918,6 +1918,7 @@ function RegisterAssetContent({ close, initialNode }: { close: () => void; initi
               compact
               showTaskDescription={false}
               value={datasetProfile}
+              features={inspectionDraft.featuresFor(form.node_id, form.path)}
               onChange={inspectionDraft.manualChange}
               onFieldEdit={inspectionDraft.touch}
               disabled={busy}
