@@ -14,8 +14,9 @@ const server = await createServer({
 
 try {
   const { PreflightChecks, sharedNormIncompatibilityDetail } = await server.ssrLoadModule('/src/PreflightChecks.tsx');
-  const render = (checks, summarizedSharedNormError) => renderToStaticMarkup(
-    React.createElement(PreflightChecks, { checks, summarizedSharedNormError }),
+  const { preflightValidationAsset } = await server.ssrLoadModule('/src/datasetValidationHelpers.ts');
+  const render = (checks, summarizedSharedNormError, showDatasetValidationNotice) => renderToStaticMarkup(
+    React.createElement(PreflightChecks, { checks, summarizedSharedNormError, showDatasetValidationNotice }),
   );
   const fps = { name: 'dataset_fps', ok: true, severity: 'warning', code: 'DATASET_FPS_MISMATCH', message: '登记 20 Hz，元信息 60 Hz；使用实际采样率。' };
 
@@ -91,6 +92,52 @@ try {
     assert.match(html, /详见上方的失败原因/);
     assert.doesNotMatch(html, /collect_1029_human|SHARED_NORM_INVALID/);
     assert.equal(sharedNormIncompatibilityDetail('SHARED_NORM_INVALID: 共享统计文件在预检期间改变'), undefined);
+  });
+
+  const baseValidationCode = 'DATASET_BASE_VALIDATION_REQUIRED';
+  const validationMessage = `${baseValidationCode}: 数据集 /data/项目 A/demo 的基础校验证据缺失或已失效，请先在数据集配置中执行基础校验`;
+  const validationAsset = { id: 'target', kind: 'DATASET', node_id: 'node-1', path: '/data//项目 A/./demo/' };
+  const failedValidationPreview = {
+    status: 'FAILED',
+    request: { node_id: 'node-1', profile_id: 'runtime-2', inputs: { dataset_0: 'other', dataset_1: 'target', norm_1: 'norm' } },
+    error: { code: baseValidationCode, message: validationMessage },
+  };
+
+  await test('missing receipts resolve the matching frozen dataset for current and legacy error wording', () => {
+    const assets = [{ ...validationAsset, id: 'other', path: '/data/项目 A/demo-longer' }, validationAsset];
+    for (const reason of [
+      '的基础校验证据缺失或已失效，请先在数据集配置中执行基础校验',
+      '缺少匹配的基础校验结果，或数据、登记配置、校验环境已变化',
+      '的 ReCap 监督基础校验证据缺失或已失效，请先在数据集配置中执行基础校验',
+    ]) {
+      const preview = { ...failedValidationPreview, error: { code: baseValidationCode, message: `数据集 /data/项目 A/demo ${reason}` } };
+      assert.equal(preflightValidationAsset(preview, assets), validationAsset);
+    }
+    assert.equal(preflightValidationAsset(failedValidationPreview, assets), validationAsset);
+  });
+
+  await test('refresh does not target unrelated assets, other machines, or ambiguous paths', () => {
+    const otherAssets = [
+      { ...validationAsset, node_id: 'another-node' },
+      { ...validationAsset, id: 'other', path: '/data/项目 A/demo-longer' },
+      { ...validationAsset, id: 'unselected' },
+      { ...validationAsset, id: 'norm' },
+    ];
+    assert.equal(preflightValidationAsset(failedValidationPreview, otherAssets), undefined);
+    assert.equal(preflightValidationAsset(failedValidationPreview, [validationAsset, { ...validationAsset, id: 'other' }]), undefined);
+    assert.equal(preflightValidationAsset(failedValidationPreview, [{ ...validationAsset, path: '/data/项目 A/demo/../demo' }]), undefined);
+    assert.equal(preflightValidationAsset({ ...failedValidationPreview, status: 'READY' }, [validationAsset]), undefined);
+  });
+
+  await test('missing-receipt checks point to one action while unrelated failures keep their detail', () => {
+    const html = render([
+      { name: 'dataset_timestamps', ok: false, message: validationMessage },
+      { name: 'validation', ok: false, message: validationMessage },
+      { name: 'norm_contract', ok: false, message: '归一化参数维度不匹配' },
+    ], undefined, true);
+    assert.match(html, /请处理上方的数据集基础校验提示/);
+    assert.match(html, /归一化参数维度不匹配/);
+    assert.doesNotMatch(html, /DATASET_BASE_VALIDATION_REQUIRED|\/data\/项目 A/);
   });
 } finally {
   await server.close();

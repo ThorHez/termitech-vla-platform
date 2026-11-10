@@ -36,6 +36,11 @@ import { DatasetBindings, DatasetBindingSummary } from './DatasetBindings';
 import { newDatasetBindings } from './datasetBindingHelpers';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { PreflightChecks, sharedNormIncompatibilityDetail } from './PreflightChecks';
+import { PreflightDatasetValidation } from './PreflightDatasetValidation';
+import {
+  DATASET_BASE_VALIDATION_REQUIRED,
+  preflightValidationAsset,
+} from './datasetValidationHelpers';
 import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft';
 import type { ImageLayoutEdits } from './imageLayout';
 import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
@@ -569,6 +574,7 @@ function RunWizardContent({
   const [previewId, setPreviewId] = useState('');
   const [createdPreview, setCreatedPreview] = useState<Preview>();
   const [busy, setBusy] = useState(false);
+  const [datasetValidationPending, setDatasetValidationPending] = useState(false);
   const [error, setError] = useState<Error>();
   const idempotencyKey = useRef(crypto.randomUUID());
   const recipeSelection = useRef<string | undefined>(undefined);
@@ -653,6 +659,12 @@ function RunWizardContent({
   const previewResource = useApi<Preview>(previewId ? `/run-previews/${previewId}` : null, 1800);
   const preview = previewResource.data?.id === previewId ? previewResource.data : createdPreview;
   const sharedNormDetail = sharedNormIncompatibilityDetail(preview?.error?.message);
+  const datasetValidationRequired =
+    preview?.status === 'FAILED' && preview.error?.code === DATASET_BASE_VALIDATION_REQUIRED;
+  const validationRequest = datasetValidationRequired ? preview.request : undefined;
+  const validationAsset = datasetValidationRequired
+    ? preflightValidationAsset(preview, assets.data || [])
+    : undefined;
   const previewReadError = previewId ? previewResource.error : undefined;
   const displayedError = error || (step === 2 ? previewReadError : undefined);
   const requestFailed = !previewId && !!error && !busy;
@@ -2772,10 +2784,40 @@ function RunWizardContent({
               </div>
             </div>
           )}
+          {datasetValidationRequired && (
+            <div className="error-notice">
+              <XCircle size={18} aria-hidden="true" />
+              <div>
+                <strong role="alert" title={DATASET_BASE_VALIDATION_REQUIRED}>
+                  数据集基础校验缺失或已失效
+                </strong>
+                {validationAsset && (
+                  <p>数据集「{validationAsset.name}」需要在本次训练环境刷新校验。</p>
+                )}
+                {validationAsset && validationRequest ? (
+                  <PreflightDatasetValidation
+                    key={`${preview.id}:${validationAsset.id}:${validationRequest.profile_id}`}
+                    asset={validationAsset}
+                    node={nodes.data?.find((item) => item.id === validationRequest.node_id)}
+                    profiles={profiles.data || []}
+                    profileId={validationRequest.profile_id}
+                    changed={assets.refresh}
+                    onPendingChange={setDatasetValidationPending}
+                  />
+                ) : (
+                  <p>
+                    {preview.error?.message?.replace(/^[A-Z_]+:\s*/u, '') ||
+                      '请在数据集详情完成基础校验，再重新预检。'}
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
           {preview?.checks?.length ? (
             <PreflightChecks
               checks={preview.checks}
               summarizedSharedNormError={sharedNormDetail ? preview.error?.message : undefined}
+              showDatasetValidationNotice={datasetValidationRequired}
             />
           ) : (
             preview?.status === 'PENDING' &&
@@ -2785,7 +2827,7 @@ function RunWizardContent({
               </div>
             )
           )}
-          {preview?.error && !sharedNormDetail && (
+          {preview?.error && !sharedNormDetail && !datasetValidationRequired && (
             <div className="inline-note red">
               <strong>{preview.error.code}</strong>
               <span>{preview.error.message}</span>
@@ -2974,7 +3016,11 @@ function RunWizardContent({
             />
           )}
           {(!preview || ['FAILED', 'EXPIRED', 'READY'].includes(preview.status)) && !busy && (
-            <button className="button outline" onClick={() => void beginPreview()}>
+            <button
+              className="button outline"
+              disabled={datasetValidationRequired && datasetValidationPending}
+              onClick={() => void beginPreview()}
+            >
               <RotateCcw size={15} />
               重新预检
             </button>

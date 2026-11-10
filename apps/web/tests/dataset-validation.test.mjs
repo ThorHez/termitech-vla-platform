@@ -18,6 +18,9 @@ try {
   const { DatasetValidation, DatasetValidationBadge } = await server.ssrLoadModule(
     '/src/DatasetValidation.tsx',
   );
+  const { PreflightDatasetValidation } = await server.ssrLoadModule(
+    '/src/PreflightDatasetValidation.tsx',
+  );
   const { AssetDetail } = await server.ssrLoadModule('/src/AssetDetail.tsx');
   const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
   const { ApiError, setSessionCsrf } = await server.ssrLoadModule('/src/api.ts');
@@ -153,6 +156,34 @@ try {
       mutationButton(panel(report('SUCCEEDED'), { asset: owned, auth: { ...auth, can: () => false } })),
       undefined,
     );
+  });
+
+  await test('preflight validation refresh waits for a fresh report and respects registration ownership', () => {
+    const renderRefresh = (registeredBy, auth = {}) =>
+      render(
+        React.createElement(PreflightDatasetValidation, {
+          asset: { ...asset, registered_by_user_id: registeredBy, validation: report('SUCCEEDED') },
+          node,
+          profiles: [profile],
+          profileId: profile.id,
+          changed() {},
+          onPendingChange() {},
+        }),
+        true,
+        auth,
+      );
+    const operator = {
+      user: { id: 'alice' },
+      can: (permission) => permission === 'datasets.validate',
+    };
+    for (const html of [renderRefresh('bob'), renderRefresh('alice', operator)]) {
+      assert.match(html, /<button[^>]*disabled=""[^>]*>.*刷新数据集校验/);
+      assert.match(html, /正在读取校验状态/);
+      assert.doesNotMatch(html, /基础校验已通过|重新预检/);
+    }
+    const denied = renderRefresh('bob', operator);
+    assert.doesNotMatch(denied, /<button/);
+    assert.match(denied, /联系数据集登记人或管理员/);
   });
 
   await test('cancelled validation is neutral, retains its receipt and permits an authorized retry', () => {
