@@ -27,10 +27,8 @@ export function PreflightDatasetValidation({
   changed: () => void;
   onPendingChange: (pending: boolean) => void;
 }) {
-  const { can, user } = useAuth();
-  const permitted =
-    can('assets.write') ||
-    (can('datasets.validate') && !!user?.id && asset.registered_by_user_id === user.id);
+  const { can } = useAuth();
+  const permitted = can('datasets.validate');
   const unavailable = ['ARCHIVED', 'UNAVAILABLE'].includes(asset.status || asset.state || '');
   const [receipt, setReceipt] = useState<DatasetSourceValidation>();
   const [polling, setPolling] = useState(false);
@@ -84,7 +82,7 @@ export function PreflightDatasetValidation({
   }, [current, changed]);
 
   if (unavailable) return <p>该数据集已归档或不可用。</p>;
-  if (!permitted) return <p>请联系数据集登记人或管理员刷新校验。</p>;
+  if (!permitted) return <p>当前账号没有提交数据集校验的权限，请联系操作员或管理员。</p>;
 
   async function submit() {
     if (!ready || submitting.current) return;

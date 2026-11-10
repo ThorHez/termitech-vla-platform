@@ -14,7 +14,7 @@ from .test_dataset_validations import ack, create, get, register, result, worker
 from .test_resource_ownership import PASSWORD, accounts, login
 
 
-def manual(platform):
+def manual(platform, *, historical=False):
     node = worker(platform)
     users = accounts(platform)
     users["remaining-admin"] = platform.app.state.auth.create_user("remaining-admin", PASSWORD, "admin")["id"]
@@ -26,6 +26,9 @@ def manual(platform):
     explicit = create(platform, asset)
     assert explicit.status_code == 202, explicit.text
     asset["validation"] = explicit.json()
+    if historical:
+        with platform.app.state.db.write() as session:
+            session.get(Command, asset["validation"]["id"]).required_permission = "assets.write"
     return node, users, asset
 
 
@@ -38,7 +41,7 @@ def test_explicit_revalidation_binds_admin_and_reuses_normal_pending(platform):
     node, users, asset = manual(platform)
     report = asset["validation"]
     original = command(platform, report["id"])
-    assert original.actor_user_id == users["owner-admin"] and original.required_permission == "assets.write"
+    assert original.actor_user_id == users["owner-admin"] and original.required_permission == "datasets.validate"
     assert "source_transfer_id" not in original.payload
     login(platform, "remaining-admin")
     assert create(platform, asset).json()["id"] == report["id"]
@@ -48,6 +51,25 @@ def test_explicit_revalidation_binds_admin_and_reuses_normal_pending(platform):
     fresh = create(platform, asset).json()
     assert fresh["id"] != report["id"]
     assert command(platform, fresh["id"]).actor_user_id == users["remaining-admin"]
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_admin_manual_command_retains_the_permission_it_was_accepted_with(platform, historical):
+    node, users, asset = manual(platform, historical=historical)
+    report = asset["validation"]
+    if historical:
+        assert command(platform, report["id"]).required_permission == "assets.write"
+    platform.app.state.auth.update_user(None, users["owner-admin"], {"role": "operator"})
+    assert any(item["id"] == report["id"] for item in platform.commands(node)) is (not historical)
+    if historical:
+        assert command(platform, report["id"]).status == "REJECTED"
+
+
+def test_historical_admin_manual_command_still_dispatches(platform):
+    node, _, asset = manual(platform, historical=True)
+    report = asset["validation"]
+    assert any(item["id"] == report["id"] for item in platform.commands(node))
+    assert ack(platform, node, report, result(asset)).status_code == 200
 
 
 @pytest.mark.parametrize("change", ["disabled", "demoted", "unknown"])
@@ -60,7 +82,7 @@ def test_revoked_or_unknown_manual_validation_rejects_command_and_matching_repor
             row.actor_user_id = row.required_permission = None
     else:
         platform.app.state.auth.update_user(None, users["owner-admin"],
-            {"enabled": False} if change == "disabled" else {"role": "operator"})
+            {"enabled": False} if change == "disabled" else {"role": "viewer"})
     assert not any(item["id"] == report["id"] for item in platform.commands(node))
     with platform.app.state.db.read() as session:
         old = session.get(Command, report["id"])
@@ -89,7 +111,7 @@ def test_resubmit_replaces_unusable_pending_work_without_adopting_its_actor(plat
     _, users, asset = manual(platform)
     previous = asset["validation"]
     if change == "demoted":
-        platform.app.state.auth.update_user(None, users["owner-admin"], {"role": "operator"})
+        platform.app.state.auth.update_user(None, users["owner-admin"], {"role": "viewer"})
     else:
         with platform.app.state.db.write() as session:
             row = session.get(Command, previous["id"])
@@ -170,15 +192,20 @@ def copied(fixture, monkeypatch, *, admin_intervention=False):
     return platform, target, users, finished, asset, asset["validation"]
 
 
-def test_operator_copy_derived_validation_uses_exact_output_without_granting_manual_rights(fixture, monkeypatch):
+def test_operator_copy_derived_validation_retains_provenance_and_allows_manual_refresh(fixture, monkeypatch):
     platform, target, users, source, asset, report = copied(fixture, monkeypatch)
     queued = command(platform, report["id"])
     assert queued.actor_user_id == users["alice"] and queued.required_permission == "assets.transfer"
     assert queued.payload["source_transfer_id"] == source["id"]
-    assert create(platform, asset).status_code == 403
+    assert create(platform, asset).json()["id"] == report["id"]
     assert any(item["id"] == report["id"] for item in platform.commands(target))
     assert ack(platform, target, report, result(asset)).status_code == 200
     assert get(platform, asset)["status"] == "SUCCEEDED"
+    fresh = create(platform, asset)
+    assert fresh.status_code == 202, fresh.text
+    replacement = command(platform, fresh.json()["id"])
+    assert replacement.id != report["id"] and replacement.required_permission == "datasets.validate"
+    assert "source_transfer_id" not in replacement.payload
 
 
 @pytest.mark.parametrize("change", [{"enabled": False}, {"role": "viewer"}])

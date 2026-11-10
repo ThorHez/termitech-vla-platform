@@ -14,15 +14,14 @@ from sqlalchemy.orm import object_session
 from .common import APIError, digest, now, offset_time, require_path, uid
 from .models import Asset, Command, Node, Profile
 from .schemas import InputModel
-from .resource_authorization import (
-    bind_command_actor, execution_permission_authorized, request_user_id, require_active_actor,
-)
+from .resource_authorization import bind_command_actor, execution_permission_authorized, require_active_actor
 from .account_lifecycle import task_execution_authorized
 
 
 COMMAND = "DATASET_VALIDATE"
 INTERNAL_KEY = "_dataset_validation"
 SCOPE = "dataset_source"
+VALIDATABLE_STATES = {"REGISTERED", "READY"}
 QUEUE_TTL_SECONDS = 24 * 60 * 60
 MAX_RESULT_BYTES = 256 * 1024
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
@@ -132,7 +131,7 @@ def reject_undelivered_validation(session, command, error):
 
 
 def validation_execution_authorized(session, command, *, allow_legacy=False):
-    """Recheck ownership of manual work and the provenance of registration/copy work."""
+    """Recheck manual validation authority and registration/copy provenance."""
     if command.type != COMMAND:
         return False
     source_id = command.payload.get("source_transfer_id")
@@ -140,19 +139,18 @@ def validation_execution_authorized(session, command, *, allow_legacy=False):
     if ((registration is not None and registration is not True)
             or (source_id is not None and registration is not None)):
         return False
-    owned_retry = source_id is None and registration is None and command.required_permission == "datasets.validate"
+    # Existing admin-created manual commands were admitted under assets.write.
+    manual_retry = source_id is None and registration is None and command.required_permission == "datasets.validate"
     permission = ("assets.transfer" if source_id is not None else
                   "datasets.register" if registration is True else
-                  "datasets.validate" if owned_retry else "assets.write")
+                  "datasets.validate" if manual_retry else "assets.write")
     legacy = command.actor_user_id is None and command.required_permission is None
     if (command.required_permission != permission and not legacy
             or not execution_permission_authorized(session, command.actor_user_id, permission, allow_legacy=allow_legacy)):
         return False
-    if registration is True or owned_retry:
+    if registration is True or manual_retry:
         asset = session.get(Asset, command.payload.get("asset_id"))
-        if asset is None or asset.kind != "DATASET" or asset.state in {"ARCHIVED", "UNAVAILABLE"}:
-            return False
-        if owned_retry and (command.actor_user_id is None or asset.registered_by_user_id != command.actor_user_id):
+        if asset is None or asset.kind != "DATASET" or asset.state not in VALIDATABLE_STATES:
             return False
         stored = (asset.metadata_json or {}).get(INTERNAL_KEY)
         if not isinstance(stored, dict):
@@ -245,10 +243,11 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
         return None
     if source_registration and source_transfer_id is not None:
         raise ValueError("dataset validation must have exactly one source")
+    manual = not source_registration and source_transfer_id is None
     node = session.get(Node, asset.node_id)
     if node is None:
         raise APIError(404, "NOT_FOUND", "机器不存在")
-    if asset.state in {"ARCHIVED", "UNAVAILABLE"}:
+    if asset.state not in VALIDATABLE_STATES:
         raise APIError(409, "DATASET_VALIDATION_ASSET_UNAVAILABLE", "数据集已归档或不可用，不能发起校验")
     require_path(asset.path, node.roots)
     choices = list(session.scalars(select(Profile).where(Profile.node_id == node.id, Profile.active.is_(True),
@@ -259,10 +258,13 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
     # A new registration receives its own server-written receipt. Never reuse
     # or invalidate a command referenced by supplied/imported internal metadata.
     previous = None if source_registration else validation_dict(asset, session)
-    if (previous and previous.get("status") == "PENDING" and chosen is not None
-            and previous.get("profile_id") == chosen.id and previous.get("input_digest") == input_digest(asset, chosen, node)
-            and _reuse_pending_validation(session, asset, previous)):
-        return previous
+    if previous and previous.get("status") == "PENDING":
+        same_profile = (chosen is not None and previous.get("profile_id") == chosen.id
+                        and previous.get("input_digest") == input_digest(asset, chosen, node))
+        if (same_profile or manual) and _reuse_pending_validation(session, asset, previous):
+            if same_profile:
+                return previous
+            raise APIError(409, "DATASET_VALIDATION_ALREADY_PENDING", "该数据集已有后台校验任务，请等待完成后再切换校验环境")
     reason = None
     if chosen is None:
         reason = "DATASET_VALIDATION_PROFILE_REQUIRED" if choices else "DATASET_VALIDATION_PROFILE_UNAVAILABLE"
@@ -287,13 +289,7 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
             command.payload = {**command.payload, "source_transfer_id": source_transfer_id}
             command.actor_user_id, command.required_permission = actor_user_id, "assets.transfer"
         else:
-            if source_registration:
-                permission = "datasets.register"
-            elif actor_request is not None and actor_request.state.principal.role != "admin":
-                permission = "datasets.validate"
-            else:
-                permission = "assets.write"
-            bind_command_actor(command, actor_request, permission)
+            bind_command_actor(command, actor_request, "datasets.register" if source_registration else "datasets.validate")
         if source_registration:
             command.payload = {**command.payload, "source_registration": True}
             report["registration"] = {"asset_id": asset.id, "node_id": asset.node_id, "path": asset.path,
@@ -479,10 +475,6 @@ def register_routes(app, admin, db, settings):
         with db.write() as session:
             require_active_actor(session, request, "datasets.validate")
             asset = required(session, asset_id, lock=True)
-            if request.state.principal.role != "admin" and (
-                asset.registered_by_user_id is None or asset.registered_by_user_id != request_user_id(request)
-            ):
-                raise APIError(403, "RESOURCE_ACCESS_DENIED", "只能重新校验自己登记的数据集")
             return queue_validation(session, asset, body.profile_id,
                                     heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds, actor_request=request)
 

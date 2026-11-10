@@ -106,7 +106,7 @@ def test_admin_revalidation_reuses_valid_registration_then_replaces_revoked_acto
         original = session.get(Command, old["id"])
         replacement = session.get(Command, fresh.json()["id"])
         assert original.status == "REJECTED" and original.actor_user_id == users["alice"]
-        assert replacement.actor_user_id == users["remaining-admin"] and replacement.required_permission == "assets.write"
+        assert replacement.actor_user_id == users["remaining-admin"] and replacement.required_permission == "datasets.validate"
     assert ack(platform, node, old, result(asset)).status_code == 200
     assert get(platform, asset)["id"] == fresh.json()["id"] and get(platform, asset)["status"] == "PENDING"
 

@@ -56,7 +56,13 @@ try {
     renderToStaticMarkup(
       React.createElement(
         AuthContext.Provider,
-        { value: { can: (permission) => writable && permission === 'assets.write', ...auth } },
+        {
+          value: {
+            can: (permission) =>
+              writable && ['assets.write', 'datasets.validate'].includes(permission),
+            ...auth,
+          },
+        },
         element,
       ),
     );
@@ -136,29 +142,28 @@ try {
     assert.match(panel(null), /尚未校验/);
   });
 
-  await test('operators can retry their own registered datasets while others remain readable', () => {
+  await test('operators can validate usable datasets regardless of who registered them', () => {
     const auth = { user: { id: 'alice' }, can: (permission) => permission === 'datasets.validate' };
-    const owned = { registered_by_user_id: 'alice' };
-    assert.doesNotMatch(
-      mutationButton(panel(report('SUCCEEDED'), { asset: owned, auth })).attributes,
-      /disabled/,
-    );
-    assert.match(
-      mutationButton(panel(report('PENDING'), { asset: owned, auth })).attributes,
-      /disabled/,
-    );
-    for (const registrar of ['bob', null, undefined]) {
-      const html = panel(report('SUCCEEDED'), { asset: { registered_by_user_id: registrar }, auth });
-      assert.equal(mutationButton(html), undefined);
-      assert.match(html, /基础校验通过/);
+    for (const registrar of ['alice', 'bob', null, undefined]) {
+      const options = { asset: { registered_by_user_id: registrar }, auth };
+      assert.doesNotMatch(mutationButton(panel(null, options)).attributes, /disabled/);
+      assert.doesNotMatch(
+        mutationButton(panel(report('SUCCEEDED'), options)).attributes,
+        /disabled/,
+      );
+      assert.match(mutationButton(panel(report('PENDING'), options)).attributes, /disabled/);
     }
     assert.equal(
-      mutationButton(panel(report('SUCCEEDED'), { asset: owned, auth: { ...auth, can: () => false } })),
+      mutationButton(panel(report('SUCCEEDED'), { asset: { state: 'UNAVAILABLE' }, auth })),
+      undefined,
+    );
+    assert.equal(
+      mutationButton(panel(report('SUCCEEDED'), { auth: { ...auth, can: () => false } })),
       undefined,
     );
   });
 
-  await test('preflight validation refresh waits for a fresh report and respects registration ownership', () => {
+  await test('preflight validation refresh waits for a fresh report and permits shared datasets', () => {
     const renderRefresh = (registeredBy, auth = {}) =>
       render(
         React.createElement(PreflightDatasetValidation, {
@@ -176,14 +181,17 @@ try {
       user: { id: 'alice' },
       can: (permission) => permission === 'datasets.validate',
     };
-    for (const html of [renderRefresh('bob'), renderRefresh('alice', operator)]) {
+    for (const html of [
+      renderRefresh('bob'),
+      ...['alice', 'bob', null].map((owner) => renderRefresh(owner, operator)),
+    ]) {
       assert.match(html, /<button[^>]*disabled=""[^>]*>.*刷新数据集校验/);
       assert.match(html, /正在读取校验状态/);
       assert.doesNotMatch(html, /基础校验已通过|重新预检/);
     }
-    const denied = renderRefresh('bob', operator);
+    const denied = renderRefresh('alice', { ...operator, can: () => false });
     assert.doesNotMatch(denied, /<button/);
-    assert.match(denied, /联系数据集登记人或管理员/);
+    assert.match(denied, /当前账号没有提交数据集校验的权限/);
   });
 
   await test('cancelled validation is neutral, retains its receipt and permits an authorized retry', () => {
