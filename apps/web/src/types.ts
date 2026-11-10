@@ -482,7 +482,16 @@ export interface GeneratedTrainingConfig {
   source: string;
   sha256: string;
 }
+export interface ResumeSource {
+  asset_id: string;
+  run_id: string;
+  attempt_id: string;
+  path: string;
+  output_dir: string;
+  step: number;
+}
 export interface CodeSnapshot {
+  resume_source?: ResumeSource;
   training_gpu_policy?: TrainingGpuPolicy | null;
   runtime_profile?: {
     id?: string;
@@ -534,6 +543,8 @@ export interface Attempt {
   code_changed_during_run?: boolean;
 }
 export interface Run {
+  resume?: boolean;
+  resume_source?: ResumeSource;
   training_gpu_policy?: TrainingGpuPolicy | null;
   normalization_method?: TrainingNormalizationMethod | null;
   owner_user_id?: string | null;
@@ -589,6 +600,7 @@ export interface TrainingGpuPolicy {
   memory_mb: number;
 }
 export interface RunRequest {
+  resume?: boolean;
   training_gpu_policy?: TrainingGpuPolicy;
   normalization_method?: TrainingNormalizationMethod;
   auto_config?: AutoTrainingConfig;

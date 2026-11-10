@@ -23,6 +23,7 @@ from .models import Allocation, Asset, Attempt, Command, Event, Node, Preview, P
 from .norm_outputs import norm_outputs_error, reconcile_norm_outputs
 from .model_norm_outputs import bind_model_norm_outputs, model_norm_outputs_error
 from .scheduler import enqueue, resolve_inputs
+from .training_resume import resume_preflight_error
 
 
 def get_required(session, model, identifier, label="Record"):
@@ -398,6 +399,8 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
     plan = evidence.get("plan")
     if not isinstance(plan, dict) or evidence.get("plan_digest") != canonical_digest(plan):
         return {"code": "AGENT_PREFLIGHT_INVALID", "message": "Agent 自动预检计划不完整或摘要不一致，请重新预检"}
+    if error := resume_preflight_error(session, request, snapshot, plan, checks):
+        return error
     definition = request.get("recipe_definition")
     resolved_inputs = resolve_inputs(session, request)
     expected = {"recipe": request["recipe"], "recipe_definition_digest": definition["digest"] if definition else None,

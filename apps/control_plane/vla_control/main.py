@@ -66,6 +66,7 @@ from .background_tasks import register_routes as register_background_task_routes
 from .resource_history import capture_sample, register_routes as register_resource_history_routes
 from .run_records import delete_run_record, require_replayable_run, require_visible_run
 from .training_metrics import register_routes as register_training_metric_routes
+from .training_resume import freeze_resume_source
 from .deployment_records import register_routes as register_deployment_record_routes
 from .gpu_reservations import (register_routes as register_gpu_reservation_routes, request_owner,
                                require_gpu_access, reservation_owners)
@@ -533,6 +534,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             data["parameters"] = parameters
+            freeze_resume_source(session, node, data, parameters, request)
             # The asset description belongs to this preflight, not a later
             # asset edit or an Agent-supplied source snapshot. Legacy tasks
             # retain their original command shape when no profile is present.
@@ -565,6 +567,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             enqueue(session, node.id, "PREFLIGHT", {"preview_id": preview.id, "profile_id": body.profile_id,
                 "template_id": body.template_id, "recipe": data["recipe"], "inputs": resolve_inputs(session, data),
                 "parameters": parameters, "gpu_count": body.gpu_count, "entrypoint": data.get("entrypoint"),
+                **({"resume_source": data["resume_source"]} if data.get("resume_source") is not None else {}),
                 **({"requested_gpu_uuids": data["requested_gpu_uuids"]} if data.get("requested_gpu_uuids") is not None else {}),
                 **({"training_gpu_policy": data["training_gpu_policy"]} if data.get("training_gpu_policy") is not None else {}),
                 **({"auto_config": data["auto_config"]} if data.get("auto_config") is not None else {}),
@@ -632,7 +635,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             data = preview.request
             if "recipe" not in data:
                 raise APIError(409, "AGENT_RECIPE_UNSUPPORTED", "旧版预检未绑定训练配方，请更新 Agent 后重新预检")
-            node, profile, _ = validate_request(session, data, frozen=True)
+            node, profile, parameters = validate_request(session, data, frozen=True)
+            freeze_resume_source(session, node, data, parameters, request, frozen=True)
             require_no_pending_writeback(session, node.id, profile.code_dir)
             if not valid_snapshot(preview.code_snapshot):
                 raise APIError(409, "CODE_VERSION_UNAVAILABLE", "预检未记录完整代码版本，请重新预检")
@@ -654,7 +658,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if node.last_seen < offset_time(-settings.heartbeat_timeout_seconds):
                 raise APIError(409, "NODE_OFFLINE", "Node heartbeat has expired")
             created = now()
-            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "norm_datasets", "training_stage", "stage_config", "dataset_profiles", "auto_config", "normalization_method", "training_gpu_policy"}}
+            run_fields = {key: value for key, value in data.items() if key not in {"recipe", "recipe_revision_id", "recipe_definition", "entrypoint", "dataset_bindings", "norm_datasets", "training_stage", "stage_config", "dataset_profiles", "auto_config", "normalization_method", "training_gpu_policy", "resume", "resume_source"}}
             expectation = {key: deepcopy(value) for key, value in preview.code_snapshot.items() if key != "dataset_profiles"}
             if data["template_id"] in {"openpi-sft", "recap", "openpi-norm"}:
                 expectation["confirmed_config_sha256"] = body.confirmed_config_sha256
@@ -665,6 +669,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 expectation["requested_gpu_uuids"] = deepcopy(data["requested_gpu_uuids"])
             if data.get("training_gpu_policy") is not None:
                 expectation["training_gpu_policy"] = deepcopy(data["training_gpu_policy"])
+            if data.get("resume_source") is not None:
+                expectation["resume_source"] = deepcopy(data["resume_source"])
             if data["template_id"] == "openpi-norm":
                 from .norm_outputs import BINDING_EXPECTATIONS, freeze_norm_bindings
                 expectation[BINDING_EXPECTATIONS] = freeze_norm_bindings(session, data["inputs"], node.id)

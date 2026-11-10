@@ -189,6 +189,7 @@ class PreviewInput(InputModel):
     node_id: str
     profile_id: str
     template_id: str
+    resume: bool = Field(default=False, strict=True)
     training_stage: Literal["value", "offline_rl"] | None = None
     stage_config: dict | None = None
     auto_config: dict | None = None

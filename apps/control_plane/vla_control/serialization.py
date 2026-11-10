@@ -98,6 +98,9 @@ def run_dict(session, run):
         result["normalization_method"] = run.code_expectation["normalization_method"]
     if run.code_expectation.get("training_gpu_policy") is not None:
         result["training_gpu_policy"] = run.code_expectation["training_gpu_policy"]
+    if run.code_expectation.get("resume_source") is not None:
+        result["resume"] = True
+        result["resume_source"] = run.code_expectation["resume_source"]
     result["confirmed_config_sha256"] = run.code_expectation.get("confirmed_config_sha256")
     result["attempts"] = [attempt_dict(a) for a in attempts]
     ids = [a.id for a in attempts]

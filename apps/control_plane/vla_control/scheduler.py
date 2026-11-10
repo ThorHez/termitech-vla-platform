@@ -21,6 +21,7 @@ from .dataset_inspections import expire_pending as expire_dataset_inspections
 from .recipe_writeback import pending_for_checkout
 from .remote_models import RemoteDeployment
 from .settings import Settings
+from .training_resume import queued_resume_error
 from .gpu_selection import requested_gpu_uuids
 from .gpu_reservations import reservation_owners
 from .account_lifecycle import lock_execution_guard, training_execution_authorized
@@ -130,6 +131,10 @@ def tick(db: Database, settings: Settings) -> int:
                     run.error = {"code": "INPUT_UNAVAILABLE", "message": "An input asset is no longer available"}
                     run.queue_reason = None
                     continue
+                if error := queued_resume_error(session, node, run):
+                    run.state, run.finished_at, run.updated_at = "FAILED", now(), now()
+                    run.error, run.queue_reason = error, None
+                    continue
                 try:
                     requested = requested_gpu_uuids(run.requested_gpu_uuids, run.gpu_count)
                 except ValueError:
@@ -169,6 +174,7 @@ def tick(db: Database, settings: Settings) -> int:
                     "inputs": resolve_inputs(session, run), "parameters": run.parameters,
                     "gpu_uuids": chosen, "code_expectation": run.code_expectation,
                     "entrypoint": run.code_expectation.get("requested_entrypoint"),
+                    **({"resume_source": run.code_expectation["resume_source"]} if run.code_expectation.get("resume_source") is not None else {}),
                     **({"training_gpu_policy": policy} if policy is not None else {}),
                     **({"auto_config": run.code_expectation["auto_config"]} if run.code_expectation.get("auto_config") is not None else {}),
                     **({"normalization_method": run.code_expectation["normalization_method"]} if run.code_expectation.get("normalization_method") is not None else {}),

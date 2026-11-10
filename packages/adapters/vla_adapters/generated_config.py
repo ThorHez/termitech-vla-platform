@@ -7,6 +7,7 @@ import json
 import math
 import pprint
 import re
+from itertools import islice
 from pathlib import Path
 
 if __package__:
@@ -115,6 +116,36 @@ def _resolved_digest(config, output_root):
     return hashlib.sha256(encoded).hexdigest()
 
 
+def configuration_snapshot(config):
+    """Bounded dataclass projection; factories/functions remain labelled objects."""
+    count = 0
+
+    def convert(value, depth=0):
+        nonlocal count
+        count += 1
+        if count > 5000 or depth > 8:
+            return {"unresolved": "projection_limit"}
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else {"unresolved": "non_finite"}
+        if isinstance(value, str):
+            return value[:4096]
+        if isinstance(value, Path):
+            return str(value)[:4096]
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return {"_type": type(value).__module__ + "." + type(value).__qualname__,
+                    **{field.name: convert(getattr(value, field.name), depth + 1) for field in dataclasses.fields(value)[:128]}}
+        if isinstance(value, (tuple, list)):
+            return {"items": [convert(item, depth + 1) for item in value[:128]], "truncated": len(value) > 128}
+        if isinstance(value, dict):
+            return {str(key)[:255]: convert(item, depth + 1) for key, item in islice(value.items(), 128)
+                    if isinstance(key, (str, int))}
+        return {"_type": type(value).__module__ + "." + type(value).__qualname__, "unresolved": "code_object"}
+
+    return {"schema_version": 1, "scope": "post_merge_dataclass_before_data_factory_execution", "configuration": convert(config)}
+
+
 def generated_training_config(config, spec, *, entrypoint=None):
     """Expose resolved values and a faithful builder without serializing code.
 
@@ -131,6 +162,8 @@ def generated_training_config(config, spec, *, entrypoint=None):
     explicit_fields.update(spec.get("stage_config") or {})
     if spec.get("normalization_method") is not None:
         explicit_fields.add("normalization_method")
+    if spec.get("resume_source") is not None:
+        explicit_fields.add("resume_checkpoint")
 
     def review_fields(value, path):
         """Show active overrides and required constructors, without task noise."""
@@ -180,7 +213,7 @@ def generated_training_config(config, spec, *, entrypoint=None):
     # Keep the complete validated request needed by prepare_config. Exclude the
     # runtime attempt path and digest (which would otherwise be self-referential).
     keys = ("code_dir", "recipe", "inputs", "parameters", "gpu_count", "dataset_bindings", "auto_config",
-            "recipe_definition", "entrypoint", "template_id", "training_stage", "stage_config", "allowed_roots")
+            "recipe_definition", "entrypoint", "template_id", "training_stage", "stage_config", "allowed_roots", "resume_source")
     frozen = {key: spec[key] for key in keys if key in spec}
     if spec.get("normalization_method") is not None:
         frozen["normalization_method"] = spec["normalization_method"]

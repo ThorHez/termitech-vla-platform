@@ -22,6 +22,7 @@ from vla_adapters.runtime_options import validate_generated_normalization_method
 from vla_protocol import canonical_digest
 from vla_protocol.config_preview import validate_generated_config
 from vla_protocol.training_gpu_policy import normalize_training_gpu_policy
+from vla_protocol.training_resume import validate_resume_evidence
 
 from .metrics import gpu_inventory
 from .output_isolation import validate_output_isolation
@@ -258,6 +259,8 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
         required = {"recipe_configuration", "data_contract", "dataset_timestamps", "dataset_samples", "norm_contract", "model_checkpoint", "training_entrypoint", "training_cache"}
         if spec.get("training_stage") is not None:
             required.add("recap_stage")
+        if spec.get("resume_source") is not None:
+            required.add("resume_checkpoint")
         if not required.issubset({check["name"] for check in detailed if check["ok"]}):
             raise ValueError("missing required validation checks")
         plan = response.get("plan")
@@ -265,6 +268,7 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
             raise ValueError("missing resolved execution plan")
         validate_sample_evidence(plan)
         validate_generated_config(plan.get("generated_config"))
+        validate_resume_evidence(plan, spec.get("resume_source"))
         if canonical_digest(plan.get("auto_config")) != canonical_digest(spec.get("auto_config")):
             raise ValueError("resolved execution plan does not match automatic configuration")
         if plan.get("normalization_method") != spec.get("normalization_method"):

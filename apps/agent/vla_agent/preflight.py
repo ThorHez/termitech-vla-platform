@@ -6,6 +6,7 @@ from vla_adapters import build_launch
 from vla_adapters.dataset_bindings import validate_binding_assets
 from vla_adapters.norm_datasets import validate_norm_assets, validate_norm_configuration
 from vla_adapters.recap import validate_training_stage
+from vla_adapters.resume import normalize_resume_source
 from vla_adapters.runtime_options import normalize_normalization_method
 
 from .config import get_profile
@@ -18,6 +19,15 @@ from .training_gpu import requested_training_gpus, training_gpu_evidence, valida
 
 
 def validate_local_inputs(config: dict, payload: dict) -> tuple[dict, dict]:
+    try:
+        resume = normalize_resume_source(payload.get("resume_source"), payload.get("inputs", {}),
+            template_id=payload["template_id"], entrypoint=payload.get("entrypoint"))
+    except ValueError as exc:
+        raise AgentError(str(exc).split(":", 1)[0], str(exc)) from exc
+    if resume is not None:
+        source_output = allowed_path(resume["output_dir"], config["roots"])
+        if str(source_output) != resume["output_dir"] or not source_output.is_dir():
+            raise AgentError("RESUME_SOURCE_INVALID", "续训来源任务目录不可用或使用了链接")
     if payload["template_id"] == "openpi-norm":
         try:
             validate_norm_assets(payload.get("norm_datasets"), payload.get("inputs", {}))
@@ -97,7 +107,7 @@ def _run_preflight(config: dict, payload: dict) -> dict:
         output = str(Path(config["output_root"]) / "preflight-placeholder")
         count = payload.get("gpu_count", 0)
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), output,
-                              [f"preflight-gpu-{i}" for i in range(count)], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
+                              [f"preflight-gpu-{i}" for i in range(count)], recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}), **({"resume_source": payload["resume_source"]} if payload.get("resume_source") is not None else {}))
         checks.append({"name": "adapter", "ok": True, "message": "Template and trusted runtime configuration validated"})
         if profile.get("adapter") != "smoke":
             launch = prepare_launch(launch, config, payload.get("inputs", {}))

@@ -62,6 +62,27 @@ try {
     assert.ok(Number.isNaN(parameters.editTrainingParameter(source, 'steps', '', { type: 'integer' }).steps));
   });
 
+  await test('learning rate fields display scientific notation and preserve numeric values', () => {
+    const { formatLearningRate, editTrainingParameter, trainingParameterErrors } = parameters;
+    const defaults = parameters.trainingParameterDefaults(allSpecs);
+    assert.equal(formatLearningRate(0.000025), '2.5e-5');
+    assert.equal(formatLearningRate(0.0000025), '2.5e-6');
+    assert.equal(formatLearningRate(0), '0');
+    assert.equal(formatLearningRate(undefined), '');
+    const peak = editTrainingParameter(defaults, 'learning_rate', '2.5e-5', allSpecs.learning_rate);
+    const final = editTrainingParameter(peak, 'decay_lr', '0.0000025', allSpecs.decay_lr);
+    assert.equal(final.learning_rate, 0.000025);
+    assert.equal(final.decay_lr, 0.0000025);
+    assert.deepEqual(trainingParameterErrors(final, allSpecs, 4), []);
+    for (const text of ['2.5e-', '2.5e', '0x1', '1e999']) {
+      const invalid = editTrainingParameter(final, 'decay_lr', text, allSpecs.decay_lr);
+      assert.ok(trainingParameterErrors(invalid, allSpecs, 4).some(issue => issue.key === 'decay_lr'));
+    }
+    assert.equal(editTrainingParameter(final, 'decay_lr', '0', allSpecs.decay_lr).decay_lr, 0);
+    assert.ok(!Object.hasOwn(editTrainingParameter(final, 'decay_lr', '', allSpecs.decay_lr), 'decay_lr'));
+    assert.match(parameters.trainingParameterHint('learning_rate', allSpecs.learning_rate, true, final, false), /配方参考值：2\.5e-5/);
+  });
+
   await test('controls explain their concrete initial values and real recipe references', () => {
     const spec = { ...optional, hint: '0 表示在主进程读取数据。' };
     assert.match(parameters.trainingParameterHint('num_workers', spec, false, {}, false), /已填入初始值/);

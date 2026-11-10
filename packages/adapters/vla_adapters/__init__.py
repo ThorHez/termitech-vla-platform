@@ -11,6 +11,7 @@ from .norm_datasets import normalize_norm_datasets, validate_norm_assets, valida
 from .recap import recap_stages, runtime_adapter_for, validate_training_stage
 from .automatic_config import automatic_recipe_name, normalize_auto_config
 from .runtime_options import RUNTIME_PARAMETER_RULES, normalize_normalization_method, validate_runtime_parameter_relations
+from .resume import normalize_resume_source
 
 
 def get_templates() -> list[dict]:
@@ -110,7 +111,8 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
                  dataset_bindings: list[dict] | None = None,
                  training_stage: str | None = None, stage_config: dict | None = None,
                  auto_config: dict | None = None, normalization_method: str | None = None,
-                 norm_datasets: list[dict] | None = None, training_gpu_policy: dict | None = None) -> dict:
+                 norm_datasets: list[dict] | None = None, training_gpu_policy: dict | None = None,
+                 resume_source: dict | None = None) -> dict:
     """Build argv; Agent preflight and launch recheck validate the selected recipe."""
     from .recipe_definitions import recipe_parameters, resolve_definition
     from vla_protocol.training_gpu_policy import normalize_training_gpu_policy
@@ -131,6 +133,7 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
         if training_stage == "value" and auto_config["finetune_mode"] == "lora":
             raise ValueError("AUTO_CONFIG_UNSUPPORTED: 自动价值训练暂不支持 LoRA，请选择全量微调")
     entrypoint = validate_entrypoint(entrypoint)
+    resume_source = normalize_resume_source(resume_source, inputs, template_id=template_id, entrypoint=entrypoint)
     dataset_bindings = validate_binding_assets(dataset_bindings, inputs)
     if auto_config is not None and template_id != "openpi-norm" and (not dataset_bindings or any("processor" not in row for row in dataset_bindings)):
         raise ValueError("AUTO_CONFIG_PROCESSOR_REQUIRED: 自动配置要求每组数据使用独立数据处理器")
@@ -204,6 +207,8 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
             spec["auto_config"] = auto_config
         if normalization_method is not None:
             spec["normalization_method"] = normalization_method
+        if resume_source is not None:
+            spec.update(template_id=template_id, resume_source=resume_source)
         argv = [python, "-u", str(wrapper), "--spec-json", json.dumps(spec, ensure_ascii=False)]
     return {"argv": argv, "cwd": str(code_dir), "env": {
         "CUDA_VISIBLE_DEVICES": ",".join(gpu_uuids), "PYTHONUNBUFFERED": "1",

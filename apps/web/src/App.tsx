@@ -31,6 +31,7 @@ import RunDetail from './RunDetail';
 import { AssetTransferTaskDetail } from './AssetTransfers';
 import { backgroundTaskActiveCounts } from './backgroundTaskEntries';
 import RunWizard from './RunWizard';
+import { ResumeTrainingWizard } from './ResumeTrainingWizard';
 import PolicyDeployments from './PolicyDeployments';
 import { ThemeControl, ThemeProvider, ThemeSettings } from './theme';
 import type { Run } from './types';
@@ -78,7 +79,12 @@ function Shell() {
   const path = route.split('?')[0];
   const queryParams = new URLSearchParams(route.split('?')[1] || '');
   const [mobileNav, setMobileNav] = useState(false);
-  const [wizard, setWizard] = useState<{ nodeId?: string; templateId?: string; sourceRun?: Run }>();
+  const [wizard, setWizard] = useState<{
+    nodeId?: string;
+    templateId?: string;
+    sourceRun?: Run;
+    resume?: boolean;
+  }>();
   const { overview, alerts, runs, assetTransfers, refresh } = useData();
   const activeTasks = backgroundTaskActiveCounts(runs.data, assetTransfers.data);
   const taskCountsReady = runs.data !== undefined && assetTransfers.data !== undefined;
@@ -259,7 +265,10 @@ function Shell() {
                 nodeFilter={queryParams.get('node') || undefined}
               />
             ) : path === '/templates' ? (
-              <TemplatesPage createRun={createRun} />
+              <TemplatesPage
+                createRun={createRun}
+                resumeTraining={() => setWizard({ resume: true })}
+              />
             ) : path === '/runs' ? (
               <RunsPage createRun={() => createRun()} />
             ) : path.startsWith('/runs/sync/') ? (
@@ -273,6 +282,9 @@ function Shell() {
                 id={decodeURIComponent(path.slice('/runs/'.length))}
                 onRetry={(sourceRun) => {
                   if (can('training.write')) setWizard({ sourceRun });
+                }}
+                onResume={(sourceRun) => {
+                  if (can('training.write')) setWizard({ sourceRun, resume: true });
                 }}
               />
             ) : path === '/deployments' || path.startsWith('/deployments/') ? (
@@ -302,15 +314,19 @@ function Shell() {
           </footer>
         </div>
       </div>
-      {wizard && can('training.write') && (
-        <RunWizard
-          key={wizard.sourceRun?.id || 'new-training'}
-          initialNode={wizard.nodeId}
-          initialTemplate={wizard.templateId}
-          sourceRun={wizard.sourceRun}
-          close={() => setWizard(undefined)}
-        />
-      )}
+      {wizard &&
+        can('training.write') &&
+        (wizard.resume ? (
+          <ResumeTrainingWizard sourceRun={wizard.sourceRun} close={() => setWizard(undefined)} />
+        ) : (
+          <RunWizard
+            key={wizard.sourceRun?.id || 'new-training'}
+            initialNode={wizard.nodeId}
+            initialTemplate={wizard.templateId}
+            sourceRun={wizard.sourceRun}
+            close={() => setWizard(undefined)}
+          />
+        ))}
     </div>
   );
 }

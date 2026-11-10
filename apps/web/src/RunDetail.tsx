@@ -40,7 +40,7 @@ import { stageParameterLabels, trainingStageLabels } from './recap';
 import type { Asset, Logs, Run, RunEvent } from './types';
 import { deployableOutputs, sourceDeploymentBlocker } from './policyDeployment';
 import { TrainingMetrics } from './TrainingMetrics';
-import { retryableRun } from './runRetry';
+import { resumeCheckpoints, retryableRun } from './runRetry';
 import { requestedGpuSummary } from './trainingGpuSelection';
 import { trainingGpuPolicySummary } from './trainingGpuPolicy';
 import { RunDeleteAction } from './RunDeleteAction';
@@ -81,11 +81,20 @@ function outputStep(output: Asset) {
   return typeof step === 'number' && Number.isFinite(step) ? step : -1;
 }
 
-export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run: Run) => void }) {
+export default function RunDetail({
+  id,
+  onRetry,
+  onResume,
+}: {
+  id: string;
+  onRetry?: (run: Run) => void;
+  onResume?: (run: Run) => void;
+}) {
   const { can, user } = useAuth();
   const { nodes, templates, assets, refresh } = useData();
   const detail = useApi<Run>(`/runs/${id}`, 3000);
   const run = detail.data?.id === id ? detail.data : undefined;
+  const resumeSource = run?.resume_source ?? run?.code_expectation?.resume_source;
   const canManage = can('training.write') && canManageResource(user, run?.owner_user_id);
   const live = !run || !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(run.state);
   const events = useRunFeed<RunEvent>(`/runs/${id}/events`, 'events', live);
@@ -169,6 +178,13 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                   {run.state === 'FAILED' ? '重新配置并启动' : '重新训练'}
                 </button>
               )}
+              {onResume &&
+                can('training.write') &&
+                resumeCheckpoints(run, user?.id ?? '', user?.role === 'admin').length > 0 && (
+                  <button type="button" className="button outline" onClick={() => onResume(run)}>
+                    从检查点续训
+                  </button>
+                )}
               {can('training.write') &&
                 run.template_id === 'openpi-sft' &&
                 deployableOutputs(run).length > 0 &&
@@ -242,6 +258,12 @@ export default function RunDetail({ id, onRetry }: { id: string; onRetry?: (run:
                   训练模板
                 </span>
                 <strong>{template?.name || run.template_id}</strong>
+                {resumeSource && (
+                  <a href={`#/runs/${encodeURIComponent(resumeSource.run_id)}`}>
+                    续训来源 · 检查点 {resumeSource.step}
+                    <ExternalLink size={12} />
+                  </a>
+                )}
               </div>
               <div>
                 <span>

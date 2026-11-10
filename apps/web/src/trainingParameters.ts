@@ -126,6 +126,23 @@ export function optionalTrainingParameter(spec: ParameterSpec): boolean {
   return spec.optional === true || spec.required === false;
 }
 
+export function isLearningRateParameter(key: string): boolean {
+  return key === 'learning_rate' || key === 'decay_lr';
+}
+
+export function formatLearningRate(value: number | undefined): string {
+  if (value === undefined || !Number.isFinite(value)) return '';
+  return value === 0 ? '0' : value.toExponential();
+}
+
+export function parseLearningRate(text: string, required: boolean): number | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return required ? NaN : undefined;
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(trimmed)) return NaN;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : NaN;
+}
+
 /** Clearing an override restores inheritance; an incomplete required value stays invalid. */
 export function editTrainingParameter(
   parameters: Record<string, number>,
@@ -134,8 +151,12 @@ export function editTrainingParameter(
   spec: ParameterSpec,
 ): Record<string, number> {
   const next = { ...parameters };
-  if (text === '' && optionalTrainingParameter(spec)) delete next[key];
-  else next[key] = text === '' ? NaN : Number(text);
+  const required = !optionalTrainingParameter(spec);
+  let value: number | undefined;
+  if (isLearningRateParameter(key)) value = parseLearningRate(text, required);
+  else if (text !== '' || required) value = text === '' ? NaN : Number(text);
+  if (value === undefined) delete next[key];
+  else next[key] = value;
   return next;
 }
 
@@ -150,10 +171,10 @@ export function trainingParameterHint(
     fsdp_devices: '推荐跟随申请的 GPU 数量；手动分片数须能整除申请的 GPU 数量。',
     steps: '本次训练执行的总步数。',
     batch_size: '全局批次大小，须为申请 GPU 数量的整数倍。',
-    learning_rate: '学习率预热后的峰值。',
+    learning_rate: '学习率预热后的峰值，例如 2.5e-5。',
     warmup_steps: '学习率增长到峰值的预热步数。',
     decay_steps: '学习率计划的总衰减步数，必须大于预热步数。',
-    decay_lr: '衰减结束时的学习率，不能大于峰值学习率。',
+    decay_lr: '衰减结束时的学习率，例如 2.5e-6，不能大于峰值学习率。',
     clip_gradient_norm: '梯度范数裁剪阈值，必须大于 0。',
     ema_decay: '模型参数指数滑动平均的衰减系数，范围为 0 ≤ EMA < 1。',
     save_interval: '每隔多少训练步保存一次检查点。',
@@ -162,7 +183,7 @@ export function trainingParameterHint(
   };
   const source =
     advanced && Object.hasOwn(recipeDefaults, key)
-      ? `配方参考值：${recipeDefaults[key]}；本次训练使用输入框中的数值。`
+      ? `配方参考值：${isLearningRateParameter(key) ? formatLearningRate(recipeDefaults[key]) : recipeDefaults[key]}；本次训练使用输入框中的数值。`
       : edited
         ? '当前为本次训练设置。'
         : '已填入初始值，可直接修改。';

@@ -19,7 +19,7 @@ from pathlib import Path
 
 if __package__:
     from .automatic_config import normalize_auto_config
-    from .generated_config import generated_training_config
+    from .generated_config import configuration_snapshot, generated_training_config
     from .image_runtime import image_processing_contract
     from .composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from .cache_contract import inspect_training_cache
@@ -31,10 +31,11 @@ if __package__:
     from .submission_validation import MODE, require_cached_dataset_source, submission_evidence
     from .entrypoints import read_entrypoint, validate_entrypoint
     from .recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
+    from .resume import normalize_resume_source
     from .runtime_options import normalize_normalization_method
 else:
     from automatic_config import normalize_auto_config
-    from generated_config import generated_training_config
+    from generated_config import configuration_snapshot, generated_training_config
     from image_runtime import image_processing_contract
     from composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from cache_contract import inspect_training_cache
@@ -46,6 +47,7 @@ else:
     from submission_validation import MODE, require_cached_dataset_source, submission_evidence
     from entrypoints import read_entrypoint, validate_entrypoint
     from recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
+    from resume import normalize_resume_source
     from runtime_options import normalize_normalization_method
 
 
@@ -138,6 +140,12 @@ def training_entrypoint(config, spec):
     if multi and entry == (code / "scripts/train.py").resolve():
         raise ValueError("ENTRYPOINT_RECIPE_MISMATCH: 此配方包含多个数据集，请选择 scripts/train_multi_dataset.py 或兼容的混采入口")
     tree = ast.parse(read_entrypoint(entry))
+    if spec.get("resume_source") is not None and (entry != code / "scripts/train.py" or not any(
+            isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+                and target.id == "PLATFORM_CHECKPOINT_RESUME_VERSION" for target in node.targets)
+            and isinstance(node.value, ast.Constant) and type(node.value.value) is int and node.value.value == 1
+            for node in tree.body)):
+        raise ValueError("RESUME_UNSUPPORTED: 标准 SFT 入口未声明支持读取独立续训检查点，请升级训练代码")
     main = next((node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main"), None)
     init = any(isinstance(node, (ast.FunctionDef, ast.Assign, ast.ImportFrom)) and
                (getattr(node, "name", None) == "init_wandb" or
@@ -639,6 +647,75 @@ def model_contract(spec):
             "parameter_bytes": parameter_bytes, "file_manifest_digest": manifest}, total_bytes
 
 
+def resume_checkpoint_contract(config, spec, model, datasets):
+    """Verify read-only source evidence in both preflight and launch plans."""
+    source = normalize_resume_source(spec.get("resume_source"), spec["inputs"], template_id=spec.get("template_id"),
+                                     entrypoint=spec.get("entrypoint"))
+    if source is None:
+        return {}
+    if (getattr(config, "resume_checkpoint", None) != source["path"] or config.resume or config.overwrite
+            or hasattr(config.data, "datasets") or len(datasets) != 1):
+        raise ValueError("RESUME_UNSUPPORTED: 续训需要绑定标准单数据集 SFT 和独立输出目录")
+    checkpoint, output = Path(source["path"]), Path(source["output_dir"])
+    if model["checkpoint_path"] != str(checkpoint) or model["path"] != str(checkpoint / "params"):
+        raise ValueError("RESUME_CHECKPOINT_INVALID: 续训需要包含 params 和 train_state 的完整检查点")
+    try:
+        metadata_path = checkpoint / "_CHECKPOINT_METADATA"
+        train_state = checkpoint / "train_state"
+        if local_path(metadata_path, spec) != metadata_path or local_path(train_state, spec) != train_state:
+            raise ValueError("续训检查点的提交记录和 train_state 不可使用符号链接")
+        metadata, metadata_sha = read_json(metadata_path, spec, limit=1024 * 1024)
+        committed = metadata.get("commit_timestamp_nsecs")
+        if type(committed) is not int or committed <= 0:
+            raise ValueError("Orbax 尚未提交检查点")
+        _, state_sha = read_json(train_state / "_METADATA", spec)
+        rows, state_bytes, state_manifest = file_manifest(train_state, spec)
+        names = {row[0] for row in rows if row[1] > 0}
+        if "manifest.ocdbt" not in names or not any(name.startswith("d/")
+                or re.fullmatch(r"ocdbt\.process_[^/]+/d/.+", name) for name in names):
+            raise ValueError("train_state 缺少非空 Orbax 张量分片或清单")
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"RESUME_CHECKPOINT_INVALID: 续训需要完整且已提交的训练检查点：{exc}") from exc
+    try:
+        source_config = output / "effective_training.json"
+        if local_path(source_config, spec) != source_config:
+            raise ValueError("原配置不可使用符号链接")
+        recorded, config_sha = read_json(source_config, spec)
+        previous = recorded["configuration"]
+        plan = recorded["execution_plan"]
+        old_datasets = plan["datasets"]
+        if (recorded.get("schema_version") != 1
+                or recorded.get("scope") != "post_merge_dataclass_before_data_factory_execution"
+                or not isinstance(previous, dict) or recorded.get("execution_plan_digest") != fingerprint(plan)
+                or not isinstance(old_datasets, list) or len(old_datasets) != 1 or not isinstance(old_datasets[0], dict)
+                or plan.get("normalization", {}).get("mode") != "per_dataset"
+                or plan.get("requested_entrypoint") is not None
+                or not isinstance(plan.get("entrypoint"), str) or not plan["entrypoint"].endswith("/scripts/train.py")
+                or previous.get("name") != checkpoint.parent.parent.name or previous.get("exp_name") != "platform"
+                or previous.get("checkpoint_base_dir") != str(output / "checkpoints")
+                or type(previous.get("num_train_steps")) is not int or previous["num_train_steps"] <= source["step"]):
+            raise ValueError("原任务缺少与检查点一致的单数据集 SFT 配置证据")
+    except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"RESUME_SOURCE_CONFIG_INVALID: 无法核对续训来源的原始有效配置：{exc}") from exc
+    current = configuration_snapshot(config)["configuration"]
+    allowed_changes = {"num_train_steps", "checkpoint_base_dir", "weight_loader", "resume_checkpoint"}
+    if fingerprint({key: value for key, value in previous.items() if key not in allowed_changes}) != fingerprint(
+            {key: value for key, value in current.items() if key not in allowed_changes}):
+        raise ValueError("RESUME_CONFIG_MISMATCH: 续训必须沿用原任务的模型、优化器、学习率和其他有效配置")
+    old, new = old_datasets[0], datasets[0]
+    required = ("dataset_asset_id", "norm_asset_id", "path", "metadata_sha256", "data_manifest_digest",
+                "norm_path", "norm_sha256")
+    stable = (*required, "effective_fps", "video_manifest_digest", "image_processing")
+    if (any(not isinstance(old.get(key), str) or not old[key] for key in required)
+            or any(old.get(key) != new.get(key) for key in stable)):
+        raise ValueError("RESUME_DATA_MISMATCH: 续训必须沿用原任务的数据集和归一化统计，且文件证据一致")
+    return {"resume_source": source, "resume_checkpoint": {"checkpoint_metadata_sha256": metadata_sha,
+        "commit_timestamp_nsecs": committed, "params_manifest_digest": model["file_manifest_digest"],
+        "train_state_metadata_sha256": state_sha, "train_state_manifest_digest": state_manifest,
+        "train_state_bytes": state_bytes, "source_effective_config_sha256": config_sha,
+        "source_execution_plan_digest": recorded["execution_plan_digest"]}}
+
+
 def storage_estimate(config, model, reference_bytes):
     # Existing train_state provides the best local estimate. A params-only input
     # needs a conservative allowance for optimizer state and EMA as well.
@@ -754,6 +831,9 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
     model["asset_id"] = spec["inputs"]["model"].get("id")
     passed("model_checkpoint", f"Orbax 权重元数据与文件清单有效：{model['path']}")
     entry = training_entrypoint(config, spec)
+    resume = resume_checkpoint_contract(config, spec, model, datasets)
+    if resume:
+        passed("resume_checkpoint", f"已核对原任务配置、训练状态和检查点：{resume['resume_source']['path']}")
     passed("training_entrypoint", str(entry))
     roots = spec.get("allowed_roots")
     if not isinstance(roots, list) or not roots:
@@ -764,6 +844,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "dataset_fps_policy": resolve_registered_fps(spec),
             "dataset_fps_runtime": fps_runtime if fps_runtime and fps_runtime.get("installed") is True else None,
             "generated_config": generated_training_config(config, spec, entrypoint=entry),
+            **resume,
             **({"auto_config": normalize_auto_config(spec["auto_config"])} if spec.get("auto_config") is not None else {}),
             **({"normalization_method": requested_method} if requested_method is not None else {}),
             **({"training_gpu_policy": spec["training_gpu_policy"]} if spec.get("training_gpu_policy") is not None else {}),
@@ -776,7 +857,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "parameters": spec["parameters"], "gpu_count": spec["gpu_count"], "entrypoint": str(entry),
             "entrypoint_sha256": hashlib.sha256(read_entrypoint(entry)).hexdigest(),
             "adapter_sha256": fingerprint({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "submission_validation.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py", "image_policy.py", "image_runtime.py")}),
+                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "submission_validation.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py", "image_policy.py", "image_runtime.py", "resume.py")}),
             "data_validation_mode": MODE, "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),

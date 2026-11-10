@@ -1,5 +1,44 @@
 import { api, post } from './api';
-import type { Asset, DatasetSourceValidation, Node, Profile } from './types';
+import type { Asset, DatasetSourceValidation, Node, Preview, Profile } from './types';
+
+export const DATASET_BASE_VALIDATION_REQUIRED = 'DATASET_BASE_VALIDATION_REQUIRED';
+
+function validationPath(path: string) {
+  const parts = path.split('/');
+  if (!path.startsWith('/') || parts.includes('..') || /[\r\n\0]/u.test(path)) return undefined;
+  return `/${parts.filter((part) => part && part !== '.').join('/')}`;
+}
+
+export function preflightValidationAsset(preview: Preview, assets: readonly Asset[]) {
+  const request = preview.request;
+  if (
+    preview.status !== 'FAILED' ||
+    preview.error?.code !== DATASET_BASE_VALIDATION_REQUIRED ||
+    !request?.profile_id
+  )
+    return undefined;
+  // Older Agents report the resolved path in the message. Match it only to
+  // dataset IDs frozen in this preview, never the mutable draft or a basename.
+  const message = preview.error.message?.replace(/^DATASET_BASE_VALIDATION_REQUIRED:\s*/u, '');
+  const match = message?.match(
+    /^数据集 (\/[^\r\n]*) (?:的基础校验证据缺失或已失效|缺少匹配的基础校验结果|的 ReCap 监督基础校验证据缺失或已失效)(?:[，；。]|$)/u,
+  );
+  const path = match && validationPath(match[1]);
+  if (!path) return undefined;
+  const boundIds = new Set(
+    Object.entries(request.inputs || {}).flatMap(([role, id]) =>
+      /^dataset(?:_\d+)?$/u.test(role) ? [id] : [],
+    ),
+  );
+  const candidates = assets.filter(
+    (asset) =>
+      asset.kind === 'DATASET' &&
+      asset.node_id === request.node_id &&
+      boundIds.has(asset.id) &&
+      validationPath(asset.path) === path,
+  );
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
 
 export function datasetValidationPresentation(report?: DatasetSourceValidation | null) {
   if (!report) return { state: 'REGISTERED', label: '尚未校验' };

@@ -8,6 +8,7 @@ import { validRequestedGpuList } from './trainingGpuSelection';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
 import { validTrainingGpuPolicy } from './trainingGpuPolicy';
 import type {
+  Asset,
   AutoTrainingConfig,
   DatasetBinding,
   NormDataset,
@@ -53,6 +54,64 @@ const numericControls = (value: unknown): Record<string, number> => {
 
 export function retryableRun(run: Pick<Run, 'state'>): boolean {
   return terminalStates.has(run.state);
+}
+
+export function resumeCheckpoints(run: Run, userId: string, admin: boolean): Asset[] {
+  if (
+    run.template_id !== 'openpi-sft' ||
+    !retryableRun(run) ||
+    (!admin && run.owner_user_id !== userId) ||
+    (run.dataset_bindings ?? run.code_expectation?.dataset_bindings ?? []).length > 1 ||
+    run.entrypoint ||
+    run.code_expectation?.requested_entrypoint
+  )
+    return [];
+  const attempts = new Set(
+    (run.attempts ?? [])
+      .filter(
+        (attempt) =>
+          terminalStates.has(attempt.state ?? attempt.status ?? '') &&
+          !attempt.code_changed_during_run,
+      )
+      .map((attempt) => attempt.id),
+  );
+  return (run.outputs ?? [])
+    .filter(
+      (asset) =>
+        asset.kind === 'MODEL' &&
+        asset.state === 'READY' &&
+        asset.node_id === run.node_id &&
+        !!asset.origin_attempt_id &&
+        attempts.has(asset.origin_attempt_id) &&
+        asset.metadata?.format === 'openpi-orbax' &&
+        typeof asset.metadata.step === 'number' &&
+        Number.isSafeInteger(asset.metadata.step) &&
+        asset.metadata.step >= 0,
+    )
+    .sort((a, b) => Number(b.metadata?.step) - Number(a.metadata?.step));
+}
+
+export function resumeTrainingRequest(
+  run: Run,
+  checkpoint: Asset,
+  steps: number,
+  name: string,
+): RunRequest {
+  const request = retryTrainingSnapshot(run).request;
+  const step = checkpoint.metadata?.step;
+  if (typeof step !== 'number' || !Number.isSafeInteger(steps) || steps <= step + 1)
+    throw new Error('续训目标总步数必须大于检查点已完成步数。');
+  if (!(run.dataset_bindings ?? run.code_expectation?.dataset_bindings)) {
+    delete request.dataset_bindings;
+    request.inputs = { dataset: assetId(run.inputs?.dataset), norm: assetId(run.inputs?.norm) };
+  }
+  return {
+    ...request,
+    name,
+    resume: true,
+    inputs: { ...request.inputs, model: checkpoint.id },
+    parameters: { ...request.parameters, steps },
+  };
 }
 
 export function retryTrainingName(name?: string): string {

@@ -1,4 +1,5 @@
 import { AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
+import { DATASET_BASE_VALIDATION_REQUIRED } from './datasetValidationHelpers';
 import type { PreflightCheck } from './types';
 
 const labels: Record<string, string> = {
@@ -13,6 +14,7 @@ const labels: Record<string, string> = {
   dataset_samples: '基础校验证据与数据处理配置',
   norm_contract: '归一化参数',
   model_checkpoint: '模型检查点',
+  resume_checkpoint: '续训检查点',
   training_entrypoint: '训练入口',
   norm_entrypoint: '统计脚本入口',
   training_cache: '训练缓存与数据加载权限',
@@ -43,9 +45,11 @@ export function sharedNormIncompatibilityDetail(message?: string) {
 export function PreflightChecks({
   checks,
   summarizedSharedNormError,
+  showDatasetValidationNotice,
 }: {
   checks: readonly PreflightCheck[];
   summarizedSharedNormError?: string;
+  showDatasetValidationNotice?: boolean;
 }) {
   return (
     <div className="preflight-checks">
@@ -58,11 +62,17 @@ export function PreflightChecks({
         const label = sharedNormDetail
           ? '数据集能否共用归一化参数'
           : labels[check.name] || check.name;
-        const message = sharedNormDetail
+        const summarizedDatasetValidation =
+          showDatasetValidationNotice &&
+          !check.ok &&
+          (check.code === DATASET_BASE_VALIDATION_REQUIRED ||
+            check.message?.startsWith(`${DATASET_BASE_VALIDATION_REQUIRED}:`));
+        const detail = sharedNormDetail
           ? check.message === summarizedSharedNormError
             ? '详见上方的失败原因。'
             : sharedNormDetail
           : check.message;
+        const message = summarizedDatasetValidation ? '请处理上方的数据集基础校验提示。' : detail;
         const status = !check.ok ? '未通过' : warning ? '警告' : '通过';
         return (
           <div

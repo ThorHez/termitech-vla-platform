@@ -2029,8 +2029,10 @@ const algorithmInfo: Record<string, { icon: typeof Workflow; color: string; text
 };
 export function TemplatesPage({
   createRun,
+  resumeTraining,
 }: {
   createRun: (nodeId?: string, templateId?: string) => void;
+  resumeTraining?: () => void;
 }) {
   const { can } = useAuth();
   const { templates, enabled } = useData();
@@ -2095,6 +2097,18 @@ export function TemplatesPage({
                 </div>
                 <footer>
                   <span className="tag mono">{template.id}</span>
+                  {can('training.write') &&
+                    template.id === 'openpi-sft' &&
+                    template.status === 'AVAILABLE' &&
+                    resumeTraining && (
+                      <button
+                        type="button"
+                        className="button outline small"
+                        onClick={resumeTraining}
+                      >
+                        从检查点续训
+                      </button>
+                    )}
                   {can('training.write') && (
                     <button
                       className={`button small ${template.status === 'AVAILABLE' ? 'outline' : 'ghost'}`}

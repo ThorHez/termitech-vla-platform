@@ -37,7 +37,7 @@ RECIPE_PART_PATHS = {f"{prefix}openpi/training/recipes/{method}.py"
 RECIPE_SOURCE_PATHS = SOURCE_PATHS | RECIPE_PART_PATHS
 LITERAL_ROOTS = {"data", "model", "optimizer", "lr_schedule"}
 _PROTECTED_FIELDS = {"name", "code_dir", "python", "entrypoint", "output_dir", "output_root", "checkpoint_base_dir",
-                     "exp_name", "resume", "overwrite", "wandb_enabled"}
+                     "exp_name", "resume", "resume_checkpoint", "overwrite", "wandb_enabled"}
 _FIELD_PATH = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:(?:\.[A-Za-z][A-Za-z0-9_]*)|(?:\[(?:0|[1-9][0-9]?)\]))*")
 _ASSET_FIELDS = {"repo_id", "repo_ids", "assets", "assets_dir", "asset_id", "asset_ids", "composition",
                  "norm_stats", "norm_stats_path", "norm_stats_dir", "norm_path", "norm_dir", "shared_norm_stats_path",

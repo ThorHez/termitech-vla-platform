@@ -118,6 +118,38 @@ try {
     for (const state of ['RUNNING', 'UNKNOWN', 'QUEUED', 'CANCELLING']) assert.equal(helper.retryableRun({ state }), false);
   });
 
+  await test('resume selects terminal owned SFT checkpoints and only changes source model and total steps', () => {
+    const source = fixture();
+    source.owner_user_id = 'operator';
+    source.dataset_bindings = source.dataset_bindings.slice(0, 1);
+    delete source.inputs.dataset_1;
+    delete source.inputs.norm_1;
+    source.attempts = [{ id: 'old-attempt', state: 'FAILED' }];
+    const checkpoint = { id: 'checkpoint', kind: 'MODEL', state: 'READY', node_id: 'node-a',
+      origin_attempt_id: 'old-attempt', metadata: { format: 'openpi-orbax', step: 9999 } };
+    source.outputs = [checkpoint, { ...checkpoint, id: 'removed', state: 'UNAVAILABLE' }];
+    assert.deepEqual(helper.resumeCheckpoints(source, 'operator', false), [checkpoint]);
+    assert.deepEqual(helper.resumeCheckpoints(source, 'someone-else', false), []);
+    assert.deepEqual(helper.resumeCheckpoints(source, 'administrator', true), [checkpoint]);
+    for (const changes of [{ state: 'RUNNING' }, { entrypoint: 'custom.py' }, { dataset_bindings: fixture().dataset_bindings }]) {
+      assert.deepEqual(helper.resumeCheckpoints({ ...source, ...changes }, 'operator', false), []);
+    }
+    assert.throws(() => helper.resumeTrainingRequest(source, checkpoint, 10000, '继续'), /总步数/);
+    const before = structuredClone(source);
+    const request = helper.resumeTrainingRequest(source, checkpoint, 120000, '继续');
+    assert.equal(request.resume, true);
+    assert.deepEqual(request.inputs, { model: 'checkpoint' });
+    assert.deepEqual(request.parameters, { ...source.parameters, steps: 120000 });
+    assert.deepEqual(request.dataset_bindings, source.dataset_bindings);
+    assert.deepEqual(request.auto_config, source.auto_config);
+    assert.equal(request.gpu_count, source.gpu_count);
+    assert.deepEqual(source, before);
+    assert.equal(helper.retryTrainingSnapshot(source).request.resume, undefined);
+    const firstCheckpoint = { ...checkpoint, metadata: { ...checkpoint.metadata, step: 0 } };
+    assert.deepEqual(helper.resumeCheckpoints({ ...source, outputs: [firstCheckpoint] }, 'operator', false), [firstCheckpoint]);
+    assert.equal(helper.resumeTrainingRequest(source, firstCheckpoint, 2, '继续').parameters.steps, 2);
+  });
+
   await test('draft comparison detects changed training settings but ignores wizard UI position and field tracking', () => {
     const first = helper.retryTrainingSnapshot(fixture()), second = structuredClone(first);
     second.step = 1; second.editedParameters = ['resource_recommendation.auto.num_workers'];

@@ -16,7 +16,6 @@ import stat
 import sys
 import inspect
 from contextlib import contextmanager
-from itertools import islice
 from pathlib import Path
 
 if __package__:
@@ -26,9 +25,11 @@ if __package__:
     from .dataset_bindings import validate_binding_assets
     from .dataset_fps import install_registered_fps, registered_fps_context
     from .entrypoints import read_entrypoint
+    from .generated_config import configuration_snapshot
     from .image_runtime import install_image_processing
     from .recipe_definitions import apply_overrides, validate_definition
     from .recap_runtime import apply_stage, stage_request
+    from .resume import normalize_resume_source
     from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                   validate_runtime_parameter_relations)
     from .training_plan import fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
@@ -39,9 +40,11 @@ else:
     from dataset_bindings import validate_binding_assets
     from dataset_fps import install_registered_fps, registered_fps_context
     from entrypoints import read_entrypoint
+    from generated_config import configuration_snapshot
     from image_runtime import install_image_processing
     from recipe_definitions import apply_overrides, validate_definition
     from recap_runtime import apply_stage, stage_request
+    from resume import normalize_resume_source
     from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                  validate_runtime_parameter_relations)
     from training_plan import fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
@@ -56,6 +59,8 @@ def resolve_config(base, spec, config_module, weight_loaders):
             raise ValueError("RECIPE_DEFINITION_MISMATCH: saved recipe has a different base config")
         base = apply_overrides(base, definition["overrides"])
     inputs = spec["inputs"]
+    resume = normalize_resume_source(spec.get("resume_source"), inputs, template_id=spec.get("template_id"),
+                                     entrypoint=spec.get("entrypoint"))
     bindings = validate_binding_assets(spec.get("dataset_bindings"), inputs)
     stage, stage_config = stage_request(spec)
     if stage == "offline_rl" and "acp_dropout" in stage_config:
@@ -203,6 +208,20 @@ def resolve_config(base, spec, config_module, weight_loaders):
         raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方需要 CheckpointWeightLoaderWithValueHead 初始化价值头")
     root_overrides = {name: value for name, value in runtime_overrides.items()
                       if name not in SCHEDULE_PARAMETERS | OPTIMIZER_PARAMETERS}
+    supports_resume = any(field.name == "resume_checkpoint" for field in dataclasses.fields(base))
+    if resume is not None:
+        if not supports_resume or hasattr(data, "datasets"):
+            raise ValueError("RESUME_UNSUPPORTED: 当前训练环境不支持原生单数据集 SFT 断点续训")
+        if parameters["steps"] <= resume["step"] + 1:
+            raise ValueError("RESUME_STEPS_INVALID: 续训总步数必须大于检查点已完成步数")
+        checkpoint = local_path(resume["path"], spec)
+        source_output = local_path(resume["output_dir"], spec)
+        new_output = Path(spec["output_dir"]).resolve()
+        if (str(checkpoint) != resume["path"] or str(source_output) != resume["output_dir"]
+                or source_output.is_relative_to(new_output) or new_output.is_relative_to(source_output)):
+            raise ValueError("RESUME_SOURCE_INVALID: 续训来源不可使用链接，且输出必须位于独立目录")
+    if supports_resume:
+        root_overrides["resume_checkpoint"] = resume["path"] if resume else None
     if normalization_method is not None:
         if "normalization_method" not in {field.name for field in dataclasses.fields(base)}:
             raise ValueError("NORMALIZATION_METHOD_UNSUPPORTED: 当前训练代码不支持显式归一化方法，请升级 openpi-umi 后重新预检")
@@ -217,36 +236,6 @@ def resolve_config(base, spec, config_module, weight_loaders):
         checkpoint_base_dir=str(Path(spec["output_dir"]) / "checkpoints"),
         exp_name="platform", resume=False, overwrite=False, wandb_enabled=False, **root_overrides, **component_changes)
     return install_image_processing(apply_stage(config, spec), spec, config_module)
-
-
-def configuration_snapshot(config):
-    """Bounded dataclass projection; factories/functions remain labelled objects."""
-    count = 0
-
-    def convert(value, depth=0):
-        nonlocal count
-        count += 1
-        if count > 5000 or depth > 8:
-            return {"unresolved": "projection_limit"}
-        if value is None or isinstance(value, (bool, int)):
-            return value
-        if isinstance(value, float):
-            return value if math.isfinite(value) else {"unresolved": "non_finite"}
-        if isinstance(value, str):
-            return value[:4096]
-        if isinstance(value, Path):
-            return str(value)[:4096]
-        if dataclasses.is_dataclass(value) and not isinstance(value, type):
-            return {"_type": type(value).__module__ + "." + type(value).__qualname__,
-                    **{field.name: convert(getattr(value, field.name), depth + 1) for field in dataclasses.fields(value)[:128]}}
-        if isinstance(value, (tuple, list)):
-            return {"items": [convert(item, depth + 1) for item in value[:128]], "truncated": len(value) > 128}
-        if isinstance(value, dict):
-            return {str(key)[:255]: convert(item, depth + 1) for key, item in islice(value.items(), 128)
-                    if isinstance(key, (str, int))}
-        return {"_type": type(value).__module__ + "." + type(value).__qualname__, "unresolved": "code_object"}
-
-    return {"schema_version": 1, "scope": "post_merge_dataclass_before_data_factory_execution", "configuration": convert(config)}
 
 
 def prepare_config(spec):

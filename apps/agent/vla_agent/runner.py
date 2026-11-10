@@ -155,7 +155,10 @@ def execute(config: dict, attempt_id: str) -> int:
         policy = validate_training_gpu_policy(payload, profile, require_frozen=True)
         if profile.get("adapter") != "smoke":
             expectation = payload.get("code_expectation", {})
-            generated = expectation.get("automatic_preflight", {}).get("plan", {}).get("generated_config")
+            frozen_plan = expectation.get("automatic_preflight", {}).get("plan", {})
+            if frozen_plan.get("resume_source") != payload.get("resume_source"):
+                raise AgentError("RESUME_SOURCE_MISMATCH", "启动命令与预检冻结的续训来源不一致，请重新预检")
+            generated = frozen_plan.get("generated_config")
             try:
                 validate_generated_config(generated)
             except ValueError as exc:
@@ -184,7 +187,7 @@ def execute(config: dict, attempt_id: str) -> int:
         if policy is not None:
             check_training_gpus(payload["gpu_uuids"], policy)
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), str(output),
-                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}))
+                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}), **({"resume_source": payload["resume_source"]} if payload.get("resume_source") is not None else {}))
         allowed_path(launch["cwd"], config["roots"])
         if profile.get("adapter") != "smoke":
             if not isinstance(payload["code_expectation"].get("automatic_preflight"), dict):
