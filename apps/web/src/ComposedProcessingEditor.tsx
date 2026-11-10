@@ -8,12 +8,15 @@ import { trainingNormalizationLabel } from './trainingNormalization';
 import { inferCompositionRepresentations } from './compositionRepresentationDefaults';
 import type { TrainingNormalizationMethod } from './types';
 import {
+  actionNormalizationMask,
   composedProcessingErrors,
   composedProcessingSummary,
   draftComposedProcessing,
   inferSourceActionLayout,
+  resizeActionBlock,
   umiV4ComposedPreset,
   updateComposedProcessingFromProfile,
+  withActionNormalizationMask,
   VISUAL_SLOTS,
   type ActionBlock,
   type ActionKind,
@@ -64,6 +67,62 @@ function move<T>(rows: T[], index: number, offset: number): T[] {
   return next;
 }
 
+function SharedActionNormalization({
+  block,
+  onChange,
+}: {
+  block: ActionBlock;
+  onChange: (block: ActionBlock) => void;
+}) {
+  const mask = actionNormalizationMask(block);
+  const selected = mask.filter(Boolean).length;
+  const applyMask = (next: boolean[]) => onChange(withActionNormalizationMask(block, next));
+  if (!mask.length) return <p className="field-hint">填写动作宽度后可按维配置归一化。</p>;
+
+  return (
+    <details className="composed-action-normalization">
+      <summary>
+        按维配置归一化 · {selected} / {mask.length} 维
+      </summary>
+      <p className="field-hint">
+        维度从该分块的第 0 维开始。未勾选的维度保留原始数值，所有时间步使用同一设置。
+      </p>
+      <div className="composed-action-normalization-buttons">
+        <button
+          type="button"
+          className="button outline small"
+          disabled={selected === mask.length}
+          onClick={() => applyMask(mask.map(() => true))}
+        >
+          全部归一化
+        </button>
+        <button
+          type="button"
+          className="button outline small"
+          disabled={selected === 0}
+          onClick={() => applyMask(mask.map(() => false))}
+        >
+          全部跳过
+        </button>
+      </div>
+      <div className="composed-action-normalization-grid">
+        {mask.map((checked, index) => (
+          <label className="checkbox-label" key={index}>
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(event) =>
+                applyMask(mask.map((entry, dim) => (index === dim ? event.target.checked : entry)))
+              }
+            />
+            第 {index} 维
+          </label>
+        ))}
+      </div>
+    </details>
+  );
+}
+
 export function ComposedProcessingEditor({
   value,
   profile,
@@ -92,10 +151,10 @@ export function ComposedProcessingEditor({
       'state_fields',
       value.state_fields.map((field, row) => (row === index ? { ...field, ...next } : field)),
     );
-  const action = (index: number, next: Partial<ActionBlock>) =>
+  const action = (index: number, next: ActionBlock) =>
     set(
       'action_layout',
-      value.action_layout.map((block, row) => (row === index ? { ...block, ...next } : block)),
+      value.action_layout.map((block, row) => (row === index ? next : block)),
     );
   const camera = (index: number, next: Partial<ComposedCamera>) =>
     set(
@@ -496,7 +555,7 @@ export function ComposedProcessingEditor({
                   value={block.arm}
                   disabled={block.kind === 'shared'}
                   onChange={(event) =>
-                    action(index, { arm: event.target.value as ActionBlock['arm'] })
+                    action(index, { ...block, arm: event.target.value as ActionBlock['arm'] })
                   }
                 >
                   <option value="left">左臂</option>
@@ -538,20 +597,27 @@ export function ComposedProcessingEditor({
                   max={Math.min(128, sourceAction.width ?? 128)}
                   step={1}
                   value={block.width || ''}
-                  onChange={(event) => action(index, { width: number(event.target.value) })}
+                  onChange={(event) =>
+                    action(index, resizeActionBlock(block, number(event.target.value)))
+                  }
                 />
               </Field>
             </div>
-            {purpose !== 'norm' && (
-              <label className="checkbox-label">
-                <input
-                  type="checkbox"
-                  checked={block.normalize}
-                  onChange={(event) => action(index, { normalize: event.target.checked })}
-                />
-                归一化动作分块 {index + 1}
-              </label>
-            )}
+            {purpose !== 'norm' &&
+              (block.kind === 'shared' ? (
+                <SharedActionNormalization block={block} onChange={(next) => action(index, next)} />
+              ) : (
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={block.normalize}
+                    onChange={(event) =>
+                      action(index, { ...block, normalize: event.target.checked })
+                    }
+                  />
+                  归一化动作分块 {index + 1}
+                </label>
+              ))}
           </div>
         ))}
       </section>

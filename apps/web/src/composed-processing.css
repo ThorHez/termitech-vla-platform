@@ -124,6 +124,21 @@
   background: var(--bg-danger, #fff2f0);
   color: var(--text-danger, #b42318);
 }
+.composed-action-normalization > summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.composed-action-normalization-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+.composed-action-normalization-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+  gap: 6px;
+}
 @media (max-width: 580px) {
   .composed-processing-editor {
     padding: 12px;

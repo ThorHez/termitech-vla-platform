@@ -505,6 +505,66 @@ try {
     const history=renderToStaticMarkup(React.createElement(DatasetProcessing,{binding:configuredBinding(processing),dataset,entries:[capability],slots:[],index:0,stage:'sft',managedParameters:{},readOnly:true,onChange(){}}));
     assert.match(history,/共享动作 \[14\]/);
   });
+  await test('shared action dimensions can be skipped independently and survive training draft and template storage', async () => {
+    const { ComposedProcessingEditor } = await server.ssrLoadModule('/src/ComposedProcessingEditor.tsx');
+    const { encodeTrainingDraft, decodeTrainingDraft } = await server.ssrLoadModule('/src/trainingDraft.ts');
+    const { prepareTrainingTemplate } = await server.ssrLoadModule('/src/trainingTemplate.ts');
+    const processing = clone(fixtures.valid.find(value => value.action_layout.length === 1 && value.action_layout[0].kind === 'shared'));
+    const original = { ...processing.action_layout[0], normalize: true };
+    const mask = helpers.actionNormalizationMask(original);
+    assert.deepEqual(mask, Array(14).fill(true));
+    mask[1] = mask[7] = false;
+    const mixed = helpers.withActionNormalizationMask(original, mask);
+    processing.action_layout = [mixed];
+    assert.deepEqual(errors(processing), []);
+    assert.deepEqual(normalize(processing).action_layout, [mixed]);
+    assert.deepEqual(normalize(processing, 'norm').action_layout, [original]);
+    assert.deepEqual(helpers.resizeActionBlock(mixed, 16).normalize_mask, [...mask, true, true]);
+    assert.deepEqual(helpers.resizeActionBlock(helpers.resizeActionBlock(mixed, NaN), 14), mixed);
+    assert.deepEqual(helpers.resizeActionBlock(mixed, 1), { ...original, width: 1 });
+    assert.deepEqual(helpers.selectActionKind(mixed, 'joint'), { ...original, arm: 'left', kind: 'joint' });
+    assert.deepEqual(helpers.withActionNormalizationMask(mixed, Array(14).fill(false)), { ...original, normalize: false });
+
+    const render = purpose => renderToStaticMarkup(React.createElement(ComposedProcessingEditor, {
+      value: processing, profile: profileFor(processing), purpose, onChange() {},
+    }));
+    const html = render('training');
+    assert.match(html, /按维配置归一化 · 12 \/ 14 维/);
+    assert.match(html, /<input type="checkbox" checked=""\/>第 0 维/);
+    assert.match(html, /<input type="checkbox"\/>第 1 维/);
+    assert.doesNotMatch(render('norm'), /按维配置归一化/);
+
+    const row = configuredBinding(processing);
+    assert.equal(stateFor({ binding: row, dataset: asset(processing) }).valid, true);
+    const request = { name: 'Masked actions', node_id: 'node', profile_id: 'profile', template_id: 'openpi-sft',
+      inputs: {}, dataset_bindings: [row], parameters: {}, gpu_count: 1 };
+    const snapshot = { request, step: 0, advancedRecipe: false, editedParameters: [], editedStageParameters: [], entrypointEdited: false };
+    for (const serialized of [encodeTrainingDraft(snapshot), prepareTrainingTemplate(snapshot)]) {
+      assert.deepEqual(decodeTrainingDraft(serialized).request.dataset_bindings[0].processor.parameters.composition.action_layout, [mixed]);
+    }
+  });
+  await test('shared masks require exact boolean width and uniform masks keep the legacy form', () => {
+    const processing = clone(fixtures.valid.find(value => value.action_layout.length === 1 && value.action_layout[0].kind === 'shared'));
+    const block = processing.action_layout[0];
+    const withBlock = action => ({ ...processing, action_layout: [action] });
+    for (const normalizeValue of [true, false]) {
+      const uniform = withBlock({ ...block, normalize_mask: Array(block.width).fill(normalizeValue) });
+      assert.deepEqual(errors(uniform), []);
+      assert.deepEqual(normalize(uniform).action_layout, [{ ...block, normalize: normalizeValue }]);
+    }
+    const valid = [false, ...Array(block.width - 1).fill(true)];
+    for (const invalid of [
+      { ...block, normalize_mask: [true] },
+      { ...block, normalize_mask: [1, ...valid.slice(1)] },
+      { ...block, normalize_mask: null },
+      { ...block, normalize: false, normalize_mask: valid },
+      { ...block, kind: 'joint', normalize_mask: valid },
+    ]) {
+      for (const purpose of ['training', 'norm']) {
+        assert.match(errors(withBlock(invalid), purpose).join(), /逐维归一化设置无效/);
+      }
+    }
+  });
   await test('shared actions survive normalization, norm requests, drafts and reusable templates without conversion', async () => {
     const { encodeTrainingDraft,decodeTrainingDraft }=await server.ssrLoadModule('/src/trainingDraft.ts');
     const { prepareTrainingTemplate }=await server.ssrLoadModule('/src/trainingTemplate.ts');

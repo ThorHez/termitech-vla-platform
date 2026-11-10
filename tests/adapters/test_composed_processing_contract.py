@@ -87,6 +87,70 @@ def test_camera_augmentation_rejects_invalid_and_incompatible_choices(core, kind
             normalize(selected)
 
 
+@pytest.fixture
+def shared_action_composition():
+    return deepcopy(next(value for value in CORPUS["valid"] if len(value["action_layout"]) == 1
+                         and value["action_layout"][0]["kind"] == "shared"))
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_uniform_shared_action_masks_canonicalize_to_legacy_boolean(core, shared_action_composition, enabled):
+    selected = shared_action_composition
+    block = selected["action_layout"][0]
+    block.update(normalize=not enabled, normalize_mask=[enabled] * block["width"])
+    legacy = deepcopy(selected)
+    legacy["action_layout"][0].pop("normalize_mask")
+    legacy["action_layout"][0]["normalize"] = enabled
+    clean = normalize_composition(selected)
+    assert clean == core.normalize_composition(selected) == normalize_composition(legacy)
+    assert composition_digest(selected) == composition_digest(legacy)
+
+
+def test_mixed_shared_action_mask_is_frozen_in_training_but_ignored_by_statistics(core, shared_action_composition):
+    legacy = shared_action_composition
+    legacy["action_layout"][0]["normalize"] = True
+    selected = deepcopy(legacy)
+    block = selected["action_layout"][0]
+    mask = [True] * (block["width"] - 2) + [False, True]
+    block["normalize_mask"] = mask
+    clean = normalize_composition(selected)
+    assert clean == core.normalize_composition(selected) == normalize_composition(clean)
+    assert clean["action_layout"][0]["normalize_mask"] == mask
+    assert clean["action_layout"][0]["normalize_mask"] is not mask
+    assert composition_digest(selected) != composition_digest(legacy)
+    assert normalize_processor({"name": "ComposableDataConfig", "parameters": {"composition": selected}})[
+        "parameters"]["composition"] == clean
+
+    for valid_mask in (mask, [True] * block["width"], [False] * block["width"]):
+        block["normalize_mask"] = valid_mask
+        numeric = normalize_composition(selected, norm_stats=True)
+        assert numeric == core.normalize_composition(selected, norm_stats=True)
+        assert numeric["action_layout"] == legacy["action_layout"]
+        assert composition_digest(selected, norm_stats=True) == composition_digest(legacy, norm_stats=True)
+
+
+@pytest.mark.parametrize("variant", ["wrong_width", "numeric", "null", "disabled", "non_shared"])
+def test_malformed_shared_action_masks_are_rejected_in_training_and_statistics(core, shared_action_composition, variant):
+    selected = deepcopy(CORPUS["valid"][0]) if variant == "non_shared" else shared_action_composition
+    block = selected["action_layout"][0]
+    mask = [True] * block["width"]
+    block["normalize"] = True
+    if variant == "wrong_width":
+        mask.pop()
+    elif variant == "numeric":
+        mask[0] = 1
+    elif variant == "null":
+        mask = None
+    elif variant == "disabled":
+        block["normalize"] = False
+        mask[0] = False
+    block["normalize_mask"] = mask
+    for normalize in (normalize_composition, core.normalize_composition):
+        for norm_stats in (False, True):
+            with pytest.raises(ValueError, match="COMPOSITION_INVALID"):
+                normalize(selected, norm_stats=norm_stats)
+
+
 def test_declarations_have_independent_state_and_action_encodings_and_no_dimension_guessing():
     spec = normalize_composition(CORPUS["valid"][0])
     assert spec["state_representation"] == "joint" and spec["action_representation"] == "eef"

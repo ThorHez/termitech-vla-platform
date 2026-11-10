@@ -22,14 +22,42 @@ export interface ActionBlock {
   kind: ActionKind;
   width: number;
   normalize: boolean;
+  normalize_mask?: boolean[];
 }
 
 export function selectActionKind(block: ActionBlock, kind: ActionKind): ActionBlock {
+  const { normalize_mask, ...fields } = block;
   return {
-    ...block,
+    ...fields,
     kind,
     arm: kind === 'shared' ? 'shared' : block.arm === 'shared' ? 'left' : block.arm,
+    ...(kind === 'shared' && normalize_mask !== undefined ? { normalize_mask } : {}),
   };
+}
+
+export function actionNormalizationMask(block: ActionBlock): boolean[] {
+  const width = integer(block.width, 1, 128) ? block.width : 0;
+  return Array.from({ length: width }, (_, index) => {
+    const entry = block.normalize_mask?.[index];
+    return typeof entry === 'boolean' ? entry : block.normalize === true;
+  });
+}
+
+export function withActionNormalizationMask(block: ActionBlock, mask: boolean[]): ActionBlock {
+  const { normalize_mask: _previous, ...fields } = block;
+  const normalize = mask.some(Boolean);
+  return {
+    ...fields,
+    normalize,
+    ...(normalize && !mask.every(Boolean) ? { normalize_mask: [...mask] } : {}),
+  };
+}
+
+export function resizeActionBlock(block: ActionBlock, width: number): ActionBlock {
+  const resized = { ...block, width };
+  return block.kind === 'shared' && Array.isArray(block.normalize_mask) && integer(width, 1, 128)
+    ? withActionNormalizationMask(resized, actionNormalizationMask(resized))
+    : resized;
 }
 export interface ComposedCamera {
   key: string;
@@ -154,6 +182,20 @@ const finite = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
 const exact = (value: Record<string, unknown>, keys: string[]) =>
   Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+const validActionMask = (block: {
+  kind?: unknown;
+  width?: unknown;
+  normalize?: unknown;
+  normalize_mask?: unknown;
+}) =>
+  block.kind === 'shared' &&
+  integer(block.width, 1, 128) &&
+  Array.isArray(block.normalize_mask) &&
+  block.normalize_mask.length === block.width &&
+  Array.from(block.normalize_mask).every((entry) => typeof entry === 'boolean') &&
+  (!block.normalize_mask.some(Boolean) ||
+    block.normalize_mask.every(Boolean) ||
+    block.normalize === true);
 const choice = (value: unknown, options: readonly string[]) =>
   typeof value === 'string' && options.includes(value);
 const blankDeclaration = (value: unknown) =>
@@ -261,7 +303,13 @@ export function composedProcessingErrors(
     const blocks = new Map<string, number>();
     let width = 0;
     value.action_layout.forEach((block, index) => {
-      if (!object(block) || !exact(block, ACTION_KEYS)) {
+      if (
+        !object(block) ||
+        !exact(
+          block,
+          Object.hasOwn(block, 'normalize_mask') ? [...ACTION_KEYS, 'normalize_mask'] : ACTION_KEYS,
+        )
+      ) {
         errors.push(`动作分块 ${index + 1} 的属性不完整。`);
         return;
       }
@@ -277,6 +325,8 @@ export function composedProcessingErrors(
       if (!integer(block.width, 1, 128))
         errors.push(`动作分块 ${index + 1} 的宽度需要是 1 到 128 的整数。`);
       else width += block.width;
+      if (Object.hasOwn(block, 'normalize_mask') && !validActionMask(block))
+        errors.push(`动作分块 ${index + 1} 的逐维归一化设置无效，请核对共享动作的宽度和维度选择。`);
       const key = `${block.arm}:${block.kind}`;
       if (blocks.has(key)) errors.push('同一机械臂不能重复登记相同动作分块。');
       if (integer(block.width, 1, 128)) blocks.set(key, block.width);
@@ -411,7 +461,11 @@ export function normalizeComposedProcessing(
     joint_unit: blankDeclaration(spec.joint_unit) ? '' : spec.joint_unit,
     coordinate_frame: spec.coordinate_frame == null ? '' : spec.coordinate_frame.trim(),
     state_fields: spec.state_fields.map((field) => ({ ...field, key: field.key.trim() })),
-    action_layout: spec.action_layout.map((block) => ({ ...block })),
+    action_layout: spec.action_layout.map((block) => {
+      const { normalize_mask, ...fields } = block;
+      if (!normalize_mask || !validActionMask(block)) return { ...block };
+      return purpose === 'norm' ? fields : withActionNormalizationMask(block, normalize_mask);
+    }),
     cameras:
       purpose === 'norm'
         ? []

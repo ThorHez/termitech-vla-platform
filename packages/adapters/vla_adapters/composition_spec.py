@@ -141,7 +141,10 @@ def normalize_composition(value, *, norm_stats=False):
         _fail("动作布局需要 1 到 16 个分块")
     result["action_layout"] = []
     for item in layout:
-        _object(item, {"arm", "kind", "width", "normalize"}, "动作分块")
+        fields = {"arm", "kind", "width", "normalize"}
+        if isinstance(item, dict) and "normalize_mask" in item:
+            fields.add("normalize_mask")
+        _object(item, fields, "动作分块")
         if type(item["normalize"]) is not bool:
             _fail("动作归一化选项需要布尔值")
         block = {"arm": _enum(item["arm"], arms | {"shared"}, "动作所属机械臂"),
@@ -149,6 +152,20 @@ def normalize_composition(value, *, norm_stats=False):
             "width": _integer(item["width"], 1, 128, "动作分块宽度"), "normalize": item["normalize"]}
         if (block["arm"] == "shared") != (block["kind"] == "shared"):
             _fail("共享动作类型必须使用共享归属，普通动作类型必须明确归属机械臂")
+        if "normalize_mask" in item:
+            mask = item["normalize_mask"]
+            if block["kind"] != "shared":
+                _fail("仅共享动作支持逐维归一化 normalize_mask")
+            if not isinstance(mask, list) or len(mask) != block["width"] or any(type(value) is not bool for value in mask):
+                _fail("动作 normalize_mask 必须为与分块宽度一致的布尔列表")
+            mixed = any(mask) and not all(mask)
+            if mixed and not block["normalize"]:
+                _fail("部分维度归一化需要启用动作分块的 normalize")
+            if not norm_stats:
+                if mixed:
+                    block["normalize_mask"] = list(mask)
+                else:
+                    block["normalize"] = mask[0]
         result["action_layout"].append(block)
     if len({(item["arm"], item["kind"]) for item in result["action_layout"]}) != len(layout):
         _fail("每个机械臂的动作分块类型不能重复")

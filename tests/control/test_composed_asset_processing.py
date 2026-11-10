@@ -102,6 +102,33 @@ def test_composition_is_frozen_with_asset_even_after_edits_and_reaches_start(pla
     assert start["payload"]["dataset_bindings"][0]["processor"] == composition_choice(profile)
 
 
+@pytest.mark.parametrize("tampered", [False, True])
+def test_training_freezes_the_selected_shared_action_mask(platform, tampered):
+    mask = [True] * 9 + [False]
+    layout = [{"arm": "shared", "kind": "shared", "width": 10, "normalize": True, "normalize_mask": mask}]
+    node, identifier, command, code, profile = pending(platform, source_only=True, action_layout=layout)
+    processor = command["payload"]["dataset_bindings"][0]["processor"]
+    assert processor["parameters"]["composition"]["action_layout"] == layout
+    assert "processing" not in profile
+    if tampered:
+        evidence = code["automatic_preflight"]
+        composition = evidence["plan"]["datasets"][0]["composition"]
+        composition["spec"]["action_layout"][0]["normalize_mask"] = list(reversed(mask))
+        composition["digest"] = composition_digest(composition["spec"])
+        evidence["plan_digest"] = canonical_digest(evidence["plan"])
+    checked = acknowledge(platform, node, identifier, command, code)
+    if tampered:
+        assert checked["status"] == "FAILED", checked
+        assert checked["error"]["code"] == "AGENT_COMPOSITION_UNSUPPORTED"
+        return
+    assert checked["status"] == "READY", checked
+    run = submit(platform, identifier)
+    assert run.status_code == 201, run.text
+    assert platform.schedule() == 1
+    start = next(item for item in platform.commands(node) if item["type"] == "START")
+    assert start["payload"]["dataset_bindings"][0]["processor"] == processor
+
+
 @pytest.mark.parametrize("change", ["legacy", "different", "omit"])
 def test_asset_history_does_not_choose_the_current_training_processor(platform, change):
     node, inputs, rows, profile = setup_composed(platform)
