@@ -85,7 +85,7 @@ def numeric_evidence(config):
     composition = config.data.composition
     states = [field["key"] for field in composition["state_fields"]]
     source = Path(sys.modules["openpi.training.numeric_stats"].__file__)
-    return {"schema_version": 2, "reader": "pyarrow_parquet_projection",
+    return {"schema_version": 3, "reader": "pyarrow_parquet_projection",
             "columns": [*states, composition["action_key"]],
             "state_columns": states, "action_column": composition["action_key"],
             "temporal_columns": [], "action_sequence": "per_frame",
@@ -153,9 +153,15 @@ def test_norm_rejects_unproven_legacy_processor_without_visual_fallback(automati
         norm_entry.prepare_config(legacy)
 
 
-def test_norm_preflight_uses_numeric_projection_without_sample_model_or_tokenizer_creation(automatic_norm, monkeypatch):
+@pytest.mark.parametrize("packed", [False, True])
+def test_norm_preflight_uses_numeric_projection_without_sample_model_or_tokenizer_creation(automatic_norm, monkeypatch, packed):
     spec, _ = automatic_norm
     config = norm_entry.prepare_config(spec)
+    action_shape = [config.model.action_horizon, 10] if packed else [10]
+    info_path = Path(spec["inputs"]["dataset_0"]["path"]) / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["features"][config.data.composition["action_key"]]["shape"] = action_shape
+    info_path.write_text(json.dumps(info))
     calls = []
     selected = SimpleNamespace(repo_id=spec["inputs"]["dataset_0"]["path"])
 
@@ -167,29 +173,35 @@ def test_norm_preflight_uses_numeric_projection_without_sample_model_or_tokenize
     monkeypatch.setattr(type(config.data), "create", lambda *args: pytest.fail("Do not construct a model/tokenizer during statistics preflight"))
     numeric_projection = sys.modules["openpi.training.numeric_stats"]
     monkeypatch.setattr(numeric_projection, "build_numeric_statistics_config", project, raising=False)
-    monkeypatch.setattr(numeric_projection, "numeric_io_evidence", lambda data: numeric_evidence(config), raising=False)
+    monkeypatch.setattr(numeric_projection, "numeric_io_evidence", lambda data: {
+        **numeric_evidence(config), "action_sequence": "packed_all_steps" if packed else "per_frame",
+    }, raising=False)
 
-    class Array:
-        ndim, size, shape = 2, 10, (1, 10)
+    actions = SimpleNamespace(ndim=1 + len(action_shape), size=10, shape=(1, *action_shape))
+    state = SimpleNamespace(ndim=2, size=7, shape=(1, 7))
 
     numeric = ModuleType("numpy")
-    numeric.asarray = lambda _: Array()
+    numeric.asarray = lambda value: value
     numeric.isfinite = lambda _: SimpleNamespace(all=lambda: True)
     monkeypatch.setitem(sys.modules, "numpy", numeric)
     probe_config = SimpleNamespace(data=config.data, model=config.model, assets_dirs="unused-assets",
                                    batch_size=config.batch_size)
     statistics = SimpleNamespace(create_torch_dataloader=lambda *args, **kwargs:
-                                 (iter([{"state": object(), "actions": object()}]), 1))
+                                 (iter([{"state": state, "actions": actions}]), 1))
     result = norm_entry.inspect_dataset(probe_config, spec, statistics, "dataset_0", spec["norm_datasets"][0])
     assert calls == [(config.data, spec["auto_config"]["action_horizon"], None)]
     assert result["dataset_asset_id"] == spec["norm_datasets"][0]["dataset_asset_id"]
     assert result["numeric_io"]["image_columns"] == [] and result["numeric_io"]["video_decode"] is False
     assert result["composition"]["spec"]["cameras"] == []
-    assert result["sample_shapes"]["actions"] == [10]
+    assert result["sample_shapes"]["actions"] == action_shape
+    if packed:
+        actions.ndim, actions.shape = 2, (1, 10)
+        with pytest.raises(ValueError, match="NORM_SAMPLE_INVALID.*形状"):
+            norm_entry.inspect_dataset(probe_config, spec, statistics, "dataset_0", spec["norm_datasets"][0])
     monkeypatch.setattr(numeric_projection, "numeric_io_evidence", lambda data: {
-        **numeric_evidence(config), "schema_version": 1, "action_sequence": "episode_clamp",
+        **numeric_evidence(config), "schema_version": 2, "action_sequence": "packed_first_step",
     })
-    with pytest.raises(ValueError, match="NORM_RUNTIME_UNSUPPORTED.*单步"):
+    with pytest.raises(ValueError, match="NORM_RUNTIME_UNSUPPORTED.*原始动作形状"):
         norm_entry.inspect_dataset(probe_config, spec, statistics, "dataset_0", spec["norm_datasets"][0])
 
 

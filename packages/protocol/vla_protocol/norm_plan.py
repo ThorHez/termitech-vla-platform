@@ -175,7 +175,7 @@ def _validate_composition(dataset, processor, auto_config):
 def _validate_numeric_io(dataset, spec):
     evidence = dataset.get("numeric_io")
     if (not isinstance(evidence, dict) or type(evidence.get("schema_version")) is not int
-            or evidence["schema_version"] not in (1, 2) or evidence.get("reader") != "pyarrow_parquet_projection"
+            or evidence["schema_version"] not in (1, 2, 3) or evidence.get("reader") != "pyarrow_parquet_projection"
             or evidence.get("image_columns") != [] or evidence.get("video_decode") is not False):
         raise ValueError("Statistics need numeric-only source projection without image or video decoding")
 
@@ -200,7 +200,14 @@ def _validate_numeric_io(dataset, spec):
     if (not isinstance(shape, list) or len(shape) not in {1, 2}
             or any(type(size) is not int or size < 1 for size in shape)):
         raise ValueError("Statistics numeric projection requires a valid stored action shape")
-    if evidence["schema_version"] == 2:
+    if evidence["schema_version"] == 3:
+        expected_sequence = "per_frame" if len(shape) == 1 else "packed_all_steps"
+        if evidence.get("action_sequence") != expected_sequence or temporal != []:
+            raise ValueError("Statistics numeric projection must prove stored action sampling without temporal columns")
+        if dataset["sample_shapes"]["actions"] != shape:
+            raise ValueError("Statistics action sample must match its stored action shape")
+    elif evidence["schema_version"] == 2:
+        # Frozen schema-2 plans sampled only the first step of each stored action block.
         expected_sequence = "per_frame" if len(shape) == 1 else "packed_first_step"
         if evidence.get("action_sequence") != expected_sequence or temporal != []:
             raise ValueError("Statistics numeric projection must prove single-step action sampling")

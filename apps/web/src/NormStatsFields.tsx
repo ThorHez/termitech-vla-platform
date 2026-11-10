@@ -47,7 +47,7 @@ export function NormStatsFields({
             <Field
               label="动作预测长度"
               required
-              hint="用于核对已存储动作块的长度。每行统计一个动作向量，动作块取第一步。"
+              hint="用于核对已存储动作块的长度。逐帧动作每行计入一次，动作块的所有时间步按动作维度合并统计。"
             >
               <input
                 required

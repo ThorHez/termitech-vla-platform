@@ -20,7 +20,7 @@ if __package__:
     from .norm_datasets import normalize_norm_datasets, validate_norm_assets, validate_norm_configuration
     from .openpi_entry import training_module
     from .training_plan import (dataset_contract, file_manifest, fingerprint, local_path, read_json,
-                                require_lerobot_source, single_step_statistics_projection)
+                                require_lerobot_source, stored_action_statistics_projection)
 else:
     from cache_contract import configure_cache, inspect_numeric_cache
     from dataset_fps import install_registered_fps, registered_fps_context
@@ -31,7 +31,7 @@ else:
     from norm_datasets import normalize_norm_datasets, validate_norm_assets, validate_norm_configuration
     from openpi_entry import training_module
     from training_plan import (dataset_contract, file_manifest, fingerprint, local_path, read_json,
-                               require_lerobot_source, single_step_statistics_projection)
+                               require_lerobot_source, stored_action_statistics_projection)
 
 
 def dataset_items(spec):
@@ -185,17 +185,19 @@ def inspect_dataset(config, spec, statistics, role, row):
     if local_path(data.repo_id, spec) != dataset:
         raise ValueError("NORM_SOURCE_MISMATCH: 配方未使用本次选择的数据集")
     projection = numeric_stats.numeric_io_evidence(data)
-    if not single_step_statistics_projection(projection):
-        raise ValueError("NORM_RUNTIME_UNSUPPORTED: 当前 OpenPI 不支持单步动作归一化统计，请升级训练代码后重新预检")
+    if not stored_action_statistics_projection(projection):
+        raise ValueError("NORM_RUNTIME_UNSUPPORTED: 当前 OpenPI 不支持按原始动作形状统计，请升级训练代码后重新预检")
     loader, _ = statistics.create_torch_dataloader(data, config.model.action_horizon,
         config.batch_size, config.model, 0, max_frames=1)
     sample = next(iter(loader))
     shapes = {}
     for key in ("state", "actions"):
         values = np.asarray(sample[key])
-        if values.ndim < 2 or (key == "actions" and values.ndim != 2) or not values.size or not np.isfinite(values).all():
+        if values.ndim < 2 or not values.size or not np.isfinite(values).all():
             raise ValueError(f"NORM_SAMPLE_INVALID: {key} 必须是有限的数值向量")
         shapes[key] = list(values.shape[1:])
+    if composed and shapes["actions"] != composed["actions_shape"]:
+        raise ValueError("NORM_SAMPLE_INVALID: 动作样本形状与数据集登记形状不一致")
     result = {"path": str(dataset), "frames": info["total_frames"], "metadata_sha256": info_digest,
               "manifest_sha256": manifest, "sample_shapes": shapes, "factory": type(config.data).__name__,
               "numeric_io": projection, **composed}

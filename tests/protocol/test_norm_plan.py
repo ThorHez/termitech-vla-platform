@@ -9,7 +9,7 @@ from vla_protocol import canonical_digest
 from vla_protocol.norm_plan import validate_norm_cache, validate_norm_plan
 
 
-def norm_plan(*, composed=False, per_frame=False, schema_version=2):
+def norm_plan(*, composed=False, per_frame=False, schema_version=3):
     spec = json.loads((Path(__file__).resolve().parents[1] / "fixtures/composed-processing-v1.json").read_text())["valid"][0]
     spec["cameras"] = []
     states = [row["key"] for row in spec["state_fields"]] if composed else ["observation.state"]
@@ -17,18 +17,22 @@ def norm_plan(*, composed=False, per_frame=False, schema_version=2):
     temporal = ["episode_index", "frame_index", "timestamp"] if schema_version == 1 and per_frame else []
     if schema_version == 1:
         sequence = "episode_clamp" if per_frame else "packed"
-    else:
+    elif schema_version == 2:
         sequence = "per_frame" if per_frame else "packed_first_step"
+    else:
+        sequence = "per_frame" if per_frame else "packed_all_steps"
     columns = [*states, action, *temporal]
     width = sum(row["width"] for row in spec["action_layout"]) if composed else 14
+    actions_shape = [width] if per_frame else [16, width]
+    sample_action_shape = {1: [16, width], 2: [width], 3: actions_shape}[schema_version]
     row = {"dataset_asset_id": "data", **({"processor": {"name": "ComposableDataConfig",
         "parameters": {"composition": spec}}} if composed else {"recipe_index": 0})}
     inputs = {"dataset_0": {"id": "data", "kind": "DATASET", "path": "/machine/data"}}
     request = {"recipe": "recipe", "parameters": {"batch_size": 32, "num_workers": 0}, "norm_datasets": [row]}
     dataset = {**row, "path": "/machine/data", "input_role": "dataset_0", "frames": 32,
         "metadata_sha256": "a" * 64, "manifest_sha256": "b" * 64,
-        "sample_shapes": {"state": [7], "actions": [16, width] if schema_version == 1 else [width]},
-        "actions_shape": [width] if per_frame else [16, width],
+        "sample_shapes": {"state": [7], "actions": list(sample_action_shape)},
+        "actions_shape": actions_shape,
         "numeric_io": {"schema_version": schema_version, "reader": "pyarrow_parquet_projection", "columns": columns,
             "state_columns": states, "action_column": action, "temporal_columns": temporal,
             "action_sequence": sequence, "image_columns": [], "video_decode": False,
@@ -57,8 +61,8 @@ def norm_plan(*, composed=False, per_frame=False, schema_version=2):
 
 @pytest.mark.parametrize("composed", [False, True])
 @pytest.mark.parametrize("per_frame", [False, True])
-@pytest.mark.parametrize("schema_version", [1, 2])
-def test_numeric_source_plan_preserves_legacy_and_single_step_proofs(composed, per_frame, schema_version):
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_numeric_source_plan_accepts_stored_action_sampling_and_preserves_legacy_proofs(composed, per_frame, schema_version):
     plan, request, inputs = norm_plan(composed=composed, per_frame=per_frame, schema_version=schema_version)
     assert validate_norm_plan(plan, request, inputs) is plan
     assert validate_norm_cache(plan["training_cache"], plan["datasets"], ["/machine"]) is plan["training_cache"]
@@ -75,14 +79,14 @@ def test_legacy_temporal_projection_deduplicates_an_explicit_numeric_state_colum
 
 @pytest.mark.parametrize("per_frame", [False, True])
 def test_single_step_projection_rejects_sequence_from_the_other_action_layout(per_frame):
-    plan, request, inputs = norm_plan(per_frame=per_frame)
+    plan, request, inputs = norm_plan(per_frame=per_frame, schema_version=2)
     plan["datasets"][0]["numeric_io"]["action_sequence"] = "packed_first_step" if per_frame else "per_frame"
     with pytest.raises(ValueError, match="single-step action sampling"):
         validate_norm_plan(plan, request, inputs)
 
 
 def test_single_step_projection_rejects_temporal_reads_and_window_samples():
-    plan, request, inputs = norm_plan(per_frame=True)
+    plan, request, inputs = norm_plan(per_frame=True, schema_version=2)
     wrong_projection = copy.deepcopy(plan)
     evidence = wrong_projection["datasets"][0]["numeric_io"]
     evidence["temporal_columns"] = ["episode_index", "frame_index", "timestamp"]
@@ -92,6 +96,32 @@ def test_single_step_projection_rejects_temporal_reads_and_window_samples():
         validate_norm_plan(wrong_projection, request, inputs)
     plan["datasets"][0]["sample_shapes"]["actions"] = [16, 14]
     with pytest.raises(ValueError, match="one action vector per row"):
+        validate_norm_plan(plan, request, inputs)
+
+
+@pytest.mark.parametrize("per_frame,sequence", [(True, "packed_all_steps"), (False, "packed_first_step"), (False, "per_frame")])
+def test_stored_action_projection_rejects_inconsistent_sequence(per_frame, sequence):
+    plan, request, inputs = norm_plan(per_frame=per_frame)
+    plan["datasets"][0]["numeric_io"]["action_sequence"] = sequence
+    with pytest.raises(ValueError, match="stored action sampling"):
+        validate_norm_plan(plan, request, inputs)
+
+
+@pytest.mark.parametrize("per_frame,sample_shape", [(True, [16, 14]), (False, [14]), (False, [15, 14]), (False, [16, 13])])
+def test_stored_action_projection_rejects_inconsistent_sample_shape(per_frame, sample_shape):
+    plan, request, inputs = norm_plan(per_frame=per_frame)
+    plan["datasets"][0]["sample_shapes"]["actions"] = sample_shape
+    with pytest.raises(ValueError, match="match its stored action shape"):
+        validate_norm_plan(plan, request, inputs)
+
+
+def test_stored_action_projection_rejects_temporal_reads():
+    plan, request, inputs = norm_plan(per_frame=True)
+    evidence = plan["datasets"][0]["numeric_io"]
+    evidence["temporal_columns"] = ["episode_index", "frame_index", "timestamp"]
+    evidence["columns"].extend(evidence["temporal_columns"])
+    plan["training_cache"]["datasets"][0]["columns"] = list(evidence["columns"])
+    with pytest.raises(ValueError, match="without temporal columns"):
         validate_norm_plan(plan, request, inputs)
 
 

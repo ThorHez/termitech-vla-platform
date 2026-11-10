@@ -550,11 +550,11 @@ def shared_norm_contract(data_factory, factories, datasets, spec):
             "validator": {"path": "src/openpi/training/shared_norm.py", "sha256": digest}}}
 
 
-def single_step_statistics_projection(evidence):
-    """Require the single-action reader in the registered OpenPI environment."""
+def stored_action_statistics_projection(evidence):
+    """Require the stored-action reader in the registered OpenPI environment."""
     return (isinstance(evidence, dict)
-            and type(evidence.get("schema_version")) is int and evidence["schema_version"] == 2
-            and evidence.get("action_sequence") in ("per_frame", "packed_first_step")
+            and type(evidence.get("schema_version")) is int and evidence["schema_version"] == 3
+            and evidence.get("action_sequence") in ("per_frame", "packed_all_steps")
             and evidence.get("temporal_columns") == [])
 
 
@@ -598,8 +598,8 @@ def auto_shared_norm_contract(config, spec):
         raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化计划不完整，不能退回逐数据集统计")
     projections = result.get("numeric_io")
     if (not isinstance(projections, list) or len(projections) != len(config.data.datasets)
-            or not all(single_step_statistics_projection(row) for row in projections)):
-        raise ValueError("SHARED_NORM_UNSUPPORTED: 当前 OpenPI 不支持单步动作归一化统计，请升级训练代码后重新预检")
+            or not all(stored_action_statistics_projection(row) for row in projections)):
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 当前 OpenPI 不支持按原始动作形状统计，请升级训练代码后重新预检")
     # The destination is intentionally absent before training; resolve its
     # existing task ancestor without requiring a generated statistics file.
     output = Path(result.get("output_path", ""))

@@ -68,7 +68,7 @@ def planner(training, monkeypatch):
         path.write_text("# frozen numeric implementation " + name)
     plan = {"mode": "auto_shared", "method": "weighted_raw_samples", "coverage": "full",
             "fingerprint": "f" * 64, "sources": [{"weight": row["weight"]} for row in spec["dataset_bindings"]],
-            "numeric_io": [{"schema_version": 2, "action_sequence": "per_frame", "temporal_columns": []}
+            "numeric_io": [{"schema_version": 3, "action_sequence": "per_frame", "temporal_columns": []}
                            for _ in spec["dataset_bindings"]],
             "output_path": str(Path(spec["output_dir"]) / "normalization/norm_stats.json")}
     calls = []
@@ -156,8 +156,7 @@ def test_preflight_rejects_missing_or_wrong_checkout_automatic_statistics(planne
     elif case == "missing_source":
         Path(helper.__file__).unlink()
     elif case == "old_reader":
-        plan["numeric_io"][0].update(schema_version=1, action_sequence="episode_clamp",
-            temporal_columns=["episode_index", "frame_index", "timestamp"])
+        plan["numeric_io"][0].update(schema_version=2, action_sequence="packed_first_step")
     else:
         plan.pop("fingerprint")
     with pytest.raises(ValueError, match="MODULE_OUTSIDE_CODE_DIR|SHARED_NORM_UNSUPPORTED"):
