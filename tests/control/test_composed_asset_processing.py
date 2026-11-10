@@ -9,7 +9,7 @@ from vla_protocol import canonical_digest
 from vla_adapters.composition_spec import composition_choice, composition_digest
 from vla_control.data_processors import _entry
 
-from .conftest import ADMIN, automatic_preflight, snapshot
+from .conftest import ADMIN, automatic_preflight, snapshot, inspected_profile_payload
 from .test_multi_dataset_control import configured
 from .test_task_recipe import request_preview
 from .test_automatic_preflight import acknowledge, submit
@@ -46,7 +46,7 @@ def setup_composed(platform, *, source_only=False, **composition_options):
              "component": "other", "arm": "shared", "shape": [16, declared["action_dim"]]},
         ]
     response = platform.client.patch(f"/api/v1/assets/{rows[0]['dataset_asset_id']}/dataset-profile", headers=ADMIN,
-                                     json={"dataset_profile": declared})
+                                     json=inspected_profile_payload(platform, rows[0]['dataset_asset_id'], declared))
     assert response.status_code == 200, response.text
     profile = response.json()["metadata"]["dataset_profile"]
     rows[0].pop("recipe_index")
@@ -54,9 +54,11 @@ def setup_composed(platform, *, source_only=False, **composition_options):
     return node, inputs, rows, profile
 
 
-def pending(platform, *, source_only=False, customized=False, **composition_options):
+def pending(platform, *, source_only=False, customized=False, augmentation=None, **composition_options):
     node, inputs, rows, profile = setup_composed(platform, source_only=source_only, **composition_options)
     selected = rows[0]["processor"]["parameters"]["composition"]
+    if augmentation is not None:
+        selected["cameras"][0]["augmentation"] = augmentation
     if customized:
         selected["state_fields"].reverse()
         selected["normalization"] = "zscore"
@@ -147,6 +149,30 @@ def test_agent_must_prove_composition_model_and_source(platform, field, value):
     checked = acknowledge(platform, node, identifier, command, code)
     assert checked["status"] == "FAILED", checked
     assert checked["error"]["code"] == "AGENT_COMPOSITION_UNSUPPORTED"
+
+
+@pytest.mark.parametrize("route", [None, 1, 0])
+def test_explicit_default_is_frozen_and_requires_agent_augmentation_evidence(platform, route):
+    node, identifier, command, code, _ = pending(platform, source_only=True, augmentation="default")
+    selected = command["payload"]["dataset_bindings"][0]["processor"]["parameters"]["composition"]["cameras"][0]
+    assert selected["augmentation"] == "default"
+    evidence = code["automatic_preflight"]
+    if route is not None:
+        evidence["plan"]["datasets"][0]["image_processing"] = {"schema_version": 1,
+            "augmentation_codes": {selected["slot"]: route}, "uniform_augmentation_code": None}
+        evidence["plan_digest"] = canonical_digest(evidence["plan"])
+    checked = acknowledge(platform, node, identifier, command, code)
+    if route != 0:
+        assert checked["status"] == "FAILED", checked
+        assert checked["error"]["code"] == "AGENT_IMAGE_AUGMENTATION_MISMATCH"
+        return
+    assert checked["status"] == "READY", checked
+    run = submit(platform, identifier)
+    assert run.status_code == 201, run.text
+    assert platform.schedule() == 1
+    start = next(item for item in platform.commands(node) if item["type"] == "START")
+    actual = start["payload"]["dataset_bindings"][0]["processor"]["parameters"]["composition"]["cameras"][0]
+    assert actual == selected
 
 
 def test_catalog_preserves_only_traceable_v1_composition_capability():

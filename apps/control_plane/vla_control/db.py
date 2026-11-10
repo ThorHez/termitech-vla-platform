@@ -157,6 +157,10 @@ class Database:
                 connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN gpu_mode VARCHAR(16) NOT NULL DEFAULT 'exclusive'")
             if "gpu_memory_mb" not in policy_columns:
                 connection.exec_driver_sql("ALTER TABLE policy_deployments ADD COLUMN gpu_memory_mb INTEGER")
+            for table_name in ("training_templates", "dataset_format_templates"):
+                template_columns = {column["name"] for column in inspect(connection).get_columns(table_name)}
+                if "shared" not in template_columns:
+                    connection.exec_driver_sql(f"ALTER TABLE {table_name} ADD COLUMN shared BOOLEAN NOT NULL DEFAULT false")
             # Old versions permitted duplicate template names. Keep the latest
             # content, break timestamp ties by id, and invalidate every old CAS
             # revision before enforcing per-account uniqueness. The auth guard

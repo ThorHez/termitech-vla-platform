@@ -109,6 +109,8 @@ SFT 与 ReCap `code_snapshot.automatic_preflight` 固定 `{schema_version:1,scop
 
 数据集、归一化、初始模型与混采权重由本次训练的资产绑定唯一决定。配方中的 repo_id、assets、norm 路径、weight_loader 和 data.weights 仅显示源码参考，禁止另存或回写这些字段及其容器；历史修订仍可读取，但含此类覆盖时需先保存干净版本。网页不从源码路径或权重自动选择任务资产；新行从未选择资产、等权重开始，用户显式确认。显式绑定完整替换训练数据列表，允许增删、重排和复用原配方的数据处理项；不隐含加入原配方的其他数据。旧行沿用 recipe_index 对应的图像、状态、动作处理；独立 processor 行从所选训练环境导出的具体 DataConfigFactory 类及其参数构造，分别覆盖 repo_id、归一化资产及混采权重；state padding 与合并归一化策略保留。单数据集配方仅接受一行、索引 0。绑定列表冻结在 `code_snapshot.dataset_bindings` 和 `automatic_preflight.plan.dataset_bindings`，通过 PREFLIGHT/START 传递；页面改动后重新预检，控制面、Agent 和 wrapper 均核对行数、顺序、路径、权重和配对。生效计划固定 input_authority:registered_assets、每组 dataset_asset_id/norm_asset_id/recipe_index 以及 model.asset_id；提交与启动均验证资产身份。旧 Agent 或旧预检缺少该证明时拒绝新提交，要求升级后重新预检；已有运行的冻结历史保留。
 
+相机级 `dataset_profile.cameras[].image_processing.resize_mode` 指定到 224×224 的尺寸处理，训练模板的 `composition.cameras[].augmentation` 指定训练增强。非标准或未知尺寸必须在资产登记时通过可信元信息明确选择。预检冻结两项策略，训练按样本和相机执行，显式增强覆盖旧资产中的增强设置。纯数值 `norm_stats` 不执行图像策略。具体字段、兼容边界与升级要求见 [数据集图像处理](dataset-image-processing.md)。
+
 
 独立数据处理器目录：POST `/api/v1/nodes/{id}/data-processors` 接收 `{profile_id}`，GET 同路径 `/{query_id}` 轮询。Agent 在后台使用登记的训练解释器执行 CPU/offline 目录探针，读取本项目配置模块导出的具体 dataclass DataConfigFactory 子类，不局限所选配方。响应 catalog.entries 提供类名、说明、可编辑的有界静态参数、复杂参数限制及来源；发现不代表数据兼容或已通过训练验收。资源字段、嵌套 Multi 工厂、合成 Fake 及未支持的 RLDS 加载器不可作为独立数据处理器。查询按机器、Profile 和代码来源隔离，拒绝过期或漂移结果。
 

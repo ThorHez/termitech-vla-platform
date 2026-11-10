@@ -13,8 +13,10 @@ const server = await createServer({
 });
 
 try {
-  const { PreflightChecks } = await server.ssrLoadModule('/src/PreflightChecks.tsx');
-  const render = (checks) => renderToStaticMarkup(React.createElement(PreflightChecks, { checks }));
+  const { PreflightChecks, sharedNormIncompatibilityDetail } = await server.ssrLoadModule('/src/PreflightChecks.tsx');
+  const render = (checks, summarizedSharedNormError) => renderToStaticMarkup(
+    React.createElement(PreflightChecks, { checks, summarizedSharedNormError }),
+  );
   const fps = { name: 'dataset_fps', ok: true, severity: 'warning', code: 'DATASET_FPS_MISMATCH', message: '登记 20 Hz，元信息 60 Hz；使用实际采样率。' };
 
   await test('a successful FPS warning has a warning row, triangle and accessible Chinese status', () => {
@@ -70,6 +72,25 @@ try {
     assert.match(html, /aria-label="通过：统计脚本入口"/);
     assert.match(html, /<strong>统计脚本入口<\/strong>/);
     assert.doesNotMatch(html, /norm_entrypoint/);
+  });
+
+  await test('legacy shared norm incompatibilities explain the check in Chinese', () => {
+    const message = 'SHARED_NORM_INVALID: source state/action layouts, ordering, encoding, units or numeric processing differ';
+    const html = render([{ name: 'validation', ok: false, message }]);
+    assert.match(html, /未通过：数据集能否共用归一化参数/);
+    assert.match(html, /各组绑定的 NORM 仅作参考/);
+    assert.doesNotMatch(html, /SHARED_NORM_INVALID|source state\/action/);
+  });
+
+  await test('the failed check points to the shared norm notice when that notice shows the details', () => {
+    const detail = '本次多数据集训练会自动计算共享归一化参数。第 4 组「collect_1029_human」的动作表示为关节。';
+    const message = 'SHARED_NORM_INVALID: ' + detail;
+    assert.equal(sharedNormIncompatibilityDetail(message), detail);
+    const html = render([{ name: 'validation', ok: false, message }], message);
+    assert.match(html, /未通过：数据集能否共用归一化参数/);
+    assert.match(html, /详见上方的失败原因/);
+    assert.doesNotMatch(html, /collect_1029_human|SHARED_NORM_INVALID/);
+    assert.equal(sharedNormIncompatibilityDetail('SHARED_NORM_INVALID: 共享统计文件在预检期间改变'), undefined);
   });
 } finally {
   await server.close();

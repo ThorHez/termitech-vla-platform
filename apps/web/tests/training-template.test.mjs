@@ -32,7 +32,7 @@ try {
           processor: { name: 'ComposableDataConfig', parameters: { composition: {
             action_key: 'actions', state_fields: [{ key: 'observation.joints', width: 6, arm: 'left', kind: 'joint', normalize: true }],
             action_layout: [{ width: 3, kind: 'position', arm: 'left' }, { width: 6, kind: 'rotation', arm: 'left' }, { width: 1, kind: 'gripper', arm: 'left' }],
-            cameras: [{ key: 'observation.images.wrist', slot: 'left_wrist_0_rgb', kind: 'rgb', layout: 'chw', time_index: null }],
+            cameras: [{ key: 'observation.images.wrist', slot: 'left_wrist_0_rgb', kind: 'rgb', layout: 'chw', time_index: null, augmentation: 'color' }],
             gripper_range: null, nested: { list: [1, { text: 'preserve arbitrary nested processor settings' }] },
           } } } },
         { dataset_asset_id: 'data-b', norm_asset_id: 'norm-b', weight: 50, processor: { name: 'OtherProcessor', parameters: { image_horizon: 2, options: { normalized: true } } } },

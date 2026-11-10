@@ -1,11 +1,11 @@
-"""Account-owned, declarative dataset formats; never asset or training writes."""
+"""Declarative dataset formats with account ownership and workspace sharing."""
 
 import json
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import defer
 from starlette.concurrency import run_in_threadpool
 
@@ -32,7 +32,7 @@ def _conflict():
 
 
 def _not_found():
-    # The same response covers missing and another account's identity.
+    # The same response covers missing and inaccessible templates.
     return APIError(404, "NOT_FOUND", "数据集格式模板不存在")
 
 
@@ -57,6 +57,9 @@ def normalize_profile(value):
     try:
         profile = DatasetProfile.model_validate(value).model_dump(mode="json", exclude_none=True)
         profile.pop("processing", None)
+        for camera in profile["cameras"]:
+            if "image_processing" in camera:
+                camera["image_processing"].pop("augmentation", None)
         encoded = json.dumps(profile, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
     except (ValidationError, ValueError, TypeError, UnicodeError, RecursionError) as error:
         # Never echo arbitrary profile values into an error or audit record.
@@ -88,25 +91,36 @@ async def _body(request, operation):
         value = json.loads(b"".join(chunks), parse_constant=reject_constant, object_pairs_hook=unique_keys)
     except (ValueError, TypeError, UnicodeError, RecursionError) as error:
         raise _invalid("模板请求必须为有效 JSON") from error
-    fields = {"name", "profile"} if operation == "create" else (
-        {"expected_revision", "name", "profile"} if operation == "update" else {"expected_revision"})
+    fields = {
+        "create": {"name", "profile"},
+        "update": {"expected_revision", "name", "profile"},
+        "sharing": {"expected_revision", "shared"},
+        "delete": {"expected_revision"},
+    }[operation]
     if type(value) is not dict or set(value) != fields:
         raise _invalid("模板请求字段无效，用户归属由当前登录账户确定")
     if operation != "create":
         revision = value["expected_revision"]
         if type(revision) is not int or not 1 <= revision <= MAX_EXPECTED_REVISION:
             raise _invalid("模板版本必须为有效的正整数")
-    if operation != "delete":
+    if operation == "sharing" and type(value["shared"]) is not bool:
+        raise _invalid("共享状态必须为布尔值")
+    if operation in {"create", "update"}:
         value["name"] = _name(value["name"])
         value["profile"] = normalize_profile(value["profile"])
     return value
 
 
-def _representation(row, include_profile=True):
-    result = {key: getattr(row, key) for key in ("id", "name", "revision", "created_at", "updated_at")}
+def _representation(row, user_id, include_profile=True):
+    result = {key: getattr(row, key) for key in ("id", "name", "revision", "created_at", "updated_at", "shared")}
+    result["is_owner"] = row.user_id == user_id
     if include_profile:
         result["profile"] = row.profile
     return result
+
+
+def _visible_to(user_id):
+    return or_(DatasetFormatTemplate.user_id == user_id, DatasetFormatTemplate.shared.is_(True))
 
 
 def _owned(session, user_id, template_id):
@@ -155,7 +169,7 @@ def create_template(db, user_id, value, request=None):
             row.revision += 1
             row.updated_at = stamp
         session.flush()
-        result = _representation(row)
+        result = _representation(row, user_id)
     return result, 201 if created else 200
 
 
@@ -179,8 +193,30 @@ def update_template(db, user_id, template_id, value, request=None):
             execution_options={"synchronize_session": False})
         if changed.rowcount != 1:
             raise _conflict()
-        return {"id": template_id, "name": value["name"], "profile": value["profile"],
-                "revision": revision + 1, "created_at": row.created_at, "updated_at": stamp}
+        return {**_representation(row, user_id), "name": value["name"], "profile": value["profile"],
+                "revision": revision + 1, "updated_at": stamp}
+
+
+def change_template_sharing(db, user_id, template_id, value, request=None):
+    revision = value["expected_revision"]
+    shared = value["shared"]
+    with db.write() as session:
+        _lock_owner(session, user_id, request)
+        row = _owned(session, user_id, template_id)
+        if row.revision != revision or row.revision >= MAX_EXPECTED_REVISION:
+            raise _conflict()
+        if row.shared == shared:
+            return _representation(row, user_id, include_profile=False)
+        stamp = now()
+        changed = session.execute(update(DatasetFormatTemplate).where(
+            DatasetFormatTemplate.id == template_id, DatasetFormatTemplate.user_id == user_id,
+            DatasetFormatTemplate.revision == revision,
+        ).values(shared=shared, revision=revision + 1, updated_at=stamp),
+            execution_options={"synchronize_session": False})
+        if changed.rowcount != 1:
+            raise _conflict()
+        return {**_representation(row, user_id, include_profile=False), "shared": shared,
+                "revision": revision + 1, "updated_at": stamp}
 
 
 def delete_template(db, user_id, template_id, revision, request=None):
@@ -212,16 +248,20 @@ def register_routes(app, dependencies, db, auth):
     def list_templates(request: Request):
         user_id = owner(request)
         with db.read() as session:
-            rows = session.scalars(select(DatasetFormatTemplate).where(DatasetFormatTemplate.user_id == user_id)
+            rows = session.scalars(select(DatasetFormatTemplate).where(_visible_to(user_id))
                 .options(defer(DatasetFormatTemplate.profile))
                 .order_by(DatasetFormatTemplate.updated_at.desc(), DatasetFormatTemplate.id))
-            return response([_representation(row, include_profile=False) for row in rows])
+            return response([_representation(row, user_id, include_profile=False) for row in rows])
 
     @app.get("/api/v1/dataset-format-templates/{template_id}", dependencies=dependencies)
     def read(template_id: str, request: Request):
         user_id = owner(request)
         with db.read() as session:
-            return response(_representation(_owned(session, user_id, template_id)))
+            row = session.scalar(select(DatasetFormatTemplate).where(
+                DatasetFormatTemplate.id == template_id, _visible_to(user_id)))
+            if row is None:
+                raise _not_found()
+            return response(_representation(row, user_id))
 
     @app.post("/api/v1/dataset-format-templates", dependencies=dependencies, status_code=201)
     async def create(request: Request):
@@ -237,6 +277,13 @@ def register_routes(app, dependencies, db, auth):
         value = await _body(request, "update")
         owner(request)
         return response(await run_in_threadpool(update_template, db, user_id, template_id, value, request))
+
+    @app.put("/api/v1/dataset-format-templates/{template_id}/sharing", dependencies=dependencies)
+    async def share(template_id: str, request: Request):
+        user_id = owner(request)
+        value = await _body(request, "sharing")
+        owner(request)
+        return response(await run_in_threadpool(change_template_sharing, db, user_id, template_id, value, request))
 
     @app.delete("/api/v1/dataset-format-templates/{template_id}", dependencies=dependencies)
     async def remove(template_id: str, request: Request):

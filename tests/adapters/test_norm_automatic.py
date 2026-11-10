@@ -84,12 +84,11 @@ def automatic_norm(automatic, composed_module, monkeypatch):
 def numeric_evidence(config):
     composition = config.data.composition
     states = [field["key"] for field in composition["state_fields"]]
-    temporal = ["episode_index", "frame_index", "timestamp"]
     source = Path(sys.modules["openpi.training.numeric_stats"].__file__)
-    return {"schema_version": 1, "reader": "pyarrow_parquet_projection",
-            "columns": [*states, composition["action_key"], *temporal],
+    return {"schema_version": 2, "reader": "pyarrow_parquet_projection",
+            "columns": [*states, composition["action_key"]],
             "state_columns": states, "action_column": composition["action_key"],
-            "temporal_columns": temporal, "action_sequence": "episode_clamp",
+            "temporal_columns": [], "action_sequence": "per_frame",
             "image_columns": [], "video_decode": False,
             "source": {"path": "src/openpi/training/numeric_stats.py", "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}}
 
@@ -171,7 +170,7 @@ def test_norm_preflight_uses_numeric_projection_without_sample_model_or_tokenize
     monkeypatch.setattr(numeric_projection, "numeric_io_evidence", lambda data: numeric_evidence(config), raising=False)
 
     class Array:
-        ndim, size, shape = 3, 20, (1, 2, 10)
+        ndim, size, shape = 2, 10, (1, 10)
 
     numeric = ModuleType("numpy")
     numeric.asarray = lambda _: Array()
@@ -186,6 +185,12 @@ def test_norm_preflight_uses_numeric_projection_without_sample_model_or_tokenize
     assert result["dataset_asset_id"] == spec["norm_datasets"][0]["dataset_asset_id"]
     assert result["numeric_io"]["image_columns"] == [] and result["numeric_io"]["video_decode"] is False
     assert result["composition"]["spec"]["cameras"] == []
+    assert result["sample_shapes"]["actions"] == [10]
+    monkeypatch.setattr(numeric_projection, "numeric_io_evidence", lambda data: {
+        **numeric_evidence(config), "schema_version": 1, "action_sequence": "episode_clamp",
+    })
+    with pytest.raises(ValueError, match="NORM_RUNTIME_UNSUPPORTED.*单步"):
+        norm_entry.inspect_dataset(probe_config, spec, statistics, "dataset_0", spec["norm_datasets"][0])
 
 
 def test_norm_auto_plan_freezes_all_models_and_generated_config_and_rejects_drift(automatic_norm, monkeypatch):
@@ -204,7 +209,7 @@ def test_norm_auto_plan_freezes_all_models_and_generated_config_and_rejects_drif
                 "manifest_sha256": norm_entry.norm_manifest(path, selected)[2],
                 "composition": contract["composition"], "actions_shape": contract["actions_shape"],
                 "numeric_io": numeric_evidence(config),
-                "sample_shapes": {"state": [7], "actions": [config.model.action_horizon, 10]},
+                "sample_shapes": {"state": [7], "actions": [10]},
                 "model_configuration": {"model_type": "pi05" if config.model.pi05 else "pi0",
                     "action_horizon": config.model.action_horizon, "action_dim": config.model.action_dim}}
 

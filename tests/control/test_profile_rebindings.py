@@ -302,8 +302,13 @@ def test_browser_requires_admin_permission_csrf_and_recent_password_proof(platfo
                 assert client.post("/api/v1/auth/reauth", json={"password": password}).status_code == 200
                 assert client.post(path(node), json=body()).status_code == 202
                 audits = client.get("/api/v1/audit").json()
-                assert any(row["actor_username"] == "profile-admin" and row["path"] == path(node)
-                           and row["action"] == "api.mutation" and row["status"] == 202 for row in audits)
+                completed = [row for row in audits if row["actor_username"] == "profile-admin"
+                             and row["path"] == "/api/v1/nodes/{node_id}/profile-rebindings"
+                             and row["action"] == "machines.rebind_profile" and row["status"] == 202]
+                assert len(completed) == 1
+                assert {key: completed[0]["details"][key] for key in ("operation_label", "category", "target_type")} == {
+                    "operation_label": "切换训练环境", "category": "machines", "target_type": "node"}
+                assert completed[0]["details"]["target_id"] == completed[0]["details"]["node_id"] == node["node_id"]
             else:
                 assert client.get(path(node), params={"profile_id": "default"}).status_code == 403
         finally:

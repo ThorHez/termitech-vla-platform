@@ -16,6 +16,13 @@ import { DatasetInspection, useDatasetInspectionDraft } from './DatasetInspectio
 import { DatasetFormatTemplates } from './DatasetFormatTemplates';
 import { inferImageLayout, type ImageLayoutFeature } from './imageLayout';
 import {
+  imageProcessingErrors,
+  imageRegistrationErrors,
+  imageResizeLabels,
+  imageSourceResolution,
+  type ImageProcessingPolicy,
+} from './imageProcessingPolicy';
+import {
   composedProcessingErrors,
   normalizeComposedProcessing,
   type ComposedProcessingSpec,
@@ -26,6 +33,7 @@ export interface DatasetCamera {
   name: string;
   key: string;
   kind: 'rgb' | 'depth';
+  image_processing?: ImageProcessingPolicy;
 }
 
 export type { DatasetFieldAnnotation } from './datasetFieldAnnotations';
@@ -114,6 +122,14 @@ export function datasetProfileErrors(profile: DatasetProfile): string[] {
         !['rgb', 'depth'].includes(camera.kind)
       )
         errors.push(`请完整填写视觉输入 ${index + 1} 的名称、真实字段名和图像类型。`);
+      if (camera?.image_processing !== undefined)
+        errors.push(...imageProcessingErrors(camera.image_processing));
+      if (
+        camera?.kind === 'depth' &&
+        camera.image_processing?.augmentation !== undefined &&
+        !['default', 'none'].includes(camera.image_processing.augmentation)
+      )
+        errors.push('深度图不支持 RGB 颜色增强，请选择默认增强或关闭增强。');
     }
     if (
       new Set(profile.cameras.map((camera) => camera?.name?.trim())).size !== profile.cameras.length
@@ -191,7 +207,10 @@ export function readDatasetProfile(value: unknown): DatasetProfile | undefined {
     if (
       profile.cameras.some(
         (camera) =>
-          !camera || Object.keys(camera).some((key) => !['name', 'key', 'kind'].includes(key)),
+          !camera ||
+          Object.keys(camera).some(
+            (key) => !['name', 'key', 'kind', 'image_processing'].includes(key),
+          ),
       )
     )
       return undefined;
@@ -266,6 +285,15 @@ export function applyComposedProcessing(
               `视觉输入 ${index + 1}`,
             key: camera.key,
             kind: camera.kind,
+            ...(profile.cameras.find((item) => item.key.trim() === camera.key.trim())
+              ?.image_processing
+              ? {
+                  image_processing: structuredClone(
+                    profile.cameras.find((item) => item.key.trim() === camera.key.trim())!
+                      .image_processing,
+                  ),
+                }
+              : {}),
           };
         })
       : profile.cameras,
@@ -343,7 +371,14 @@ export function DatasetProfileForm({
   const camera = (index: number, next: Partial<DatasetCamera>) =>
     set(
       'cameras',
-      value.cameras.map((item, position) => (position === index ? { ...item, ...next } : item)),
+      value.cameras.map((item, position) => {
+        if (position !== index) return item;
+        const updated = { ...item, ...next };
+        const sourceChanged = updated.key.trim() !== item.key.trim() || updated.kind !== item.kind;
+        if (sourceChanged && updated.image_processing?.augmentation !== undefined)
+          updated.image_processing = { resize_mode: updated.image_processing.resize_mode };
+        return updated;
+      }),
     );
   return (
     <fieldset className={`dataset-profile-form${compact ? ' compact' : ''}`} disabled={disabled}>
@@ -415,67 +450,105 @@ export function DatasetProfileForm({
             ? '每行登记一个 RGB 或深度字段；同一相机的 RGB 与深度分开填写。'
             : '分别登记 RGB 或深度字段；同一相机的 RGB 与深度算两个输入。'}
         </p>
-        {value.cameras.map((item, index) => (
-          <div className="dataset-profile-camera" key={index}>
-            <div className="dataset-profile-section-title">
-              <strong>视觉输入 {index + 1}</strong>
-              <button
-                type="button"
-                className="icon-button"
-                aria-label={`移除视觉输入 ${index + 1}`}
-                title="移除视觉输入"
-                disabled={disabled || value.cameras.length <= 1}
-                onClick={() =>
-                  set(
-                    'cameras',
-                    value.cameras.filter((_, position) => position !== index),
-                  )
-                }
-              >
-                <Trash2 size={15} />
-              </button>
-            </div>
-            <div className="form-grid">
-              <Field label={`视角名称 ${index + 1}`} required>
-                <input
-                  required
-                  maxLength={100}
-                  value={item.name}
-                  placeholder="例如 左腕、右腕、头部"
-                  onChange={(event) => camera(index, { name: event.target.value })}
-                />
-              </Field>
-              <Field label={`图像类型 ${index + 1}`}>
-                <select
-                  value={item.kind}
-                  onChange={(event) =>
-                    camera(index, { kind: event.target.value as DatasetCamera['kind'] })
+        {value.cameras.map((item, index) => {
+          const size = imageSourceResolution(features, item.key, item.kind);
+          const alreadyTargetSize = size?.[0] === 224 && size[1] === 224;
+          return (
+            <div className="dataset-profile-camera" key={index}>
+              <div className="dataset-profile-section-title">
+                <strong>视觉输入 {index + 1}</strong>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label={`移除视觉输入 ${index + 1}`}
+                  title="移除视觉输入"
+                  disabled={disabled || value.cameras.length <= 1}
+                  onClick={() =>
+                    set(
+                      'cameras',
+                      value.cameras.filter((_, position) => position !== index),
+                    )
                   }
                 >
-                  <option value="rgb">RGB 彩色</option>
-                  <option value="depth">深度</option>
-                </select>
-              </Field>
-            </div>
-            <Field
-              label={`数据字段名 ${index + 1}`}
-              required
-              hint={
-                compact ? undefined : '填写数据文件中的完整键名；相机数量相同，字段映射也可能不同。'
-              }
-            >
-              <input
+                  <Trash2 size={15} />
+                </button>
+              </div>
+              <div className="form-grid">
+                <Field label={`视角名称 ${index + 1}`} required>
+                  <input
+                    required
+                    maxLength={100}
+                    value={item.name}
+                    placeholder="例如 左腕、右腕、头部"
+                    onChange={(event) => camera(index, { name: event.target.value })}
+                  />
+                </Field>
+                <Field label={`图像类型 ${index + 1}`}>
+                  <select
+                    value={item.kind}
+                    onChange={(event) =>
+                      camera(index, {
+                        kind: event.target.value as DatasetCamera['kind'],
+                      })
+                    }
+                  >
+                    <option value="rgb">RGB 彩色</option>
+                    <option value="depth">深度</option>
+                  </select>
+                </Field>
+              </div>
+              <Field
+                label={`数据字段名 ${index + 1}`}
                 required
-                maxLength={256}
-                value={item.key}
-                placeholder="例如 observation.images.left_wrist"
-                title="填写数据文件中的完整键名；相机数量相同，字段映射也可能不同。"
-                onChange={(event) => camera(index, { key: event.target.value })}
-              />
-              <DatasetCameraShape camera={item} features={features} />
-            </Field>
-          </div>
-        ))}
+                hint={
+                  compact
+                    ? undefined
+                    : '填写数据文件中的完整键名；相机数量相同，字段映射也可能不同。'
+                }
+              >
+                <input
+                  required
+                  maxLength={256}
+                  value={item.key}
+                  placeholder="例如 observation.images.left_wrist"
+                  title="填写数据文件中的完整键名；相机数量相同，字段映射也可能不同。"
+                  onChange={(event) => camera(index, { key: event.target.value })}
+                />
+                <DatasetCameraShape camera={item} features={features} />
+              </Field>
+              <div className="dataset-image-policy-fields">
+                <Field
+                  label={`图像处理方式 ${index + 1}`}
+                  required={Boolean(features && item.key && !alreadyTargetSize)}
+                  hint="目标尺寸为 224×224。非此尺寸必须明确选择；处理在训练读取时执行，不修改原数据。"
+                >
+                  <select
+                    aria-label={`图像处理方式 ${index + 1}`}
+                    value={item.image_processing?.resize_mode || ''}
+                    onChange={(event) =>
+                      camera(index, {
+                        image_processing: event.target.value
+                          ? {
+                              ...item.image_processing,
+                              resize_mode: event.target
+                                .value as ImageProcessingPolicy['resize_mode'],
+                            }
+                          : undefined,
+                      })
+                    }
+                  >
+                    <option value="">请选择处理方式</option>
+                    {Object.entries(imageResizeLabels).map(([key, label]) => (
+                      <option value={key} key={key}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+            </div>
+          );
+        })}
       </div>
       {showTaskDescription && (
         <Field label="任务描述" required hint="描述机器人执行的任务，可填写多行。">
@@ -535,7 +608,13 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
   const errorArea = useRef<HTMLDivElement>(null);
   const pending = useRef(false);
   const formId = useId();
-  const errors = datasetProfileErrors(value);
+  const errors = [
+    ...datasetProfileErrors(value),
+    ...imageRegistrationErrors(
+      value.cameras,
+      inspectionDraft.featuresFor(asset.node_id, asset.path),
+    ),
+  ];
   useEffect(() => {
     if (error) errorArea.current?.scrollIntoView({ block: 'nearest' });
   }, [error]);
@@ -587,7 +666,10 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
           try {
             await api<Asset>(`/assets/${encodeURIComponent(asset.id)}/dataset-profile`, {
               method: 'PATCH',
-              body: JSON.stringify({ dataset_profile: normalizedDatasetProfile(value) }),
+              body: JSON.stringify({
+                dataset_profile: normalizedDatasetProfile(value),
+                dataset_inspection_id: inspectionDraft.inspectionIdFor(asset.node_id, asset.path),
+              }),
             });
             assets.refresh();
             close();

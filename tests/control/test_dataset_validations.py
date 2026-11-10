@@ -10,7 +10,7 @@ from vla_control.common import now, offset_time, uid
 from vla_control.dataset_validations import INTERNAL_KEY, queue_validation
 from vla_control.models import Allocation, Asset, Attempt, Command, Node, Profile, Run
 
-from .conftest import ADMIN, ENROLL
+from .conftest import ADMIN, ENROLL, profile_inspection
 from .test_asset_transfers import create as create_transfer, fixture, result_for, run_copy
 from .test_dataset_batches import batch, scan, submit
 from .test_dataset_profiles import profile as dataset_profile
@@ -24,8 +24,11 @@ def worker(platform, name="dataset-worker", *, supported=True):
 
 
 def register(platform, node, **changes):
-    response = platform.client.post("/api/v1/assets", headers=ADMIN, json={"kind": "DATASET", "name": "dataset",
-        "node_id": node["node_id"], "path": "/machine/data", "metadata": {"dataset_profile": dataset_profile()}, **changes})
+    body = {"kind": "DATASET", "name": "dataset", "node_id": node["node_id"], "path": "/machine/data",
+            "metadata": {"dataset_profile": dataset_profile()}, **changes}
+    if body["kind"] == "DATASET" and body["metadata"].get("dataset_profile"):
+        body["dataset_inspection_id"] = profile_inspection(platform, node["node_id"], body["path"], body["metadata"]["dataset_profile"])
+    response = platform.client.post("/api/v1/assets", headers=ADMIN, json=body)
     assert response.status_code == 201, response.text
     return response.json()
 
@@ -106,7 +109,8 @@ def test_registration_queues_one_dataset_scoped_command_and_safe_ack_updates_onl
 def test_equivalent_remote_path_spellings_accept_agent_evidence_without_changing_registration(
         platform, registered_path, returned_path):
     node = worker(platform)
-    asset = register(platform, node, path=registered_path)
+    # This regression covers path identity, independent of optional image/profile registration.
+    asset = register(platform, node, path=registered_path, metadata={})
     value = {**result(asset), "path": returned_path}
     assert ack(platform, node, asset["validation"], value).status_code == 200
     report = get(platform, asset)

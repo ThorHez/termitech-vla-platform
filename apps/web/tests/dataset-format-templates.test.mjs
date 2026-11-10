@@ -159,7 +159,7 @@ try {
     assert.match(html, /选择格式模板/);
     assert.match(html, /套用模板/);
     assert.match(html, /保存当前格式为模板/);
-    assert.match(html, /模板仅当前账户可见/);
+    assert.match(html, /登记时可套用个人模板或工作区共享模板/);
     assert.doesNotMatch(html, /<form/);
     assert.ok((html.match(/type="button"/g) || []).length >= 4);
   });
@@ -177,7 +177,7 @@ try {
       ),
     );
     assert.match(html, /保存当前格式为模板/);
-    assert.match(html, /模板仅当前账户可见/);
+    assert.match(html, /个人模板或工作区共享模板/);
   });
   await test('personal format management exposes list, own draft, clone/save and deletion without public asset editing', () => {
     const html = renderToStaticMarkup(
@@ -192,9 +192,11 @@ try {
         React.createElement(PersonalDatasetFormats, { close() {} }),
       ),
     );
-    assert.match(html, /我的格式模板/);
+    assert.match(html, /数据集格式模板/);
     assert.match(html, /选择格式模板/);
     assert.match(html, /载入个人草稿/);
+    assert.match(html, /共享到工作区/);
+    assert.match(html, /个人模板默认仅自己可见/);
     assert.match(html, /删除所选模板/);
     assert.match(html, /个人格式草稿/);
     assert.match(html, /保存当前格式为模板/);

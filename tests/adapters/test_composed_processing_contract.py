@@ -66,6 +66,27 @@ def test_both_normalizers_reject_incomplete_or_ambiguous_compositions(core, valu
             normalize(value)
 
 
+@pytest.mark.parametrize("choice", ["default", "none", "color", "crop_rotate_color"])
+def test_explicit_camera_augmentation_is_canonical_and_ignored_by_norm_stats(core, choice):
+    legacy = normalize_composition(CORPUS["valid"][0])
+    selected = deepcopy(legacy)
+    selected["cameras"][0]["augmentation"] = choice
+    assert "augmentation" not in core.normalize_composition(legacy)["cameras"][0]
+    assert normalize_composition(selected) == core.normalize_composition(selected) == selected
+    assert composition_digest(selected) != composition_digest(legacy)
+    assert composition_digest(selected, norm_stats=True) == composition_digest(legacy, norm_stats=True)
+
+
+@pytest.mark.parametrize("kind,choice", [("depth", "color"), ("depth", "crop_rotate_color"),
+    ("rgb", None), ("rgb", "unsupported")])
+def test_camera_augmentation_rejects_invalid_and_incompatible_choices(core, kind, choice):
+    selected = deepcopy(CORPUS["valid"][0])
+    selected["cameras"][0].update(kind=kind, augmentation=choice)
+    for normalize in (normalize_composition, core.normalize_composition):
+        with pytest.raises(ValueError, match="COMPOSITION_INVALID"):
+            normalize(selected)
+
+
 def test_declarations_have_independent_state_and_action_encodings_and_no_dimension_guessing():
     spec = normalize_composition(CORPUS["valid"][0])
     assert spec["state_representation"] == "joint" and spec["action_representation"] == "eef"

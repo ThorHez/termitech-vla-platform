@@ -9,7 +9,7 @@ from sqlalchemy import select
 from vla_adapters.dataset_contracts import verify_registered_dataset_profile
 from vla_control.models import Asset, Command, Run
 
-from .conftest import ADMIN
+from .conftest import ADMIN, profile_inspection
 
 
 def profile():
@@ -32,11 +32,13 @@ def profile():
 
 
 def register(platform, node, declaration=None):
+    declared = profile() if declaration is None else declaration
     return platform.client.post("/api/v1/assets", headers=ADMIN, json={
         "name": "composite source", "kind": "DATASET", "node_id": node["node_id"],
         "path": "/machine/composite", "version": "v1",
-        "metadata": {"dataset_profile": profile() if declaration is None else declaration,
+        "metadata": {"dataset_profile": declared,
                      "custom": {"preserve": True}},
+        "dataset_inspection_id": profile_inspection(platform, node["node_id"], "/machine/composite", declared),
     })
 
 

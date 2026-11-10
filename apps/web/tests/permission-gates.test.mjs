@@ -86,8 +86,8 @@ try {
 
   await test('operators can register all asset types while viewers keep a shared readonly catalog', () => {
     for (const role of ['admin', 'operator'])
-      assert.match(render(role, AssetsPage), />我的格式模板</);
-    assert.doesNotMatch(render('viewer', AssetsPage), />我的格式模板</);
+      assert.match(render(role, AssetsPage), />数据集格式模板</);
+    assert.doesNotMatch(render('viewer', AssetsPage), />数据集格式模板</);
     assert.match(render('admin', AssetsPage), />登记资产</);
     assert.match(render('admin', AssetsPage), />批量登记数据集</);
     assert.match(render('operator', AssetsPage), />登记资产</);

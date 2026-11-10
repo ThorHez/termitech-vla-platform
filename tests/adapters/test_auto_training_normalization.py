@@ -1,9 +1,11 @@
 """Automatic startup normalization is frozen before execution, not in preflight."""
 
 import copy
+import dataclasses
 import hashlib
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,7 @@ from vla_adapters import openpi_entry, training_plan
 from vla_adapters.openpi_entry import checkpoint_norm_descriptor, resolve_config
 from vla_adapters.training_plan import auto_shared_norm_contract, inspect_training_config
 
+from test_shared_normalization import shared
 from test_training_plan import training  # noqa: F401
 
 
@@ -65,6 +68,8 @@ def planner(training, monkeypatch):
         path.write_text("# frozen numeric implementation " + name)
     plan = {"mode": "auto_shared", "method": "weighted_raw_samples", "coverage": "full",
             "fingerprint": "f" * 64, "sources": [{"weight": row["weight"]} for row in spec["dataset_bindings"]],
+            "numeric_io": [{"schema_version": 2, "action_sequence": "per_frame", "temporal_columns": []}
+                           for _ in spec["dataset_bindings"]],
             "output_path": str(Path(spec["output_dir"]) / "normalization/norm_stats.json")}
     calls = []
     helper = SimpleNamespace(__file__=str(root / relative[0]),
@@ -99,7 +104,49 @@ def test_preview_and_attempt_outputs_have_identical_frozen_normalization_identit
     assert preview == actual
 
 
-@pytest.mark.parametrize("case", ["outside_module", "outside_output", "missing_source", "incomplete_plan"])
+@dataclasses.dataclass
+class ComposableDataConfig:
+    repo_id: str
+    composition: dict
+
+
+@pytest.mark.parametrize("change, expected", [
+    ("composition", ("状态表示（组合向量与关节）", "动作表示（组合向量与关节）")),
+    ("metadata", ("源元数据的位置单位（m与mm）",)),
+])
+def test_shared_layout_error_explains_reference_norms_and_names_the_differing_groups(
+    planner, monkeypatch, change, expected,
+):
+    config, spec, helper, _, _ = planner
+    factories = [
+        ComposableDataConfig(child.repo_id, {
+            "state_representation": "composite", "action_representation": "composite",
+        })
+        for child in config.data.datasets
+    ]
+    if change == "composition":
+        factories[2].composition.update(state_representation="joint", action_representation="joint")
+    else:
+        for index, factory in enumerate(factories):
+            path = Path(factory.repo_id) / "meta/info.json"
+            info = json.loads(path.read_text())
+            path.write_text(json.dumps({**info, "position_unit": "mm" if index == 2 else "m"}))
+    config.data.datasets = factories
+    monkeypatch.setitem(sys.modules, "openpi.training.shared_norm", shared)
+    helper.planned_training_normalization = lambda actual: shared.source_descriptors(actual.data.datasets, [1.] * 3)
+
+    with pytest.raises(ValueError) as caught:
+        auto_shared_norm_contract(config, spec)
+
+    message = str(caught.value)
+    assert message.startswith("SHARED_NORM_INVALID: 本次多数据集训练会自动计算共享归一化参数")
+    assert "各组绑定的 norm_stats 仅作参考" in message
+    assert f"第 1 组「{Path(factories[0].repo_id).name}」与第 3 组「{Path(factories[2].repo_id).name}」" in message
+    assert all(detail in message for detail in expected)
+    assert str(Path(factories[2].repo_id).parent) not in message
+
+
+@pytest.mark.parametrize("case", ["outside_module", "outside_output", "missing_source", "incomplete_plan", "old_reader"])
 def test_preflight_rejects_missing_or_wrong_checkout_automatic_statistics(planner, case):
     config, spec, helper, plan, _ = planner
     if case == "outside_module":
@@ -108,6 +155,9 @@ def test_preflight_rejects_missing_or_wrong_checkout_automatic_statistics(planne
         plan["output_path"] = str(Path(spec["code_dir"]) / "norm_stats.json")
     elif case == "missing_source":
         Path(helper.__file__).unlink()
+    elif case == "old_reader":
+        plan["numeric_io"][0].update(schema_version=1, action_sequence="episode_clamp",
+            temporal_columns=["episode_index", "frame_index", "timestamp"])
     else:
         plan.pop("fingerprint")
     with pytest.raises(ValueError, match="MODULE_OUTSIDE_CODE_DIR|SHARED_NORM_UNSUPPORTED"):

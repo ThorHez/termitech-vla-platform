@@ -247,6 +247,7 @@ def test_state_dim_requires_one_explicit_vector_and_depth_requires_real_semantic
     declared=profile();declared['cameras'][0]['kind']='depth'
     with pytest.raises(ValueError,match='深度'):verify_registered_dataset_profile(declared,info())
     document=info();document['features']['observation.images.wrist']['info']={'is_depth':True}
+    document['features']['observation.images.wrist']['shape']=[224,224,1]
     assert verify_registered_dataset_profile(declared,document)==declared
     declared['cameras'][0]['kind']='rgb'
     with pytest.raises(ValueError,match='RGB'):verify_registered_dataset_profile(declared,document)
@@ -258,6 +259,66 @@ def test_derived_task_requires_explicit_verified_task_index_evidence():
     with pytest.raises(ValueError,match='task'):verify_registered_dataset_profile(declared,document)
     assert verify_registered_dataset_profile(declared,document,derived_features=['task'])==declared
     with pytest.raises(ValueError):verify_registered_dataset_profile(declared,document,derived_features=['made_up'])
+
+
+def numeric_camera_case(kind='depth'):
+    selected = json.loads((Path(__file__).resolve().parents[1] / 'fixtures/composed-processing-v1.json').read_text())['valid'][0]
+    key = 'observation.range' if kind == 'depth' else 'observation.color_array'
+    selected['cameras'][0].update(key=key, kind=kind, layout='hwc')
+    declared = profile()
+    declared['cameras'][0].update(key=key, kind=kind,
+        image_processing={'resize_mode': 'pad', 'augmentation': 'none'})
+    declared['feature_keys'] = [key, 'actions']
+    document = info()
+    document['features'].pop('observation.images.wrist')
+    document['features'].update({
+        key: {'dtype': 'float32', 'shape': [360, 640] if kind == 'depth' else [360, 640, 3]},
+        'observation.joints': {'dtype': 'float32', 'shape': [6]},
+        'observation.gripper': {'dtype': 'float32', 'shape': [1]},
+        'task': {'dtype': 'string', 'shape': [1]},
+    })
+    if kind == 'depth':
+        document['features'][key]['semantic'] = 'depth'
+    return declared, document, selected, key
+
+
+@pytest.mark.parametrize('kind', ['rgb', 'depth'])
+def test_numeric_camera_is_accepted_only_by_explicit_matching_composition(kind):
+    from vla_adapters.composition_spec import verify_composition_metadata
+    declared, document, selected, _ = numeric_camera_case(kind)
+    before = copy.deepcopy((declared, document, selected))
+    assert verify_registered_dataset_profile(declared, document, selected_composition=selected) == declared
+    assert verify_composition_metadata(selected, document)
+    assert (declared, document, selected) == before
+    with pytest.raises(ValueError, match='DATASET_PROFILE_MISMATCH'):
+        verify_registered_dataset_profile(declared, document)
+
+
+@pytest.mark.parametrize('case', ['wrong_kind', 'wrong_key', 'unsupported_dtype', 'missing_depth_semantics', 'state_alias'])
+def test_numeric_camera_does_not_bypass_source_kind_semantics_or_state_separation(case):
+    declared, document, selected, key = numeric_camera_case()
+    if case == 'wrong_kind':
+        selected['cameras'][0]['kind'] = 'rgb'
+    elif case == 'wrong_key':
+        selected['cameras'][0]['key'] = 'observation.other_range'
+    elif case == 'unsupported_dtype':
+        document['features'][key]['dtype'] = 'string'
+    elif case == 'missing_depth_semantics':
+        document['features'][key].pop('semantic')
+    else:
+        selected['cameras'][0]['key'] = 'observation.joints'
+        declared['cameras'][0]['key'] = 'observation.joints'
+    with pytest.raises(ValueError, match='DATASET_PROFILE_MISMATCH|COMPOSITION_INVALID'):
+        verify_registered_dataset_profile(declared, document, selected_composition=selected)
+
+
+def test_selected_numeric_camera_still_requires_real_image_shape_in_composition_metadata():
+    from vla_adapters.composition_spec import verify_composition_metadata
+    declared, document, selected, key = numeric_camera_case('rgb')
+    document['features'][key]['shape'] = [16]
+    assert verify_registered_dataset_profile(declared, document, selected_composition=selected)
+    with pytest.raises(ValueError, match='RGB 元信息'):
+        verify_composition_metadata(selected, document)
 
 
 def test_legacy_training_plan_omits_profile_and_registered_plan_freezes_verified_profile(training):

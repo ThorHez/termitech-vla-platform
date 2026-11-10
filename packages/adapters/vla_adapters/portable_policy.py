@@ -28,7 +28,7 @@ DATACLASS_MODULES = MODEL_MODULES | frozenset({
     "openpi.transforms", "openpi.policies.aloha_policy", "openpi.policies.droid_policy",
     "openpi.policies.libero_policy", "openpi.policies.umi_policy", "vla_adapters.policy_inference",
 })
-ADAPTER_FILES = ("policy_inference.py", "composition_spec.py", "portable_policy.py")
+ADAPTER_FILES = ("policy_inference.py", "composition_spec.py", "portable_policy.py", "image_runtime.py", "image_policy.py")
 
 
 class PortableRepresentationUnsupported(ValueError):

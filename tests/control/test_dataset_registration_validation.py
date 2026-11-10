@@ -1,4 +1,4 @@
-"""Registration grants a bounded check of its new dataset, not manual rights."""
+"""Registration queues a bounded check with its original actor."""
 
 from copy import deepcopy
 
@@ -32,12 +32,16 @@ def test_operator_registration_queues_only_its_new_dataset_check(platform):
     assert command.payload["source_registration"] is True and "source_transfer_id" not in command.payload
     receipt = asset["validation"]["registration"]
     assert receipt["asset_id"] == asset["id"] and receipt["actor_user_id"] == users["alice"]
-    assert create(platform, asset).status_code == 403
+    pending = create(platform, asset)
+    assert pending.status_code == 202, pending.text
+    assert pending.json()["id"] == command.id
     assert platform.client.post(f"/api/v1/assets/{asset['id']}/validation/cancel").status_code == 403
     assert any(item["id"] == command.id for item in platform.commands(node))
     assert ack(platform, node, asset["validation"], result(asset)).status_code == 200
     assert get(platform, asset)["status"] == "SUCCEEDED"
-    assert create(platform, asset).status_code == 403
+    fresh = create(platform, asset)
+    assert fresh.status_code == 202, fresh.text
+    assert fresh.json()["id"] != command.id
 
 
 @pytest.mark.parametrize("change", [{"enabled": False}, {"role": "viewer"}])
@@ -64,7 +68,7 @@ def test_admin_demoted_to_operator_retains_accepted_registration_rights(platform
     assert ack(platform, node, asset["validation"], result(asset)).status_code == 200
     login(platform, "owner-admin")
     assert get(platform, asset)["status"] == "SUCCEEDED"
-    assert create(platform, asset).status_code == 403
+    assert create(platform, asset).status_code == 202
 
 
 @pytest.mark.parametrize("change", ["disabled", "logout"])

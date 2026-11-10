@@ -69,6 +69,18 @@
   font-weight: 600;
 }
 
+.dataset-image-policy-fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-column: 1 / -1;
+  gap: 10px;
+  min-width: 0;
+}
+
+.dataset-image-policy-fields .field {
+  min-width: 0;
+}
+
 .dataset-profile-advanced {
   border-top: 1px solid var(--border);
   margin-top: 16px;

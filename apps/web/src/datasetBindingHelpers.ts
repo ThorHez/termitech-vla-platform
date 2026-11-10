@@ -69,11 +69,6 @@ export function copyDatasetBinding(
   return { ...settings, dataset_asset_id: '', norm_asset_id: '' };
 }
 
-export function datasetNormalizationMode(bindings: readonly DatasetBinding[]) {
-  if (bindings.length <= 1) return 'single';
-  return new Set(bindings.map((binding) => binding.norm_asset_id)).size === 1 ? 'shared' : 'legacy';
-}
-
 export function sharedNormalizationAssetId(bindings: readonly DatasetBinding[]) {
   const first = bindings[0]?.norm_asset_id || '';
   return bindings.every((binding) => binding.norm_asset_id === first) ? first : '';
@@ -90,12 +85,7 @@ export function appendDatasetBinding(
   bindings: readonly DatasetBinding[],
   defaultRecipeIndex = 0,
 ): DatasetBinding[] {
-  const next = copyDatasetBinding(bindings[0], defaultRecipeIndex);
-  // A new multi-source selection shares its first row's explicitly chosen
-  // statistics. Existing distinct row selections stay intact until switched.
-  if (bindings.length === 1 || datasetNormalizationMode(bindings) === 'shared')
-    next.norm_asset_id = sharedNormalizationAssetId(bindings);
-  return [...bindings, next];
+  return [...bindings, copyDatasetBinding(bindings[0], defaultRecipeIndex)];
 }
 
 export function selectDatasetBinding(
@@ -103,14 +93,9 @@ export function selectDatasetBinding(
   selection: Pick<DatasetBinding, 'dataset_asset_id' | 'norm_asset_id'>,
   defaultRecipeIndex: number,
   preserveProcessing = false,
-  sharedNormAssetId?: string,
 ): DatasetBinding {
   const { processor, recipe_index: recipeIndex, ...rest } = binding;
-  const selected = {
-    ...rest,
-    ...selection,
-    ...(sharedNormAssetId === undefined ? {} : { norm_asset_id: sharedNormAssetId }),
-  };
+  const selected = { ...rest, ...selection };
   // A copied row has no asset yet. Its first selection supplies the identity
   // without replacing the processing settings that were just copied.
   if (preserveProcessing || !binding.dataset_asset_id) {
@@ -131,8 +116,6 @@ export function selectTrainingDatasetBinding(
   preserveProcessing = false,
 ): DatasetBinding[] {
   const dataset = assets.find((asset) => asset.id === datasetAssetId && asset.kind === 'DATASET');
-  const sharedNormId =
-    datasetNormalizationMode(bindings) === 'shared' ? sharedNormalizationAssetId(bindings) : '';
   return bindings.map((binding, row) =>
     row !== index
       ? binding
@@ -144,7 +127,6 @@ export function selectTrainingDatasetBinding(
           },
           defaultRecipeIndex,
           preserveProcessing,
-          sharedNormId || undefined,
         ),
   );
 }

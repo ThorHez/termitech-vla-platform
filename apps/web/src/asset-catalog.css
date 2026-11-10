@@ -21,3 +21,16 @@
   font-size: 10px;
   line-height: 1.7;
 }
+
+@media (max-width: 740px) {
+  .toolbar-filters.asset-catalog-filters {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .toolbar-filters.asset-catalog-filters > select {
+    width: 100%;
+  }
+  .asset-catalog-filters .search-field {
+    grid-column: 1 / -1;
+  }
+}

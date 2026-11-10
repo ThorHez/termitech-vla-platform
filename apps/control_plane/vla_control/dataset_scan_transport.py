@@ -134,6 +134,7 @@ def inspect(fd,path,relative):
             if not isinstance(features,dict) or not 1<=len(features)<=256:
                 fail('DATASET_SCAN_INVALID_METADATA','LeRobot info.json requires a bounded nonempty features object')
             signature=[]
+            declared=[]
             for key,feature in sorted(features.items()):
                 if not text(key,256) or not isinstance(feature,dict) or not text(feature.get('dtype'),64):
                     fail('DATASET_SCAN_INVALID_METADATA','LeRobot feature declarations are invalid')
@@ -141,7 +142,11 @@ def inspect(fd,path,relative):
                 if not isinstance(shape,list) or len(shape)>5 or any(type(n) is not int or not 0<n<=2**31-1 for n in shape):
                     fail('DATASET_SCAN_INVALID_METADATA','LeRobot feature shapes are invalid')
                 signature.append({'key':key,'dtype':feature['dtype'],'shape':shape,'names':feature.get('names')})
+                names=feature.get('names')
+                names=names if isinstance(names,list) and len(names)<=512 and all(text(n,256) for n in names) else []
+                declared.append({'key':key,'dtype':feature['dtype'],'shape':shape,'names':names})
             entry['feature_signature']=hashlib.sha256(encode(signature)).hexdigest()
+            entry['features']=declared
             entry['summary']=metadata_summary(info,meta_fd)
         finally:os.close(meta_fd)
     except ScanError as error:entry['error']={'code':error.code,'message':error.message}
@@ -261,8 +266,23 @@ def _validated_result(result, parent, roots, max_datasets):
         raise TransferError('DATASET_SCAN_INVALID_RESULT', '机器返回的数据集扫描结果无效')
     seen = set()
     for entry in result['entries']:
-        if not isinstance(entry, dict) or set(entry) != {'path', 'relative_path', 'name', 'info_sha256', 'feature_signature', 'summary', 'error'}:
+        fields = {'path', 'relative_path', 'name', 'info_sha256', 'feature_signature', 'summary', 'error'}
+        if not isinstance(entry, dict) or not fields <= set(entry) or set(entry) - fields - {'features'}:
             raise TransferError('DATASET_SCAN_INVALID_RESULT', '机器返回的数据集条目无效')
+        if 'features' in entry:
+            features = entry['features']
+            if not isinstance(features, list) or not 1 <= len(features) <= 256:
+                raise TransferError('DATASET_SCAN_INVALID_RESULT', '机器返回的图像字段无效')
+            for feature in features:
+                if (not isinstance(feature, dict) or set(feature) != {'key', 'dtype', 'shape', 'names'}
+                        or not _text(feature.get('key'), 256) or not _text(feature.get('dtype'), 64)
+                        or not isinstance(feature.get('shape'), list) or len(feature['shape']) > 5
+                        or any(type(n) is not int or not 1 <= n <= 2**31 - 1 for n in feature['shape'])
+                        or not isinstance(feature.get('names'), list) or len(feature['names']) > 512
+                        or any(not _text(name, 256) for name in feature['names'])):
+                    raise TransferError('DATASET_SCAN_INVALID_RESULT', '机器返回的图像字段形状无效')
+            if len({feature['key'] for feature in features}) != len(features):
+                raise TransferError('DATASET_SCAN_INVALID_RESULT', '机器返回重复图像字段')
         try:
             path = _path(entry['path'])
         except TransferError:

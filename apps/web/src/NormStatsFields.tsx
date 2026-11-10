@@ -47,7 +47,7 @@ export function NormStatsFields({
             <Field
               label="动作预测长度"
               required
-              hint="单步动作由加载器按此长度展开；已存动作块需与此长度兼容。"
+              hint="用于核对已存储动作块的长度。每行统计一个动作向量，动作块取第一步。"
             >
               <input
                 required

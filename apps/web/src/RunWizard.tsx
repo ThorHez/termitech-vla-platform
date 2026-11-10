@@ -35,7 +35,7 @@ import {
 import { DatasetBindings, DatasetBindingSummary } from './DatasetBindings';
 import { newDatasetBindings } from './datasetBindingHelpers';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
-import { PreflightChecks } from './PreflightChecks';
+import { PreflightChecks, sharedNormIncompatibilityDetail } from './PreflightChecks';
 import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft';
 import type { ImageLayoutEdits } from './imageLayout';
 import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
@@ -652,6 +652,7 @@ function RunWizardContent({
   requestRef.current = request;
   const previewResource = useApi<Preview>(previewId ? `/run-previews/${previewId}` : null, 1800);
   const preview = previewResource.data?.id === previewId ? previewResource.data : createdPreview;
+  const sharedNormDetail = sharedNormIncompatibilityDetail(preview?.error?.message);
   const previewReadError = previewId ? previewResource.error : undefined;
   const displayedError = error || (step === 2 ? previewReadError : undefined);
   const requestFailed = !previewId && !!error && !busy;
@@ -2762,8 +2763,20 @@ function RunWizardContent({
               </p>
             </div>
           </div>
+          {sharedNormDetail && (
+            <div className="error-notice" role="alert">
+              <XCircle size={18} aria-hidden="true" />
+              <div>
+                <strong title={preview?.error?.code}>这些数据集无法共用归一化参数</strong>
+                <p>{sharedNormDetail}</p>
+              </div>
+            </div>
+          )}
           {preview?.checks?.length ? (
-            <PreflightChecks checks={preview.checks} />
+            <PreflightChecks
+              checks={preview.checks}
+              summarizedSharedNormError={sharedNormDetail ? preview.error?.message : undefined}
+            />
           ) : (
             preview?.status === 'PENDING' &&
             !progressUnavailable && (
@@ -2772,7 +2785,7 @@ function RunWizardContent({
               </div>
             )
           )}
-          {preview?.error && (
+          {preview?.error && !sharedNormDetail && (
             <div className="inline-note red">
               <strong>{preview.error.code}</strong>
               <span>{preview.error.message}</span>

@@ -22,7 +22,7 @@ from vla_control.remote_models import RemoteConnection
 from vla_control.ssh_remote import RemoteError
 from vla_control.storage_configurations import _in_use
 
-from .conftest import ADMIN
+from .conftest import ADMIN, profile_inspection
 from .test_checkpoint_transfers import SECRET, bind_ssh
 from .test_dataset_profiles import profile
 from .test_policy_deployments import add_run
@@ -39,6 +39,7 @@ def fixture(platform):
     asset = platform.client.post('/api/v1/assets', headers=ADMIN, json={
         'node_id': source['node_id'], 'kind': 'DATASET', 'name': 'folding data',
         'path': '/machine/data/folding', 'version': 'v2',
+        'dataset_inspection_id': profile_inspection(platform, source['node_id'], '/machine/data/folding', profile()),
         'metadata': {'dataset_profile': profile(), 'description': 'Retain task semantics',
                      'inspection': {'node_id': 'old-machine'}, 'dataset_asset_id': 'foreign-id'}}).json()
     assert asset.get('id'), asset
@@ -116,7 +117,7 @@ def test_create_is_asset_bound_durable_and_does_not_queue_agent_commands(fixture
     with platform.app.state.db.read() as session:
         row = session.get(AssetTransfer, item['id'])
         assert row.binding_snapshot['source_connection']['id'] == connections[0].id
-        assert list(session.scalars(select(Command))) == []
+        assert list(session.scalars(select(Command).where(Command.status == 'PENDING'))) == []
         assert [r.id for r in active_asset_transfers(session, asset_id=asset['id'])] == [item['id']]
 
 

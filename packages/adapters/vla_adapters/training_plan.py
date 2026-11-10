@@ -13,12 +13,14 @@ import math
 import os
 import re
 import stat
+import sys
 import time
 from pathlib import Path
 
 if __package__:
     from .automatic_config import normalize_auto_config
     from .generated_config import generated_training_config
+    from .image_runtime import image_processing_contract
     from .composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from .cache_contract import inspect_training_cache
     from .data_processors import processor_identity, validate_processor_instance
@@ -33,6 +35,7 @@ if __package__:
 else:
     from automatic_config import normalize_auto_config
     from generated_config import generated_training_config
+    from image_runtime import image_processing_contract
     from composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from cache_contract import inspect_training_cache
     from data_processors import processor_identity, validate_processor_instance
@@ -216,6 +219,8 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
         if type(info.get(key)) is not int or info[key] <= 0:
             raise ValueError(f"DATASET_FORMAT: {path} 的 {key} 必须大于零")
     features = info.get("features")
+    image_policy = (image_processing_contract(factory, registered_profile, features, code_dir=spec["code_dir"], model_config=model_config)
+                    if not norm_stats else None)
     composition = normalize_composition(factory.composition, norm_stats=norm_stats) if type(factory).__name__ == COMPOSABLE_PROCESSOR else None
     action_key = composition["action_key"] if composition else "actions"
     if not isinstance(features, dict) or not isinstance(features.get(action_key), dict):
@@ -329,6 +334,7 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
             "fps_source": "registered" if isinstance(registered_profile, dict) and "fps" in registered_profile else "metadata",
             "actions_shape": actions, "data_bytes": data_bytes, "data_manifest_digest": manifest,
             **({"warnings": warnings} if warnings else {}),
+            **({"image_processing": image_policy} if image_policy is not None else {}),
             **video_evidence, **derived, **declared, **composed}
 
 
@@ -409,6 +415,99 @@ def norm_contract(factory, spec, *, normalization_method=None):
     return {"norm_path": str(norm_path), "norm_sha256": sha}
 
 
+_SHARED_NORM_LAYOUT_ERROR = (
+    "SHARED_NORM_INVALID: source state/action layouts, ordering, encoding, units or numeric processing differ"
+)
+_SHARED_NORM_FIELD_LABELS = {
+    "state_representation": "状态表示",
+    "action_representation": "动作表示",
+    "action_mode": "动作编码",
+    "state_fields": "状态字段或拼接顺序",
+    "action_key": "动作字段",
+    "action_layout": "动作分块或排列顺序",
+    "state_history": "状态历史长度",
+    "rotation_representation": "旋转表示",
+    "position_unit": "位置单位",
+    "joint_unit": "关节单位",
+    "coordinate_frame": "坐标系",
+    "gripper_range": "夹爪范围",
+    "arm_mode": "机械臂模式",
+    "robot_model": "机器人型号",
+    "robot_type": "机器人类型",
+}
+_SHARED_NORM_VALUE_LABELS = {
+    "composite": "组合向量", "joint": "关节", "eef": "末端",
+    "absolute": "绝对值", "delta": "增量",
+}
+
+
+def _shared_norm_field_differences(left, right):
+    details = []
+    for key, label in _SHARED_NORM_FIELD_LABELS.items():
+        before, after = left.get(key), right.get(key)
+        if (key in left) == (key in right) and fingerprint(before) == fingerprint(after):
+            continue
+        if all(isinstance(value, str) and re.fullmatch(r"[\w./-]{1,40}", value) for value in (before, after)):
+            before = _SHARED_NORM_VALUE_LABELS.get(before, before)
+            after = _SHARED_NORM_VALUE_LABELS.get(after, after)
+            details.append(f"{label}（{before}与{after}）")
+        else:
+            details.append(label)
+    return details
+
+
+def _shared_norm_layout_message(factories, spec, validator, *, automatic):
+    mode = ("本次多数据集训练会自动计算共享归一化参数，各组绑定的 norm_stats 仅作参考。"
+            if automatic else "本次训练使用共享归一化参数。")
+    message = "SHARED_NORM_INVALID: " + mode
+    guidance = "请在「训练数据集」中核对各组处理配置及原始数据定义后重新预检。"
+    fallback = message + "各组的状态、动作或数据处理配置不一致，无法共用一份归一化统计。" + guidance
+
+    # Reuse the selected OpenPI validator's comparison inputs for diagnostics.
+    # Older or custom validators may only provide the original error.
+    processor = getattr(validator, "_processor", None)
+    numeric_source = getattr(validator, "_numeric_source", None)
+    if not callable(processor) or not callable(numeric_source):
+        return fallback
+
+    def comparison(factory):
+        info, _ = read_json(Path(factory.repo_id) / "meta/info.json", spec)
+        return {"processor": processor(factory, compatibility=True),
+                "numeric_source": numeric_source(factory, info)}
+
+    def group(index, factory):
+        name = Path(factory.repo_id).name
+        name = "".join(char if char.isprintable() else " " for char in name[:80])
+        return f"第 {index} 组「{name}」"
+
+    try:
+        first = comparison(factories[0])
+        first_digest = fingerprint(first)
+        for index, factory in enumerate(factories[1:], start=2):
+            other = comparison(factory)
+            if fingerprint(other) == first_digest:
+                continue
+            left, right = first["processor"], other["processor"]
+            details = _shared_norm_field_differences(
+                left["fields"].get("composition") or {}, right["fields"].get("composition") or {})
+            if not details and fingerprint(left) != fingerprint(right):
+                details.append("数据处理器配置或实现")
+            left, right = first["numeric_source"], other["numeric_source"]
+            details.extend("源元数据的" + detail for detail in
+                           _shared_norm_field_differences(left["declarations"], right["declarations"]))
+            if fingerprint(left["features"]) != fingerprint(right["features"]):
+                details.append("源元数据的数值字段定义")
+            if fingerprint(left["field_annotations"]) != fingerprint(right["field_annotations"]):
+                details.append("源元数据的状态或动作字段标注")
+            difference = f"差异包括{'、'.join(details[:4])}。" if details else ""
+            return (message + f"{group(1, factories[0])}与{group(index, factory)}的数据定义不一致。"
+                    + difference + guidance)
+    except (AttributeError, LookupError, OSError, TypeError, ValueError):
+        # A second metadata read is best effort. Keep the original rejection.
+        pass
+    return fallback
+
+
 def shared_norm_contract(data_factory, factories, datasets, spec):
     """Use the selected checkout's lightweight provenance checker, never scan raw samples."""
     path = getattr(data_factory, "shared_norm_stats_path", None)
@@ -441,9 +540,22 @@ def shared_norm_contract(data_factory, factories, datasets, spec):
     document, sha = read_json(norm, spec)
     if sha != datasets[0]["norm_sha256"]:
         raise ValueError("SHARED_NORM_INVALID: 共享统计文件在预检期间改变，请重新预检")
-    metadata = validate(document, factories, list(data_factory.weights))
+    try:
+        metadata = validate(document, factories, list(data_factory.weights))
+    except ValueError as exc:
+        if str(exc) != _SHARED_NORM_LAYOUT_ERROR:
+            raise
+        raise ValueError(_shared_norm_layout_message(factories, spec, module, automatic=False)) from exc
     return {"mode": "shared", "shared": {"path": str(norm), "sha256": sha, "metadata": metadata,
             "validator": {"path": "src/openpi/training/shared_norm.py", "sha256": digest}}}
+
+
+def single_step_statistics_projection(evidence):
+    """Require the single-action reader in the registered OpenPI environment."""
+    return (isinstance(evidence, dict)
+            and type(evidence.get("schema_version")) is int and evidence["schema_version"] == 2
+            and evidence.get("action_sequence") in ("per_frame", "packed_first_step")
+            and evidence.get("temporal_columns") == [])
 
 
 def auto_shared_norm_contract(config, spec):
@@ -470,7 +582,13 @@ def auto_shared_norm_contract(config, spec):
         if not candidate.is_relative_to(code):
             raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化实现路径超出 OpenPI 项目")
         implementations[name] = hashlib.sha256(read_entrypoint(candidate)).hexdigest()
-    result = plan(config)
+    try:
+        result = plan(config)
+    except ValueError as exc:
+        if str(exc) != _SHARED_NORM_LAYOUT_ERROR:
+            raise
+        validator = sys.modules.get("openpi.training.shared_norm")
+        raise ValueError(_shared_norm_layout_message(config.data.datasets, spec, validator, automatic=True)) from exc
     if (not isinstance(result, dict) or result.get("mode") != "auto_shared"
             or result.get("method") != "weighted_raw_samples"
             or result.get("coverage") != "full"
@@ -478,6 +596,10 @@ def auto_shared_norm_contract(config, spec):
             or not isinstance(result.get("sources"), list)
             or len(result["sources"]) != len(config.data.datasets)):
         raise ValueError("SHARED_NORM_UNSUPPORTED: 自动共享归一化计划不完整，不能退回逐数据集统计")
+    projections = result.get("numeric_io")
+    if (not isinstance(projections, list) or len(projections) != len(config.data.datasets)
+            or not all(single_step_statistics_projection(row) for row in projections)):
+        raise ValueError("SHARED_NORM_UNSUPPORTED: 当前 OpenPI 不支持单步动作归一化统计，请升级训练代码后重新预检")
     # The destination is intentionally absent before training; resolve its
     # existing task ancestor without requiring a generated statistics file.
     output = Path(result.get("output_path", ""))
@@ -654,7 +776,7 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "parameters": spec["parameters"], "gpu_count": spec["gpu_count"], "entrypoint": str(entry),
             "entrypoint_sha256": hashlib.sha256(read_entrypoint(entry)).hexdigest(),
             "adapter_sha256": fingerprint({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "submission_validation.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py")}),
+                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "submission_validation.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py", "image_policy.py", "image_runtime.py")}),
             "data_validation_mode": MODE, "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),

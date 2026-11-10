@@ -22,13 +22,47 @@ const labels: Record<string, string> = {
   validation: '预检验证',
 };
 
-export function PreflightChecks({ checks }: { checks: readonly PreflightCheck[] }) {
+const sharedNormCodePrefix = 'SHARED_NORM_INVALID: ';
+const legacySharedNormMismatch =
+  'source state/action layouts, ordering, encoding, units or numeric processing differ';
+
+export function sharedNormIncompatibilityDetail(message?: string) {
+  if (!message?.startsWith(sharedNormCodePrefix)) return undefined;
+  const detail = message.slice(sharedNormCodePrefix.length);
+  if (detail === legacySharedNormMismatch) {
+    return '各组数据的状态或动作定义不一致。自动计算共享归一化时，各组绑定的 NORM 仅作参考。请在「训练数据集」中核对各组的状态字段顺序、动作表示和单位。';
+  }
+  if (
+    detail.startsWith('本次多数据集训练会自动计算共享归一化参数') ||
+    detail.startsWith('本次训练使用共享归一化参数')
+  ) {
+    return detail;
+  }
+}
+
+export function PreflightChecks({
+  checks,
+  summarizedSharedNormError,
+}: {
+  checks: readonly PreflightCheck[];
+  summarizedSharedNormError?: string;
+}) {
   return (
     <div className="preflight-checks">
       {checks.map((check, index) => {
         const warning = check.ok === true && check.severity === 'warning';
         const state = !check.ok ? 'bad' : warning ? 'warning' : 'ok';
-        const label = labels[check.name] || check.name;
+        const sharedNormDetail = check.ok
+          ? undefined
+          : sharedNormIncompatibilityDetail(check.message);
+        const label = sharedNormDetail
+          ? '数据集能否共用归一化参数'
+          : labels[check.name] || check.name;
+        const message = sharedNormDetail
+          ? check.message === summarizedSharedNormError
+            ? '详见上方的失败原因。'
+            : sharedNormDetail
+          : check.message;
         const status = !check.ok ? '未通过' : warning ? '警告' : '通过';
         return (
           <div
@@ -48,7 +82,7 @@ export function PreflightChecks({ checks }: { checks: readonly PreflightCheck[] 
               {label}
               {warning && <small className="preflight-warning-label">警告</small>}
             </strong>
-            <span>{check.message}</span>
+            <span>{message}</span>
           </div>
         );
       })}

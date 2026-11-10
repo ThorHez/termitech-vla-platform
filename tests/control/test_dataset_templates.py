@@ -113,6 +113,21 @@ def test_same_trimmed_name_updates_existing_template_instead_of_duplicating(temp
     assert len(client.get(PATH).json()) == 1
 
 
+def test_format_templates_store_geometry_without_legacy_training_augmentation(templates):
+    _, client, _ = templates
+    login(client)
+    source = deepcopy(PROFILE)
+    source["cameras"][0]["image_processing"] = {"resize_mode": "pad", "augmentation": "color"}
+    created = create(client, profile=source)
+    assert created.status_code == 201, created.text
+    saved = created.json()
+    assert saved["profile"]["cameras"][0]["image_processing"] == {"resize_mode": "pad"}
+    source["cameras"][0]["image_processing"]["resize_mode"] = "center_crop"
+    changed = update(client, saved, profile=source)
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["profile"]["cameras"][0]["image_processing"] == {"resize_mode": "center_crop"}
+
+
 def test_revision_updates_and_deletes_fail_on_stale_content(templates):
     _, client, _ = templates
     login(client)

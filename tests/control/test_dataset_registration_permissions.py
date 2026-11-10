@@ -6,6 +6,7 @@ from sqlalchemy import delete, func, select
 from vla_control.auth_models import UserSession
 from vla_control.common import offset_time
 from vla_control.models import Asset, Command
+from .conftest import profile_inspection
 
 from .test_dataset_profiles import profile
 from .test_multiuser_task_permissions import team  # noqa: F401
@@ -40,16 +41,17 @@ def test_registration_is_granted_for_all_supported_kinds_to_admin_and_operator(t
 @pytest.mark.parametrize("creator", ["alice", "team-admin"])
 @pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
 def test_operator_can_archive_only_own_registered_assets_and_cannot_edit_existing_assets(team, creator, kind):
-    _, node, _, clients = team
+    platform, node, _, clients = team
     metadata = {"dataset_profile": profile()} if kind == "DATASET" else {}
-    created = clients[creator].post("/api/v1/assets", json=body(node, kind=kind, metadata=metadata))
+    evidence = ({"dataset_inspection_id": profile_inspection(platform, node["node_id"], "/machine/datasets/new", profile())}
+                if kind == "DATASET" else {})
+    created = clients[creator].post("/api/v1/assets", json=body(node, kind=kind, metadata=metadata, **evidence))
     assert created.status_code == 201, created.text
     asset = created.json()
     root = f"/api/v1/assets/{asset['id']}"
     for method, suffix, payload in (
         ("PATCH", "/dataset-profile", {"dataset_profile": {**profile(), "fps": 10}}),
         ("PUT", "/norm-binding", {"norm_path": "/machine/norms/replacement"}),
-        ("POST", "/validations", {}),
         ("POST", "/validation/cancel", {}),
     ):
         response = clients["alice"].request(method, root + suffix, json=payload)
@@ -63,7 +65,7 @@ def test_operator_can_archive_only_own_registered_assets_and_cannot_edit_existin
 
 @pytest.mark.parametrize("binding", ["existing", "path"])
 def test_operator_can_set_initial_profile_and_norm_without_modifying_existing_assets(team, binding):
-    _, node, _, clients = team
+    platform, node, _, clients = team
     admin = clients["team-admin"]
     norm = admin.post("/api/v1/assets", json=body(node, name="shared norm", kind="NORM", path="/machine/norms/shared"))
     assert norm.status_code == 201, norm.text
@@ -71,7 +73,8 @@ def test_operator_can_set_initial_profile_and_norm_without_modifying_existing_as
     declaration = {"norm_asset_id": original["id"]} if binding == "existing" else {"norm_path": original["path"]}
     source_profile = {**profile(), "fps": 20}
     created = clients["alice"].post("/api/v1/assets", json=body(node,
-        metadata={"dataset_profile": source_profile}, **declaration))
+        metadata={"dataset_profile": source_profile},
+        dataset_inspection_id=profile_inspection(platform, node["node_id"], "/machine/datasets/new", source_profile), **declaration))
     assert created.status_code == 201, created.text
     asset = created.json()
     assert asset["norm_asset_id"] == original["id"]

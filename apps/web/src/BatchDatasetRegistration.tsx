@@ -10,6 +10,7 @@ import { DatasetNormField } from './DatasetNormBinding';
 import { datasetNormInputError } from './datasetNormAssets';
 import { PathAutocomplete } from './PathAutocomplete';
 import { DatasetValidationBadge } from './DatasetValidation';
+import { retainMatchingImageProcessing } from './imageProcessingPolicy';
 import {
   applyBatchNorm,
   batchIdempotency,
@@ -660,7 +661,7 @@ function BatchDatasetRegistrationContent({
                     value={profile}
                     disabled={Boolean(busy)}
                     onApply={(value) => {
-                      setProfile(value);
+                      setProfile((previous) => retainMatchingImageProcessing(value, previous));
                       setMetadataOnly(false);
                     }}
                   />
@@ -673,6 +674,10 @@ function BatchDatasetRegistrationContent({
                     />
                     仅登记路径，稍后由管理员补录数据集特征
                   </label>
+                  <p className="field-hint">
+                    逐个检查扫描得到的图像尺寸；非 224×224
+                    图像必须填写公共数据特征，并为相应视觉输入选择处理方式。
+                  </p>
                   {!metadataOnly && (
                     <details className="batch-dataset-profile-review">
                       <summary>
@@ -683,6 +688,7 @@ function BatchDatasetRegistrationContent({
                       <DatasetProfileForm
                         compact
                         value={profile}
+                        features={selected[0]?.entry.features}
                         onChange={setProfile}
                         disabled={Boolean(busy)}
                       />

@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { Field } from './components';
 import { RobotTypeField } from './RobotTypeField';
 import { inferImageLayout } from './imageLayout';
+import { imageAugmentationLabels, isImageAugmentation } from './imageProcessingPolicy';
 import { trainingNormalizationLabel } from './trainingNormalization';
 import { inferCompositionRepresentations } from './compositionRepresentationDefaults';
 import type { TrainingNormalizationMethod } from './types';
@@ -577,6 +578,7 @@ export function ComposedProcessingEditor({
                     time_index: null,
                     depth_min: 0,
                     depth_max: 1,
+                    augmentation: 'default',
                   },
                 ])
               }
@@ -637,9 +639,16 @@ export function ComposedProcessingEditor({
                 <Field label={`组合图像类型 ${index + 1}`}>
                   <select
                     value={item.kind}
-                    onChange={(event) =>
-                      camera(index, { kind: event.target.value as ComposedCamera['kind'] })
-                    }
+                    onChange={(event) => {
+                      const kind = event.target.value as ComposedCamera['kind'];
+                      camera(index, {
+                        kind,
+                        ...(kind === 'depth' &&
+                        (item.augmentation === 'color' || item.augmentation === 'crop_rotate_color')
+                          ? { augmentation: 'default' }
+                          : {}),
+                      });
+                    }}
                   >
                     <option value="rgb">RGB 彩色</option>
                     <option value="depth">深度</option>
@@ -686,6 +695,44 @@ export function ComposedProcessingEditor({
                       })
                     }
                   />
+                </Field>
+                <Field
+                  label={`训练图像增强 ${index + 1}`}
+                  hint={
+                    item.kind === 'depth'
+                      ? '深度图不使用 RGB 随机增强。'
+                      : '仅用于训练。保存训练模板时随该视角保留。'
+                  }
+                >
+                  <select
+                    aria-label={`训练图像增强 ${index + 1}`}
+                    value={item.augmentation ?? ''}
+                    onChange={(event) => {
+                      const augmentation = event.target.value;
+                      if (isImageAugmentation(augmentation)) camera(index, { augmentation });
+                    }}
+                  >
+                    {item.augmentation === undefined && (
+                      <option value="" disabled>
+                        沿用旧配置 ·{' '}
+                        {
+                          imageAugmentationLabels[
+                            profile.cameras.find(
+                              (source) =>
+                                source.key.trim() === item.key.trim() && source.kind === item.kind,
+                            )?.image_processing?.augmentation ?? 'default'
+                          ]
+                        }
+                      </option>
+                    )}
+                    {Object.entries(imageAugmentationLabels)
+                      .filter(([key]) => item.kind !== 'depth' || ['default', 'none'].includes(key))
+                      .map(([key, label]) => (
+                        <option value={key} key={key}>
+                          {label}
+                        </option>
+                      ))}
+                  </select>
                 </Field>
                 {item.kind === 'depth' && (
                   <>

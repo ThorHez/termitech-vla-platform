@@ -3,6 +3,8 @@ import { datasetProfileErrors } from './DatasetProfileForm';
 import { datasetFormatProfile } from './datasetFormatTemplateData';
 import { datasetNormBindingPayload, datasetNormInputError } from './datasetNormAssets';
 import type { Asset } from './types';
+import type { ImageLayoutFeature } from './imageLayout';
+import { imageRegistrationErrors } from './imageProcessingPolicy';
 
 export interface DatasetScanEntry {
   path: string;
@@ -10,6 +12,7 @@ export interface DatasetScanEntry {
   name: string;
   info_sha256?: string;
   feature_signature?: string;
+  features?: ImageLayoutFeature[];
   summary: {
     fps?: number;
     robot_type?: string;
@@ -80,8 +83,7 @@ export function datasetScanScope(
 export function batchScanPathError(path: string): string | undefined {
   const value = path.trim();
   if (!value) return '请选择要扫描的父目录。';
-  if (canonicalDatasetPath(value) === '/')
-    return '请选择数据集所在目录，不能扫描文件系统根目录。';
+  if (canonicalDatasetPath(value) === '/') return '请选择数据集所在目录，不能扫描文件系统根目录。';
   if (value.length > 4096 || !canonicalDatasetPath(value))
     return '父目录需要有效的本机绝对路径，不能包含 .. 或控制字符。';
 }
@@ -123,9 +125,7 @@ export function applyBatchNorm(
   normPath: string,
 ): DatasetScanRow[] {
   return rows.map((row) =>
-    row.selected && !row.entry.error && !row.existingAssetId
-      ? { ...row, normId, normPath }
-      : row,
+    row.selected && !row.entry.error && !row.existingAssetId ? { ...row, normId, normPath } : row,
   );
 }
 
@@ -164,6 +164,12 @@ export function batchRegistrationError({
       return '请为每个选中的数据集填写有效名称，最多 200 个字符。';
     const normError = datasetNormInputError(nodeId, row.normId, row.normPath, assets);
     if (normError) return `数据集「${row.name.trim()}」：${normError}`;
+    const imageError = imageRegistrationErrors(
+      metadataOnly ? undefined : profile.cameras,
+      row.entry.features,
+    )[0];
+    if (imageError)
+      return `数据集「${row.name.trim()}」：${imageError}${metadataOnly ? ' 请取消仅登记路径并填写图像处理配置。' : ''}`;
   }
   if (!metadataOnly) {
     const error = datasetProfileErrors(profile)[0];

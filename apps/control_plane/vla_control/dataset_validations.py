@@ -14,7 +14,9 @@ from sqlalchemy.orm import object_session
 from .common import APIError, digest, now, offset_time, require_path, uid
 from .models import Asset, Command, Node, Profile
 from .schemas import InputModel
-from .resource_authorization import bind_command_actor, execution_permission_authorized, require_active_actor
+from .resource_authorization import (
+    bind_command_actor, execution_permission_authorized, request_user_id, require_active_actor,
+)
 from .account_lifecycle import task_execution_authorized
 
 
@@ -130,12 +132,7 @@ def reject_undelivered_validation(session, command, error):
 
 
 def validation_execution_authorized(session, command, *, allow_legacy=False):
-    """Authorize explicit admin work or the exact output of registration/copy.
-
-    Neither registration nor transfer grants explicit validation rights. Each
-    registration receipt binds its new asset and original actor; copy checks
-    bind the transfer's output and current admin capability for intervention.
-    """
+    """Recheck ownership of manual work and the provenance of registration/copy work."""
     if command.type != COMMAND:
         return False
     source_id = command.payload.get("source_transfer_id")
@@ -143,28 +140,34 @@ def validation_execution_authorized(session, command, *, allow_legacy=False):
     if ((registration is not None and registration is not True)
             or (source_id is not None and registration is not None)):
         return False
+    owned_retry = source_id is None and registration is None and command.required_permission == "datasets.validate"
     permission = ("assets.transfer" if source_id is not None else
-                  "datasets.register" if registration is True else "assets.write")
+                  "datasets.register" if registration is True else
+                  "datasets.validate" if owned_retry else "assets.write")
     legacy = command.actor_user_id is None and command.required_permission is None
     if (command.required_permission != permission and not legacy
             or not execution_permission_authorized(session, command.actor_user_id, permission, allow_legacy=allow_legacy)):
         return False
-    if registration is True:
+    if registration is True or owned_retry:
         asset = session.get(Asset, command.payload.get("asset_id"))
         if asset is None or asset.kind != "DATASET" or asset.state in {"ARCHIVED", "UNAVAILABLE"}:
+            return False
+        if owned_retry and (command.actor_user_id is None or asset.registered_by_user_id != command.actor_user_id):
             return False
         stored = (asset.metadata_json or {}).get(INTERNAL_KEY)
         if not isinstance(stored, dict):
             return False
-        receipt = stored.get("registration")
+        if registration is True and stored.get("registration") != {
+            "asset_id": asset.id, "node_id": asset.node_id, "path": asset.path,
+            "created_at": asset.created_at, "actor_user_id": command.actor_user_id,
+            "input_digest": command.payload.get("input_digest"),
+        }:
+            return False
         node, profile = _context(session, asset, command.payload.get("profile_id"))
-        return bool(isinstance(receipt, dict) and node is not None and profile is not None
+        return bool(node is not None and profile is not None
                     and stored.get("status") == "PENDING" and stored.get("id") == command.id
                     and stored.get("profile_id") == command.payload.get("profile_id")
                     and stored.get("input_digest") == command.payload.get("input_digest")
-                    and receipt == {"asset_id": asset.id, "node_id": asset.node_id, "path": asset.path,
-                                    "created_at": asset.created_at, "actor_user_id": command.actor_user_id,
-                                    "input_digest": command.payload.get("input_digest")}
                     and command.node_id == asset.node_id and command.payload.get("path") == asset.path
                     and command.payload.get("registered_profile") == _metadata(asset).get("dataset_profile")
                     and input_digest(asset, profile, node) == command.payload.get("input_digest"))
@@ -232,7 +235,7 @@ def _reuse_pending_validation(session, asset, previous):
         return True
     code = "COMMAND_ACTOR_REQUIRED" if command.actor_user_id is None else "COMMAND_AUTHORIZATION_REVOKED"
     reject_undelivered_validation(session, command,
-        {"code": code, "message": "校验发起账户或权限已失效，旧校验未下发；请由管理员重新提交"})
+        {"code": code, "message": "校验发起账户或权限已失效，旧校验未下发，请使用有权限的账户重新提交"})
     return False
 
 
@@ -284,7 +287,13 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
             command.payload = {**command.payload, "source_transfer_id": source_transfer_id}
             command.actor_user_id, command.required_permission = actor_user_id, "assets.transfer"
         else:
-            bind_command_actor(command, actor_request, "datasets.register" if source_registration else "assets.write")
+            if source_registration:
+                permission = "datasets.register"
+            elif actor_request is not None and actor_request.state.principal.role != "admin":
+                permission = "datasets.validate"
+            else:
+                permission = "assets.write"
+            bind_command_actor(command, actor_request, permission)
         if source_registration:
             command.payload = {**command.payload, "source_registration": True}
             report["registration"] = {"asset_id": asset.id, "node_id": asset.node_id, "path": asset.path,
@@ -468,8 +477,13 @@ def register_routes(app, admin, db, settings):
     @app.post("/api/v1/assets/{asset_id}/validations", dependencies=admin, status_code=202)
     def create(asset_id: str, body: ValidationInput, request: Request):
         with db.write() as session:
-            require_active_actor(session, request, "assets.write")
-            return queue_validation(session, required(session, asset_id, lock=True), body.profile_id,
+            require_active_actor(session, request, "datasets.validate")
+            asset = required(session, asset_id, lock=True)
+            if request.state.principal.role != "admin" and (
+                asset.registered_by_user_id is None or asset.registered_by_user_id != request_user_id(request)
+            ):
+                raise APIError(403, "RESOURCE_ACCESS_DENIED", "只能重新校验自己登记的数据集")
+            return queue_validation(session, asset, body.profile_id,
                                     heartbeat_timeout_seconds=settings.heartbeat_timeout_seconds, actor_request=request)
 
     @app.get("/api/v1/assets/{asset_id}/validation", dependencies=admin)

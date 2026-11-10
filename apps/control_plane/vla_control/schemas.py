@@ -108,9 +108,12 @@ class AssetInput(InputModel):
     metadata: dict = Field(default_factory=dict)
     norm_asset_id: str | None = Field(default=None, min_length=1, max_length=36)
     norm_path: str | None = Field(default=None, min_length=1, max_length=4096, strict=True)
+    dataset_inspection_id: str | None = Field(default=None, min_length=1, max_length=36, strict=True)
 
     @model_validator(mode="after")
     def dataset_metadata(self):
+        if self.dataset_inspection_id is not None and self.kind != "DATASET":
+            raise ValueError("只有数据集资产可以提交图像元信息读取记录")
         if "norm_path" in self.model_fields_set:
             if "norm_asset_id" in self.model_fields_set or self.norm_path is None:
                 raise ValueError("norm_path 与 norm_asset_id 只能填写一个；路径不能为空")
@@ -120,6 +123,7 @@ class AssetInput(InputModel):
 
 class AssetDatasetProfileInput(InputModel):
     dataset_profile: DatasetProfile
+    dataset_inspection_id: str | None = Field(default=None, min_length=1, max_length=36, strict=True)
 
 
 class AssetNormBindingInput(InputModel):

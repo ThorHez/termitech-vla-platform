@@ -175,7 +175,7 @@ def _validate_composition(dataset, processor, auto_config):
 def _validate_numeric_io(dataset, spec):
     evidence = dataset.get("numeric_io")
     if (not isinstance(evidence, dict) or type(evidence.get("schema_version")) is not int
-            or evidence["schema_version"] != 1 or evidence.get("reader") != "pyarrow_parquet_projection"
+            or evidence["schema_version"] not in (1, 2) or evidence.get("reader") != "pyarrow_parquet_projection"
             or evidence.get("image_columns") != [] or evidence.get("video_decode") is not False):
         raise ValueError("Statistics need numeric-only source projection without image or video decoding")
 
@@ -198,11 +198,21 @@ def _validate_numeric_io(dataset, spec):
         raise ValueError("Statistics numeric reader needs traceable source identity")
     shape = dataset.get("actions_shape")
     if (not isinstance(shape, list) or len(shape) not in {1, 2}
-            or any(type(size) is not int or size < 1 for size in shape)
-            or (len(shape) == 2 and (evidence.get("action_sequence") != "packed" or temporal != []))
-            or (len(shape) == 1 and (evidence.get("action_sequence") != "episode_clamp"
-                                    or temporal != ["episode_index", "frame_index", "timestamp"]))):
-        raise ValueError("Statistics numeric projection must prove its packed or episode-bound action sampling")
+            or any(type(size) is not int or size < 1 for size in shape)):
+        raise ValueError("Statistics numeric projection requires a valid stored action shape")
+    if evidence["schema_version"] == 2:
+        expected_sequence = "per_frame" if len(shape) == 1 else "packed_first_step"
+        if evidence.get("action_sequence") != expected_sequence or temporal != []:
+            raise ValueError("Statistics numeric projection must prove single-step action sampling")
+        if dataset["sample_shapes"]["actions"] != [shape[-1]]:
+            raise ValueError("Statistics single-step sample must contain one action vector per row")
+    else:
+        # Frozen schema-1 plans still describe the earlier horizon-based reader.
+        expected_sequence, expected_temporal = (
+            ("episode_clamp", ["episode_index", "frame_index", "timestamp"]) if len(shape) == 1 else ("packed", [])
+        )
+        if evidence.get("action_sequence") != expected_sequence or temporal != expected_temporal:
+            raise ValueError("Statistics numeric projection must prove its packed or episode-bound action sampling")
     if spec is not None:
         if (not isinstance(spec, dict) or not isinstance(spec.get("state_fields"), list)
                 or any(not isinstance(row, dict) or not isinstance(row.get("key"), str) for row in spec["state_fields"])

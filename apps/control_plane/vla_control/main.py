@@ -31,6 +31,7 @@ from .recipe_suggestions import acknowledge as acknowledge_recipe_query, create_
 from .recipe_details import acknowledge as acknowledge_recipe_detail
 from .data_processors import acknowledge as acknowledge_data_processors, register_routes as register_data_processor_routes
 from .dataset_inspections import acknowledge as acknowledge_dataset_inspection, expire_pending as expire_dataset_inspections, register_routes as register_dataset_inspection_routes
+from .dataset_image_processing import registration_evidence, retain_legacy_image_augmentation
 from .dataset_validations import (COMMAND as DATASET_VALIDATION_COMMAND, acknowledge as acknowledge_dataset_validation,
                                  invalidate_validation, queue_validation, reject_undelivered_validation,
                                  validation_execution_authorized, register_routes as register_dataset_validation_routes)
@@ -428,6 +429,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             require_active_actor(session, request, "assets.register")
             node = get_required(session, Node, body.node_id, "Node")
             require_path(body.path, node.roots)
+            metadata = deepcopy(body.metadata)
+            if body.kind == "DATASET":
+                evidence = registration_evidence(session, node, body.path, metadata.get("dataset_profile"),
+                                                 inspection_id=body.dataset_inspection_id)
+                if evidence is not None:
+                    metadata["_image_registration"] = evidence
             if body.kind == "NORM":
                 # Explicit versioned registrations retain their own identity,
                 # but share the automatic path mutex so batch prelocking sees
@@ -447,7 +454,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             else:
                 validate_norm_binding(session, kind=body.kind, node_id=node.id, norm_asset_id=norm_asset_id)
             asset = Asset(id=uid(), node_id=node.id, name=body.name, kind=body.kind, path=body.path,
-                          version=body.version, metadata_json=body.metadata, state="REGISTERED", created_at=now(),
+                          version=body.version, metadata_json=metadata, state="REGISTERED", created_at=now(),
                           norm_asset_id=norm_asset_id,
                           registered_by_user_id=request_owner(request))
             session.add(asset)
@@ -501,8 +508,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 raise APIError(409, "ASSET_ARCHIVED", "已归档资产不能编辑数据集描述")
             if active_asset_transfers(session, asset_id=asset_id):
                 raise APIError(409, "ASSET_IN_USE", "资产正在同步，请等待完成或先取消同步")
+            declared = body.dataset_profile.model_dump(mode="json", exclude_none=True)
+            retain_legacy_image_augmentation(declared, asset.metadata_json.get("dataset_profile"))
+            node = get_required(session, Node, asset.node_id, "Node")
+            evidence = registration_evidence(session, node, asset.path, declared,
+                                             inspection_id=body.dataset_inspection_id,
+                                             existing_metadata=asset.metadata_json)
             asset.metadata_json = {**asset.metadata_json,
-                                   "dataset_profile": body.dataset_profile.model_dump(mode="json", exclude_none=True)}
+                                   "dataset_profile": declared,
+                                   "_image_registration": evidence}
             invalidate_validation(session, asset)
             session.flush()
             return asset_dict(asset)
@@ -870,20 +884,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 "RECIPE_WRITE": "recipes.writeback", "POLICY_DEPLOY_TEST": "training.write",
                                 "PATH_SUGGEST": "assets.query", "DATASET_INSPECT": "assets.query",
                                 "RECIPE_DETAIL": "recipes.query", "DATA_PROCESSORS": "recipes.query",
-                                "RECIPE_SUGGEST": "training.write" if row.payload.get("code_only") else "recipes.query",
-                                DATASET_VALIDATION_COMMAND: "assets.transfer" if row.payload.get("source_transfer_id")
-                                    else "datasets.register" if row.payload.get("source_registration") is True
-                                    else "assets.write"}.get(row.type)
-                    if required is not None or row.required_permission is not None:
-                        permission = required or row.required_permission
-                        legacy = (row.actor_user_id is None and row.required_permission is None
-                                  and settings.legacy_admin_enabled)
-                        metadata_valid = row.required_permission == permission or legacy
-                        authorized = metadata_valid and execution_permission_authorized(
-                            session, row.actor_user_id, permission, allow_legacy=settings.legacy_admin_enabled)
+                                "RECIPE_SUGGEST": "training.write" if row.payload.get("code_only") else "recipes.query"}.get(row.type)
+                    if row.type == DATASET_VALIDATION_COMMAND or required is not None or row.required_permission is not None:
                         if row.type == DATASET_VALIDATION_COMMAND:
-                            authorized = authorized and validation_execution_authorized(
+                            authorized = validation_execution_authorized(
                                 session, row, allow_legacy=settings.legacy_admin_enabled)
+                        else:
+                            permission = required or row.required_permission
+                            legacy = (row.actor_user_id is None and row.required_permission is None
+                                      and settings.legacy_admin_enabled)
+                            metadata_valid = row.required_permission == permission or legacy
+                            authorized = metadata_valid and execution_permission_authorized(
+                                session, row.actor_user_id, permission, allow_legacy=settings.legacy_admin_enabled)
                         deployment = None
                         if row.type == "POLICY_DEPLOY_TEST":
                             deployment = session.get(PolicyDeployment, row.payload.get("deployment_id"))

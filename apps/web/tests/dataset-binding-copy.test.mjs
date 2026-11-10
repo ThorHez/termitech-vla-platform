@@ -25,7 +25,7 @@ try {
         { arm: 'left', kind: 'joint', width: 6, normalize: true },
         { arm: 'left', kind: 'gripper', width: 1, normalize: false },
       ],
-      cameras: [{ key: 'observation.images.wrist', slot: 'left_wrist_0_rgb', kind: 'rgb', layout: 'chw', time_index: null }],
+      cameras: [{ key: 'observation.images.wrist', slot: 'left_wrist_0_rgb', kind: 'rgb', layout: 'chw', time_index: null, augmentation: 'color' }],
       gripper_range: [0, 1], aux_keys: ['task_phase'], prompt_key: 'task',
     } } },
   });

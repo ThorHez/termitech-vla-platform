@@ -37,7 +37,7 @@ export function DatasetValidation({
   profiles?: Profile[];
   changed?: () => void;
 }) {
-  const { can } = useAuth();
+  const { can, user } = useAuth();
   const [receipt, setReceipt] = useState<DatasetSourceValidation>();
   const [polling, setPolling] = useState(asset.validation?.status === 'PENDING');
   const detail = useApi<DatasetSourceValidation | null>(
@@ -65,7 +65,10 @@ export function DatasetValidation({
   const [error, setError] = useState<Error>();
   const pending = useRef(false);
   const published = useRef(JSON.stringify(asset.validation || null));
-  const writable = can('assets.write') && (asset.status || asset.state) !== 'ARCHIVED';
+  const writable =
+    (asset.status || asset.state) !== 'ARCHIVED' &&
+    (can('assets.write') ||
+      (can('datasets.validate') && !!user?.id && asset.registered_by_user_id === user.id));
   const blocker = datasetValidationBlockedReason(asset, report, node, selected, profiles, busy);
   useEffect(() => setPolling(report?.status === 'PENDING'), [report?.status]);
   useEffect(() => {
@@ -151,7 +154,7 @@ export function DatasetValidation({
             disabled={!!blocker}
             title={blocker}
             onClick={async () => {
-              if (pending.current || blocker || !can('assets.write')) return;
+              if (pending.current || blocker || !writable) return;
               pending.current = true;
               setBusy(true);
               setError(undefined);

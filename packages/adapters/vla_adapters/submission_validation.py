@@ -96,6 +96,7 @@ def submission_evidence(data, source):
             "timestamp_contract_sha256": _digest(data["timestamp_contract"]),
             "source_evidence": source, "source_evidence_sha256": _digest(source),
             "composition_sha256": _digest(data.get("composition")),
+            "image_processing_sha256": _digest(data.get("image_processing")),
             "processor_identity_sha256": _digest(data.get("processor_identity"))}
 
 

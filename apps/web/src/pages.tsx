@@ -87,6 +87,8 @@ import {
 import { DatasetFormatTemplates, DatasetFormatTemplateDialog } from './DatasetFormatTemplates';
 import { PersonalDatasetFormats } from './PersonalDatasetFormats';
 import { datasetNormBindingPayload, datasetNormInputError } from './datasetNormAssets';
+import { imageRegistrationErrors } from './imageProcessingPolicy';
+import { resourceOwnerLabel } from './resourcePermissions';
 import './asset-registration.css';
 import './asset-catalog.css';
 import {
@@ -1017,12 +1019,15 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
   );
 }
 
+const UNRECORDED_REGISTRANT = 'unrecorded';
+
 export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const { user, can } = useAuth();
-  const { assets, nodes, profiles, runs, enabled, refresh } = useData();
+  const { assets, members, nodes, profiles, runs, enabled, refresh } = useData();
   const [kind, setKind] = useState('ALL');
   const [nodeId, setNodeId] = useState(nodeFilter || '');
   const [query, setQuery] = useState('');
+  const [registrant, setRegistrant] = useState('');
   const [register, setRegister] = useState(false);
   const [batchRegister, setBatchRegister] = useState(false);
   const [syncSelection, setSyncSelection] = useState<{ owner: string; ids: string[] }>({
@@ -1042,10 +1047,26 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const [assetPage, setAssetPage] = useState({ filters: '', page: 1 });
   const assetTableRef = useRef<HTMLDivElement>(null);
   const [showArchived, setShowArchived] = useState(false);
+  const registrantId = registrant === UNRECORDED_REGISTRANT ? null : registrant || undefined;
   const catalogProjection = useMemo(
-    () => datasetCatalogAssets(assets.data || [], showArchived),
-    [assets.data, showArchived],
+    () => datasetCatalogAssets(assets.data || [], showArchived, registrantId),
+    [assets.data, showArchived, registrantId],
   );
+  const registrantOptions = useMemo(() => {
+    const ids = new Set((assets.data || []).map((asset) => asset.registered_by_user_id));
+    ids.add(registrantId);
+    return [...ids]
+      .filter((id): id is string => Boolean(id && id !== user?.id))
+      .map((id) => {
+        const member = members.data?.find((entry) => entry.id === id);
+        const name = resourceOwnerLabel(id, members.data);
+        return {
+          id,
+          label: member && name !== member.username ? `${name} · ${member.username}` : name,
+        };
+      })
+      .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'));
+  }, [assets.data, members.data, registrantId, user?.id]);
   const catalogAssets = catalogProjection.assets;
   const selectableCatalogAssets = catalogProjection.selectionAssets;
   const canTransferAssets = can('assets.transfer');
@@ -1064,7 +1085,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
     if (archiving && (!archiveAsset || !canArchiveAsset(user, archiveAsset, can)))
       setArchiving(undefined);
   }, [archiving, archiveAsset, user, can]);
-  const filterKey = JSON.stringify([selectionOwner, kind, nodeId, query, showArchived]);
+  const filterKey = JSON.stringify([selectionOwner, kind, nodeId, query, showArchived, registrant]);
   useEffect(() => {
     setAssetPage((previous) =>
       previous.filters === filterKey ? previous : { filters: filterKey, page: 1 },
@@ -1124,6 +1145,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       .toLowerCase()
       .includes(query.toLowerCase()),
   );
+  const hasFilters = Boolean(query || nodeId || kind !== 'ALL' || registrant);
   const catalogEntries = groupDatasetNormAssets(
     catalogAssetGroups(filtered, assets.data || [], runs.data),
     catalogProjection.boundNorms,
@@ -1226,6 +1248,11 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
       <td>
         <span>{assetKinds[asset.kind] || asset.kind}</span>
         <span className="subtext mono">{asset.version}</span>
+        <span className="subtext">
+          {asset.registered_by_user_id
+            ? `登记人：${asset.registered_by_user_id === user?.id ? '我' : resourceOwnerLabel(asset.registered_by_user_id, members.data)}`
+            : '未记录登记人'}
+        </span>
       </td>
       <td>
         <a className="node-link" href={`#/nodes/${asset.node_id}`}>
@@ -1283,7 +1310,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
                 onClick={() => setPersonalFormatsOpen(true)}
               >
                 <FileSliders size={17} />
-                我的格式模板
+                数据集格式模板
               </button>
             )}
             {canRegisterDatasets && (
@@ -1334,7 +1361,21 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             </button>
           ))}
         </div>
-        <div className="toolbar-filters">
+        <div className="toolbar-filters asset-catalog-filters">
+          <select
+            aria-label="按登记人筛选"
+            value={registrant}
+            onChange={(event) => setRegistrant(event.target.value)}
+          >
+            <option value="">全部登记人</option>
+            {user?.id && <option value={user.id}>我登记的</option>}
+            {registrantOptions.map(({ id, label }) => (
+              <option value={id} key={id}>
+                {label}
+              </option>
+            ))}
+            <option value={UNRECORDED_REGISTRANT}>未记录登记人</option>
+          </select>
           <select
             aria-label="按机器筛选"
             value={nodeId}
@@ -1410,7 +1451,9 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         </label>
       </div>
       {kind === 'NORM' && (
-        <p className="field-hint">已绑定的 norm_stats 可展开对应数据集查看，此处仅列独立项。</p>
+        <p className="field-hint">
+          当前登记人范围内已随数据集分组的 norm_stats，可展开对应数据集查看。
+        </p>
       )}
       <ErrorNotice error={assets.error} retry={assets.refresh} />
       <div className="panel">
@@ -1470,11 +1513,9 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         ) : (
           <Empty
             icon={Database}
-            title={
-              query || nodeId || kind !== 'ALL' ? '没有符合条件的资产' : '建立你的本地资产目录'
-            }
+            title={hasFilters ? '没有符合条件的资产' : '建立你的本地资产目录'}
             description={
-              query || nodeId || kind !== 'ALL'
+              hasFilters
                 ? '调整搜索条件，或登记新的本地资产。'
                 : '登记已有数据集、归一化参数和模型的本机路径。预检时，Agent 会验证它们是否可用。'
             }
@@ -1708,7 +1749,15 @@ function RegisterAssetContent({
   const pending = useRef(false);
   const nameEdited = useRef(false);
   const profileErrors =
-    form.kind === 'DATASET' && !deferProfile ? datasetProfileErrors(datasetProfile) : [];
+    form.kind === 'DATASET'
+      ? [
+          ...(!deferProfile ? datasetProfileErrors(datasetProfile) : []),
+          ...imageRegistrationErrors(
+            deferProfile ? undefined : datasetProfile.cameras,
+            inspectionDraft.featuresFor(form.node_id, form.path),
+          ),
+        ]
+      : [];
   const normError =
     form.kind === 'DATASET'
       ? datasetNormInputError(form.node_id, normAssetId, normPath, assets.data || [])
@@ -1795,6 +1844,14 @@ function RegisterAssetContent({
                   form.kind === 'DATASET' && !deferProfile
                     ? { dataset_profile: normalizedDatasetProfile(datasetProfile) }
                     : {},
+                ...(form.kind === 'DATASET'
+                  ? {
+                      dataset_inspection_id: inspectionDraft.inspectionIdFor(
+                        form.node_id,
+                        form.path,
+                      ),
+                    }
+                  : {}),
               },
               { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(20000)]) },
             );
@@ -1913,19 +1970,22 @@ function RegisterAssetContent({
               </label>
               {deferProfile ? (
                 <p className="field-hint">
-                  仍可登记路径；之后补录已有数据集特征需要管理员。补录后，新建训练会使用这些特征匹配处理器。
+                  读取元信息后可登记路径；发现非 224×224
+                  图像时，必须取消稍后补录并明确指定处理方式。
                 </p>
-              ) : (
-                <>
-                  <DatasetInspection
-                    compact
-                    node={node}
-                    path={form.path}
-                    value={datasetProfile}
-                    draft={inspectionDraft}
-                    disabled={busy}
-                  />
-                </>
+              ) : null}
+              <DatasetInspection
+                compact
+                node={node}
+                path={form.path}
+                value={datasetProfile}
+                draft={inspectionDraft}
+                disabled={busy}
+              />
+              {deferProfile && profileErrors.length > 0 && (
+                <p className="field-hint required" role="status">
+                  {profileErrors[0]}
+                </p>
               )}
             </>
           )}

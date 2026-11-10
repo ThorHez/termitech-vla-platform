@@ -66,6 +66,7 @@ def batch(tmp_path):
         return {"path": path, "entries": [
             {"path": path + "/" + name, "name": name, "relative_path": name,
              "info_sha256": hashlib.sha256(name.encode()).hexdigest(), "feature_signature": "f" * 64,
+             "features": [{"key": "observation.images.top", "dtype": "video", "shape": [3, 224, 224], "names": []}],
              "summary": {"fps": 20, "robot_type": "ARX5", "total_frames": 100, "task_description": "Fold cloth.", "private_token": "never-return"},
              "error": None if name != "bad" else {"code": "INVALID_METADATA", "message": "Metadata unreadable"}}
             for name in ("first", "nested/second", "bad")], "warnings": [], "truncated": False,
@@ -381,7 +382,6 @@ def test_operator_can_scan_and_register_new_datasets_with_initial_norm_but_canno
     for method, path, body in (
         ("PATCH", "/dataset-profile", {"profile": deepcopy(PROFILE)}),
         ("PUT", "/norm-binding", {"norm_asset_id": None}),
-        ("POST", "/validations", {}),
         ("POST", "/validation/cancel", {}),
     ):
         denied = client.request(method, "/api/v1/assets/" + created["id"] + path, json=body)

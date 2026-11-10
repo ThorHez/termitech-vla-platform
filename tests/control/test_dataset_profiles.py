@@ -9,7 +9,7 @@ from sqlalchemy import select
 from vla_control.dataset_profiles import normalize_dataset_profile, validate_asset_metadata
 from vla_control.models import Asset, Command, Run
 
-from .conftest import ADMIN, ENROLL
+from .conftest import ADMIN, ENROLL, profile_inspection
 
 
 def profile(**changes):
@@ -21,16 +21,21 @@ def profile(**changes):
 
 
 def register_asset(platform, node, metadata=None, kind="DATASET"):
+    inspection = ({"dataset_inspection_id": profile_inspection(platform, node["node_id"], "/machine/data", metadata["dataset_profile"])}
+                  if kind == "DATASET" and metadata and "dataset_profile" in metadata else {})
     response = platform.client.post("/api/v1/assets", headers=ADMIN, json={
         "node_id": node["node_id"], "name": "training data", "kind": kind,
-        "path": "/machine/data", "version": "v1", "metadata": metadata or {}})
+        "path": "/machine/data", "version": "v1", "metadata": metadata or {}, **inspection})
     assert response.status_code == 201, response.text
     return response.json()
 
 
 def patch_profile(platform, asset, value=None, **extra):
+    value = profile() if value is None else value
+    evidence = ({"dataset_inspection_id": profile_inspection(platform, asset["node_id"], asset["path"], value)}
+                if asset.get("node_id") and asset.get("path") else {})
     return platform.client.patch(f"/api/v1/assets/{asset['id']}/dataset-profile", headers=ADMIN,
-                                 json={"dataset_profile": profile() if value is None else value, **extra})
+                                 json={"dataset_profile": value, **evidence, **extra})
 
 
 def asset_row(platform, asset_id):
@@ -122,8 +127,8 @@ def test_profile_update_only_changes_its_namespace_preserving_asset_and_frozen_r
     after = asset_row(platform, asset["id"])
     assert {key: value for key, value in after.items() if key != "metadata"} == {
         key: value for key, value in before.items() if key != "metadata"}
-    assert {key: value for key, value in after["metadata"].items() if key != "_dataset_validation"} == {
-        **{key: value for key, value in before["metadata"].items() if key != "_dataset_validation"},
+    assert {key: value for key, value in after["metadata"].items() if key not in {"_dataset_validation", "_image_registration"}} == {
+        **{key: value for key, value in before["metadata"].items() if key not in {"_dataset_validation", "_image_registration"}},
         "dataset_profile": normalize_dataset_profile(changed)}
     validation = after["metadata"]["_dataset_validation"]
     assert validation["status"] == "STALE" and validation["error"]["code"] == "DATASET_VALIDATION_INPUT_CHANGED"
@@ -171,7 +176,8 @@ def test_dataset_profile_patch_respects_asset_write_permission_and_csrf(platform
         assert login.status_code == 200
         path = f"/api/v1/assets/{asset['id']}/dataset-profile"
         csrf = login.json()["csrf_token"]
-        response = client.patch(path, json={"dataset_profile": profile()}, headers={"X-CSRF-Token": csrf})
+        response = client.patch(path, json={"dataset_profile": profile(),
+            "dataset_inspection_id": profile_inspection(platform, node["node_id"], asset["path"], profile())}, headers={"X-CSRF-Token": csrf})
         assert response.status_code == status, response.text
         if status == 200:
             response = client.patch(path, json={"dataset_profile": profile()})

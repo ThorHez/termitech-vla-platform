@@ -41,6 +41,8 @@ try {
     revision: 3,
     created_at: '2026-10-27T00:00:00Z',
     updated_at: '2026-10-27T01:00:00Z',
+    shared: false,
+    is_owner: true,
     content: { schema_version: 1 },
   };
   const response = (value, status = 200) =>
@@ -57,7 +59,8 @@ try {
         onApply() {},
       }),
     );
-    assert.match(html, /aria-label="我的训练模板"/);
+    assert.match(html, /aria-label="训练模板"/);
+    assert.match(html, /工作区共享模板/);
     assert.match(html, /跨浏览器和设备恢复/);
     assert.match(html, /保存模板/);
     assert.match(html, /同名覆盖更新，新名称另存/);
@@ -72,14 +75,15 @@ try {
     }
   });
 
-  await test('template API carries account assertions, session cookies, CSRF and exact update/delete revisions', async () => {
+  await test('template API carries account assertions, session cookies, CSRF and exact mutation revisions', async () => {
     setSessionCsrf('csrf-library');
     const calls = [];
+    const { content, ...metadata } = record;
     globalThis.fetch = async (url, options) => {
       calls.push({ url, options });
       if (options.method === 'DELETE') return response({ id: record.id, deleted: true });
+      if (url.endsWith('/sharing')) return response({ ...metadata, shared: true, revision: 4 });
       if (!options.method && url.endsWith('/training-templates')) {
-        const { content, ...metadata } = record;
         assert.ok(content);
         return response([metadata]);
       }
@@ -94,7 +98,12 @@ try {
       assert.deepEqual(await client.get(record.id), record);
       assert.deepEqual(await client.create(body), record);
       assert.deepEqual(await client.update(record.id, body, 3), record);
-      assert.deepEqual(await client.remove(record.id, 3), { id: record.id, deleted: true });
+      assert.deepEqual(await client.setSharing(record.id, true, 3), {
+        ...metadata,
+        shared: true,
+        revision: 4,
+      });
+      assert.deepEqual(await client.remove(record.id, 4), { id: record.id, deleted: true });
       assert.deepEqual(
         calls.map(({ url, options }) => [url, options.method || 'GET']),
         [
@@ -102,6 +111,7 @@ try {
           ['/api/v1/training-templates/template-a', 'GET'],
           ['/api/v1/training-templates', 'POST'],
           ['/api/v1/training-templates/template-a', 'PUT'],
+          ['/api/v1/training-templates/template-a/sharing', 'PUT'],
           ['/api/v1/training-templates/template-a', 'DELETE'],
         ],
       );
@@ -114,7 +124,8 @@ try {
       }
       assert.deepEqual(JSON.parse(calls[2].options.body), body);
       assert.deepEqual(JSON.parse(calls[3].options.body), { ...body, expected_revision: 3 });
-      assert.deepEqual(JSON.parse(calls[4].options.body), { expected_revision: 3 });
+      assert.deepEqual(JSON.parse(calls[4].options.body), { shared: true, expected_revision: 3 });
+      assert.deepEqual(JSON.parse(calls[5].options.body), { expected_revision: 4 });
     } finally {
       client.dispose();
       setSessionCsrf();

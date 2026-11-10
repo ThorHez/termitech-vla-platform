@@ -5,6 +5,7 @@ import { canArchiveAsset } from './assetArchive';
 import { Badge, Modal } from './components';
 import { assetKinds } from './data';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
+import { imageProcessingSummary } from './imageProcessingPolicy';
 import { datasetFormatProfile } from './datasetFormatTemplateData';
 import { boundDatasetNorm, datasetNormSelectionError } from './datasetNormAssets';
 import { DatasetValidation } from './DatasetValidation';
@@ -215,6 +216,9 @@ export function AssetDetail({
                           {camera.name} · {camera.kind === 'depth' ? '深度' : 'RGB 彩色'}
                         </span>
                         <code>{camera.key}</code>
+                        {camera.image_processing && (
+                          <span>{imageProcessingSummary(camera.image_processing)}</span>
+                        )}
                       </div>
                     ))}
                   </dd>

@@ -16,7 +16,7 @@ try {
   const {
     trainingDatasetNormId,
     selectTrainingDatasetBinding,
-    datasetNormalizationMode,
+    appendDatasetBinding,
     copyDatasetBinding,
   } = await server.ssrLoadModule('/src/datasetBindingHelpers.ts');
   const {
@@ -182,12 +182,10 @@ try {
     assert.deepEqual(selected, [{ dataset_asset_id: 'cloth-b', norm_asset_id: 'norm-cloth-b', weight: 7, recipe_index: 5 }]);
   });
 
-  await test('empty shared normalization defaults only the selected row and cannot spread a single-dataset norm', () => {
+  await test('choosing datasets fills only their own empty normalization references', () => {
     const rows = [binding(), binding(), binding()], before = structuredClone(rows);
-    assert.equal(datasetNormalizationMode(rows), 'shared');
     const first = selectTrainingDatasetBinding(rows, 1, 'cloth-a', assets());
     assert.deepEqual(first.map((row) => row.norm_asset_id), ['', 'norm-cloth-a', '']);
-    assert.equal(datasetNormalizationMode(first), 'legacy');
     assert.strictEqual(first[0], rows[0]);
     assert.strictEqual(first[2], rows[2]);
     const second = selectTrainingDatasetBinding(first, 2, 'cloth-b', assets());
@@ -195,20 +193,22 @@ try {
     assert.deepEqual(rows, before);
   });
 
-  await test('an explicit nonempty shared norm remains shared when another dataset is chosen', () => {
+  await test('selecting a dataset replaces its inherited reference from an older draft', () => {
     const rows = [binding('cloth-a', 'shared-norm'), binding('', 'shared-norm')];
     const selected = selectTrainingDatasetBinding(rows, 1, 'cloth-b', assets());
-    assert.deepEqual(selected.map((row) => row.norm_asset_id), ['shared-norm', 'shared-norm']);
-    assert.equal(datasetNormalizationMode(selected), 'shared');
+    assert.deepEqual(selected.map((row) => row.norm_asset_id), ['shared-norm', 'norm-cloth-b']);
     assert.strictEqual(selected[0], rows[0]);
     assert.deepEqual(selected[1].processor, rows[1].processor);
   });
 
-  await test('changing a different legacy row leaves the manually selected normalization untouched', () => {
-    const rows = [binding('cloth-a', 'manual-norm'), binding('', '')];
+  await test('adding and choosing a second dataset preserves the first manual reference', () => {
+    const first = binding('cloth-a', 'manual-norm');
+    const rows = appendDatasetBinding([first]);
+    assert.equal(rows[1].dataset_asset_id, '');
+    assert.equal(rows[1].norm_asset_id, '');
     const selected = selectTrainingDatasetBinding(rows, 1, 'cloth-b', assets());
     assert.deepEqual(selected.map((row) => row.norm_asset_id), ['manual-norm', 'norm-cloth-b']);
-    assert.strictEqual(selected[0], rows[0]);
+    assert.strictEqual(selected[0], first);
   });
 
   await test('entering training fills empty norms through validated bindings but retains nonempty explicit overrides', () => {
@@ -242,8 +242,9 @@ try {
       bindings: [binding('cloth-a', 'norm-cloth-a'), binding('cloth-b', 'norm-cloth-b')],
       slots: [], assets: assets(), node: resources().nodes[0], showProcessing: false, onChange() {},
     }));
-    assert.match(grouped, /启动时自动计算共享归一化参数/);
-    assert.match(grouped, /每组已绑定的参数继续保留/);
+    assert.match(grouped, /训练启动时按全部源数据与本次混采权重计算一份共享 norm_stats/);
+    assert.match(grouped, /归一化参数参考 1/);
+    assert.match(grouped, /归一化参数参考 2/);
     assert.doesNotMatch(grouped, /逐组归一化（旧配置）|已保留草稿或模板中原有的逐组选择/);
   });
 } finally {

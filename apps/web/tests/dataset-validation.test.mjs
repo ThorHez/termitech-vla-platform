@@ -49,11 +49,11 @@ try {
     checks: [],
     ...changes,
   });
-  const render = (element, writable = true) =>
+  const render = (element, writable = true, auth = {}) =>
     renderToStaticMarkup(
       React.createElement(
         AuthContext.Provider,
-        { value: { can: (permission) => writable && permission === 'assets.write' } },
+        { value: { can: (permission) => writable && permission === 'assets.write', ...auth } },
         element,
       ),
     );
@@ -66,6 +66,7 @@ try {
         changed() {},
       }),
       options.writable !== false,
+      options.auth,
     );
   const mutationButton = (html) =>
     [...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)]
@@ -130,6 +131,28 @@ try {
     );
     assert.ok(mutationButton(panel(null)));
     assert.match(panel(null), /尚未校验/);
+  });
+
+  await test('operators can retry their own registered datasets while others remain readable', () => {
+    const auth = { user: { id: 'alice' }, can: (permission) => permission === 'datasets.validate' };
+    const owned = { registered_by_user_id: 'alice' };
+    assert.doesNotMatch(
+      mutationButton(panel(report('SUCCEEDED'), { asset: owned, auth })).attributes,
+      /disabled/,
+    );
+    assert.match(
+      mutationButton(panel(report('PENDING'), { asset: owned, auth })).attributes,
+      /disabled/,
+    );
+    for (const registrar of ['bob', null, undefined]) {
+      const html = panel(report('SUCCEEDED'), { asset: { registered_by_user_id: registrar }, auth });
+      assert.equal(mutationButton(html), undefined);
+      assert.match(html, /基础校验通过/);
+    }
+    assert.equal(
+      mutationButton(panel(report('SUCCEEDED'), { asset: owned, auth: { ...auth, can: () => false } })),
+      undefined,
+    );
   });
 
   await test('cancelled validation is neutral, retains its receipt and permits an authorized retry', () => {

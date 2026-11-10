@@ -9,6 +9,11 @@ import hashlib
 import json
 import math
 
+if __package__:
+    from .image_policy import AUGMENTATIONS
+else:
+    from image_policy import AUGMENTATIONS
+
 
 COMPOSABLE_PROCESSOR = "ComposableDataConfig"
 FIELDS = {"schema_version", "robot_model", "arm_mode", "state_representation", "state_fields", "state_history",
@@ -182,18 +187,25 @@ def normalize_composition(value, *, norm_stats=False):
         _fail("标准模型支持 1 到 3 个视觉输入")
     result["cameras"] = []
     for item in cameras:
-        _object(item, {"key", "slot", "kind", "layout", "time_index", "depth_min", "depth_max"}, "视觉输入")
+        fields = {"key", "slot", "kind", "layout", "time_index", "depth_min", "depth_max"}
+        if isinstance(item, dict) and "augmentation" in item:
+            fields.add("augmentation")
+        _object(item, fields, "视觉输入")
         index = item["time_index"]
         if index is not None:
             index = _integer(index, -64, 63, "图像时间索引")
         low, high = _number(item["depth_min"], "深度最小值"), _number(item["depth_max"], "深度最大值")
         if low >= high:
             _fail("深度显示范围需要最小值小于最大值")
-        result["cameras"].append({"key": _key(item["key"], "图像字段名"),
+        camera = {"key": _key(item["key"], "图像字段名"),
             "slot": _enum(item["slot"], set(SLOTS), "模型视觉输入槽"),
             "kind": _enum(item["kind"], {"rgb", "depth"}, "图像类型"),
             "layout": _enum(item["layout"], {"chw", "hwc"}, "图像布局"), "time_index": index,
-            "depth_min": low, "depth_max": high})
+            "depth_min": low, "depth_max": high}
+        if "augmentation" in item:
+            choices = {"default", "none"} if camera["kind"] == "depth" else AUGMENTATIONS
+            camera["augmentation"] = _enum(item["augmentation"], choices, "训练图像增强方式")
+        result["cameras"].append(camera)
     if len({item["key"] for item in result["cameras"]}) != len(cameras) or len({item["slot"] for item in result["cameras"]}) != len(cameras):
         _fail("视觉字段与模型输入槽不能重复")
     keys = [item["key"] for item in result["state_fields"] + result["cameras"]]

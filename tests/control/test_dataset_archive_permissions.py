@@ -10,7 +10,7 @@ from vla_control.common import now, offset_time, uid
 from vla_control.db import Database
 from vla_control.models import Asset, Command, Run, RunInput
 
-from .conftest import ENROLL
+from .conftest import ENROLL, profile_inspection
 from .test_asset_transfers import create as copy_asset, fixture
 from .test_dataset_profiles import profile
 from .test_dataset_registration_permissions import body
@@ -140,7 +140,9 @@ def test_own_asset_being_synchronized_cannot_be_archived_until_copy_is_cancelled
     users = accounts(platform)
     login(platform, "alice")
     response = platform.client.post("/api/v1/assets", json=body(source, kind=kind,
-        path="/machine/data/alice-owned", metadata={"dataset_profile": profile()} if kind == "DATASET" else {}))
+        path="/machine/data/alice-owned", metadata={"dataset_profile": profile()} if kind == "DATASET" else {},
+        **({"dataset_inspection_id": profile_inspection(platform, source["node_id"], "/machine/data/alice-owned", profile())}
+           if kind == "DATASET" else {})))
     assert response.status_code == 201, response.text
     asset = response.json()
     assert asset["registered_by_user_id"] == users["alice"]

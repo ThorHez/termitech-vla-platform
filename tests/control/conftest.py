@@ -1,18 +1,45 @@
 from dataclasses import dataclass
 import hashlib
+import posixpath
 
 from fastapi.testclient import TestClient
 import pytest
 
-from vla_control.common import now
+from vla_control.common import now, uid
 from vla_control.main import create_app
 from vla_control.scheduler import tick
 from vla_control.settings import Settings
+from vla_control.models import Asset, Command
 from vla_protocol import canonical_digest
 
 
 ADMIN = {"Authorization": "Bearer test-admin"}
 ENROLL = {"Authorization": "Bearer test-enrollment"}
+
+
+def profile_inspection(platform, node_id, path, profile):
+    """Trusted synthetic 224px metadata for tests of unrelated profile fields."""
+    features = [{"key": row["key"].strip(), "dtype": "video", "shape": [3 if row.get("kind") == "rgb" else 1, 224, 224], "names": []}
+                for row in profile.get("cameras", []) if isinstance(row, dict) and isinstance(row.get("key"), str)]
+    features = list({row["key"]: row for row in features}.values()) or [
+        {"key": "actions", "dtype": "float32", "shape": [7], "names": []}]
+    path = "/" + posixpath.normpath(path).lstrip("/")
+    query_id = uid()
+    with platform.app.state.db.write() as session:
+        session.add(Command(id=query_id, node_id=node_id, type="DATASET_INSPECT", status="APPLIED",
+            payload={"path": path}, result={"schema_version": 1, "path": path,
+                "source": {"info_sha256": "a" * 64, "tasks_sha256": None}, "features": features,
+                "suggestions": {}, "processing": {}, "evidence": [], "warnings": []},
+            created_at=now(), acknowledged_at=now()))
+    return query_id
+
+
+def inspected_profile_payload(platform, asset_id, profile):
+    with platform.app.state.db.read() as session:
+        asset = session.get(Asset, asset_id)
+        node_id, path = asset.node_id, asset.path
+    return {"dataset_profile": profile,
+            "dataset_inspection_id": profile_inspection(platform, node_id, path, profile)}
 
 GENERATED_CONFIG_SOURCE = "# CPU fixture: resolved configuration used for confirmation tests.\nCONFIG = {\"fixture\": True}\n"
 GENERATED_CONFIG_SHA256 = hashlib.sha256(GENERATED_CONFIG_SOURCE.encode("utf-8")).hexdigest()

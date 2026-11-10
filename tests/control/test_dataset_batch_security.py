@@ -59,6 +59,7 @@ def ready(fixture):
     scan = create(fixture)
     entries = [{"path": PARENT + "/" + name, "relative_path": name, "name": name,
         "info_sha256": "a" * 64, "feature_signature": "b" * 64,
+        "features": [{"key": "observation.images.top", "dtype": "video", "shape": [3, 224, 224], "names": []}],
         "summary": {"fps": 20}, "error": None} for name in ("a", "b")]
     value = {"path": PARENT, "entries": entries, "warnings": [], "truncated": False,
              "scanned_directories": 3, "skipped_directories": 0}

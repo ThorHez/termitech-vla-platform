@@ -94,14 +94,25 @@ import React,{useState}from'react';import{createRoot}from'react-dom/client';
 import{AuthContext}from'/src/auth.tsx';import{setSessionCsrf}from'/src/api.ts';
 import{DatasetInspection,useDatasetInspectionDraft}from'/src/DatasetInspection.tsx';
 import{DatasetProfileForm,emptyDatasetProfile}from'/src/DatasetProfileForm.tsx';
+import{ComposedProcessingEditor}from'/src/ComposedProcessingEditor.tsx';
+import{trainingCompositionDraft}from'/src/composedProcessing.ts';
+import{imageRegistrationErrors}from'/src/imageProcessingPolicy.ts';
 import'/src/styles.css';import'/src/theme.css';
 function Probe({config}){const[profile,setProfile]=useState(()=>({...emptyDatasetProfile(),robot_type:'custom robot',
-  task_description:'Keep this task',cameras:[{name:'My wrist',key:'observation.images.main',kind:'rgb'}]}));
+  task_description:'Keep this task',cameras:[{name:'My wrist',key:'observation.images.main',kind:'rgb',
+  ...(config.legacyAugmentation ? {image_processing:{resize_mode:'pad',augmentation:config.legacyAugmentation}} : {})}]}));
+const[composition,setComposition]=useState();
 const draft=useDatasetInspectionDraft(profile,setProfile);window.__applyTemplate=value=>draft.applyTemplate(value);
 const features=draft.featuresFor(config.node?.id,config.path);
+const compositionProfile={...profile,image_features:features};
 return <><DatasetInspection compact node={config.node} path={config.path} value={profile} draft={draft}/>
 <div id="profile-form"><DatasetProfileForm compact value={profile} onChange={draft.manualChange} onFieldEdit={draft.touch} features={features}/></div>
+<button type="button" onClick={()=>setComposition(trainingCompositionDraft(compositionProfile))}>创建训练组合</button>
+{composition && <div id="training-composition"><ComposedProcessingEditor value={composition} profile={compositionProfile} onChange={setComposition}/>
+<pre id="composition-value">{JSON.stringify(composition)}</pre></div>}
 <pre id="fresh-features" style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere',maxWidth:'100%'}}>{JSON.stringify(features??null)}</pre>
+<pre id="inspection-id">{draft.inspectionIdFor(config.node?.id,config.path)??''}</pre>
+<pre id="image-errors">{JSON.stringify(imageRegistrationErrors(profile.cameras,features))}</pre>
 <pre id="profile-value" style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere',maxWidth:'100%'}}>{JSON.stringify(profile)}</pre></>;}
 function App(){const[config,setConfig]=useState(window.__initial);window.__update=value=>setConfig(old=>({...old,...value}));
 return <AuthContext.Provider value={{user:{id:'alice'},can:()=>true,loading:false,expired:false}}><Probe config={config}/></AuthContext.Provider>;}
@@ -252,8 +263,10 @@ setSessionCsrf('fixture','alice');createRoot(document.getElementById('root')).re
           );
           await fixture.ready();
           assert.match(await fixture.image(), /\[480, 640, 3\]/);
+          assert.equal(await fixture.page.locator('#inspection-id').textContent(), 'inspection');
           await fixture.update({ node: { id: 'node-b', status: 'ONLINE' }, path: '/datasets/b' });
           await fixture.cleared();
+          assert.equal(await fixture.page.locator('#inspection-id').textContent(), '');
           assert.doesNotMatch(await fixture.image(), /480|640/);
           assert.equal((await fixture.profile()).robot_type, 'custom robot');
           assert.equal((await fixture.profile()).cameras[0].name, 'My wrist');
@@ -306,6 +319,7 @@ setSessionCsrf('fixture','alice');createRoot(document.getElementById('root')).re
             .getByRole('button', { name: '读取数据集字段，推断并填入默认值', exact: true })
             .click();
           await fixture.cleared();
+          assert.equal(await fixture.page.locator('#inspection-id').textContent(), '');
           assert.doesNotMatch(await fixture.image(), /480|640/);
           await waitFor(() => releaseFailure);
           releaseFailure();
@@ -313,6 +327,79 @@ setSessionCsrf('fixture','alice');createRoot(document.getElementById('root')).re
           assert.equal(await fixture.fresh(), null);
           assert.match(await fixture.image(), /待读取数据集元数据/);
           assert.equal((await fixture.profile()).cameras[0].key, 'observation.images.main');
+          assert.deepEqual(fixture.errors, []);
+          await fixture.close();
+        },
+      );
+
+      await t.test(
+        'a non-224 image still requires an explicit resize and new assets save geometry only',
+        async () => {
+          const fixture = await mount({}, ({ nodeId, path: selectedPath }) => query(
+            nodeId, selectedPath, inspection(selectedPath, 7, [3, 360, 640], [3, 224, 224]), 'image-proof',
+          ));
+          await fixture.ready();
+          const resize = fixture.page.getByRole('combobox', { name: '图像处理方式 1', exact: true });
+          assert.equal(await resize.inputValue(), '');
+          assert.equal(await fixture.page.getByRole('combobox', { name: '训练图像增强 1', exact: true }).count(), 0);
+          assert.equal((await fixture.profile()).cameras[0].image_processing, undefined);
+          assert.match(await fixture.page.locator('#image-errors').textContent(), /640×360.*明确选择/);
+          await resize.selectOption('pad');
+          await fixture.page.waitForFunction(() => document.querySelector('#image-errors').textContent === '[]');
+          assert.deepEqual((await fixture.profile()).cameras[0].image_processing, { resize_mode: 'pad' });
+          assert.equal(await fixture.page.locator('#inspection-id').textContent(), 'image-proof');
+          if (process.env.VLA_IMAGE_POLICY_SCREENSHOT) {
+            await mkdir(path.dirname(process.env.VLA_IMAGE_POLICY_SCREENSHOT), { recursive: true });
+            await fixture.page.locator('fieldset.dataset-profile-form').screenshot({ path: process.env.VLA_IMAGE_POLICY_SCREENSHOT });
+          }
+          await resize.selectOption('');
+          await fixture.page.waitForFunction(() => document.querySelector('#image-errors').textContent !== '[]');
+          assert.equal((await fixture.profile()).cameras[0].image_processing, undefined);
+          assert.deepEqual(fixture.errors, []);
+          await fixture.close();
+        },
+      );
+
+      await t.test(
+        'training composition sets each view independently and leaves saved asset geometry and legacy augmentation intact',
+        async () => {
+          const fixture = await mount({ legacyAugmentation: 'color' }, ({ nodeId, path: selectedPath }) => {
+            const value = inspection(selectedPath, 7, [3, 224, 224], [224, 224, 3]);
+            value.features.push({ key: 'observation.images.right', dtype: 'image', shape: [3, 224, 224], names: [] });
+            return query(nodeId, selectedPath, value);
+          });
+          await fixture.ready();
+          await fixture.page.getByRole('button', { name: '添加视角', exact: true }).click();
+          await fixture.page.getByRole('button', { name: '添加视角', exact: true }).click();
+          const names = fixture.page.getByPlaceholder('例如 左腕、右腕、头部', { exact: true });
+          for (const [index, name] of ['头部', '左腕', '右腕'].entries()) await names.nth(index).fill(name);
+          const fields = fixture.page.getByPlaceholder('例如 observation.images.left_wrist', { exact: true });
+          await fields.nth(1).fill('observation.images.alt');
+          await fields.nth(2).fill('observation.images.right');
+          await fixture.page.getByRole('combobox', { name: '图像处理方式 1', exact: true }).selectOption('center_crop');
+          const savedAsset = await fixture.profile();
+          assert.deepEqual(savedAsset.cameras.map((camera) => camera.image_processing), [
+            { resize_mode: 'center_crop', augmentation: 'color' }, undefined, undefined,
+          ]);
+          await fixture.page.getByRole('button', { name: '创建训练组合', exact: true }).click();
+          const composition = () => fixture.page.locator('#composition-value').textContent().then(JSON.parse);
+          assert.deepEqual((await composition()).cameras.map((camera) => camera.augmentation), ['color', 'default', 'default']);
+          const policies = ['crop_rotate_color', 'color', 'color'];
+          for (let index = 0; index < policies.length; index++) {
+            const augmentation = fixture.page.getByRole('combobox', { name: `训练图像增强 ${index + 1}`, exact: true });
+            await augmentation.selectOption(policies[index]);
+          }
+          assert.deepEqual((await composition()).cameras.map((camera) => camera.augmentation), policies);
+          if (process.env.VLA_IMAGE_AUGMENTATION_SCREENSHOT) {
+            await mkdir(path.dirname(process.env.VLA_IMAGE_AUGMENTATION_SCREENSHOT), { recursive: true });
+            await fixture.page.locator('section[aria-label="模型视觉槽位"]').screenshot({ path: process.env.VLA_IMAGE_AUGMENTATION_SCREENSHOT });
+          }
+          await fixture.page.getByRole('combobox', { name: '训练图像增强 1', exact: true }).selectOption('default');
+          assert.deepEqual((await composition()).cameras.map((camera) => camera.augmentation), ['default', 'color', 'color']);
+          assert.deepEqual(await fixture.profile(), savedAsset);
+          assert.equal(await fixture.page.locator('#image-errors').textContent(), '[]');
+          await fields.nth(0).fill('observation.images.replaced');
+          assert.deepEqual((await fixture.profile()).cameras[0].image_processing, { resize_mode: 'center_crop' });
           assert.deepEqual(fixture.errors, []);
           await fixture.close();
         },

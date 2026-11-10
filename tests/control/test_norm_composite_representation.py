@@ -4,7 +4,7 @@ from copy import deepcopy
 
 from vla_protocol import canonical_digest
 
-from .conftest import ADMIN, confirmed_run_request
+from .conftest import ADMIN, confirmed_run_request, inspected_profile_payload
 from .test_composed_asset_processing import description
 from .test_multi_dataset_control import configured
 from .test_norm_tasks import acknowledge, batch_outputs, pending_batch_norm
@@ -107,7 +107,7 @@ def test_sft_inherits_composite_fields_as_shared_raw_actions_and_keeps_training_
     rows[0].pop('recipe_index')
     rows[0]['processor'] = processor
     response = platform.client.patch(f"/api/v1/assets/{rows[0]['dataset_asset_id']}/dataset-profile", headers=ADMIN,
-                                     json={'dataset_profile': profile})
+                                     json=inspected_profile_payload(platform, rows[0]['dataset_asset_id'], profile))
     assert response.status_code == 200, response.text
     response = request_preview(platform, node, inputs=inputs, dataset_bindings=rows)
     assert response.status_code == 202, response.text

@@ -100,6 +100,51 @@ try {
     }
   });
 
+  await test('registrant filtering scopes bound norms without changing batch selection eligibility', () => {
+    const mine = { ...dataset, registered_by_user_id: 'alice' };
+    const theirs = { ...norm, registered_by_user_id: 'bob' };
+    const sameRegistrant = asset('same-registrant', {
+      norm_asset_id: theirs.id,
+      registered_by_user_id: 'bob',
+    });
+    const standaloneWhenFiltered = asset('alice-norm', {
+      kind: 'NORM',
+      registered_by_user_id: 'alice',
+    });
+    const otherDataset = asset('other-dataset', {
+      norm_asset_id: standaloneWhenFiltered.id,
+      registered_by_user_id: 'bob',
+    });
+    const missing = asset('missing-registrant', { metadata: { registered_by_user_id: 'alice' } });
+    const historical = asset('historical', { registered_by_user_id: null });
+    const archived = asset('archived', { registered_by_user_id: 'alice', status: 'ARCHIVED' });
+    const raw = [
+      mine,
+      theirs,
+      sameRegistrant,
+      standaloneWhenFiltered,
+      otherDataset,
+      missing,
+      historical,
+      archived,
+    ];
+
+    const owned = project(raw, false, 'alice');
+    assert.deepEqual(ids(owned.assets), [mine.id, standaloneWhenFiltered.id]);
+    assert.equal(owned.boundNorms.size, 0);
+    assert.deepEqual(ids(owned.selectionAssets), ids(raw.slice(0, -1)));
+    assert.deepEqual(ids(project(raw, true, 'alice').assets), [
+      mine.id,
+      standaloneWhenFiltered.id,
+      archived.id,
+    ]);
+    assert.deepEqual(ids(project(raw, false, null).assets), [missing.id, historical.id]);
+
+    const other = project(raw, false, 'bob');
+    assert.deepEqual(ids(other.assets), [sameRegistrant.id, otherDataset.id]);
+    assert.deepEqual([...other.boundNorms], [[sameRegistrant.id, theirs]]);
+  });
+
   await test('kind and search filters consume the projection without resurrecting bound norm rows', () => {
     const standalone = asset('independent', { kind: 'NORM' });
     const projection = project([dataset, norm, standalone]);

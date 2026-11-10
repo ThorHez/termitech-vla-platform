@@ -4,7 +4,7 @@ import pytest
 
 from vla_protocol import canonical_digest
 from vla_protocol.norm_plan import NORM_CHECKS
-from .conftest import ADMIN, confirmed_run_request, generated_config, snapshot
+from .conftest import ADMIN, confirmed_run_request, generated_config, snapshot, inspected_profile_payload
 
 
 def numeric_io(spec=None):
@@ -166,7 +166,7 @@ def pending_batch_norm(platform, *, explicit_processor=False, auto_config=None, 
         processor["parameters"]["composition"]["normalization"] = "zscore"
         for row in rows:
             response = platform.client.patch(f"/api/v1/assets/{row['dataset_asset_id']}/dataset-profile", headers=ADMIN,
-                                             json={"dataset_profile": declared})
+                                             json=inspected_profile_payload(platform, row['dataset_asset_id'], declared))
             assert response.status_code == 200, response.text
             row.pop("recipe_index", None)
             row["processor"] = copy.deepcopy(processor)

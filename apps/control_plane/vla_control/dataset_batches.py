@@ -20,6 +20,7 @@ from .common import APIError, digest, now, offset_time, require_path, uid
 from .dataset_batch_models import DatasetBatchRegistration, DatasetScan
 from .dataset_norm_bindings import _lock_norm_path, canonical_norm_path, resolve_norm_path, validate_norm_binding
 from .dataset_profiles import normalize_dataset_profile
+from .dataset_image_processing import image_registration_evidence
 from .dataset_validations import queue_validation
 from .models import Asset, Node
 from .remote_models import RemoteConnection, RemoteDeployment
@@ -220,8 +221,29 @@ def _scan_result(value, path, roots):
             hashes[key] = raw
         if error is None and hashes["info_sha256"] is None:
             raise APIError(502, "DATASET_SCAN_INVALID_RESULT", "候选缺少元信息指纹")
+        features = item.get("features")
+        declared = None
+        if features is not None:
+            if not isinstance(features, list) or not 1 <= len(features) <= 256:
+                raise APIError(502, "DATASET_SCAN_INVALID_RESULT", "扫描图像字段元信息无效")
+            declared = []
+            for feature in features:
+                if not isinstance(feature, dict) or set(feature) != {"key", "dtype", "shape", "names"}:
+                    raise APIError(502, "DATASET_SCAN_INVALID_RESULT", "扫描图像字段元信息无效")
+                key = _text(feature.get("key"), 256, "字段名")
+                dtype = _text(feature.get("dtype"), 64, "字段类型")
+                shape, names = feature.get("shape"), feature.get("names")
+                if (not isinstance(shape, list) or len(shape) > 5
+                        or any(type(n) is not int or not 1 <= n <= 2**31 - 1 for n in shape)
+                        or not isinstance(names, list) or len(names) > 512):
+                    raise APIError(502, "DATASET_SCAN_INVALID_RESULT", "扫描图像字段形状无效")
+                declared.append({"key": key, "dtype": dtype, "shape": shape,
+                                 "names": [_text(name, 256, "坐标名") for name in names]})
+            if len({feature["key"] for feature in declared}) != len(declared):
+                raise APIError(502, "DATASET_SCAN_INVALID_RESULT", "扫描图像字段不能重复")
         entries.append({"path": target, "relative_path": str(PurePosixPath(target).relative_to(parent)),
-                        "name": name, "summary": clean, "error": error, **hashes})
+                        "name": name, "summary": clean, "error": error, **hashes,
+                        **({"features": declared} if declared is not None else {})})
     warnings = value.get("warnings", [])
     if not isinstance(warnings, list) or len(warnings) > 100 or any(not isinstance(v, str) or len(v) > 1000 for v in warnings):
         raise APIError(502, "DATASET_SCAN_INVALID_RESULT", "扫描提示无效")
@@ -438,6 +460,13 @@ class DatasetBatchManager:
             _node_registration_lock(session, node_id)
             existing = _existing(session, node_id)
             pending = [(entry, path) for entry, path in zip(body.entries, canonical) if path not in existing]
+            image_evidence = {}
+            for entry, path in pending:
+                source = admitted[path]
+                if not isinstance(source.get("features"), list):
+                    raise APIError(409, "DATASET_IMAGE_INSPECTION_REQUIRED", "原扫描缺少图像字段形状，请重新扫描后选择图像处理方式")
+                image_evidence[path] = image_registration_evidence(entry.profile, source["features"],
+                    source={"info_sha256": source["info_sha256"], "tasks_sha256": None}, scan_id=scan.id)
             # Claim every automatic NORM path before taking NORM row locks, and
             # take known NORM references before INSERT's implicit Node FK lock.
             norm_paths = sorted({canonical_norm_path(entry.norm_path) for entry, _ in pending if entry.norm_path is not None})
@@ -468,7 +497,8 @@ class DatasetBatchManager:
                     continue
                 source = admitted[path]
                 metadata = {"batch_registration": {"scan_id": scan.id, "info_sha256": source["info_sha256"],
-                            "feature_signature": source.get("feature_signature"), "metadata_only": True}}
+                            "feature_signature": source.get("feature_signature"), "metadata_only": True},
+                            "_image_registration": image_evidence[path]}
                 if entry.profile is not None:
                     metadata["dataset_profile"] = deepcopy(entry.profile)
                 norm_id = norms[canonical_norm_path(entry.norm_path)] if entry.norm_path is not None else entry.norm_asset_id

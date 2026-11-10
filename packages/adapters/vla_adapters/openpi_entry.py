@@ -26,6 +26,7 @@ if __package__:
     from .dataset_bindings import validate_binding_assets
     from .dataset_fps import install_registered_fps, registered_fps_context
     from .entrypoints import read_entrypoint
+    from .image_runtime import install_image_processing
     from .recipe_definitions import apply_overrides, validate_definition
     from .recap_runtime import apply_stage, stage_request
     from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
@@ -38,6 +39,7 @@ else:
     from dataset_bindings import validate_binding_assets
     from dataset_fps import install_registered_fps, registered_fps_context
     from entrypoints import read_entrypoint
+    from image_runtime import install_image_processing
     from recipe_definitions import apply_overrides, validate_definition
     from recap_runtime import apply_stage, stage_request
     from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
@@ -214,7 +216,7 @@ def resolve_config(base, spec, config_module, weight_loaders):
         batch_size=spec["parameters"]["batch_size"],
         checkpoint_base_dir=str(Path(spec["output_dir"]) / "checkpoints"),
         exp_name="platform", resume=False, overwrite=False, wandb_enabled=False, **root_overrides, **component_changes)
-    return apply_stage(config, spec)
+    return install_image_processing(apply_stage(config, spec), spec, config_module)
 
 
 def configuration_snapshot(config):

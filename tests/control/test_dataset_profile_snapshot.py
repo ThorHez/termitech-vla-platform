@@ -10,7 +10,7 @@ from vla_control.common import snapshot_identity
 from vla_control.models import Asset, Preview
 from vla_control.scheduler import resolve_inputs
 
-from .conftest import ADMIN, automatic_preflight, snapshot
+from .conftest import ADMIN, automatic_preflight, snapshot, inspected_profile_payload
 from .test_automatic_preflight import acknowledge, submit
 from .test_dataset_profiles import profile
 from .test_multi_dataset_control import configured
@@ -19,7 +19,7 @@ from .test_task_recipe import inputs, request_preview
 
 def describe(platform, asset_id, **changes):
     response = platform.client.patch(f"/api/v1/assets/{asset_id}/dataset-profile", headers=ADMIN,
-                                     json={"dataset_profile": profile(**changes)})
+                                     json=inspected_profile_payload(platform, asset_id, profile(**changes)))
     assert response.status_code == 200, response.text
     return response.json()["metadata"]["dataset_profile"]
 

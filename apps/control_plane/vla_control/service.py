@@ -8,6 +8,7 @@ from vla_adapters import get_templates, resolve_recipe, validate_parameters
 from vla_adapters.dataset_bindings import binding_inputs, normalize_dataset_bindings
 from vla_adapters.norm_datasets import normalize_norm_datasets, norm_inputs, validate_norm_configuration
 from vla_adapters.entrypoints import validate_entrypoint
+from vla_adapters.image_policy import composition_augmentation_codes, normalize_image_processing
 from vla_adapters.recipe_definitions import recipe_parameters, resolve_definition
 from vla_adapters.recap import runtime_adapter_for, validate_training_stage
 from vla_adapters.sample_evidence import validate_sample_evidence
@@ -546,6 +547,20 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
                     or any(camera["slot"] not in (depth_keys if camera["kind"] == "depth" else image_keys)
                            for camera in expected_spec["cameras"])):
                 return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 未证明所选模型使用本次选择的全部视觉，或深度/RGB 视图分类不一致，请重新预检"}
+            cameras = expected_spec["cameras"]
+            if any("augmentation" in camera for camera in cameras):
+                try:
+                    source_policies = {camera["key"]: normalize_image_processing(camera["image_processing"])
+                                       for camera in (declared or {}).get("cameras", []) if "image_processing" in camera}
+                    expected_codes = composition_augmentation_codes(cameras, source_policies)
+                except (ValueError, TypeError, KeyError):
+                    return {"code": "DATASET_PROFILE_MISMATCH", "message": "冻结的数据集图像策略无效，请重新检查数据集配置"}
+                policy = dataset.get("image_processing")
+                if (not isinstance(policy, dict) or type(policy.get("schema_version")) is not int
+                        or policy["schema_version"] != 1 or policy.get("uniform_augmentation_code") is not None
+                        or canonical_digest(policy.get("augmentation_codes")) != canonical_digest(expected_codes)):
+                    return {"code": "AGENT_IMAGE_AUGMENTATION_MISMATCH",
+                            "message": "Agent 未证明逐视角增强与本次训练配置一致，请更新 Agent 和 OpenPI 后重新预检"}
         elif dataset.get("composition") is not None or dataset.get("factory") == "ComposableDataConfig":
             return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 返回了本次训练数据绑定未选择的组合处理配置，请重新预检"}
     if model.get("asset_id") != resolved_inputs["model"]["id"]:

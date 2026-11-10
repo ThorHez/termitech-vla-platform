@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { BookMarked, Download, RefreshCw, Save, Trash2 } from 'lucide-react';
+import { BookMarked, Download, RefreshCw, Save, Share2, Trash2 } from 'lucide-react';
 import { api, date } from './api';
 import { ErrorNotice, Field } from './components';
 import type { TrainingDraftSnapshot } from './trainingDraft';
@@ -63,6 +63,11 @@ export function createTrainingTemplateClient(userId: string) {
         method: 'PUT',
         body: JSON.stringify({ ...body, expected_revision: expectedRevision }),
       }),
+    setSharing: (id: string, shared: boolean, expectedRevision: number) =>
+      request<TrainingTemplateSummary>(`${path(id)}/sharing`, {
+        method: 'PUT',
+        body: JSON.stringify({ shared, expected_revision: expectedRevision }),
+      }),
     remove: (id: string, expectedRevision: number) =>
       request<{ id: string; deleted: boolean }>(path(id), {
         method: 'DELETE',
@@ -72,7 +77,7 @@ export function createTrainingTemplateClient(userId: string) {
 }
 
 type TemplateClient = ReturnType<typeof createTrainingTemplateClient>;
-type Operation = 'save' | 'apply' | 'delete';
+type Operation = 'save' | 'apply' | 'delete' | 'share';
 type LibraryState = {
   userId: string;
   rows: TrainingTemplateSummary[];
@@ -82,6 +87,7 @@ type LibraryState = {
   loading: boolean;
   operation?: Operation;
   confirmDelete: boolean;
+  confirmShare: boolean;
   error?: Error;
   notice: string;
 };
@@ -93,6 +99,7 @@ const initialState = (userId: string, name: string): LibraryState => ({
   description: '',
   loading: true,
   confirmDelete: false,
+  confirmShare: false,
   notice: '',
 });
 const summary = ({
@@ -102,14 +109,24 @@ const summary = ({
   revision,
   created_at,
   updated_at,
-}: TrainingTemplateRecord) => ({
+  shared,
+  is_owner,
+}: TrainingTemplateSummary): TrainingTemplateSummary => ({
   id,
   name,
   description,
   revision,
   created_at,
   updated_at,
+  shared,
+  is_owner,
 });
+
+// Older controllers return only account-owned rows and have neither flag.
+const isOwned = (row: TrainingTemplateSummary) =>
+  row.is_owner === true || (row.is_owner === undefined && row.shared === undefined);
+const visibility = (row: TrainingTemplateSummary) =>
+  !isOwned(row) ? '工作区共享' : row.shared ? '我的 · 已共享' : '我的 · 私有';
 
 export function TrainingTemplateLibrary({
   userId,
@@ -143,13 +160,22 @@ export function TrainingTemplateLibrary({
     try {
       const rows = await scope.list();
       if (sequence !== loadSequence.current) return;
-      update(scope, (previous) => ({
-        ...previous,
-        rows,
-        selectedId: rows.some((row) => row.id === previous.selectedId) ? previous.selectedId : '',
-        loading: false,
-        confirmDelete: false,
-      }));
+      update(scope, (previous) => {
+        const selectedId = rows.some((row) => row.id === previous.selectedId)
+          ? previous.selectedId
+          : '';
+        const removedSelection = previous.selectedId && !selectedId;
+        return {
+          ...previous,
+          rows,
+          selectedId,
+          name: removedSelection ? latestName.current.slice(0, 100) : previous.name,
+          description: removedSelection ? '' : previous.description,
+          loading: false,
+          confirmDelete: false,
+          confirmShare: false,
+        };
+      });
     } catch (error) {
       if (sequence !== loadSequence.current) return;
       update(scope, (previous) => ({
@@ -173,8 +199,10 @@ export function TrainingTemplateLibrary({
 
   const view = state.userId === userId ? state : initialState(userId, snapshot.request.name);
   const selected = view.rows.find((row) => row.id === view.selectedId);
+  const sharedByOther = !!selected && !isOwned(selected);
+  const existing = view.rows.find((row) => isOwned(row) && row.name === view.name.trim());
   const disabled = busy || view.loading || Boolean(view.operation) || !userId;
-  const persistable = Boolean(view.name.trim());
+  const persistable = !sharedByOther && Boolean(view.name.trim());
   const perform = async (
     operation: Operation,
     action: (scope: TemplateClient) => Promise<void>,
@@ -203,20 +231,17 @@ export function TrainingTemplateLibrary({
         description: view.description.trim(),
         content: prepareTrainingTemplate(snapshot),
       };
-      const existing = view.rows.find((row) => row.name === body.name);
       const record = existing
         ? await scope.update(existing.id, body, existing.revision)
         : await scope.create(body);
       update(scope, (previous) => ({
         ...previous,
-        rows: [
-          summary(record),
-          ...previous.rows.filter((row) => row.id !== record.id && row.name !== record.name),
-        ],
+        rows: [summary(record), ...previous.rows.filter((row) => row.id !== record.id)],
         selectedId: record.id,
         name: record.name,
         description: record.description,
         confirmDelete: false,
+        confirmShare: false,
         notice: `已${record.revision > 1 ? '更新' : '保存'}模板「${record.name}」· v${record.revision}。`,
       }));
     });
@@ -233,12 +258,13 @@ export function TrainingTemplateLibrary({
         name: record.name,
         description: record.description,
         confirmDelete: false,
+        confirmShare: false,
         notice: `已套用「${record.name}」· v${record.revision}，请核对配置后重新预检。`,
       }));
     });
   const remove = () =>
     perform('delete', async (scope) => {
-      if (!selected || !view.confirmDelete) return;
+      if (!selected || sharedByOther || !view.confirmDelete) return;
       await scope.remove(selected.id, selected.revision);
       update(scope, (previous) => ({
         ...previous,
@@ -247,7 +273,22 @@ export function TrainingTemplateLibrary({
         name: latestName.current.slice(0, 100),
         description: '',
         confirmDelete: false,
+        confirmShare: false,
         notice: `已删除模板「${selected.name}」。`,
+      }));
+    });
+  const setSharing = (shared: boolean) =>
+    perform('share', async (scope) => {
+      if (!selected?.is_owner || (shared && !view.confirmShare)) return;
+      const record = await scope.setSharing(selected.id, shared, selected.revision);
+      if (record.id !== selected.id || !record.is_owner || record.shared !== shared) {
+        throw new Error('模板共享结果与所选记录不一致，请刷新后核对。');
+      }
+      update(scope, (previous) => ({
+        ...previous,
+        rows: previous.rows.map((row) => (row.id === record.id ? summary(record) : row)),
+        confirmShare: false,
+        notice: shared ? `已共享「${record.name}」。` : `「${record.name}」现为个人模板。`,
       }));
     });
   const refresh = () => {
@@ -255,14 +296,14 @@ export function TrainingTemplateLibrary({
     if (scope && current(scope) && !disabled && !running.current) void load(scope);
   };
   return (
-    <section className="training-template-library" aria-label="我的训练模板">
+    <section className="training-template-library" aria-label="训练模板">
       <header className="training-template-heading">
         <div>
           <h3>
             <BookMarked size={16} />
-            我的训练模板
+            训练模板
           </h3>
-          <p>按当前账号保存多套配置，跨浏览器和设备恢复。套用后核对配置，再预检启动。</p>
+          <p>保存个人配置或套用工作区共享模板，支持跨浏览器和设备恢复。</p>
         </div>
         <button type="button" className="button small ghost" disabled={disabled} onClick={refresh}>
           <RefreshCw size={13} className={view.loading ? 'spin' : ''} />
@@ -284,6 +325,7 @@ export function TrainingTemplateLibrary({
                   name: row?.name || snapshot.request.name.slice(0, 100),
                   description: row?.description || '',
                   confirmDelete: false,
+                  confirmShare: false,
                   notice: '',
                   error: undefined,
                 }));
@@ -291,14 +333,14 @@ export function TrainingTemplateLibrary({
             >
               <option value="">
                 {view.loading
-                  ? '正在读取个人模板…'
+                  ? '正在读取训练模板…'
                   : view.rows.length
                     ? '选择模板'
                     : '暂无模板，可保存当前配置'}
               </option>
               {view.rows.map((row) => (
                 <option key={row.id} value={row.id}>
-                  {row.name} · v{row.revision}
+                  {row.name} · {visibility(row)} · v{row.revision}
                 </option>
               ))}
             </select>
@@ -307,7 +349,7 @@ export function TrainingTemplateLibrary({
             <div className="training-template-selection">
               <strong>{selected.name}</strong>
               <span>
-                v{selected.revision} · 更新于 {date(selected.updated_at)}
+                {visibility(selected)} · v{selected.revision} · 更新于 {date(selected.updated_at)}
               </span>
               {selected.description && <p>{selected.description}</p>}
               <div className="training-template-actions">
@@ -320,17 +362,74 @@ export function TrainingTemplateLibrary({
                   <Download size={13} />
                   {view.operation === 'apply' ? '正在套用…' : '套用模板'}
                 </button>
-                <button
-                  type="button"
-                  className="button small ghost"
-                  disabled={disabled}
-                  onClick={() => setState((previous) => ({ ...previous, confirmDelete: true }))}
-                >
-                  <Trash2 size={13} />
-                  删除
-                </button>
+                {selected.is_owner && (
+                  <button
+                    type="button"
+                    className="button small ghost"
+                    disabled={disabled}
+                    onClick={() => {
+                      if (selected.shared) void setSharing(false);
+                      else
+                        setState((previous) => ({
+                          ...previous,
+                          confirmShare: true,
+                          confirmDelete: false,
+                        }));
+                    }}
+                  >
+                    <Share2 size={13} />
+                    {view.operation === 'share'
+                      ? '正在更新…'
+                      : selected.shared
+                        ? '取消共享'
+                        : '共享到工作区'}
+                  </button>
+                )}
+                {!sharedByOther && (
+                  <button
+                    type="button"
+                    className="button small ghost"
+                    disabled={disabled}
+                    onClick={() =>
+                      setState((previous) => ({
+                        ...previous,
+                        confirmDelete: true,
+                        confirmShare: false,
+                      }))
+                    }
+                  >
+                    <Trash2 size={13} />
+                    删除
+                  </button>
+                )}
               </div>
-              {view.confirmDelete && (
+              {selected.is_owner && view.confirmShare && (
+                <div role="group" aria-label="确认共享训练模板">
+                  <p className="field-hint">
+                    有训练权限的工作区成员可以读取模板「{selected.name}
+                    」的名称、说明与配置，并套用到自己的训练草稿。
+                  </p>
+                  <div className="training-template-actions">
+                    <button
+                      type="button"
+                      className="button small primary"
+                      disabled={disabled}
+                      onClick={() => void setSharing(true)}
+                    >
+                      确认共享
+                    </button>
+                    <button
+                      type="button"
+                      className="button small ghost"
+                      disabled={disabled}
+                      onClick={() => setState((previous) => ({ ...previous, confirmShare: false }))}
+                    >
+                      取消
+                    </button>
+                  </div>
+                </div>
+              )}
+              {!sharedByOther && view.confirmDelete && (
                 <div className="training-template-delete" role="alert">
                   <p>确认删除「{selected.name}」？</p>
                   <div className="training-template-actions">
@@ -357,48 +456,58 @@ export function TrainingTemplateLibrary({
               )}
             </div>
           ) : (
-            <p className="field-hint">模板仅当前账号可见。同名保存会覆盖更新，使用新名称可另存模板。</p>
+            <p className="field-hint">新模板默认为个人可见，可选择已有模板共享给工作区。</p>
           )}
         </div>
-        <div className="training-template-editor">
-          <Field label="模板名称" required>
-            <input
-              value={view.name}
-              maxLength={100}
-              disabled={disabled}
-              placeholder="例如 双臂叠衣 · π0.5"
-              onChange={(event) =>
-                setState((previous) => ({ ...previous, name: event.target.value }))
-              }
-            />
-          </Field>
-          <Field label="模板说明">
-            <textarea
-              value={view.description}
-              maxLength={2000}
-              rows={2}
-              disabled={disabled}
-              placeholder="记录适用的数据、模型与训练方式"
-              onChange={(event) =>
-                setState((previous) => ({ ...previous, description: event.target.value }))
-              }
-            />
-          </Field>
-          <div className="training-template-actions">
-            <button
-              type="button"
-              className="button small"
-              disabled={disabled || !persistable}
-              onClick={() => void save()}
-            >
-              <Save size={13} />
-              {view.operation === 'save' ? '正在保存…' : '保存模板'}
-            </button>
+        {sharedByOther ? (
+          <p className="field-hint">套用共享模板后，可清除模板选择并将当前配置另存为个人模板。</p>
+        ) : (
+          <div className="training-template-editor">
+            <Field label="模板名称" required>
+              <input
+                value={view.name}
+                maxLength={100}
+                disabled={disabled}
+                placeholder="例如 双臂叠衣 · π0.5"
+                onChange={(event) =>
+                  setState((previous) => ({ ...previous, name: event.target.value }))
+                }
+              />
+            </Field>
+            <Field label="模板说明">
+              <textarea
+                value={view.description}
+                maxLength={2000}
+                rows={2}
+                disabled={disabled}
+                placeholder="记录适用的数据、模型与训练方式"
+                onChange={(event) =>
+                  setState((previous) => ({ ...previous, description: event.target.value }))
+                }
+              />
+            </Field>
+            <div className="training-template-actions">
+              <button
+                type="button"
+                className="button small"
+                disabled={disabled || !persistable}
+                onClick={() => void save()}
+              >
+                <Save size={13} />
+                {view.operation === 'save'
+                  ? '正在保存…'
+                  : existing?.shared
+                    ? '更新共享模板'
+                    : '保存模板'}
+              </button>
+            </div>
+            <p className="field-hint">
+              {existing?.shared
+                ? '保存后，工作区成员将看到更新后的配置。套用模板后仍需重新预检及确认生成的 config。'
+                : '保存当前训练配置。同名覆盖更新，新名称另存。模板仍需重新预检及确认生成的 config。'}
+            </p>
           </div>
-          <p className="field-hint">
-            保存当前训练配置：同名覆盖更新，新名称另存。模板仍需重新预检及确认生成的 config。
-          </p>
-        </div>
+        )}
       </div>
       {view.notice && (
         <p className="training-template-notice" role="status">

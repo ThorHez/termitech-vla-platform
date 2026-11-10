@@ -9,6 +9,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from vla_adapters.composition_spec import canonical_text_trim, normalize_composition
+from vla_adapters.image_policy import normalize_image_processing
 
 
 class _ProfileModel(BaseModel):
@@ -27,8 +28,20 @@ class DatasetCamera(_ProfileModel):
     name: str = Field(min_length=1, max_length=100)
     key: str = Field(min_length=1, max_length=256)
     kind: Literal["rgb", "depth"]
+    image_processing: dict | None = None
 
     _normalize_text = field_validator("name", "key", mode="before")(_text)
+
+    @field_validator("image_processing", mode="before")
+    @classmethod
+    def processing_choice(cls, value):
+        return normalize_image_processing(value) if value is not None else None
+
+    @model_validator(mode="after")
+    def depth_processing(self):
+        if self.kind == "depth" and self.image_processing and self.image_processing.get("augmentation", "default") not in {"default", "none"}:
+            raise ValueError("深度图不支持 RGB 颜色或裁剪旋转颜色增强")
+        return self
 
 
 class DatasetFieldAnnotation(_ProfileModel):
@@ -144,8 +157,8 @@ def normalize_dataset_profile(value) -> dict:
 def validate_asset_metadata(kind, metadata) -> dict:
     """Keep existing metadata intact; reserve one validated dataset namespace."""
     clean = deepcopy(metadata)
-    if "_dataset_validation" in clean:
-        raise ValueError("_dataset_validation 是服务端保留的校验状态，不能从客户端提交")
+    if {"_dataset_validation", "_image_registration"} & set(clean):
+        raise ValueError("_dataset_validation 与 _image_registration 是服务端保留的校验状态，不能从客户端提交")
     if "dataset_profile" in clean:
         if kind != "DATASET":
             raise ValueError("只有数据集资产可以登记数据集描述")

@@ -67,7 +67,7 @@ def test_revoke_all_invalidates_old_cookies_and_preserves_metadata(accounts, cap
         assert session.scalar(select(UserSession)) is None
         event = session.scalar(select(AuditEvent).where(AuditEvent.action == "auth.sessions_revoked"))
         assert event.method == "CLI" and event.path == "local-console" and event.status == 200
-        assert event.details == {"count": 2}
+        assert event.details == {"count": 2, "category": "auth", "operation_label": "撤销登录会话", "target_type": "user"}
     # Revocation leaves the same password usable for a new independent session.
     response = admin.post("/api/v1/auth/login", json={"username": "admin", "password": PASSWORD})
     assert response.status_code == 200 and response.json()["user"]["role"] == "admin"

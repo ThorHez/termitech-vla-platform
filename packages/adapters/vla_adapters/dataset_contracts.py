@@ -16,8 +16,10 @@ import re
 
 if __package__:
     from .composition_spec import canonical_text_trim, normalize_composition, normalize_field_annotations
+    from .image_policy import normalize_image_processing, validate_profile_image_processing
 else:
     from composition_spec import canonical_text_trim, normalize_composition, normalize_field_annotations
+    from image_policy import normalize_image_processing, validate_profile_image_processing
 
 
 MAX_SOURCE_BYTES = 1024 * 1024
@@ -120,14 +122,24 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
         fail("数据集相机登记数量无效")
     names, keys = set(), set()
     features = info["features"]
+    composed_cameras = {(row["key"], row["kind"]) for row in selected_composition["cameras"]} if selected_composition else set()
     for camera in cameras:
-        if (not isinstance(camera, dict) or set(camera) != {"name", "key", "kind"}
+        if (not isinstance(camera, dict) or not {"name", "key", "kind"} <= set(camera)
+                or set(camera) - {"name", "key", "kind", "image_processing"}
                 or not _text(camera.get("name")) or len(camera["name"]) > 100 or not _text(camera.get("key"))
                 or camera.get("kind") not in ("rgb", "depth") or camera["name"] in names or camera["key"] in keys):
             fail("数据集相机登记字段无效")
         names.add(camera["name"]);keys.add(camera["key"])
         feature = features.get(camera["key"])
-        if not isinstance(feature, dict) or feature.get("dtype") not in ("image", "video"):
+        dtype = feature.get("dtype") if isinstance(feature, dict) else None
+        # Numeric camera tensors require an explicitly selected composition,
+        # whose separate metadata check verifies frame shape, time and layout.
+        # A profile label alone cannot turn an ordinary numeric state field
+        # into an input accepted by an unrelated recipe or processor.
+        numeric_camera = ((camera["key"], camera["kind"]) in composed_cameras
+                          and isinstance(dtype, str)
+                          and re.fullmatch(r"(?:u?int(?:8|16|32|64)?|float(?:16|32|64)?|double|bfloat16)", dtype) is not None)
+        if not isinstance(feature, dict) or dtype not in ("image", "video") and not numeric_camera:
             fail("登记的相机字段不存在或不是 image/video：" + camera["key"])
         detail = feature.get("info") if isinstance(feature.get("info"), dict) else {}
         depth = bool(re.search(r"(?:^|[._/])depth(?:$|[._/])", camera["key"], re.I)
@@ -136,6 +148,8 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
             fail("相机字段缺少明确的深度语义：" + camera["key"])
         if camera["kind"] == "rgb" and depth:
             fail("深度字段被登记为 RGB：" + camera["key"])
+        if "image_processing" in camera:
+            camera["image_processing"] = normalize_image_processing(camera["image_processing"])
     declared = clean.get("feature_keys", [])
     if (not isinstance(declared, list) or len(declared) > MAX_FEATURES or not all(_text(key) for key in declared)
             or len(set(declared)) != len(declared)):
@@ -212,6 +226,8 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
             warnings.append({"code": "DATASET_FPS_MISMATCH", "supplied": supplied, "metadata": actual,
                 "effective": supplied, "source": "registered",
                 "message": f"登记采样率 {supplied:g} Hz 与 meta/info.json 的 {actual:g} Hz 不一致；本次训练进程内采用登记采样率 {supplied:g} Hz，不自动重采样、修改时间戳或写回元信息文件。"})
+    if not norm_stats:
+        validate_profile_image_processing(clean, features)
     return clean
 
 

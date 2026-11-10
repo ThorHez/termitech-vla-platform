@@ -56,6 +56,7 @@ for action, label, category, target, method, path, parameter in (
     ("datasets.register_batch", "批量登记数据集", "assets", "dataset_scan", "POST", "/nodes/{node_id}/dataset-scans/{scan_id}/register", "scan_id"),
     ("dataset_templates.save", "保存个人数据集格式模板", "templates", "dataset_template", "POST", "/dataset-format-templates", None),
     ("dataset_templates.update", "修改个人数据集格式模板", "templates", "dataset_template", "PUT", "/dataset-format-templates/{template_id}", "template_id"),
+    ("dataset_templates.sharing", "更改数据集格式模板共享范围", "templates", "dataset_template", "PUT", "/dataset-format-templates/{template_id}/sharing", "template_id"),
     ("dataset_templates.delete", "删除个人数据集格式模板", "templates", "dataset_template", "DELETE", "/dataset-format-templates/{template_id}", "template_id"),
     ("queries.paths", "查询机器路径", "queries", "query", "POST", "/nodes/{node_id}/path-suggestions", None),
     ("queries.dataset_fields", "读取数据集字段", "queries", "query", "POST", "/nodes/{node_id}/dataset-inspections", None),
@@ -87,6 +88,7 @@ for action, label, category, target, method, path, parameter in (
     ("drafts.clear", "清空个人训练草稿", "drafts", "training_draft", "DELETE", "/training-draft", None),
     ("training_templates.create", "保存个人训练模板", "templates", "training_template", "POST", "/training-templates", None),
     ("training_templates.update", "修改个人训练模板", "templates", "training_template", "PUT", "/training-templates/{template_id}", "template_id"),
+    ("training_templates.sharing", "更改训练模板共享范围", "templates", "training_template", "PUT", "/training-templates/{template_id}/sharing", "template_id"),
     ("training_templates.delete", "删除个人训练模板", "templates", "training_template", "DELETE", "/training-templates/{template_id}", "template_id"),
     ("recipes.create", "登记公共配方", "recipes", "recipe", "POST", "/recipes", None),
     ("recipes.revise", "修订公共配方", "recipes", "recipe", "POST", "/recipes/{recipe_id}/revisions", "recipe_id"),
@@ -179,8 +181,14 @@ def prime_context(db, request):
         return
     column = func.coalesce(Node.display_name, Node.name) if model is Node else (
         User.display_name if model is User else model.name)
+    query = select(column).where(model.id == target)
+    if model in (TrainingTemplate, DatasetFormatTemplate):
+        principal = getattr(request.state, "principal", None)
+        if principal is None or principal.legacy:
+            return
+        query = query.where(model.user_id == principal.user_id)
     with db.read() as session:
-        label = session.scalar(select(column).where(model.id == target))
+        label = session.scalar(query)
     if _text(label):
         request.state.operation_target_name = _text(label)
 

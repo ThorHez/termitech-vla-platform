@@ -2,10 +2,19 @@ import type { CatalogAssetEntry } from './modelAssetGroups';
 import type { Asset } from './types';
 
 /** A catalog projection only; the complete asset set remains authoritative for APIs. */
-export function datasetCatalogAssets(assets: readonly Asset[], showArchived = false) {
-  const scope = assets.filter(
+export function datasetCatalogAssets(
+  assets: readonly Asset[],
+  showArchived = false,
+  registrantId?: string | null,
+) {
+  const selectionAssets = assets.filter(
     (asset) => showArchived || (asset.status || asset.state) !== 'ARCHIVED',
   );
+  // Scope before grouping so a bound norm is only folded into a matching dataset.
+  const scope =
+    registrantId === undefined
+      ? selectionAssets
+      : selectionAssets.filter((asset) => (asset.registered_by_user_id ?? null) === registrantId);
   const norms = new Map(
     scope.filter((asset) => asset.kind === 'NORM').map((asset) => [asset.id, asset]),
   );
@@ -20,7 +29,7 @@ export function datasetCatalogAssets(assets: readonly Asset[], showArchived = fa
   }
   return {
     assets: scope.filter((asset) => asset.kind !== 'NORM' || !embeddedNormIds.has(asset.id)),
-    selectionAssets: scope,
+    selectionAssets,
     boundNorms,
     embeddedNormIds,
   };

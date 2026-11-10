@@ -1,6 +1,6 @@
 """ORM models; source files and model weights never enter this database."""
 
-from sqlalchemy import BigInteger, Boolean, JSON, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, JSON, ForeignKey, ForeignKeyConstraint, Index, Integer, String, Text, UniqueConstraint, false
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -242,7 +242,7 @@ class TrainingTemplateDraft(Base):
 
 
 class TrainingTemplate(Base):
-    """Private reusable wizard inputs, never preflight or launch authorization."""
+    """Reusable wizard inputs with owner-managed visibility."""
     __tablename__ = "training_templates"
     __table_args__ = (Index("uq_training_templates_user_name", "user_id", "name", unique=True),)
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -250,6 +250,7 @@ class TrainingTemplate(Base):
     name: Mapped[str] = mapped_column(String(100))
     description: Mapped[str] = mapped_column(Text, default="")
     content: Mapped[dict] = mapped_column(JSON)
+    shared: Mapped[bool] = mapped_column(Boolean, server_default=false())
     revision: Mapped[int] = mapped_column(BigInteger, default=1)
     created_at: Mapped[str] = mapped_column(String(40))
     updated_at: Mapped[str] = mapped_column(String(40), index=True)

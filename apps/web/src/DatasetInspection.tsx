@@ -4,6 +4,7 @@ import { LoaderCircle, RefreshCw } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { DatasetProfile } from './DatasetProfileForm';
 import type { Node } from './types';
+import { retainMatchingImageProcessing } from './imageProcessingPolicy';
 import {
   canonicalDatasetInspectionPath,
   clearAutomaticInspectionDefaults,
@@ -37,6 +38,7 @@ export function useDatasetInspectionDraft(
   const [featureMetadata, setFeatureMetadata] = useState<{
     scope: string;
     features: DatasetInspectionDTO['features'];
+    inspectionId?: string;
   }>();
   const manualChange = useCallback((next: DatasetProfile) => {
     recordInspectionEdits(state.current!, latest.current.value, next);
@@ -47,15 +49,19 @@ export function useDatasetInspectionDraft(
     state.current!.touched.add(path);
   }, []);
   const applyTemplate = useCallback((profile: DatasetProfile) => {
-    const next = replaceInspectionDraftFromTemplate(profile, state.current!);
+    const next = replaceInspectionDraftFromTemplate(
+      retainMatchingImageProcessing(profile, latest.current.value),
+      state.current!,
+    );
     latest.current.value = next;
     latest.current.onChange(next);
   }, []);
-  const apply = useCallback((inspection: DatasetInspectionDTO) => {
+  const apply = useCallback((inspection: DatasetInspectionDTO, inspectionId?: string) => {
     if (currentScope.current !== undefined)
       setFeatureMetadata({
         scope: currentScope.current,
         features: structuredClone(inspection.features),
+        inspectionId,
       });
     const merged = mergeDatasetInspection(latest.current.value, inspection, state.current!);
     if (JSON.stringify(merged.profile) !== JSON.stringify(latest.current.value)) {
@@ -80,7 +86,20 @@ export function useDatasetInspectionDraft(
   }, []);
   const featuresFor = (nodeId: string | undefined, path: string) =>
     featureMetadata?.scope === inspectionScope(nodeId, path) ? featureMetadata.features : undefined;
-  return { manualChange, touch, applyTemplate, apply, resetScope, clearFeatures, featuresFor };
+  const inspectionIdFor = (nodeId: string | undefined, path: string) =>
+    featureMetadata?.scope === inspectionScope(nodeId, path)
+      ? featureMetadata.inspectionId
+      : undefined;
+  return {
+    manualChange,
+    touch,
+    applyTemplate,
+    apply,
+    resetScope,
+    clearFeatures,
+    featuresFor,
+    inspectionIdFor,
+  };
 }
 
 function failure(error: unknown) {
@@ -147,6 +166,7 @@ export function DatasetInspection({
     scope: string;
     loading?: boolean;
     inspection?: DatasetInspectionDTO;
+    inspectionId?: string;
     error?: string;
     applied?: string[];
     kept?: string[];
@@ -204,10 +224,11 @@ export function DatasetInspection({
             if (!active()) return;
             if (result.status !== 'READY' || !result.inspection)
               throw new Error(result.error?.message || '未能读取数据集元信息，请重试。');
-            const merged = latest.current.draft.apply(result.inspection);
+            const merged = latest.current.draft.apply(result.inspection, result.id);
             setView({
               scope,
               inspection: result.inspection,
+              inspectionId: result.id,
               applied: merged.applied,
               kept: merged.kept,
             });
@@ -231,7 +252,7 @@ export function DatasetInspection({
   // it does not enable the mode or complete unknown physical declarations.
   useEffect(() => {
     if (current?.inspection && ready && value.processing) {
-      const merged = latest.current.draft.apply(current.inspection);
+      const merged = latest.current.draft.apply(current.inspection, current.inspectionId);
       setView((previous) =>
         previous?.scope === scope && previous.inspection === current.inspection
           ? { ...previous, applied: [...new Set([...(previous.applied || []), ...merged.applied])] }

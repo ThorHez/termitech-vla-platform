@@ -1,4 +1,9 @@
 import { inferImageLayout, type ImageFeature } from './imageLayout';
+import {
+  isImageAugmentation,
+  type ImageAugmentation,
+  type ImageProcessingPolicy,
+} from './imageProcessingPolicy';
 import { fillMissingCompositionRepresentations } from './compositionRepresentationDefaults';
 
 export type Arm = 'left' | 'right';
@@ -34,6 +39,7 @@ export interface ComposedCamera {
   time_index: number | null;
   depth_min: number;
   depth_max: number;
+  augmentation?: ImageAugmentation;
 }
 export interface ComposedProcessingSpec {
   schema_version: 1;
@@ -65,7 +71,12 @@ export interface ProcessingProfileSeed {
   rotation_representation:
     | Exclude<ComposedProcessingSpec['rotation_representation'], ''>
     | 'unknown';
-  cameras: { name: string; key: string; kind: 'rgb' | 'depth' }[];
+  cameras: {
+    name: string;
+    key: string;
+    kind: 'rgb' | 'depth';
+    image_processing?: ImageProcessingPolicy;
+  }[];
   /** Read-only source facts for this training binding, never a saved asset composition. */
   image_features?: readonly ImageFeature[];
   feature_keys?: string[];
@@ -321,7 +332,13 @@ export function composedProcessingErrors(
     const keys = new Set<string>(),
       slots = new Set<string>();
     cameras.forEach((camera, index) => {
-      if (!object(camera) || !exact(camera, CAMERA_KEYS)) {
+      if (
+        !object(camera) ||
+        !exact(
+          camera,
+          Object.hasOwn(camera, 'augmentation') ? [...CAMERA_KEYS, 'augmentation'] : CAMERA_KEYS,
+        )
+      ) {
         errors.push(`组合视觉输入 ${index + 1} 的属性不完整。`);
         return;
       }
@@ -336,6 +353,12 @@ export function composedProcessingErrors(
       slots.add(String(camera.slot));
       if (!choice(camera.kind, ['rgb', 'depth']) || !choice(camera.layout, ['chw', 'hwc']))
         errors.push(`组合视觉输入 ${index + 1} 的图像类型或布局无效。`);
+      if (Object.hasOwn(camera, 'augmentation')) {
+        if (!isImageAugmentation(camera.augmentation))
+          errors.push(`组合视觉输入 ${index + 1} 的训练增强方式无效。`);
+        else if (camera.kind === 'depth' && !['default', 'none'].includes(camera.augmentation))
+          errors.push(`组合视觉输入 ${index + 1} 的深度图不支持 RGB 训练增强。`);
+      }
       if (camera.time_index !== null && !integer(camera.time_index, -64, 63))
         errors.push('图像时间索引需要是 -64 到 63 的整数，静态图像请留空。');
       if (
@@ -480,6 +503,7 @@ export function draftComposedProcessing(profile: ProcessingProfileSeed): Compose
       time_index: null,
       depth_min: 0,
       depth_max: 1,
+      augmentation: camera.image_processing?.augmentation ?? 'default',
     })),
     prompt_key: profile.feature_keys?.includes('task') ? 'task' : '',
     normalization: 'quantile',
@@ -743,6 +767,10 @@ export function updateComposedProcessingFromProfile(
         : VISUAL_SLOTS.find((candidate) => !used.has(candidate) && !reserved.has(candidate)) ||
           ('' as VisualSlot);
     used.add(slot);
+    const augmentation =
+      old?.kind === camera.kind
+        ? old.augmentation
+        : (camera.image_processing?.augmentation ?? 'default');
     return {
       key: camera.key,
       kind: camera.kind,
@@ -754,6 +782,7 @@ export function updateComposedProcessingFromProfile(
       time_index: prior?.time_index ?? null,
       depth_min: prior?.depth_min ?? 0,
       depth_max: prior?.depth_max ?? 1,
+      ...(augmentation !== undefined ? { augmentation } : {}),
     };
   });
   return {

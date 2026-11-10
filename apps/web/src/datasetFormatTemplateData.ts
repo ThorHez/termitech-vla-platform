@@ -10,6 +10,8 @@ export interface DatasetFormatTemplateSummary {
   revision: number;
   created_at: string;
   updated_at: string;
+  shared: boolean;
+  is_owner: boolean;
 }
 
 export interface DatasetFormatTemplate extends DatasetFormatTemplateSummary {
@@ -21,7 +23,18 @@ export function datasetFormatProfile(value: unknown): DatasetProfile | undefined
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const { processing: _processing, ...raw } = value as Record<string, unknown>;
   const profile = readDatasetProfile(raw);
-  return profile ? structuredClone(normalizedDatasetProfile(profile)) : undefined;
+  if (!profile) return undefined;
+  return structuredClone(
+    normalizedDatasetProfile({
+      ...profile,
+      cameras: profile.cameras.map(({ image_processing, ...camera }) => ({
+        ...camera,
+        ...(image_processing
+          ? { image_processing: { resize_mode: image_processing.resize_mode } }
+          : {}),
+      })),
+    }),
+  );
 }
 
 export function datasetTemplateNameError(value: string): string | undefined {

@@ -15,6 +15,8 @@ export interface TrainingTemplateSummary {
   revision: number;
   created_at: string;
   updated_at: string;
+  shared: boolean;
+  is_owner: boolean;
 }
 
 export interface TrainingTemplateRecord extends TrainingTemplateSummary {

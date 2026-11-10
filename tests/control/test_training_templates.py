@@ -66,7 +66,11 @@ def test_multiple_templates_are_durable_private_inputs_without_preflight_or_laun
     content = {"schema_version": 1, "request": {"name": "", "node_id": "saved-machine",
                "profile_id": "saved-environment", "template_id": "openpi-sft", "inputs": {"model": "model-a"},
                "parameters": {"batch_size": 32}, "dataset_bindings": [{"dataset_asset_id": "", "norm_asset_id": "",
-               "weight": 1, "processor": {"name": "ComposableDataConfig", "parameters": {"composition": {"action_key": "actions"}}}}]},
+               "weight": 1, "processor": {"name": "ComposableDataConfig", "parameters": {"composition": {
+                   "action_key": "actions",
+                   "cameras": [{"key": "observation.images.left_wrist", "slot": "left_wrist_0_rgb",
+                                "kind": "rgb", "layout": "chw", "augmentation": "color"}],
+               }}}}]},
                "step": 0, "advanced_recipe": False, "edited_parameters": ["auto_config.action_horizon:automatic"]}
     first = create(client, content=content)
     assert first.status_code == 201, first.text
@@ -293,7 +297,8 @@ def test_concurrent_initialization_serializes_legacy_duplicate_merge_and_index_c
     with ThreadPoolExecutor(max_workers=2) as pool:
         list(pool.map(initialize, range(2)))
     assert client.get(PATH).json() == [{"id": "latest-race", "name": "legacy race", "description": "latest",
-        "revision": 6, "created_at": original["created_at"], "updated_at": newer}]
+        "revision": 6, "created_at": original["created_at"], "updated_at": newer,
+        "shared": False, "is_owner": True}]
     assert client.get(PATH + "/latest-race").json()["content"] == {"request": {"name": "latest"}}
 
 

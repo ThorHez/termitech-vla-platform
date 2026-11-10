@@ -5,7 +5,6 @@ import { Field } from './components';
 import {
   appendDatasetBinding,
   bindSharedNormalization,
-  datasetNormalizationMode,
   selectTrainingDatasetBinding,
   sharedNormalizationAssetId,
 } from './datasetBindingHelpers';
@@ -26,7 +25,12 @@ import {
 } from './datasetBindingDisclosure';
 import type { ImageLayoutEdits } from './imageLayout';
 import { trainingNormalizationLabel } from './trainingNormalization';
-import { datasetProfileSummary, type DatasetProfile } from './DatasetProfileForm';
+import {
+  datasetProfileSummary,
+  readDatasetProfile,
+  type DatasetProfile,
+} from './DatasetProfileForm';
+import { DatasetImageProcessingSummary } from './DatasetImageProcessingSummary';
 import type {
   Asset,
   DatasetBinding,
@@ -109,10 +113,8 @@ export function DatasetBindings({
           asset.kind === 'NORM' &&
           !['ARCHIVED', 'UNAVAILABLE'].includes(asset.status || asset.state || ''),
       );
-  const normalizationMode = datasetNormalizationMode(bindings);
-  const sharedNormalization = normalizationMode === 'shared';
+  const multipleDatasets = bindings.length > 1;
   const sharedNormId = sharedNormalizationAssetId(bindings);
-  const sharedNorm = norms.find((asset) => asset.id === sharedNormId);
   const processingChoices = slots.length
     ? slots
     : [{ recipe_index: 0, weight: 1, processing: '配方默认处理' }];
@@ -210,10 +212,10 @@ export function DatasetBindings({
       </div>
       <p className="field-hint">
         本次训练只使用这里选择的已登记资产；配方中的目录仅作源码参考。
-        {bindings.length > 1
-          ? '多数据集训练会在启动前按全部源数据与本次混采权重自动计算一份共享 norm_stats，所有数据集使用同一份统计。下方已登记参数保留为来源参考。'
+        {multipleDatasets
+          ? '各组可以独立选择已登记的归一化参数作为来源参考。训练启动时按全部源数据与本次混采权重计算一份共享 norm_stats。'
           : '选择数据集后自动带出已绑定的归一化参数，也可手动更换。'}
-        新增数据集会复制第 1 组的处理配置与混采权重；共享归一化时也会保留同一份参数。
+        新增数据集会复制第 1 组的处理配置与混采权重。选定数据集后会带出该数据集绑定的归一化参数。
       </p>
       <p className="field-hint">
         权重占比 = 本组权重 ÷ 总权重；样本数占比 = 本组帧数 ÷ 总帧数；预计采样占比 = 本组帧数 × 权重
@@ -223,59 +225,26 @@ export function DatasetBindings({
           重新读取样本数
         </button>
       </p>
-      {normalizationMode === 'legacy' && (
-        <div className="inline-note" role="status">
-          <strong>启动时自动计算共享归一化参数</strong>
-          <span>
-            每组已绑定的参数继续保留，训练脚本会从全部原始数值样本重新统计，不平均旧 norm 文件。
-            生成的共享参数会随模型保存并自动关联到模型资产。
-          </span>
-          {!readOnly && (
-            <button
-              type="button"
-              className="button outline small"
-              onClick={() => onChange(bindSharedNormalization(bindings, ''))}
-            >
-              统一选择参考参数
-            </button>
-          )}
-        </div>
-      )}
-      {sharedNormalization && (
+      {multipleDatasets && !readOnly && norms.length > 0 && (
         <div className="form-grid">
           <Field
-            label="共用的已登记参数（来源参考）"
-            required
-            hint={
-              sharedNorm?.path ||
-              (norms.length
-                ? '保留所有数据集的归一化资产来源；训练启动时重新计算本次共享统计。'
-                : '请先在「数据与模型」登记当前机器的归一化参数。')
-            }
+            label="统一设置归一化参考（可选）"
+            hint="为当前所有数据集填入同一参考参数，之后仍可逐组修改。"
           >
-            {readOnly ? (
-              <span>{sharedNorm?.name || sharedNormId || '未选择共享归一化参数'}</span>
-            ) : (
-              <select
-                required
-                value={sharedNormId}
-                onChange={(event) =>
-                  onChange(bindSharedNormalization(bindings, event.target.value))
-                }
-              >
-                <option value="">选择共享归一化参数</option>
-                {norms.map((asset) => (
-                  <option value={asset.id} key={asset.id}>
-                    {asset.name} · {asset.version}
-                  </option>
-                ))}
-              </select>
-            )}
+            <select
+              value={norms.some((asset) => asset.id === sharedNormId) ? sharedNormId : ''}
+              onChange={(event) => onChange(bindSharedNormalization(bindings, event.target.value))}
+            >
+              <option value="" disabled>
+                批量选择归一化参考
+              </option>
+              {norms.map((asset) => (
+                <option value={asset.id} key={asset.id}>
+                  {asset.name} · {asset.version}
+                </option>
+              ))}
+            </select>
           </Field>
-          <p className="field-hint">
-            这里选择已登记参数，不会启动全量统计任务。确认开始训练后，脚本按本次数据、处理配置和混采权重生成共享统计，
-            不会把单源参数作为多源训练的最终统计。
-          </p>
         </div>
       )}
       {showProcessing && <DataProcessorCatalogStatus {...catalogState} />}
@@ -299,7 +268,7 @@ export function DatasetBindings({
         const contentId = `${disclosureId}-dataset-${index}`;
         const selectionIssues = [
           !dataset ? '请选择数据集' : '',
-          !norm ? (sharedNormalization ? '请选择共享归一化参数' : '请选择归一化参数') : '',
+          !norm ? '请选择归一化参数' : '',
           !Number.isFinite(binding.weight) || binding.weight <= 0 ? '混采权重需大于 0' : '',
         ].filter(Boolean);
         const validation = automaticValidity[bindingKey(binding, index)];
@@ -455,40 +424,38 @@ export function DatasetBindings({
                       ))}
                     </select>
                   </Field>
-                  {!sharedNormalization && (
-                    <Field
-                      label={`归一化参数 ${index + 1}`}
+                  <Field
+                    label={`${multipleDatasets ? '归一化参数参考' : '归一化参数'} ${index + 1}`}
+                    required
+                    hint={
+                      (dataset?.norm_asset_id &&
+                        !binding.norm_asset_id &&
+                        datasetNormSelectionError(
+                          dataset.node_id,
+                          dataset.norm_asset_id,
+                          assets,
+                        )) ||
+                      (norm
+                        ? `${norm.path}${dataset?.norm_asset_id === norm.id ? ' · 已从数据集绑定带出，可手动更换。' : ''}`
+                        : '') ||
+                      (norms.length
+                        ? '选择此数据集对应的归一化参数。'
+                        : '请先在「数据与模型」登记当前机器的归一化参数。')
+                    }
+                  >
+                    <select
                       required
-                      hint={
-                        (dataset?.norm_asset_id &&
-                          !binding.norm_asset_id &&
-                          datasetNormSelectionError(
-                            dataset.node_id,
-                            dataset.norm_asset_id,
-                            assets,
-                          )) ||
-                        (norm
-                          ? `${norm.path}${dataset?.norm_asset_id === norm.id ? ' · 已从数据集绑定带出，可手动更换。' : ''}`
-                          : '') ||
-                        (norms.length
-                          ? '选择此数据集对应的归一化参数。'
-                          : '请先在「数据与模型」登记当前机器的归一化参数。')
-                      }
+                      value={binding.norm_asset_id}
+                      onChange={(event) => update(index, { norm_asset_id: event.target.value })}
                     >
-                      <select
-                        required
-                        value={binding.norm_asset_id}
-                        onChange={(event) => update(index, { norm_asset_id: event.target.value })}
-                      >
-                        <option value="">选择归一化参数</option>
-                        {norms.map((asset) => (
-                          <option value={asset.id} key={asset.id}>
-                            {asset.name} · {asset.version}
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                  )}
+                      <option value="">选择归一化参数</option>
+                      {norms.map((asset) => (
+                        <option value={asset.id} key={asset.id}>
+                          {asset.name} · {asset.version}
+                        </option>
+                      ))}
+                    </select>
+                  </Field>
                   <Field
                     label={`混采权重 ${index + 1}`}
                     required
@@ -513,6 +480,11 @@ export function DatasetBindings({
                     />
                   </Field>
                 </div>
+              )}
+              {showProcessing && (
+                <DatasetImageProcessingSummary
+                  profile={readDatasetProfile(dataset?.metadata?.dataset_profile)}
+                />
               )}
               {showProcessing && (
                 <DatasetProcessing
@@ -614,7 +586,8 @@ export function DatasetBindingSummary({
       {bindings.map((binding, index) => {
         const dataset = assets.find((asset) => asset.id === binding.dataset_asset_id);
         const norm = assets.find((asset) => asset.id === binding.norm_asset_id);
-        const frozen = profiles?.[`dataset_${index}`];
+        const frozen =
+          profiles?.[`dataset_${index}`] || (index === 0 ? profiles?.dataset : undefined);
         return (
           <div key={index}>
             <strong>
@@ -640,6 +613,7 @@ export function DatasetBindingSummary({
               <>
                 <span>预检时的数据特征：{datasetProfileSummary(frozen)}</span>
                 <span>任务描述：{frozen.task_description}</span>
+                <DatasetImageProcessingSummary profile={frozen} />
               </>
             )}
             {dataset?.path && <code>{dataset.path}</code>}

@@ -111,12 +111,13 @@ def test_existing_public_assets_and_recipes_are_admin_managed(team, name, kind):
         ("POST", f"/assets/{identifier}/archive", {}),
         ("PATCH", f"/assets/{identifier}/dataset-profile", {}),
         ("PUT", f"/assets/{identifier}/norm-binding", {}),
-        ("POST", f"/assets/{identifier}/validations", {}),
         ("POST", "/recipes", {}),
         ("POST", "/recipes/unknown/revisions", {}),
     ):
         result = clients[name].request(method, "/api/v1" + path, json=body)
         assert result.status_code == 403, (method, path, result.text)
+    validation = clients[name].post(f"/api/v1/assets/{identifier}/validations", json={})
+    assert validation.status_code == (403 if name == "reader" or kind == "DATASET" else 404), validation.text
     assert clients[name].get("/api/v1/assets").status_code == 200
     assert clients[name].get("/api/v1/recipes").status_code == 200
     assert admin.post(f"/api/v1/assets/{identifier}/archive").status_code == 200

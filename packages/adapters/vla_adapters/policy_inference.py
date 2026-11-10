@@ -9,6 +9,7 @@ from copy import deepcopy
 import dataclasses
 
 from .composition_spec import SLOTS, normalize_composition
+from .image_runtime import ImageAugmentationRouting, SourceImagePolicies, resize_source_image
 
 
 def _fail(message):
@@ -24,6 +25,88 @@ def _field(data, key):
             _fail("缺少观测字段：" + key)
         current = current[part]
     return current
+
+
+@dataclasses.dataclass(frozen=True)
+class InferenceImagePolicies:
+    """Retain training geometry on observations, without training augmentation."""
+    cameras: tuple
+
+    def __call__(self, data):
+        import numpy as np
+        result = dict(data)
+        for camera in self.cameras:
+            key = camera["key"]
+            try:
+                image = _field(result, key)
+            except ValueError:
+                if camera.get("optional", False):
+                    continue
+                raise
+            # Match ComposedInferenceInputs' JSON observation boundary. Native
+            # training remains strict about codec uint8/0..1 float inputs.
+            image = np.asarray(image)
+            if camera["kind"] == "rgb" and image.dtype.kind in "iu":
+                if not np.all((image >= 0) & (image <= 255)):
+                    _fail("RGB 整数图像必须位于 0..255：" + key)
+                image = image.astype(np.uint8)
+            layout = camera["layout"]
+            if layout == "auto":
+                shape = np.asarray(image).shape
+                if len(shape) not in {3, 4} or (shape[-3] == 3) == (shape[-1] == 3):
+                    _fail("独立处理器的推理图像需要明确的 CHW/HWC 三通道轴：" + key)
+                layout = "chw" if shape[-3] == 3 else "hwc"
+            value = resize_source_image(image, layout=layout, kind=camera["kind"],
+                resize_mode=camera["resize_mode"], fill=camera["fill"], history=camera.get("history", False))
+            if key in result:
+                result[key] = value
+            else:
+                current = result
+                parts = key.split("/")
+                for part in parts[:-1]:
+                    current[part] = dict(current[part])
+                    current = current[part]
+                current[parts[-1]] = value
+        return result
+
+
+def _inference_image_policies(original, *, composed):
+    """Translate dataset-only Repack names into the serving observation names."""
+    repack = getattr(original, "repack_transforms", None)
+    inputs = list(getattr(repack, "inputs", ()))
+    policies = [item for item in inputs if isinstance(item, SourceImagePolicies)]
+    if not policies:
+        return None
+    if len(policies) != 1:
+        raise ValueError("POLICY_CONFIG_UNSUPPORTED: 无法唯一确定训练图像空间策略")
+    source = policies[0]
+    if composed:
+        cameras = tuple({**camera, "key": camera["source_key"]} for camera in source.cameras)
+        return InferenceImagePolicies(cameras)
+    mappings = [item for item in inputs if type(item).__name__ == "RepackTransform" and hasattr(item, "structure")]
+    unknown = [item for item in inputs if item is not source and item not in mappings]
+    if len(mappings) > 1 or unknown:
+        raise ValueError("POLICY_CONFIG_UNSUPPORTED: 独立处理器的图像策略需要明确的单层 Repack 推理映射")
+
+    def flatten(value, prefix=""):
+        result = {}
+        for key, item in value.items():
+            if isinstance(item, dict):
+                result.update(flatten(item, prefix + key + "/"))
+            elif isinstance(item, str):
+                result[prefix + key] = item
+            else:
+                raise ValueError("POLICY_CONFIG_UNSUPPORTED: Repack 图像字段不是可导出的静态映射")
+        return result
+
+    mapping = flatten(mappings[0].structure) if mappings else {}
+    cameras = []
+    for camera in source.cameras:
+        keys = [key for key, value in mapping.items() if value == camera["source_key"]] if mappings else [camera["source_key"]]
+        if not keys:
+            raise ValueError("POLICY_CONFIG_UNSUPPORTED: 训练图像策略的原始字段没有明确的推理映射")
+        cameras.extend({**camera, "key": key, "layout": "auto", "optional": True} for key in keys)
+    return InferenceImagePolicies(tuple(cameras))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,14 +254,24 @@ class _InferenceDataFactory:
         original = self.original.create(assets_dirs, model_config)
         inputs = list(original.data_transforms.inputs)
         composition = [item for item in inputs if type(item).__name__ == "ComposedInputs" and hasattr(item, "composition")]
+        spatial = _inference_image_policies(original, composed=bool(composition))
         if not composition:
-            return original
+            model_inputs = [item for item in original.model_transforms.inputs if not isinstance(item, ImageAugmentationRouting)]
+            if spatial is None and len(model_inputs) == len(original.model_transforms.inputs):
+                return original
+            return dataclasses.replace(original,
+                data_transforms=dataclasses.replace(original.data_transforms, inputs=([spatial, *inputs] if spatial else inputs)),
+                model_transforms=dataclasses.replace(original.model_transforms, inputs=model_inputs))
         if len(composition) != 1:
             raise ValueError("POLICY_CONFIG_UNSUPPORTED: 组合推理需要唯一的观测处理合同")
         marker = composition[0]
         spec = normalize_composition(marker.composition)
+        for camera in spec["cameras"]:
+            camera.pop("augmentation", None)
         model_inputs, positive = [], False
         for transform in original.model_transforms.inputs:
+            if isinstance(transform, ImageAugmentationRouting):
+                continue
             if type(transform).__name__ == "ACPConditionPrompt":
                 if not dataclasses.is_dataclass(transform):
                     raise ValueError("POLICY_CONFIG_UNSUPPORTED: 无法固定 ACP 推理条件")
@@ -186,6 +279,8 @@ class _InferenceDataFactory:
                 positive = True
             model_inputs.append(transform)
         adapted_inputs = [ComposedInferenceInputs(deepcopy(spec), positive) if item is marker else item for item in inputs]
+        if spatial is not None:
+            adapted_inputs.insert(0, spatial)
         width = sum(item["width"] for item in spec["action_layout"])
         state_width = sum(item["width"] for item in spec["state_fields"])
         return dataclasses.replace(original,

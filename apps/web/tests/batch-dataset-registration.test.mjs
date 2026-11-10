@@ -7,7 +7,7 @@ import { createServer } from 'vite';
 
 const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), server: { middlewareMode: true, hmr: false, ws: false }, optimizeDeps: { noDiscovery: true, include: [] }, appType: 'custom' });
 const profile = { schema_version: 1, format: 'lerobot', robot_type: 'ARX5', arm_mode: 'single', action_representation: 'unknown', action_mode: 'unknown', rotation_representation: 'unknown', task_description: 'Fold the cloth', cameras: [{ name: 'top', key: 'observation.images.top', kind: 'rgb' }], field_annotations: [{ key: 'actions', role: 'action', representation: 'composite', value_mode: 'delta', component: 'other', arm: 'left', shape: [16, 10], horizon: 16 }] };
-const entry = (path, changes = {}) => ({ path, relative_path: path.replace('/data/', ''), name: path.split('/').at(-1), summary: {}, error: null, ...changes });
+const entry = (path, changes = {}) => ({ path, relative_path: path.replace('/data/', ''), name: path.split('/').at(-1), features: [{ key: 'observation.images.top', dtype: 'video', shape: [3, 224, 224], names: [] }], summary: {}, error: null, ...changes });
 const scan = (entries) => ({ id: 'scan', node_id: 'source', path: '/data', recursive: true, max_depth: 4, state: 'READY', entries, warnings: [], truncated: false, scanned_directories: 10, skipped_directories: 0, error: null, expires_at: new Date(Date.now() + 1800000).toISOString() });
 try {
   const { scanRows, applyBatchNorm, batchRegistrationEntries, batchRegistrationError, batchIdempotency, batchScanPathError, canonicalDatasetPath, datasetScanScope } = await server.ssrLoadModule('/src/batchDatasetRegistrationData.ts');
