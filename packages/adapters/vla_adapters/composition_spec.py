@@ -16,6 +16,7 @@ else:
 
 
 COMPOSABLE_PROCESSOR = "ComposableDataConfig"
+FLAT_STATE_MODEL_TRANSFORM = "flat_state"
 FIELDS = {"schema_version", "robot_model", "arm_mode", "state_representation", "state_fields", "state_history",
           "action_representation", "action_key", "action_layout", "action_mode", "rotation_representation",
           "position_unit", "joint_unit", "coordinate_frame", "gripper_range", "cameras", "prompt_key",
@@ -118,7 +119,8 @@ def normalize_composition(value, *, norm_stats=False):
     representations = {"eef", "joint", "composite"}
     for key, choices in (("arm_mode", {"single", "bimanual"}), ("state_representation", representations),
                          ("action_representation", representations),
-                         ("normalization", {"quantile", "zscore"}), ("model_transform", {"standard"})):
+                         ("normalization", {"quantile", "zscore"}),
+                         ("model_transform", {"standard", FLAT_STATE_MODEL_TRANSFORM})):
         result[key] = _enum(value[key], choices, key)
     result["state_history"] = _integer(value["state_history"], 1, 64, "state_history")
     arms = {"left"} if result["arm_mode"] == "single" else {"left", "right"}

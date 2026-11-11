@@ -54,18 +54,23 @@ def setup_composed(platform, *, source_only=False, **composition_options):
     return node, inputs, rows, profile
 
 
-def pending(platform, *, source_only=False, customized=False, augmentation=None, **composition_options):
+def pending(platform, *, source_only=False, customized=False, augmentation=None, automatic=False,
+            state_history=1, **composition_options):
     node, inputs, rows, profile = setup_composed(platform, source_only=source_only, **composition_options)
     selected = rows[0]["processor"]["parameters"]["composition"]
+    selected["state_history"] = state_history
     if augmentation is not None:
         selected["cameras"][0]["augmentation"] = augmentation
     if customized:
         selected["state_fields"].reverse()
         selected["normalization"] = "zscore"
-    response = request_preview(platform, node, inputs=inputs, dataset_bindings=rows)
+    response = request_preview(platform, node, inputs=inputs, dataset_bindings=rows,
+                               **({"auto_config": {"model_type": "pi05", "action_horizon": 16}} if automatic else {}))
     assert response.status_code == 202, response.text
     identifier = response.json()["id"]
     command = next(item for item in platform.commands(node) if item["type"] == "PREFLIGHT")
+    rows = command["payload"]["dataset_bindings"]
+    selected = rows[0]["processor"]["parameters"]["composition"]
     evidence = automatic_preflight(command["payload"])
     data = evidence["plan"]["datasets"][0]
     data["registered_profile"] = deepcopy(profile)
@@ -73,20 +78,26 @@ def pending(platform, *, source_only=False, customized=False, augmentation=None,
     data["composition"] = {"schema_version": 1, "spec": deepcopy(selected),
         "digest": composition_digest(selected), "training_stage": "sft", "model_type": "Pi0Config",
         "action_horizon": 16, "action_dim": 32,
-        "pi05": True, "raw_state_dim": 7, "raw_action_dim": raw_action, "state_history": 1, "normalization": selected["normalization"],
+        "pi05": True, "raw_state_dim": 7, "raw_action_dim": raw_action, "state_history": state_history,
+        "normalization": selected["normalization"],
         "image_keys": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"], "depth_keys": [],
         "action_metadata_sha256": data["metadata_sha256"], "action_sequence_keys": [],
         "action_loss_mask": [1.] * raw_action + [0.] * (32 - raw_action),
         "source": {"path": "src/openpi/training/composed_processing.py", "sha256": "c" * 64}}
     data["actions_shape"] = [16, raw_action]
     evidence["plan_digest"] = canonical_digest(evidence["plan"])
-    code = snapshot(recipe="mixed", dataset_bindings=rows, automatic_preflight=evidence)
+    code = snapshot(recipe=command["payload"]["recipe"], dataset_bindings=rows, automatic_preflight=evidence,
+                    **({"auto_config": command["payload"]["auto_config"]} if automatic else {}))
     return node, identifier, command, code, profile
 
 
-def test_composition_is_frozen_with_asset_even_after_edits_and_reaches_start(platform):
-    node, identifier, command, code, profile = pending(platform)
+@pytest.mark.parametrize(("automatic", "state_history"), [(False, 1), (True, 1), (True, 2)])
+def test_composition_is_frozen_with_asset_even_after_edits_and_reaches_start(platform, automatic, state_history):
+    node, identifier, command, code, profile = pending(platform, automatic=automatic, state_history=state_history)
     assert command["payload"]["inputs"]["dataset_0"]["dataset_profile"] == profile
+    assert profile["processing"]["model_transform"] == "standard"
+    processor = command["payload"]["dataset_bindings"][0]["processor"]
+    assert processor["parameters"]["composition"]["model_transform"] == ("flat_state" if automatic else "standard")
     changed = deepcopy(profile); changed["processing"]["coordinate_frame"] = "another_frame"
     asset_id = command["payload"]["inputs"]["dataset_0"]["id"]
     response = platform.client.patch(f"/api/v1/assets/{asset_id}/dataset-profile", headers=ADMIN,
@@ -99,7 +110,7 @@ def test_composition_is_frozen_with_asset_even_after_edits_and_reaches_start(pla
     assert platform.schedule() == 1
     start = next(item for item in platform.commands(node) if item["type"] == "START")
     assert start["payload"]["inputs"]["dataset_0"]["dataset_profile"] == profile
-    assert start["payload"]["dataset_bindings"][0]["processor"] == composition_choice(profile)
+    assert start["payload"]["dataset_bindings"][0]["processor"] == processor
 
 
 @pytest.mark.parametrize("tampered", [False, True])

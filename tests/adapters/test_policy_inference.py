@@ -170,6 +170,19 @@ def test_compilation_preserves_model_norms_and_existing_transforms(training_core
     assert output["state"].shape == (1, 7)
 
 
+@pytest.mark.parametrize("mode", ["standard", "flat_state"])
+def test_inference_keeps_the_frozen_state_tokenization_order(training_core, mode):
+    spec = {**SPEC, "model_transform": mode}
+    flatten, tokenize = object(), object()
+    order = (flatten, tokenize) if mode == "flat_state" else (tokenize, flatten)
+    original = DataConfig(Group((training_core.ComposedInputs(spec, 16, 32),)),
+                          Group(order), object())
+    compiled = compile_inference_config(Config(Factory(original), object()))
+    inference = compiled.data.create(None, None)
+    assert inference.model_transforms.inputs == list(order)
+    assert inference.data_transforms.inputs[0].composition["model_transform"] == mode
+
+
 def test_non_composition_preserves_its_complete_data_config():
     original = DataConfig(Group((object(),), (object(),)), Group(), object())
     config = Config(Factory(original), object())
