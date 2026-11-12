@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 
 from vla_adapters.dataset_bindings import validate_binding_assets
+from vla_adapters.recap import RECAP_TORCH_ENTRY, recap_contract_valid
+from vla_adapters.recap_checkpoint import recap_model_evidence_valid
 from vla_adapters.norm_datasets import validate_norm_assets
 from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_adapters.runtime_options import validate_generated_normalization_method
@@ -288,21 +290,14 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
             if canonical_digest(plan.get(field)) != canonical_digest(spec.get(field)):
                 raise ValueError("resolved execution plan does not match " + field)
         if spec.get("training_stage") is not None:
-            contract = plan.get("recap_stage_contract")
-            datasets = plan.get("datasets")
-            contract_datasets = contract.get("datasets") if isinstance(contract, dict) else None
-            if (not isinstance(contract, dict) or contract.get("stage") != spec["training_stage"]
-                    or not isinstance(contract.get("model_type"), str) or not contract["model_type"]
-                    or (contract["model_type"] == "Pi0ValueConfig") != (spec["training_stage"] == "value")
-                    or not isinstance(contract.get("loader_type"), str) or not contract["loader_type"]
-                    or not isinstance(datasets, list) or not isinstance(contract_datasets, list)
-                    or len(contract_datasets) != len(datasets)
-                    or any(not isinstance(item, dict) or item.get("path") != data.get("path")
-                           or not isinstance(item.get("required_columns"), list) or not item["required_columns"]
-                           or ("value_target" if spec["training_stage"] == "value" else "is_positive") not in item["required_columns"]
-                           or any(not isinstance(column, str) or not column for column in item["required_columns"])
-                           for item, data in zip(contract_datasets, datasets))):
+            if not recap_contract_valid(spec["training_stage"], spec.get("stage_config"),
+                                        plan.get("recap_stage_contract"), plan.get("datasets"), require_pytorch=True):
                 raise ValueError("missing ReCap phase model, loader or dataset field evidence")
+            plan_inputs = plan.get("inputs")
+            if (spec.get("recap_backend") != "pytorch"
+                    or not isinstance(plan.get("entrypoint"), str) or not plan["entrypoint"].endswith("/" + RECAP_TORCH_ENTRY)
+                    or not isinstance(plan_inputs, dict) or not recap_model_evidence_valid(plan.get("model"), plan_inputs.get("model"))):
+                raise ValueError("missing ReCap PyTorch entrypoint or safetensors evidence")
         if plan.get("requested_entrypoint") != spec.get("entrypoint"):
             raise ValueError("resolved execution plan does not match requested training entrypoint")
         bindings = validate_binding_assets(spec.get("dataset_bindings"), spec.get("inputs", {}))
@@ -377,8 +372,9 @@ def _check_output_storage(config: dict, plan: dict, checks: list[dict]):
     except OSError as exc:
         raise AgentError("OUTPUT_NOT_WRITABLE", f"Agent 无法写入训练输出目录 {root}: {exc}") from exc
     required = storage["required_bytes"]
+    storage_scope = "含 checkpoint 和派生数据集" if "derived_dataset_bytes" in storage else "含 checkpoint 临时写入余量"
     if free < required:
-        raise AgentError("OUTPUT_SPACE_INSUFFICIENT", f"训练输出空间不足：可用 {free / 2**30:.2f} GiB，预计至少需要 {required / 2**30:.2f} GiB（含 checkpoint 临时写入余量）")
+        raise AgentError("OUTPUT_SPACE_INSUFFICIENT", f"训练输出空间不足：可用 {free / 2**30:.2f} GiB，预计至少需要 {required / 2**30:.2f} GiB（{storage_scope}）")
     checks.append({"name": "output_storage", "ok": True,
                    "message": f"输出目录可写，可用 {free / 2**30:.2f} GiB，预计至少需要 {required / 2**30:.2f} GiB"})
 

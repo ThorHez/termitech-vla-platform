@@ -1,7 +1,7 @@
 import type { DatasetProfile } from './DatasetProfileForm';
 import { readDatasetProfile } from './DatasetProfileForm';
 import { processorDefaults, processorParameterErrors } from './DataProcessorPicker';
-import type { Asset, DataProcessorEntry, RecipeLiteral } from './types';
+import type { Asset, DataProcessorEntry, RecipeLiteral, TrainingStage } from './types';
 
 export interface DatasetRecommendation {
   status: 'missing_profile' | 'no_match' | 'incomplete' | 'ambiguous' | 'unique';
@@ -13,7 +13,7 @@ export interface DatasetRecommendation {
 export function recommendDatasetProcessor(
   asset: Asset | undefined,
   entries: DataProcessorEntry[],
-  stage: 'sft' | 'value' | 'offline_rl' = 'sft',
+  stage: 'sft' | TrainingStage = 'sft',
   modelFamily?: 'standard' | 'memory' | 'hybrid',
   managedParameters: Record<string, RecipeLiteral> = {},
 ): DatasetRecommendation {

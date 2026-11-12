@@ -17,6 +17,10 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from vla_adapters.recap import recap_model_role
+from vla_adapters.recap_checkpoint import (RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, RECAP_TORCH_WEIGHTS,
+                                           recap_commit_matches, safetensors_header)
+
 from .safety import allowed_path, safe_identifier
 from .state import State
 
@@ -120,6 +124,26 @@ def completed_openpi_checkpoint(checkpoint: Path, *, scan: _Scan | None = None) 
     return None
 
 
+def completed_torch_recap_checkpoint(checkpoint: Path, *, scan: _Scan | None = None) -> dict | None:
+    """Require the trainer's commit marker and a complete safetensors header."""
+    scan = scan or _Scan(checkpoint, 32, 2)
+    try:
+        if not checkpoint.name.isascii() or not checkpoint.name.isdigit() or not scan.directory(checkpoint):
+            return None
+        marker = checkpoint / RECAP_TORCH_COMMIT
+        receipt = scan.json(marker, 64 * 1024)
+        if not recap_commit_matches(receipt, int(checkpoint.name)):
+            return None
+        safetensors_header(scan.local(checkpoint / RECAP_TORCH_WEIGHTS))
+        if not scan.directory(checkpoint / "assets"):
+            return None
+        saved_at = datetime.fromtimestamp(scan.regular(marker).st_mtime, timezone.utc).isoformat()
+        return {"format": RECAP_TORCH_FORMAT, "backend": "pytorch",
+                "model_role": recap_model_role(receipt["stage"]), "saved_at": saved_at}
+    except (OSError, ValueError, TypeError, OverflowError):
+        return None
+
+
 def discover_openpi_outputs(output_dir: Path, recipe: str, *, max_entries: int = 4096,
                             timeout: float = 2) -> list[dict]:
     """Bound traversal to the attempt's checkpoints tree and three levels.
@@ -142,7 +166,8 @@ def discover_openpi_outputs(output_dir: Path, recipe: str, *, max_entries: int =
                         continue
                     path = Path(entry.path)
                     if entry.name.isascii() and entry.name.isdigit():
-                        completed = completed_openpi_checkpoint(path, scan=scan)
+                        completed = (completed_torch_recap_checkpoint(path, scan=scan)
+                                     if (path / RECAP_TORCH_COMMIT).exists() else completed_openpi_checkpoint(path, scan=scan))
                         if completed:
                             results.append({"kind": "MODEL", "name": recipe + " / " + entry.name,
                                             "path": str(path), "version": entry.name,

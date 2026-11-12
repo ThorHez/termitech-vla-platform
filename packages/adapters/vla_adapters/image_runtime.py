@@ -397,3 +397,16 @@ def install_image_processing(config, spec, config_module):
                 if datasets is not None else factories[0])
         config = dataclasses.replace(config, data=data)
     return config
+
+
+def prepare_recap_worker(config, *, spec):
+    """Restore process-local FPS and image bindings in a spawned Torch rank."""
+    import openpi.training.config as config_module
+
+    if __package__:
+        from .dataset_fps import install_registered_fps
+    else:
+        from dataset_fps import install_registered_fps
+
+    install_registered_fps(spec)
+    return install_image_processing(config, spec, config_module)

@@ -69,6 +69,12 @@ export interface ComposedCamera {
   depth_max: number;
   augmentation?: ImageAugmentation;
 }
+export const COMPOSED_SUPERVISION_FIELDS = [
+  'value_target',
+  'is_positive',
+  'stage_progress_gt',
+] as const;
+
 export interface ComposedProcessingSpec {
   schema_version: 1;
   robot_model: string;
@@ -89,7 +95,7 @@ export interface ComposedProcessingSpec {
   prompt_key: string;
   normalization: 'quantile' | 'zscore';
   model_transform: 'standard' | 'flat_state';
-  aux_keys: ('value_target' | 'is_positive')[];
+  aux_keys: (typeof COMPOSED_SUPERVISION_FIELDS)[number][];
 }
 export interface ProcessingProfileSeed {
   robot_type: string;
@@ -161,6 +167,45 @@ const STATE_KEYS = ['key', 'width', 'arm', 'kind', 'normalize'];
 const ACTION_KEYS = ['arm', 'kind', 'width', 'normalize'];
 const CAMERA_KEYS = ['key', 'slot', 'kind', 'layout', 'time_index', 'depth_min', 'depth_max'];
 export const VISUAL_SLOTS: VisualSlot[] = ['base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb'];
+
+function preferredVisualSlot(key: string): VisualSlot | undefined {
+  const field = key.trim().toLowerCase().split(/[./]/).at(-1) || '';
+  const name = field.replace(/[-\s]+/g, '_').replace(/(?:_(?:rgb|color|depth|\d+))+$/, '');
+  if (/^(?:cam_)?(?:left_wrist|wrist_left|hand_left|left_hand)$/.test(name))
+    return 'left_wrist_0_rgb';
+  if (/^(?:cam_)?(?:right_wrist|wrist_right|hand_right|right_hand)$/.test(name))
+    return 'right_wrist_0_rgb';
+  if (/^(?:base|top_head|head|cam_high)$/.test(name)) return 'base_0_rgb';
+}
+
+function assignVisualSlots(
+  cameras: readonly { key: string; savedSlot?: VisualSlot; fallbackSlot?: VisualSlot }[],
+  fallbackOrder: readonly VisualSlot[] = VISUAL_SLOTS,
+): VisualSlot[] {
+  const used = new Set(cameras.flatMap(({ savedSlot }) => (savedSlot ? [savedSlot] : [])));
+  const reserve = (slot?: VisualSlot) => {
+    if (!slot || used.has(slot)) return undefined;
+    used.add(slot);
+    return slot;
+  };
+  // Reserve known views before any unnamed camera takes a remaining slot.
+  const assigned = cameras.map(
+    ({ key, savedSlot }) => savedSlot || reserve(preferredVisualSlot(key)),
+  );
+  return assigned.map(
+    (slot, index) =>
+      slot ||
+      reserve(cameras[index].fallbackSlot) ||
+      reserve(fallbackOrder.find((candidate) => !used.has(candidate))) ||
+      ('' as VisualSlot),
+  );
+}
+
+export function matchComposedCameraSlots(cameras: readonly ComposedCamera[]): ComposedCamera[] {
+  const slots = assignVisualSlots(cameras.map(({ key, slot }) => ({ key, fallbackSlot: slot })));
+  return cameras.map((camera, index) => ({ ...camera, slot: slots[index] }));
+}
+
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 const text = (value: unknown, maximum = 256): value is string =>
@@ -250,11 +295,11 @@ export function composedProcessingErrors(
     errors.push('组件组合目前只支持标准 Pi0/Pi05 模型变换。');
   if (
     !Array.isArray(value.aux_keys) ||
-    value.aux_keys.length > 2 ||
-    !value.aux_keys.every((key) => choice(key, ['value_target', 'is_positive'])) ||
+    value.aux_keys.length > COMPOSED_SUPERVISION_FIELDS.length ||
+    !value.aux_keys.every((key) => choice(key, COMPOSED_SUPERVISION_FIELDS)) ||
     new Set(value.aux_keys).size !== value.aux_keys.length
   )
-    errors.push('辅助监督字段只支持 value_target 和 is_positive，且不能重复。');
+    errors.push(`辅助监督字段只支持 ${COMPOSED_SUPERVISION_FIELDS.join('、')}，且不能重复。`);
 
   if (
     !Array.isArray(value.state_fields) ||
@@ -520,6 +565,7 @@ export function composedProfileErrors(
 export function draftComposedProcessing(profile: ProcessingProfileSeed): ComposedProcessingSpec {
   // Unknown source facts remain incomplete; optional declarations stay blank.
   const action = profile.feature_keys?.find((key) => key === 'actions' || key === 'action') || '';
+  const slots = assignVisualSlots(profile.cameras);
   return {
     schema_version: 1,
     robot_model: profile.robot_type,
@@ -551,7 +597,7 @@ export function draftComposedProcessing(profile: ProcessingProfileSeed): Compose
     gripper_range: null,
     cameras: profile.cameras.map((camera, index) => ({
       key: camera.key,
-      slot: VISUAL_SLOTS[index] || ('' as VisualSlot),
+      slot: slots[index],
       kind: camera.kind,
       layout: inferImageLayout(profile.image_features, camera.key, camera.kind).layout || '',
       time_index: null,
@@ -804,23 +850,19 @@ export function updateComposedProcessingFromProfile(
   profile: ProcessingProfileSeed,
   spec: ComposedProcessingSpec,
 ): ComposedProcessingSpec {
-  const used = new Set<VisualSlot>();
-  const reserved = new Set(
-    profile.cameras.flatMap((camera) => {
-      const old = spec.cameras.find((item) => item.key.trim() === camera.key.trim());
-      return old ? [old.slot] : [];
-    }),
+  const previous = profile.cameras.map((camera) =>
+    spec.cameras.find((item) => item.key.trim() === camera.key.trim()),
+  );
+  const slots = assignVisualSlots(
+    profile.cameras.map(({ key }, index) => ({
+      key,
+      savedSlot: previous[index]?.slot,
+      fallbackSlot: spec.cameras[index]?.slot,
+    })),
   );
   const cameras = profile.cameras.map((camera, index): ComposedCamera => {
-    const old = spec.cameras.find((item) => item.key.trim() === camera.key.trim());
+    const old = previous[index];
     const prior = old || spec.cameras[index];
-    const slot = old
-      ? old.slot
-      : prior && !used.has(prior.slot) && !reserved.has(prior.slot)
-        ? prior.slot
-        : VISUAL_SLOTS.find((candidate) => !used.has(candidate) && !reserved.has(candidate)) ||
-          ('' as VisualSlot);
-    used.add(slot);
     const augmentation =
       old?.kind === camera.kind
         ? old.augmentation
@@ -828,7 +870,7 @@ export function updateComposedProcessingFromProfile(
     return {
       key: camera.key,
       kind: camera.kind,
-      slot,
+      slot: slots[index],
       layout:
         inferImageLayout(profile.image_features, camera.key, camera.kind).layout ||
         prior?.layout ||
@@ -861,6 +903,11 @@ export function umiV4ComposedPreset(
   armMode: 'single' | 'bimanual',
 ): ComposedProcessingSpec {
   const spec = draftComposedProcessing(profile);
+  const slots = assignVisualSlots(profile.cameras, [
+    'left_wrist_0_rgb',
+    'right_wrist_0_rgb',
+    'base_0_rgb',
+  ]);
   const state_fields: StateField[] = [];
   const arms: Arm[] = armMode === 'single' ? ['left'] : ['left', 'right'];
   for (const [index, arm] of arms.entries()) {
@@ -901,7 +948,7 @@ export function umiV4ComposedPreset(
     ]),
     cameras: spec.cameras.map((camera, index) => ({
       ...camera,
-      slot: index === 0 ? 'left_wrist_0_rgb' : index === 1 ? 'right_wrist_0_rgb' : 'base_0_rgb',
+      slot: slots[index],
     })),
   };
 }

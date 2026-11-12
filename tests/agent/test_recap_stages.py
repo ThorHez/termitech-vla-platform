@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from vla_adapters.recap import RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, recap_torch_module_paths
 from vla_agent import preflight, runner, training_validation
 from vla_agent.safety import AgentError
 from vla_agent.snapshots import capture_code, compare_code
@@ -54,10 +55,17 @@ def staged_probe(fixture):
     argv = list(launch["argv"])
     index = argv.index("--spec-json")
     spec = json.loads(argv[index + 1])
-    spec.update(training_stage="offline_rl", stage_config={"acp_dropout": .1})
+    spec.update(template_id="recap", recap_backend="pytorch", training_stage="offline_rl", stage_config={"acp_dropout": .1})
     argv[index + 1] = json.dumps(spec)
+    model = plan["inputs"]["model"]
+    weight = model + "/model.safetensors"
+    plan["model"] = {"path": weight, "checkpoint_path": model, "format": "openpi-pytorch", "parameter_bytes": 1024,
+                     "metadata": [{"path": weight, "scope": "safetensors_header", "sha256": "a" * 64}]}
+    plan["entrypoint"] = spec["code_dir"] + "/" + RECAP_TORCH_ENTRY
     plan.update(training_stage=spec["training_stage"], stage_config=spec["stage_config"], recap_stage_contract={
-        "stage": "offline_rl", "model_type": "Pi0ACPConfig", "loader_type": "LeRobotACPDataset",
+        "stage": "offline_rl", "model_type": "Pi0Config", "loader_type": RECAP_TORCH_LOADER, "backend": "pytorch",
+        "runtime_versions": {"torch": "2.7.1", "safetensors": "0.5.3", "transformers": "4.53.2"},
+        "source_sha256": {"src/openpi/" + path: "b" * 64 for path in recap_torch_module_paths("offline_rl")},
         "datasets": [{"path": data["path"], "required_columns": ["is_positive"]} for data in plan["datasets"]]})
     return {**launch, "argv": argv}, plan
 
@@ -80,7 +88,7 @@ def test_phase_probe_requires_real_model_loader_and_each_derived_dataset_evidenc
     assert evidence["plan"]["training_stage"] == "offline_rl"
 
 
-@pytest.mark.parametrize("mutation", ["old_wrapper", "different_stage", "different_config", "missing_check", "missing_contract", "wrong_dataset", "no_columns", "wrong_model", "wrong_supervision"])
+@pytest.mark.parametrize("mutation", ["old_wrapper", "different_stage", "different_config", "missing_check", "missing_contract", "wrong_dataset", "no_columns", "wrong_model", "wrong_supervision", "jax_evidence"])
 def test_phase_probe_rejects_stale_or_incomplete_runtime_evidence(probe_fixture, mutation):
     launch, plan = staged_probe(probe_fixture)
     plan = copy.deepcopy(plan)
@@ -101,6 +109,8 @@ def test_phase_probe_rejects_stale_or_incomplete_runtime_evidence(probe_fixture,
         plan["recap_stage_contract"]["datasets"][-1]["required_columns"] = ["value_target"]
     elif mutation == "no_columns":
         plan["recap_stage_contract"]["datasets"][-1]["required_columns"] = []
+    elif mutation == "jax_evidence":
+        plan["model"]["format"] = "openpi-orbax"
     write_response(probe_fixture, plan, with_check=mutation != "missing_check")
     with pytest.raises(AgentError) as failure:
         training_validation.validate_training(probe_fixture["config"], launch, [])

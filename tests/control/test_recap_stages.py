@@ -3,18 +3,23 @@
 import copy
 
 import pytest
+from vla_adapters.recap import (RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, STAGE_PROGRESS,
+    STAGE_PROGRESS_ID_COLUMNS, STAGE_PROGRESS_MODEL, recap_torch_module_paths)
 from vla_protocol import canonical_digest
 
 from vla_control.models import Preview
 
 from .conftest import ADMIN, automatic_checks, automatic_preflight, snapshot
 from .test_automatic_preflight import acknowledge, submit
+from .test_dataset_validations import result as source_result
 from .test_multi_dataset_control import configured
 from .test_task_recipe import request_preview
 
 
 def pending(platform, stage="value", config=None):
     node, inputs, rows = configured(platform)
+    if stage == STAGE_PROGRESS:
+        rows = rows[:1]
     options = {} if config is None else {"stage_config": config}
     response = request_preview(platform, node, template_id="recap", training_stage=stage,
         inputs=inputs, dataset_bindings=rows, **options)
@@ -25,11 +30,26 @@ def pending(platform, stage="value", config=None):
     payload = command["payload"]
     evidence = automatic_preflight(payload)
     plan = evidence["plan"]
+    model = plan["inputs"]["model"]
+    weight = model + "/model.safetensors"
+    plan["model"].update(path=weight, format="openpi-pytorch",
+                         metadata=[{"path": weight, "scope": "safetensors_header", "sha256": "a" * 64}])
+    plan["entrypoint"] = "/machine/code/" + RECAP_TORCH_ENTRY
     plan.update(training_stage=stage, stage_config=payload["stage_config"], recap_stage_contract={
-        "stage": stage, "model_type": "Pi0ValueConfig" if stage == "value" else "Pi0ACPConfig",
-        "loader_type": "LeRobotValueDataset" if stage == "value" else "LeRobotACPDataset",
+        "stage": stage, "model_type": "Pi0ValueConfig" if stage == "value" else "Pi0Config",
+        "loader_type": RECAP_TORCH_LOADER, "backend": "pytorch",
+        "runtime_versions": {"torch": "2.7.1", "safetensors": "0.5.3", "transformers": "4.53.2"},
+        "source_sha256": {f"src/openpi/{path}": "a" * 64 for path in recap_torch_module_paths(stage)},
         "datasets": [{"path": dataset["path"], "required_columns": ["value_target"] if stage == "value" else ["advantage", "is_positive"]}
                      for dataset in plan["datasets"]]})
+    if stage == STAGE_PROGRESS:
+        plan["datasets"][0]["frames"] = 6
+        plan["recap_stage_contract"].update(
+            model_type=STAGE_PROGRESS_MODEL,
+            datasets=[{"path": plan["datasets"][0]["path"],
+                       "required_columns": ["stage_progress_gt", *STAGE_PROGRESS_ID_COLUMNS]}],
+            annotation={"output": "stage_advantage_dataset", "source_manifest_digest": "b" * 64,
+                        "n_step": 50, "positive_ratio": .3, "stage_count": 2, **payload["stage_config"]})
     evidence["plan_digest"] = canonical_digest(plan)
     code = snapshot(recipe="mixed", dataset_bindings=rows, training_stage=stage,
                     stage_config=payload["stage_config"], automatic_preflight=evidence)
@@ -88,6 +108,50 @@ def test_recap_requires_explicit_pairs_instead_of_silently_retaining_recipe_data
     node, inputs, _ = configured(platform)
     response = request_preview(platform, node, template_id="recap", training_stage="value", inputs=inputs)
     assert response.status_code == 422 and response.json()["error"]["code"] == "DATASET_BINDINGS_REQUIRED"
+
+
+@pytest.mark.parametrize("missing_output", [False, True])
+def test_stage_progress_publishes_validated_dataset_with_frozen_lineage(platform, missing_output):
+    node, identifier, command, code = pending(platform, STAGE_PROGRESS, {"n_step": 25})
+    assert acknowledge(platform, node, identifier, command, code, checks())["status"] == "READY"
+    run = submit(platform, identifier).json()
+    assert platform.schedule() == 1
+    attempt = platform.start(node, run)
+    output = "/machine/output/" + attempt["id"]
+    step = code["automatic_preflight"]["plan"]["parameters"]["steps"] - 1
+    model = {"kind": "MODEL", "name": "stage scorer", "path": output + f"/checkpoints/mixed/platform/{step}", "version": str(step),
+             "metadata": {"format": "openpi-pytorch", "backend": "pytorch", "model_role": "stage_progress_estimator", "step": step}}
+    dataset = {"kind": "DATASET", "name": "Kai0 labels", "path": output + "/stage_advantage_dataset", "version": str(step)}
+    dataset["metadata"] = {
+        "format": "lerobot", "registration_source": "recap_stage_progress",
+        "source_dataset_asset_id": run["inputs"]["dataset_0"], "source_norm_asset_id": run["inputs"]["norm_0"],
+        "scorer_checkpoint_path": model["path"], "annotation_sha256": "c" * 64, "source_manifest_digest": "b" * 64,
+        "source_validation": source_result(dataset),
+        "annotation": {"schema_version": 1, "method": "kai0_stage_progress", "score": "absolute_advantage",
+                       "n_step": 25, "positive_ratio": .3, "stage_count": 2,
+                       "frame_count": 6, "positive_count": 2,
+                       "stages": [{"stage": stage, "frame_count": 3, "positive_count": 1, "threshold": .5}
+                                  for stage in range(2)]}}
+    outputs = [model] if missing_output else [model, dataset]
+    response = platform.emit(node, attempt["id"], 2, "SUCCEEDED", {"exit_code": 0, "outputs": outputs})
+    assert response.status_code == 200, response.text
+    finished = platform.get_run(run)
+    if missing_output:
+        assert finished["state"] == "FAILED" and finished["error"]["code"] == "RECAP_STAGE_OUTPUT_INVALID"
+    else:
+        assert finished["state"] == "SUCCEEDED", finished.get("error")
+        assets = platform.client.get("/api/v1/assets", headers=ADMIN).json()
+        output_asset = next(row for row in assets if row["path"] == dataset["path"])
+        assert output_asset["norm_asset_id"] == run["inputs"]["norm_0"]
+        assert output_asset["metadata"]["source_dataset_asset_id"] == run["inputs"]["dataset_0"]
+        assert output_asset["validation"]["status"] == "SUCCEEDED"
+
+
+def test_stage_progress_rejects_multi_dataset_before_dispatch(platform):
+    node, inputs, rows = configured(platform)
+    response = request_preview(platform, node, template_id="recap", training_stage=STAGE_PROGRESS,
+                               inputs=inputs, dataset_bindings=rows)
+    assert response.status_code == 422 and response.json()["error"]["code"] == "RECAP_STAGE_DATASET_COUNT"
 
 
 @pytest.mark.parametrize("mutation,expected", [("old_agent", "AGENT_TRAINING_STAGE_UNSUPPORTED"),

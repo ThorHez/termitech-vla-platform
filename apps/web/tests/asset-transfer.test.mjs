@@ -132,6 +132,27 @@ try {
     );
     assert.equal(helpers.defaultAssetTargetName({ name: '../bad', path: '/' }), 'synced-asset');
   });
+  await test('a new folder becomes the sync parent only when the complete path is valid', () => {
+    const parent = '/data/shared///';
+    assert.equal(helpers.assetSyncDirectory({ parent }).directory, parent);
+    const valid = helpers.assetSyncDirectory({ parent, newFolder: ' 归档 模型 ' });
+    assert.equal(valid.error, undefined);
+    assert.equal(valid.directory, '/data/shared/归档 模型');
+    assert.equal(
+      helpers.assetTransferCreateRequest(asset, 'target', valid.directory, 'cloth')
+        .target_directory,
+      valid.directory,
+    );
+    for (const newFolder of ['', '..', 'another/folder', '衣'.repeat(86)]) {
+      const invalid = helpers.assetSyncDirectory({ parent, newFolder });
+      assert.match(invalid.error, /新文件夹名称/);
+      assert.equal(invalid.directory, '');
+    }
+    assert.ok(helpers.assetSyncDirectory({ parent: 'relative', newFolder: 'valid' }).error);
+    assert.ok(
+      helpers.assetSyncDirectory({ parent: `/${'x'.repeat(4094)}`, newFolder: 'valid' }).error,
+    );
+  });
   await test('only registered supported assets between two online distinct nodes can start', () => {
     const input = { asset, sourceNode, targetNode, directory: '/data', targetName: 'cloth' };
     assert.equal(helpers.assetSyncBlocker(input), undefined);

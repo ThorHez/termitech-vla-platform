@@ -158,7 +158,16 @@ export function deploymentDetailReceipt(
   return receipt;
 }
 
+function estimatorSourceStage(run?: Run) {
+  return [
+    run?.training_stage,
+    run?.code_expectation?.training_stage,
+    run?.code_expectation?.automatic_preflight?.plan.training_stage,
+  ].find((stage) => stage === 'value' || stage === 'stage_progress');
+}
+
 export function deployableOutputs(run?: Run): Asset[] {
+  if (estimatorSourceStage(run)) return [];
   return [...(run?.outputs || [])]
     .filter(
       (asset) =>
@@ -172,14 +181,12 @@ export function deployableOutputs(run?: Run): Asset[] {
 
 export function sourceDeploymentBlocker(run?: Run): string | undefined {
   if (!run) return undefined;
+  const estimator = estimatorSourceStage(run);
+  if (estimator === 'stage_progress')
+    return '此任务训练的是 Kai0 阶段进度估计器，请选择动作策略模型。';
+  if (estimator === 'value') return '此任务训练的是价值模型，请选择动作策略模型。';
   if (run.template_id !== 'openpi-sft')
     return '当前支持 OpenPI 动作策略部署，请选择 OpenPI 训练任务。';
-  if (
-    run.training_stage === 'value' ||
-    run.code_expectation?.training_stage === 'value' ||
-    run.code_expectation?.automatic_preflight?.plan.training_stage === 'value'
-  )
-    return '此任务训练的是价值模型，请选择动作策略模型。';
   if ((run.code_expectation?.automatic_preflight?.plan.datasets?.length || 0) > 1)
     return '此任务包含多组数据与归一化参数，尚需配置推理数据绑定后才能部署。';
   if (['QUEUED', 'STARTING', 'RUNNING', 'CANCELLING', 'UNKNOWN'].includes(run.state))

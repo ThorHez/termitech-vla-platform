@@ -15,9 +15,11 @@ from pathlib import Path
 
 import psutil
 from vla_adapters import build_launch
+from vla_adapters.recap import STAGE_PROGRESS, stage_progress_outputs_match
+from vla_adapters.recap_checkpoint import recap_torch_artifact_valid
 from vla_protocol.config_preview import validate_generated_config
 
-from .artifacts import ArtifactMonitor
+from .artifacts import ArtifactMonitor, completed_torch_recap_checkpoint
 from .config import load_config
 from .metrics import check_gpus, check_training_gpus, process_metrics
 from .output_isolation import validate_output_isolation
@@ -30,7 +32,8 @@ from .training_gpu import shared_training_environment, training_gpu_evidence, va
 
 
 def verified_outputs(output_dir: Path, smoke: bool, *, template_id: str | None = None,
-                     norm_datasets: list[dict] | None = None) -> list[dict]:
+                     norm_datasets: list[dict] | None = None, stage_progress: dict | None = None,
+                     recap_pytorch: dict | None = None) -> list[dict]:
     manifest = output_dir / "artifacts.json"
     if not manifest.exists():
         if not smoke:
@@ -58,6 +61,27 @@ def verified_outputs(output_dir: Path, smoke: bool, *, template_id: str | None =
         required_kind = "NORM" if template_id == "openpi-norm" else "MODEL"
         if not smoke and not any(artifact["kind"] == required_kind for artifact in result):
             raise ValueError(f"Task exited without a {required_kind} artifact")
+        if recap_pytorch is not None:
+            plan = recap_pytorch["code_expectation"]["automatic_preflight"]["plan"]
+            stage = recap_pytorch["training_stage"]
+            models = [row for row in result if row["kind"] == "MODEL"]
+            if (len(models) != 1 or not recap_torch_artifact_valid(models[0], str(output_dir), plan["recipe"], stage,
+                                                                    final_step=plan["parameters"]["steps"] - 1)):
+                raise ValueError("PyTorch ReCap needs its verified final model artifact")
+            committed = completed_torch_recap_checkpoint(Path(models[0]["path"]))
+            if committed is None or committed["model_role"] != models[0]["metadata"]["model_role"]:
+                raise ValueError("PyTorch ReCap checkpoint is incomplete or belongs to a different stage")
+        if stage_progress is not None:
+            input_ids = {role: asset["id"] for role, asset in stage_progress["inputs"].items()}
+            plan = stage_progress["code_expectation"]["automatic_preflight"]["plan"]
+            if not stage_progress_outputs_match(result, str(output_dir), input_ids, plan):
+                raise ValueError("Kai0 stage progress requires a matching model and derived dataset")
+            dataset = next(row for row in result if row["kind"] == "DATASET")
+            path = Path(dataset["path"]) / "meta" / "stage_advantage.json"
+            receipt = allowed_path(str(path), [dataset["path"]])
+            if (path != receipt or not receipt.is_file() or receipt.stat().st_size > 128 * 1024
+                    or hashlib.sha256(receipt.read_bytes()).hexdigest() != dataset["metadata"].get("annotation_sha256")):
+                raise ValueError("Kai0 derived dataset annotation receipt does not match the manifest")
         if template_id == "openpi-norm":
             from vla_adapters.norm_entry import verify_statistics
             from vla_adapters.norm_datasets import normalize_norm_datasets
@@ -218,6 +242,10 @@ def execute(config: dict, attempt_id: str) -> int:
         from .storage_configuration import cache_environment
         environment.update(cache_environment(config))
         environment = shared_training_environment(environment, policy, devices)
+        if payload["template_id"] == "recap":
+            environment.pop("VLA_RECAP_TORCH_MEMORY_FRACTION", None)
+            if policy is not None:
+                environment["VLA_RECAP_TORCH_MEMORY_FRACTION"] = environment["XLA_CLIENT_MEM_FRACTION"]
         child = subprocess.Popen(launch["argv"], cwd=launch["cwd"], env=environment,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  stdin=subprocess.DEVNULL, start_new_session=True)
@@ -326,7 +354,13 @@ def execute(config: dict, attempt_id: str) -> int:
         if cancelling:
             state.emit(attempt_id, "CANCELLED", common)
         elif child.returncode == 0:
-            state.emit(attempt_id, "SUCCEEDED", {**common, "outputs": verified_outputs(output, profile.get("adapter") == "smoke", template_id=payload["template_id"], norm_datasets=payload.get("norm_datasets"))})
+            plan = payload.get("code_expectation", {}).get("automatic_preflight", {}).get("plan", {})
+            torch_recap = (plan.get("recap_stage_contract") or {}).get("backend") == "pytorch"
+            outputs = verified_outputs(output, profile.get("adapter") == "smoke", template_id=payload["template_id"],
+                                       norm_datasets=payload.get("norm_datasets"),
+                                       stage_progress=payload if payload.get("training_stage") == STAGE_PROGRESS else None,
+                                       recap_pytorch=payload if torch_recap else None)
+            state.emit(attempt_id, "SUCCEEDED", {**common, "outputs": outputs})
         else:
             state.emit(attempt_id, "FAILED", {**common, "error": {"code": "PROCESS_EXITED", "message": f"Training process exited with code {child.returncode}"}})
         return 0

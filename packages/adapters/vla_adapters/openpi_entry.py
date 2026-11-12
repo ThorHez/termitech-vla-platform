@@ -6,6 +6,7 @@ the same resolver and preserve the recipe's single- or multi-dataset semantics.
 
 import argparse
 import dataclasses
+import functools
 import importlib.util
 import json
 import logging
@@ -13,6 +14,7 @@ import math
 import hashlib
 import os
 import stat
+import subprocess
 import sys
 import inspect
 from contextlib import contextmanager
@@ -26,13 +28,17 @@ if __package__:
     from .dataset_fps import install_registered_fps, registered_fps_context
     from .entrypoints import read_entrypoint
     from .generated_config import configuration_snapshot
-    from .image_runtime import install_image_processing
+    from .image_runtime import install_image_processing, prepare_recap_worker
     from .recipe_definitions import apply_overrides, validate_definition
+    from .recap import (STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_OUTPUT_COLUMNS,
+                        recap_model_role, stage_progress_dataset_profile, uses_torch_recap, valid_stage_progress_receipt)
+    from .recap_checkpoint import (RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, RECAP_TORCH_WEIGHTS,
+                                   recap_commit_matches, recap_weight_file, safetensors_header)
     from .recap_runtime import apply_stage, stage_request
     from .resume import normalize_resume_source
     from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                   validate_runtime_parameter_relations)
-    from .training_plan import fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
+    from .training_plan import file_manifest, fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
 else:
     from automatic_config import build_automatic_base, normalize_auto_config
     from cache_contract import configure_cache
@@ -41,13 +47,17 @@ else:
     from dataset_fps import install_registered_fps, registered_fps_context
     from entrypoints import read_entrypoint
     from generated_config import configuration_snapshot
-    from image_runtime import install_image_processing
+    from image_runtime import install_image_processing, prepare_recap_worker
     from recipe_definitions import apply_overrides, validate_definition
+    from recap import (STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_OUTPUT_COLUMNS,
+                       recap_model_role, stage_progress_dataset_profile, uses_torch_recap, valid_stage_progress_receipt)
+    from recap_checkpoint import (RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, RECAP_TORCH_WEIGHTS,
+                                  recap_commit_matches, recap_weight_file, safetensors_header)
     from recap_runtime import apply_stage, stage_request
     from resume import normalize_resume_source
     from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                  validate_runtime_parameter_relations)
-    from training_plan import fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
+    from training_plan import file_manifest, fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
 
 
 def resolve_config(base, spec, config_module, weight_loaders):
@@ -63,6 +73,7 @@ def resolve_config(base, spec, config_module, weight_loaders):
                                      entrypoint=spec.get("entrypoint"))
     bindings = validate_binding_assets(spec.get("dataset_bindings"), inputs)
     stage, stage_config = stage_request(spec)
+    torch_recap = uses_torch_recap(spec)
     if stage == "offline_rl" and "acp_dropout" in stage_config:
         for row in bindings or []:
             parameters = (row.get("processor") or {}).get("parameters", {})
@@ -133,9 +144,15 @@ def resolve_config(base, spec, config_module, weight_loaders):
                 raise ValueError("DATASET_BINDINGS_INVALID: 单数据集配方只能绑定数据处理索引 0")
             factory = base.data
         return bound_factory(factory, dataset_role, norm_role)
-    params_dir = model / "params" if (model / "params").is_dir() else model
-    if not params_dir.is_dir():
-        raise ValueError("MODEL_FORMAT: expected a local Orbax params directory")
+    if torch_recap:
+        weight_file = recap_weight_file(model)
+        if (weight_file.name != RECAP_TORCH_WEIGHTS or not weight_file.is_file()
+                or weight_file.is_symlink() or local_path(weight_file, spec) != weight_file):
+            raise ValueError("MODEL_FORMAT: PyTorch ReCap 需要 model.safetensors 文件或包含该文件的检查点目录")
+    else:
+        params_dir = model / "params" if (model / "params").is_dir() else model
+        if not params_dir.is_dir():
+            raise ValueError("MODEL_FORMAT: expected a local Orbax params directory")
     if not dataclasses.is_dataclass(base.data) or not hasattr(base.data, "repo_id"):
         raise ValueError("RECIPE_UNSUPPORTED: data factory must support a local repo_id")
     if not hasattr(base.lr_schedule, "peak_lr"):
@@ -197,14 +214,19 @@ def resolve_config(base, spec, config_module, weight_loaders):
     # Keep recipe-specific initialization for newly added value / gripper heads.
     # A plain policy loader rejects those intentionally missing parameters.
     loader = base.weight_loader
-    known = {"CheckpointWeightLoader", "CheckpointWeightLoaderWithValueHead",
+    known = {"CheckpointWeightLoader", "CheckpointWeightLoaderWithValueHead", STAGE_PROGRESS_LOADER,
              "CheckpointWeightLoaderWithGripperHead", "CheckpointWeightLoaderWithDiscreteHead",
              "CheckpointWeightLoaderIgnoreDiscreteHead", "CheckpointWeightLoaderIgnoreGripperHead"}
-    if dataclasses.is_dataclass(loader) and type(loader).__name__ in known and hasattr(loader, "params_path"):
+    if torch_recap:
+        if (not {"pytorch_weight_path", "recap_training_stage", "ema_decay"} <= {field.name for field in dataclasses.fields(base)}
+                or not callable(getattr(weight_loaders, "NoOpWeightLoader", None))):
+            raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: 请升级训练环境到支持 PyTorch ReCap 的 OpenPI-UMI")
+        loader = weight_loaders.NoOpWeightLoader()
+    elif dataclasses.is_dataclass(loader) and type(loader).__name__ in known and hasattr(loader, "params_path"):
         loader = dataclasses.replace(loader, params_path=str(params_dir))
     else:
         loader = weight_loaders.CheckpointWeightLoader(str(params_dir))
-    if stage == "value" and type(loader).__name__ != "CheckpointWeightLoaderWithValueHead":
+    if not torch_recap and stage == "value" and type(loader).__name__ != "CheckpointWeightLoaderWithValueHead":
         raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方需要 CheckpointWeightLoaderWithValueHead 初始化价值头")
     root_overrides = {name: value for name, value in runtime_overrides.items()
                       if name not in SCHEDULE_PARAMETERS | OPTIMIZER_PARAMETERS}
@@ -226,7 +248,13 @@ def resolve_config(base, spec, config_module, weight_loaders):
         if "normalization_method" not in {field.name for field in dataclasses.fields(base)}:
             raise ValueError("NORMALIZATION_METHOD_UNSUPPORTED: 当前训练代码不支持显式归一化方法，请升级 openpi-umi 后重新预检")
         root_overrides["normalization_method"] = normalization_method
-    root_overrides.setdefault("fsdp_devices", spec["gpu_count"])
+    if torch_recap:
+        if {"fsdp_devices", "ema_decay"} & root_overrides.keys():
+            raise ValueError("TRAINING_PARAMETER_UNSUPPORTED: PyTorch ReCap 使用申请 GPU 的 DDP 配置，支持无 EMA 的训练")
+        root_overrides.update(pytorch_weight_path=str(weight_file.parent), recap_training_stage=stage,
+                              fsdp_devices=1, ema_decay=None)
+    else:
+        root_overrides.setdefault("fsdp_devices", spec["gpu_count"])
     if set(root_overrides) - {field.name for field in dataclasses.fields(base)}:
         raise ValueError("TRAINING_PARAMETER_UNSUPPORTED: 当前训练环境缺少所选检查点或数据加载参数")
     config = dataclasses.replace(base, data=data,
@@ -327,11 +355,55 @@ def checkpoint_norm_descriptor(checkpoint, spec):
     return result
 
 
+def stage_progress_artifact(output, checkpoint, spec, plan):
+    dataset = output / STAGE_PROGRESS_DATASET
+    receipt, receipt_digest = read_json(dataset / "meta" / "stage_advantage.json", spec, limit=128 * 1024)
+    info, _ = read_json(dataset / "meta" / "info.json", spec)
+    annotation = plan["recap_stage_contract"]["annotation"]
+    if (dataset.resolve() != dataset or dataset.is_symlink()
+            or not valid_stage_progress_receipt(receipt, annotation, plan["datasets"][0]["frames"])
+            or info.get("total_frames") != receipt["frame_count"] or not isinstance(info.get("features"), dict)
+            or not set(STAGE_PROGRESS_OUTPUT_COLUMNS) <= set(info["features"])):
+        raise ValueError("RECAP_STAGE_OUTPUT_INVALID: Kai0 派生数据集缺少与本次训练匹配的优势标注")
+    source = spec["inputs"]["dataset_0"]
+    _, _, source_digest = file_manifest(source["path"], spec, max_entries=60000, timeout=15)
+    if source_digest != annotation["source_manifest_digest"]:
+        raise ValueError("RECAP_STAGE_SOURCE_CHANGED: Kai0 输入数据在训练或标注期间发生变化")
+    profile = stage_progress_dataset_profile(source.get("dataset_profile"))
+    validation_spec = {key: spec[key] for key in ("code_dir", "allowed_roots", "validation_cache_dir", "profile_id")}
+    validation_spec.update(path=str(dataset), registered_profile=profile,
+                           inputs={"dataset": {"path": str(dataset), "dataset_profile": profile}})
+    # A separate CPU process installs FPS for the derived path without
+    # disturbing the training process's active source FPS policy.
+    validator = Path(__file__).with_name("dataset_source_validation.py")
+    environment = {**os.environ, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu",
+                   "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"}
+    result = subprocess.run([sys.executable, "-u", str(validator), "--spec-json",
+                             json.dumps(validation_spec, ensure_ascii=False, allow_nan=False)],
+                            stdout=subprocess.PIPE, text=True, env=environment, timeout=300, check=False)
+    prefix = "VLA_DATASET_VALIDATION:"
+    lines = [line.removeprefix(prefix) for line in result.stdout.splitlines() if line.startswith(prefix)]
+    validation = json.loads(lines[0]) if len(lines) == 1 else {}
+    if (result.returncode or not isinstance(validation, dict) or validation.get("scope") != "dataset_source" or validation.get("path") != str(dataset)
+            or validation.get("profile_id") != validation_spec["profile_id"]):
+        error = validation.get("error") if isinstance(validation, dict) else None
+        reason = error.get("message", "基础校验未返回完整报告") if isinstance(error, dict) else "基础校验未返回完整报告"
+        raise ValueError("RECAP_STAGE_OUTPUT_INVALID: " + reason)
+    # Supervision evidence is already held in the machine's source cache.
+    validation.pop("recap_supervision", None)
+    return {"kind": "DATASET", "name": "Kai0 优势标注 / " + checkpoint.name, "path": str(dataset), "version": checkpoint.name,
+            "metadata": {"format": "lerobot", "registration_source": "recap_stage_progress",
+                         "source_dataset_asset_id": source["id"], "source_norm_asset_id": spec["inputs"]["norm_0"]["id"],
+                         "scorer_checkpoint_path": str(checkpoint), "source_manifest_digest": source_digest, "annotation": receipt,
+                         "annotation_sha256": receipt_digest, "source_validation": validation}}
+
+
 def _run_spec(spec, *, validate_only=False, fps_runtime=None):
     checks = []
     if validate_only:
         result = {"schema_version": 1, "scope": "configuration_and_local_assets", "checks": checks}
         try:
+            _require_current_recap_runtime(spec)
             configure_cache(spec)
             with registered_fps_context(spec) as fps_receipt:
                 config, _ = prepare_config(spec)
@@ -349,6 +421,7 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
             raise SystemExit(2)
         return
 
+    _require_current_recap_runtime(spec)
     config, definition = prepare_config(spec)
     plan = inspect_training_config(config, spec, checks=checks, fps_runtime=fps_runtime)
     if spec.get("expected_plan_digest") != fingerprint(plan):
@@ -406,23 +479,51 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
             return result
 
         module.init_wandb = local_init
-        module.main(config)
-    checkpoints = sorted((p for p in Path(config.checkpoint_dir).iterdir()
-                          if p.is_dir() and p.name.isdigit() and (p / "params").is_dir()),
-                         key=lambda p: int(p.name))
-    if not checkpoints:
-        raise RuntimeError("OUTPUT_MISSING: training exited without a completed params checkpoint")
-    last = checkpoints[-1]
+        if uses_torch_recap(spec):
+            module.main(config, worker_setup=functools.partial(prepare_recap_worker, spec=spec))
+        else:
+            module.main(config)
+    stage = spec.get("training_stage")
+    if uses_torch_recap(spec):
+        step = config.num_train_steps - 1
+        last = Path(config.checkpoint_dir) / str(step)
+        if local_path(last, spec) != last or last.is_symlink():
+            raise RuntimeError("OUTPUT_MISSING: PyTorch ReCap 缺少已提交的最终检查点")
+        marker, _ = read_json(last / RECAP_TORCH_COMMIT, spec, limit=64 * 1024)
+        if not recap_commit_matches(marker, step, stage):
+            raise RuntimeError("OUTPUT_MISSING: PyTorch ReCap 最终检查点的训练阶段或步数不匹配")
+        safetensors_header(last / RECAP_TORCH_WEIGHTS)
+        format_metadata = {"format": RECAP_TORCH_FORMAT, "backend": "pytorch", "model_role": recap_model_role(stage)}
+    else:
+        checkpoints = sorted((p for p in Path(config.checkpoint_dir).iterdir()
+                              if p.is_dir() and p.name.isdigit() and (p / "params").is_dir()),
+                             key=lambda p: int(p.name))
+        if not checkpoints:
+            raise RuntimeError("OUTPUT_MISSING: training exited without a completed params checkpoint")
+        last = checkpoints[-1]
+        format_metadata = {"format": "openpi-orbax"}
     artifact = {"kind": "MODEL", "name": spec["recipe"] + " / " + last.name,
                 "path": str(last), "version": last.name,
-                "metadata": {"format": "openpi-orbax", "recipe": spec["recipe"],
+                "metadata": {**format_metadata, "recipe": spec["recipe"],
                              "step": int(last.name), "evaluated": False}}
     norm = checkpoint_norm_descriptor(last, spec)
     if plan.get("normalization", {}).get("mode") == "auto_shared" and norm is None:
         raise RuntimeError("OUTPUT_MISSING: 自动共享训练的 checkpoint 缺少实际使用的共享 norm_stats，不能登记未绑定模型")
     if norm is not None:
         artifact["metadata"]["norm_stats"] = norm
-    (output / "artifacts.json").write_text(json.dumps([artifact], ensure_ascii=False, indent=2))
+    artifacts = [artifact]
+    if stage == STAGE_PROGRESS:
+        artifact["metadata"]["model_role"] = "stage_progress_estimator"
+        artifacts.append(stage_progress_artifact(output, last, spec, plan))
+    manifest = output / "artifacts.json"
+    temporary = output / ".artifacts.json.tmp"
+    temporary.write_text(json.dumps(artifacts, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(manifest)
+
+
+def _require_current_recap_runtime(spec):
+    if spec.get("template_id") == "recap" and not uses_torch_recap(spec):
+        raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: 新 ReCap 作业需要 PyTorch 预检，请更新 Agent 后重新预检")
 
 
 def main():

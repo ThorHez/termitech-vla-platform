@@ -5,6 +5,7 @@ import {
 } from './trainingDraft';
 import type { Asset, JsonObject, Node, Profile } from './types';
 import { requestedGpuError } from './trainingGpuSelection';
+import { recapModelError, withoutLegacyRecapSettings } from './recap';
 
 export const TRAINING_TEMPLATE_PROCESSING_MARKER = 'training_template.reuse_processing';
 
@@ -104,7 +105,12 @@ function clearDatasetReferences(snapshot: TrainingDraftSnapshot): TrainingDraftS
 
 /** Save settings and processor structure; every future run chooses its own data. */
 export function prepareTrainingTemplate(snapshot: TrainingDraftSnapshot): JsonObject {
-  return encodeTrainingDraft(clearDatasetReferences(cloneSnapshot(snapshot)));
+  const next = clearDatasetReferences(cloneSnapshot(snapshot));
+  if (next.request.template_id === 'recap') {
+    next.request = withoutLegacyRecapSettings(next.request);
+    next.entrypointEdited = false;
+  }
+  return encodeTrainingDraft(next);
 }
 
 /** Decode anew for each application. Never select replacements or reuse preflight. */
@@ -115,8 +121,13 @@ export function applyTrainingTemplate(
   const decoded = decodeTrainingDraft(record?.content);
   if (!decoded) invalidTemplate();
   const snapshot = clearDatasetReferences(decoded);
-  const request = snapshot.request;
   const issues: string[] = [];
+  const request = withoutLegacyRecapSettings(snapshot.request);
+  if (request !== snapshot.request) {
+    issues.push('模板已改用 PyTorch ReCap 入口，旧 FSDP 和 EMA 参数不再提交。');
+    snapshot.request = request;
+    snapshot.entrypointEdited = false;
+  }
   const selectedNode = resources.nodes.find((node) => node.id === request.node_id);
   if (
     request.node_id &&
@@ -169,6 +180,12 @@ export function applyTrainingTemplate(
   ) {
     issues.push('模板中的基础模型已不可用或不属于当前机器，请重新选择；不会自动替换模型。');
     request.inputs = {};
+  } else if (request.template_id === 'recap' && model) {
+    const error = recapModelError(model, request.training_stage);
+    if (error) {
+      issues.push(error);
+      request.inputs = {};
+    }
   }
 
   const savedRecipe = request.recipe_definition;

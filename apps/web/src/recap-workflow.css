@@ -1,0 +1,163 @@
+.recap-workflow {
+  margin-bottom: 16px;
+  padding: 14px;
+  border: 1px solid var(--border-default, #e7ecf0);
+  border-radius: 9px;
+  background: var(--bg-subtle, #f6fafb);
+}
+
+.recap-workflow-heading,
+.recap-workflow-kai0,
+.recap-workflow-annotation-heading,
+.recap-workflow-annotation-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.recap-workflow-heading {
+  margin-bottom: 10px;
+}
+
+.recap-workflow-heading h3 {
+  color: var(--text-primary, #304656);
+  font-size: 13px;
+}
+
+.recap-workflow p,
+.recap-workflow-copy-status {
+  color: var(--text-secondary, #556b79);
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.recap-workflow-steps {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: stretch;
+  gap: 8px;
+}
+
+.recap-workflow-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--border-default, #e1e9ed);
+  border-radius: 7px;
+  background: var(--bg-surface, #fff);
+  color: var(--text-primary, #304656);
+  text-align: left;
+}
+
+.recap-workflow-card:hover:not(:disabled),
+.recap-workflow-card[aria-expanded='true'],
+.recap-workflow-card[aria-pressed='true'],
+.recap-workflow-kai0 .button[aria-pressed='true'] {
+  border-color: var(--text-accent, #087f76);
+  background: var(--bg-success, #eaf8f5);
+}
+
+.recap-workflow-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 6px;
+  background: var(--bg-subtle, #eff5f6);
+  color: var(--text-accent, #087f76);
+}
+
+.recap-workflow-card-content {
+  display: grid;
+  gap: 3px;
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.recap-workflow-card-content strong {
+  font-size: 13px;
+}
+
+.recap-workflow-card-content > span {
+  color: var(--text-secondary, #556b79);
+}
+
+.recap-workflow-card-content > .recap-workflow-caption {
+  font-size: 10px;
+}
+
+.recap-workflow-arrow {
+  align-self: center;
+  color: var(--text-muted, #8fa4ae);
+}
+
+.recap-workflow-chevron,
+.recap-workflow-check {
+  grid-column: 3;
+  align-self: center;
+  color: var(--text-accent, #087f76);
+}
+
+.recap-workflow-card[aria-expanded='true'] .recap-workflow-chevron {
+  transform: rotate(180deg);
+}
+
+.recap-workflow-kai0 {
+  margin-top: 10px;
+}
+
+.recap-workflow-annotation {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-default, #e1e9ed);
+  border-radius: 7px;
+  background: var(--bg-surface, #fff);
+}
+
+.recap-workflow-annotation p {
+  flex: 1 1 320px;
+}
+
+.recap-workflow-annotation textarea {
+  display: block;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-default, #e1e9ed);
+  border-radius: 5px;
+  background: var(--bg-subtle, #f6fafb);
+  color: var(--text-primary, #304656);
+  font:
+    11px/1.6 'SFMono-Regular',
+    Consolas,
+    'Liberation Mono',
+    monospace;
+  resize: vertical;
+}
+
+.recap-workflow-annotation-footer {
+  margin-top: 8px;
+}
+
+.recap-config-heading {
+  margin: 0 0 9px;
+  color: var(--text-secondary, #556b79);
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .recap-workflow-steps {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 4px;
+  }
+
+  .recap-workflow-arrow {
+    margin-left: 18px;
+    transform: rotate(90deg);
+  }
+}

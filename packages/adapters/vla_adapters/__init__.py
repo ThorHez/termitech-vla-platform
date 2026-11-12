@@ -8,7 +8,8 @@ from pathlib import Path
 from .entrypoints import validate_entrypoint
 from .dataset_bindings import validate_binding_assets
 from .norm_datasets import normalize_norm_datasets, validate_norm_assets, validate_norm_configuration
-from .recap import recap_stages, runtime_adapter_for, validate_training_stage
+from .recap import (STAGE_PROGRESS, recap_stages, runtime_adapter_for, validate_recap_torch_selection,
+                    validate_stage_progress_selection, validate_training_stage)
 from .automatic_config import automatic_recipe_name, normalize_auto_config
 from .runtime_options import RUNTIME_PARAMETER_RULES, normalize_normalization_method, validate_runtime_parameter_relations
 from .resume import normalize_resume_source
@@ -21,6 +22,7 @@ def get_templates() -> list[dict]:
         "learning_rate": {"type": "number", "default": 0.00005, "min": 0.00000001, "max": 0.1, "label": "峰值学习率"},
     }
     openpi_parameters = {**parameters, **{name: dict(rule) for name, rule in RUNTIME_PARAMETER_RULES.items()}}
+    recap_parameters = {name: rule for name, rule in openpi_parameters.items() if name not in {"ema_decay", "fsdp_devices"}}
     return [
         {"id": "smoke", "name": "平台链路测试", "algorithm": "SMOKE", "status": "AVAILABLE",
          "description": "CPU 合成数据测试，验证调度、日志、指标与代码追溯；不产生 VLA 模型。",
@@ -39,9 +41,9 @@ def get_templates() -> list[dict]:
         {"id": "mem", "name": "MEM 记忆训练", "algorithm": "MEM", "status": "PLANNED",
          "description": "待接入 mem_exp 两阶段训练与记忆产物选择。", "parameters": {}, "required_inputs": []},
         {"id": "recap", "name": "ReCap 策略提升", "algorithm": "RECAP", "status": "AVAILABLE",
-         "description": "先选择价值函数训练或离线强化学习阶段，再配置对应的配方、数据、权重与参数。两阶段之间需完成离线优势标注。",
-         "runtime_adapter": "openpi-sft", "stages": recap_stages(),
-         "parameters": openpi_parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
+         "description": "使用 PyTorch 训练回报价值模型、用 Kai0 阶段进度生成优势数据，或用已标注数据训练 ACP 策略。",
+         "runtime_adapter": "openpi-sft", "backend": "pytorch", "stages": recap_stages(),
+         "parameters": recap_parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
         {"id": "rlt", "name": "RLT 离线训练", "algorithm": "RLT", "status": "PLANNED",
          "description": "待确认代码入口与 replay 数据协议。", "parameters": {}, "required_inputs": []},
     ]
@@ -130,11 +132,12 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
     if auto_config is not None:
         if template_id not in {"openpi-sft", "recap", "openpi-norm"} or recipe_definition is not None:
             raise ValueError("AUTO_CONFIG_CONFLICT: 当前模板或自定义配方不能使用自动配置")
-        if training_stage == "value" and auto_config["finetune_mode"] == "lora":
-            raise ValueError("AUTO_CONFIG_UNSUPPORTED: 自动价值训练暂不支持 LoRA，请选择全量微调")
     entrypoint = validate_entrypoint(entrypoint)
+    if template_id == "recap":
+        validate_recap_torch_selection(auto_config, entrypoint)
     resume_source = normalize_resume_source(resume_source, inputs, template_id=template_id, entrypoint=entrypoint)
     dataset_bindings = validate_binding_assets(dataset_bindings, inputs)
+    validate_stage_progress_selection(training_stage, dataset_bindings, auto_config)
     if auto_config is not None and template_id != "openpi-norm" and (not dataset_bindings or any("processor" not in row for row in dataset_bindings)):
         raise ValueError("AUTO_CONFIG_PROCESSOR_REQUIRED: 自动配置要求每组数据使用独立数据处理器")
     if template_id not in {"openpi-sft", "recap"} and dataset_bindings is not None:
@@ -196,7 +199,10 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
         if training_gpu_policy is not None:
             spec["training_gpu_policy"] = training_gpu_policy
         if template_id == "recap":
-            spec.update({"template_id": "recap", "training_stage": training_stage, "stage_config": stage_config})
+            spec.update({"template_id": "recap", "training_stage": training_stage, "stage_config": stage_config,
+                         "recap_backend": "pytorch"})
+            if training_stage == STAGE_PROGRESS:
+                spec["profile_id"] = profile.get("id")
         if dataset_bindings is not None:
             spec["dataset_bindings"] = dataset_bindings
         if entrypoint is not None:
@@ -213,4 +219,5 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
     return {"argv": argv, "cwd": str(code_dir), "env": {
         "CUDA_VISIBLE_DEVICES": ",".join(gpu_uuids), "PYTHONUNBUFFERED": "1",
         "WANDB_MODE": "disabled", "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1",
+        **({"JAX_PLATFORMS": "cpu"} if template_id == "recap" else {}),
     }}

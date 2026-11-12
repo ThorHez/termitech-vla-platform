@@ -3712,39 +3712,11 @@ tbody tr:hover {
   font-weight: 550;
   color: var(--text-primary, #607e8b);
 }
-.recap-stage-selection {
-  padding: 18px;
-  margin: 0 0 20px;
-  border: 1px solid var(--border-strong, #eadfca);
-  border-radius: 8px;
-  background: var(--bg-warning, #fffcf6);
-}
-.recap-stage-selection .field:last-child {
-  margin-bottom: 0;
-}
-.recap-flow {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin: 12px 0;
-  color: var(--text-muted, #9ca9ac);
-  font-size: 11px;
-}
-.recap-flow span {
-  padding: 5px 8px;
-  border-radius: 5px;
-  background: var(--bg-subtle, #f2f4f2);
-}
-.recap-flow span.selected {
-  color: var(--text-accent, #147d71);
-  background: var(--bg-success, #e7f5ee);
-  font-weight: 600;
-}
 .template-stage-list {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
   margin: 15px 0;
   font-size: 10px;
   color: var(--text-warning, #a3906c);

@@ -15,6 +15,7 @@ from typing import Literal
 from fastapi import Request
 from pydantic import Field, field_validator, model_validator
 from sqlalchemy import select
+from vla_adapters.recap import ESTIMATOR_MODELS
 from vla_protocol.config_preview import validate_generated_config
 from vla_protocol.gpu_policy import gpu_deployment_error, normalize_gpu_policy
 
@@ -421,8 +422,8 @@ def _training_config_name(code):
     plan = preflight.get("plan") if isinstance(preflight, dict) else None
     if not isinstance(plan, dict):
         raise APIError(422, "POLICY_DEPLOY_SOURCE_CONFIG_MISSING", "来源训练缺少完整生成配置，无法可靠恢复模型；请使用包含生成配置的训练任务")
-    if code.get("training_stage") == "value" or plan.get("training_stage") == "value":
-        raise APIError(422, "POLICY_DEPLOY_VALUE_UNSUPPORTED", "Value 阶段模型不提供机器人动作策略，请选择 SFT 或 ACP 权重")
+    if code.get("training_stage") in ESTIMATOR_MODELS or plan.get("training_stage") in ESTIMATOR_MODELS:
+        raise APIError(422, "POLICY_DEPLOY_VALUE_UNSUPPORTED", "价值或阶段进度估计器不提供机器人动作策略，请选择 SFT 或 ACP 权重")
     if len(plan.get("datasets", [])) > 1:
         raise APIError(422, "POLICY_DEPLOY_MULTI_DATASET_UNSUPPORTED", "多数据组训练的推理归一化选择尚未支持，请使用已明确单数据组处理配置的权重")
     try:

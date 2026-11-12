@@ -2,12 +2,12 @@ import { useEffect, useRef, useState } from 'react';
 import { ArrowRight, CheckCircle2, FolderSync, LoaderCircle } from 'lucide-react';
 import { api } from './api';
 import { useAuth } from './auth';
+import { AssetSyncDirectory } from './AssetSyncDirectory';
 import { AssetSyncModelOption, AssetSyncNormOption } from './AssetTransfers';
-import { assetTargetPath, assetTransferTaskPath } from './assetTransfer';
-import type { AssetTransfer } from './assetTransfer';
+import { assetSyncDirectory, assetTargetPath, assetTransferTaskPath } from './assetTransfer';
+import type { AssetSyncDirectoryDraft, AssetTransfer } from './assetTransfer';
 import { ErrorNotice, Field, Modal } from './components';
 import { assetKinds, useData } from './data';
-import { PathAutocomplete } from './PathAutocomplete';
 import { nodeAddressText } from './nodeAddress';
 import {
   batchSyncError,
@@ -69,7 +69,7 @@ function BatchAssetSyncContent({
     ),
   );
   const [targetId, setTargetId] = useState('');
-  const [directory, setDirectory] = useState('');
+  const [directoryDraft, setDirectoryDraft] = useState<AssetSyncDirectoryDraft>({ parent: '' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [result, setResult] = useState<BatchAssetSyncResult>();
@@ -85,10 +85,12 @@ function BatchAssetSyncContent({
     assetIds.map((id) => assets.data?.find((asset) => asset.id === id)?.node_id),
   );
   const targets = (nodes.data || []).filter((node) => !sourceNodeIds.has(node.id));
+  const { directory, error: directoryError } = assetSyncDirectory(directoryDraft);
   const rowsMatchSelection = JSON.stringify(rows.map((row) => row.assetId)) === assetKey;
   const blocker = !rowsMatchSelection
     ? '资产选择已变化，请重新核对当前项目。'
-    : batchSyncError({
+    : directoryError ||
+      batchSyncError({
         rows,
         assets: assets.data || [],
         nodes: nodes.data || [],
@@ -229,7 +231,7 @@ function BatchAssetSyncContent({
                 disabled={busy}
                 onChange={(event) => {
                   setTargetId(event.target.value);
-                  setDirectory('');
+                  setDirectoryDraft({ parent: '' });
                   setError(undefined);
                 }}
               >
@@ -243,15 +245,12 @@ function BatchAssetSyncContent({
                 ))}
               </select>
             </Field>
-            <PathAutocomplete
+            <AssetSyncDirectory
               key={targetId}
               node={targetNode}
-              label="目标父目录"
-              value={directory}
-              onChange={setDirectory}
-              disabled={busy || !targetNode}
-              placeholder="例如 /data/shared"
-              hint="所有资产会在此目录下创建各自的子目录。已有目标目录不会被覆盖。"
+              draft={directoryDraft}
+              onChange={setDirectoryDraft}
+              busy={busy}
             />
           </section>
           {!targets.some((node) => node.status === 'ONLINE') && (
@@ -322,7 +321,7 @@ function BatchAssetSyncContent({
           </section>
           <p className="batch-asset-sync-notice">
             一次最多 20 项，目标机器需能访问各源机器的
-            SSH。整批校验通过后才创建后台任务；直传过程、取消和重试按每项任务独立管理。
+            SSH。整批校验通过后才创建后台任务。已有目标子目录不会被覆盖，各项任务可独立取消或重试。
           </p>
           {blocker && (
             <p className="batch-asset-sync-error" role="status">

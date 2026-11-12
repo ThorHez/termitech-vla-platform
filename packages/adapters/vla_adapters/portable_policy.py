@@ -253,12 +253,13 @@ def _normalization_method(train_config, data):
 
 def export_portable_policy(train_config, code_dir, *, resolved_data=None):
     """Resolve training's data factory once on its owning machine, without weights."""
-    if type(train_config.model).__name__ == "Pi0ValueConfig":
-        _fail("Value-only models are not action policies")
+    from .recap import ESTIMATOR_MODELS
+    if type(train_config.model).__name__ in ESTIMATOR_MODELS.values():
+        _fail("Estimator models are not action policies")
     if type(train_config.model).__module__ not in MODEL_MODULES:
         _unrepresentable("Unsupported model family")
-    if getattr(train_config.data, "training_stage", None) == "value":
-        _fail("Value-only training is not an action policy")
+    if getattr(train_config.data, "training_stage", None) in ESTIMATOR_MODELS:
+        _fail("Estimator training does not produce an action policy")
     if len(getattr(train_config.data, "datasets", ())) > 1:
         _fail("Multi-dataset inference requires an explicit normalization binding")
     from .policy_inference import compile_inference_config

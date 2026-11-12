@@ -59,7 +59,9 @@ try {
     assert.deepEqual(restored.request.inputs, { model: 'model-a' });
     assert.equal(restored.request.node_id, 'node-a');
     assert.equal(restored.request.profile_id, 'native');
-    for (const key of ['parameters', 'auto_config', 'training_stage', 'stage_config', 'gpu_count', 'entrypoint']) assert.deepEqual(restored.request[key], source.request[key]);
+    for (const key of ['parameters', 'auto_config', 'training_stage', 'stage_config', 'gpu_count']) assert.deepEqual(restored.request[key], source.request[key]);
+    assert.equal(restored.request.entrypoint, undefined);
+    assert.equal(restored.entrypointEdited, false);
     restored.request.dataset_bindings.forEach((binding, index) => {
       assert.equal(binding.dataset_asset_id, '');
       assert.equal(binding.norm_asset_id, '');
@@ -69,6 +71,16 @@ try {
     });
     assert.equal(restored.request.dataset_profiles, undefined);
     assert.ok(restored.editedParameters.includes(helper.TRAINING_TEMPLATE_PROCESSING_MARKER));
+  });
+
+  await test('SFT templates still preserve an explicitly selected training entrypoint', () => {
+    const source = snapshot();
+    source.request.template_id = 'openpi-sft';
+    delete source.request.training_stage;
+    delete source.request.stage_config;
+    const restored = codec.decodeTrainingDraft(helper.prepareTrainingTemplate(source));
+    assert.equal(restored.request.entrypoint, source.request.entrypoint);
+    assert.equal(restored.entrypointEdited, true);
   });
 
   await test('each application creates an independent editable snapshot and never mutates stored content', () => {

@@ -17,8 +17,11 @@ import {
   useDataProcessorCatalog,
 } from './DataProcessorPicker';
 import { DatasetProcessing, type DatasetProcessingMode } from './DatasetProcessing';
-import { composedChoice, trainingProfileSeed } from './ComposedDatasetProcessing';
-import { trainingCompositionDraft } from './composedProcessing';
+import {
+  composedChoice,
+  stageCompositionDraft,
+  trainingProfileSeed,
+} from './ComposedDatasetProcessing';
 import {
   createDatasetBindingDisclosure,
   datasetBindingDisclosureReducer,
@@ -39,6 +42,7 @@ import type {
   RecipeDatasetSlot,
   RecipeLiteral,
   TrainingNormalizationMethod,
+  TrainingStage,
 } from './types';
 
 export function DatasetBindings({
@@ -66,7 +70,7 @@ export function DatasetBindings({
   profile?: Profile;
   onValidityChange?: (valid: boolean) => void;
   managedParameters?: Record<string, RecipeLiteral>;
-  trainingStage?: 'sft' | 'value' | 'offline_rl';
+  trainingStage?: 'sft' | TrainingStage;
   normalizationOverride?: TrainingNormalizationMethod;
   automatic?: boolean;
   showProcessing?: boolean;
@@ -114,6 +118,7 @@ export function DatasetBindings({
           !['ARCHIVED', 'UNAVAILABLE'].includes(asset.status || asset.state || ''),
       );
   const multipleDatasets = bindings.length > 1;
+  const singleDatasetStage = trainingStage === 'stage_progress';
   const sharedNormId = sharedNormalizationAssetId(bindings);
   const processingChoices = slots.length
     ? slots
@@ -138,7 +143,8 @@ export function DatasetBindings({
       if (binding.processor) return binding;
       const mode = processingModes[bindingKey(binding, index)];
       if (mode && mode !== 'composed') return binding;
-      if (!mode && !automatic && binding.recipe_index !== undefined) return binding;
+      if (!mode && !automatic && !singleDatasetStage && binding.recipe_index !== undefined)
+        return binding;
       const dataset = assets.find(
         (asset) => asset.kind === 'DATASET' && asset.id === binding.dataset_asset_id,
       );
@@ -147,7 +153,9 @@ export function DatasetBindings({
       changed = true;
       return {
         ...selection,
-        processor: composedChoice(trainingCompositionDraft(trainingProfileSeed(dataset))),
+        processor: composedChoice(
+          stageCompositionDraft(trainingProfileSeed(dataset), trainingStage),
+        ),
       };
     });
     if (changed) changeRef.current(next);
@@ -161,6 +169,7 @@ export function DatasetBindings({
     node?.id,
     profile?.id,
     trainingStage,
+    singleDatasetStage,
   ]);
   const validityRef = useRef(onValidityChange);
   validityRef.current = onValidityChange;
@@ -178,19 +187,20 @@ export function DatasetBindings({
     ]),
   );
   const valid =
-    !showProcessing ||
-    bindings.every(
-      (binding, index) =>
-        automaticValidity[bindingKey(binding, index)]?.token === validationTokens[index] &&
-        automaticValidity[bindingKey(binding, index)]?.valid === true &&
-        (!automatic || !!binding.processor) &&
-        (!binding.processor ||
-          processorParameterErrors(
-            binding.processor,
-            entries.find((entry) => entry.name === binding.processor!.name),
-            managedParameters,
-          ).length === 0),
-    );
+    (!singleDatasetStage || bindings.length === 1) &&
+    (!showProcessing ||
+      bindings.every(
+        (binding, index) =>
+          automaticValidity[bindingKey(binding, index)]?.token === validationTokens[index] &&
+          automaticValidity[bindingKey(binding, index)]?.valid === true &&
+          (!automatic || !!binding.processor) &&
+          (!binding.processor ||
+            processorParameterErrors(
+              binding.processor,
+              entries.find((entry) => entry.name === binding.processor!.name),
+              managedParameters,
+            ).length === 0),
+      ));
   useEffect(() => {
     validityRef.current?.(valid);
   }, [valid, onValidityChange]);
@@ -215,8 +225,15 @@ export function DatasetBindings({
         {multipleDatasets
           ? '各组可以独立选择已登记的归一化参数作为来源参考。训练启动时按全部源数据与本次混采权重计算一份共享 norm_stats。'
           : '选择数据集后自动带出已绑定的归一化参数，也可手动更换。'}
-        新增数据集会复制第 1 组的处理配置与混采权重。选定数据集后会带出该数据集绑定的归一化参数。
+        {singleDatasetStage
+          ? 'Kai0 阶段进度训练使用一个带 stage_progress_gt 的数据集。'
+          : '新增数据集会复制第 1 组的处理配置与混采权重。选定数据集后会带出该数据集绑定的归一化参数。'}
       </p>
+      {singleDatasetStage && bindings.length > 1 && (
+        <p className="field-hint" role="alert">
+          请移除多余数据集，只保留一组用于 Kai0 阶段进度训练。
+        </p>
+      )}
       <p className="field-hint">
         权重占比 = 本组权重 ÷ 总权重；样本数占比 = 本组帧数 ÷ 总帧数；预计采样占比 = 本组帧数 × 权重
         ÷ 全部加权帧数。预计值适用于标准多数据集采样，实际批次会波动；自定义采样器以训练实现为准。
@@ -527,7 +544,7 @@ export function DatasetBindings({
           </div>
         );
       })}
-      {!readOnly && (
+      {!readOnly && (!singleDatasetStage || bindings.length === 0) && (
         <div className="dataset-bindings-footer">
           <button
             type="button"

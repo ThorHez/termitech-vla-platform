@@ -87,13 +87,13 @@ export function assetTransferCreateRequest(
   };
 }
 
-export function assetTargetNameError(value: string): string | undefined {
+export function assetTargetNameError(value: string, label = '目标子目录名'): string | undefined {
   const name = value.trim();
-  if (!name) return '请填写目标子目录名。';
-  if (name.length > 160) return '目标子目录名最多 160 个字符。';
-  if (new TextEncoder().encode(name).length > 255) return '目标子目录名过长，请缩短名称。';
+  if (!name) return `请填写${label}。`;
+  if (name.length > 160) return `${label}最多 160 个字符。`;
+  if (new TextEncoder().encode(name).length > 255) return `${label}过长，请缩短名称。`;
   if (name === '.' || name === '..' || /[/\\\x00-\x1f\x7f-\x9f]/.test(name)) {
-    return '目标子目录名不能包含路径分隔符、控制字符，也不能是 . 或 ..。';
+    return `${label}不能包含路径分隔符、控制字符，也不能是 . 或 ..。`;
   }
 }
 
@@ -112,6 +112,23 @@ export function assetTargetDirectoryError(value: string): string | undefined {
 export function assetTargetPath(directory: string, name: string): string | undefined {
   if (assetTargetDirectoryError(directory) || assetTargetNameError(name)) return undefined;
   return `${directory.trim().replace(/\/+$/, '')}/${name.trim()}`;
+}
+
+export interface AssetSyncDirectoryDraft {
+  parent: string;
+  newFolder?: string;
+}
+
+export function assetSyncDirectory({ parent, newFolder }: AssetSyncDirectoryDraft) {
+  if (newFolder === undefined) return { directory: parent };
+  const directory = assetTargetPath(parent, newFolder);
+  if (directory === undefined) {
+    return {
+      directory: '',
+      error: assetTargetDirectoryError(parent) || assetTargetNameError(newFolder, '新文件夹名称'),
+    };
+  }
+  return { directory, error: assetTargetDirectoryError(directory) };
 }
 
 export function defaultAssetTargetName(asset: Pick<Asset, 'name' | 'path'>): string {

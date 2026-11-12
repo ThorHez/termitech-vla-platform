@@ -232,10 +232,10 @@ def normalize_composition(value, *, norm_stats=False):
             or result["prompt_key"] and (result["prompt_key"] in keys or result["action_key"] == result["prompt_key"])):
         _fail("状态、图像、动作和任务字段不能互相占用")
     aux = value["aux_keys"]
-    if (not isinstance(aux, list) or len(aux) > 2 or len(set(item for item in aux if isinstance(item, str))) != len(aux)
-            or any(item not in {"value_target", "is_positive"} for item in aux if isinstance(item, str))
+    if (not isinstance(aux, list) or len(aux) > 3 or len(set(item for item in aux if isinstance(item, str))) != len(aux)
+            or any(item not in {"value_target", "is_positive", "stage_progress_gt"} for item in aux if isinstance(item, str))
             or any(not isinstance(item, str) for item in aux)):
-        _fail("辅助字段仅支持 value_target 和 is_positive，且不能重复")
+        _fail("辅助字段仅支持 value_target、is_positive 和 stage_progress_gt，且不能重复")
     if any(key in {*keys, result["action_key"], result["prompt_key"]} for key in aux):
         _fail("辅助字段不能与其它输入字段重名")
     result["aux_keys"] = list(aux)

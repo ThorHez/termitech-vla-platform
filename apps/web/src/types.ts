@@ -73,6 +73,7 @@ export interface Asset {
   metadata?: JsonObject;
   norm_asset_id?: string | null;
   origin_attempt_id?: string | null;
+  origin_run_id?: string | null;
   created_at?: string;
   validation?: DatasetSourceValidation | null;
 }
@@ -172,7 +173,7 @@ export interface DatasetProcessorContract {
   required_features: string[];
   action_mode?: 'absolute' | 'delta' | 'unknown';
   rotation_representation?: 'axis_angle' | 'quaternion' | 'rotation_6d' | 'none' | 'unknown';
-  training_stage: 'sft' | 'value' | 'offline_rl';
+  training_stage: 'sft' | TrainingStage;
   model_family?: 'standard' | 'memory' | 'hybrid';
   evidence: 'static_repack';
 }
@@ -438,7 +439,7 @@ export interface Template {
   runtime_adapter?: string;
   stages?: TrainingStageSpec[];
 }
-export type TrainingStage = 'value' | 'offline_rl';
+export type TrainingStage = 'value' | 'stage_progress' | 'offline_rl';
 export type TrainingNormalizationMethod = 'minmax' | 'quantile' | 'zscore';
 export interface TrainingStageSpec {
   id: TrainingStage;
@@ -457,7 +458,8 @@ export interface AutomaticPreflight {
   plan: {
     generated_config?: GeneratedTrainingConfig;
     input_authority?: 'registered_assets';
-    model?: { path: string; asset_id?: string };
+    model?: { path: string; asset_id?: string; format?: string };
+    recap_stage_contract?: { backend?: string; [key: string]: unknown };
     entrypoint: string;
     datasets: {
       path: string;
@@ -573,6 +575,7 @@ export interface Run {
   code_expectation?: CodeSnapshot;
   attempts?: Attempt[];
   outputs?: Asset[];
+  input_assets?: Asset[];
   queue_reason?: string | null;
   error?: { code?: string; message?: string };
 }

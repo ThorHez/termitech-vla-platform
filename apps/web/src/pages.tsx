@@ -1021,9 +1021,35 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
 
 const UNRECORDED_REGISTRANT = 'unrecorded';
 
-export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
+export interface SceneAssetFilter {
+  id: string;
+  title: string;
+  datasetIds: readonly string[];
+  modelIds: readonly string[];
+}
+
+export function AssetsPage({
+  nodeFilter,
+  initialAssetId,
+  sceneFilter,
+}: {
+  nodeFilter?: string;
+  initialAssetId?: string;
+  sceneFilter?: SceneAssetFilter;
+}) {
   const { user, can } = useAuth();
   const { assets, members, nodes, profiles, runs, enabled, refresh } = useData();
+  const sourceAssets = useMemo(() => {
+    const available = assets.data || [];
+    if (!sceneFilter) return available;
+    const datasetIds = new Set(sceneFilter.datasetIds);
+    const modelIds = new Set(sceneFilter.modelIds);
+    return available.filter(
+      (asset) =>
+        (asset.kind === 'DATASET' && datasetIds.has(asset.id)) ||
+        (asset.kind === 'MODEL' && modelIds.has(asset.id)),
+    );
+  }, [assets.data, sceneFilter]);
   const [kind, setKind] = useState('ALL');
   const [nodeId, setNodeId] = useState(nodeFilter || '');
   const [query, setQuery] = useState('');
@@ -1040,8 +1066,22 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const [bindingDataset, setBindingDataset] = useState<Asset>();
   const [templateAsset, setTemplateAsset] = useState<Asset>();
   const [personalFormatsOpen, setPersonalFormatsOpen] = useState(false);
-  const [detailId, setDetailId] = useState<string>();
-  const detailAsset = assets.data?.find((asset) => asset.id === detailId);
+  const [detailId, setDetailId] = useState(initialAssetId);
+  const detailAsset = sourceAssets.find(
+    (asset) =>
+      asset.id === detailId &&
+      (detailId !== initialAssetId || (asset.status || asset.state) !== 'ARCHIVED'),
+  );
+  const closeAssetDetail = () => {
+    if (initialAssetId) {
+      const filters = new URLSearchParams();
+      if (nodeFilter) filters.set('node', nodeFilter);
+      if (sceneFilter) filters.set('scene', sceneFilter.id);
+      navigate(filters.size ? `/assets?${filters}` : '/assets');
+    } else {
+      setDetailId(undefined);
+    }
+  };
   const [syncAsset, setSyncAsset] = useState<Asset>();
   const [backgroundSync, setBackgroundSync] = useState<AssetTransfer>();
   const [assetPage, setAssetPage] = useState({ filters: '', page: 1 });
@@ -1049,11 +1089,11 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const [showArchived, setShowArchived] = useState(false);
   const registrantId = registrant === UNRECORDED_REGISTRANT ? null : registrant || undefined;
   const catalogProjection = useMemo(
-    () => datasetCatalogAssets(assets.data || [], showArchived, registrantId),
-    [assets.data, showArchived, registrantId],
+    () => datasetCatalogAssets(sourceAssets, showArchived, registrantId),
+    [sourceAssets, showArchived, registrantId],
   );
   const registrantOptions = useMemo(() => {
-    const ids = new Set((assets.data || []).map((asset) => asset.registered_by_user_id));
+    const ids = new Set(sourceAssets.map((asset) => asset.registered_by_user_id));
     ids.add(registrantId);
     return [...ids]
       .filter((id): id is string => Boolean(id && id !== user?.id))
@@ -1066,7 +1106,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         };
       })
       .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'));
-  }, [assets.data, members.data, registrantId, user?.id]);
+  }, [sourceAssets, members.data, registrantId, user?.id]);
   const catalogAssets = catalogProjection.assets;
   const selectableCatalogAssets = catalogProjection.selectionAssets;
   const canTransferAssets = can('assets.transfer');
@@ -1085,7 +1125,15 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
     if (archiving && (!archiveAsset || !canArchiveAsset(user, archiveAsset, can)))
       setArchiving(undefined);
   }, [archiving, archiveAsset, user, can]);
-  const filterKey = JSON.stringify([selectionOwner, kind, nodeId, query, showArchived, registrant]);
+  const filterKey = JSON.stringify([
+    selectionOwner,
+    sceneFilter?.id,
+    kind,
+    nodeId,
+    query,
+    showArchived,
+    registrant,
+  ]);
   useEffect(() => {
     setAssetPage((previous) =>
       previous.filters === filterKey ? previous : { filters: filterKey, page: 1 },
@@ -1133,7 +1181,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   const scopedAssets = catalogAssets.filter(
     (asset) => (kind === 'ALL' || asset.kind === kind) && (!nodeId || asset.node_id === nodeId),
   );
-  const scopedEntries = catalogAssetGroups(scopedAssets, assets.data || [], runs.data);
+  const scopedEntries = catalogAssetGroups(scopedAssets, sourceAssets, runs.data);
   const groupSearchText = new Map<string, string>();
   for (const entry of scopedEntries) {
     if (entry.kind === 'asset') continue;
@@ -1147,7 +1195,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   );
   const hasFilters = Boolean(query || nodeId || kind !== 'ALL' || registrant);
   const catalogEntries = groupDatasetNormAssets(
-    catalogAssetGroups(filtered, assets.data || [], runs.data),
+    catalogAssetGroups(filtered, sourceAssets, runs.data),
     catalogProjection.boundNorms,
   );
   const catalogPage = paginateAssetCatalog(
@@ -1241,7 +1289,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         {asset.kind === 'DATASET' && (
           <>
             <DatasetAssetFeatures asset={asset} />
-            <DatasetNormSummary asset={asset} assets={assets.data || []} />
+            {!sceneFilter && <DatasetNormSummary asset={asset} assets={assets.data || []} />}
           </>
         )}
       </td>
@@ -1297,52 +1345,71 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
   );
   return (
     <>
+      {sceneFilter && (
+        <Back to={`/scenes?scene=${encodeURIComponent(sceneFilter.id)}`} label="返回场景详情" />
+      )}
       <PageHeading
         eyebrow="LOCAL ASSET CATALOG"
         title="数据与模型"
-        description="统一登记本地资产，清晰关联机器、训练与产出。"
+        description={
+          sceneFilter
+            ? `查看「${sceneFilter.title}」关联的数据集和模型。`
+            : '统一登记本地资产，清晰关联机器、训练与产出。'
+        }
         actions={
-          <>
-            {can('dataset-templates.write') && (
-              <button
-                type="button"
-                className="button outline"
-                onClick={() => setPersonalFormatsOpen(true)}
-              >
-                <FileSliders size={17} />
-                数据集格式模板
-              </button>
-            )}
-            {canRegisterDatasets && (
-              <button
-                type="button"
-                className="button outline"
-                disabled={!enabled || !nodes.data?.length}
-                onClick={() => setBatchRegister(true)}
-              >
-                <Database size={17} />
-                批量登记数据集
-              </button>
-            )}
-            {canRegisterAssets && (
-              <button
-                className="button primary"
-                disabled={!enabled || !nodes.data?.length}
-                onClick={() => setRegister(true)}
-              >
-                <Plus size={17} />
-                登记资产
-              </button>
-            )}
-          </>
+          !sceneFilter && (
+            <>
+              {can('dataset-templates.write') && (
+                <button
+                  type="button"
+                  className="button outline"
+                  onClick={() => setPersonalFormatsOpen(true)}
+                >
+                  <FileSliders size={17} />
+                  数据集格式模板
+                </button>
+              )}
+              {canRegisterDatasets && (
+                <button
+                  type="button"
+                  className="button outline"
+                  disabled={!enabled || !nodes.data?.length}
+                  onClick={() => setBatchRegister(true)}
+                >
+                  <Database size={17} />
+                  批量登记数据集
+                </button>
+              )}
+              {canRegisterAssets && (
+                <button
+                  className="button primary"
+                  disabled={!enabled || !nodes.data?.length}
+                  onClick={() => setRegister(true)}
+                >
+                  <Plus size={17} />
+                  登记资产
+                </button>
+              )}
+            </>
+          )
         }
       />
-      <div className="info-strip">
-        <HardDrive size={17} />
-        <span>
-          数据和模型保存在各自机器本地，可同步到其他机器，完成文件校验后登记副本。训练使用所选机器上的资产。
-        </span>
-      </div>
+      {sceneFilter ? (
+        <div className="info-strip">
+          <Workflow size={17} aria-hidden="true" />
+          <span>场景筛选 · {sceneFilter.title}</span>
+          <a className="text-link" href="#/assets">
+            查看全部资产
+          </a>
+        </div>
+      ) : (
+        <div className="info-strip">
+          <HardDrive size={17} />
+          <span>
+            数据和模型保存在各自机器本地，可同步到其他机器，完成文件校验后登记副本。训练使用所选机器上的资产。
+          </span>
+        </div>
+      )}
       {backgroundSync && <AssetSyncBackgroundNotice transfer={backgroundSync} />}
       <div className="toolbar wrap">
         <div className="segmented">
@@ -1350,7 +1417,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             ['ALL', '全部'],
             ['DATASET', '数据集'],
             ['MODEL', '模型'],
-            ['NORM', '归一化参数'],
+            ...(!sceneFilter ? [['NORM', '归一化参数']] : []),
           ].map(([value, label]) => (
             <button
               className={kind === value ? 'selected' : ''}
@@ -1456,6 +1523,9 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         </p>
       )}
       <ErrorNotice error={assets.error} retry={assets.refresh} />
+      {initialAssetId && detailId === initialAssetId && assets.data && !detailAsset && (
+        <ErrorNotice error={new Error('该资产已归档、已移除或当前账号无法查看。')} />
+      )}
       <div className="panel">
         {assets.loading && enabled && !assets.data ? (
           <Loading />
@@ -1513,13 +1583,24 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
         ) : (
           <Empty
             icon={Database}
-            title={hasFilters ? '没有符合条件的资产' : '建立你的本地资产目录'}
-            description={
+            title={
               hasFilters
-                ? '调整搜索条件，或登记新的本地资产。'
-                : '登记已有数据集、归一化参数和模型的本机路径。预检时，Agent 会验证它们是否可用。'
+                ? '没有符合条件的资产'
+                : sceneFilter
+                  ? '此场景暂无可查看的资产'
+                  : '建立你的本地资产目录'
+            }
+            description={
+              sceneFilter
+                ? hasFilters
+                  ? '调整筛选条件，查看此场景关联的数据集和模型。'
+                  : '关联的数据集和模型会显示在这里。'
+                : hasFilters
+                  ? '调整搜索条件，或登记新的本地资产。'
+                  : '登记已有数据集、归一化参数和模型的本机路径。预检时，Agent 会验证它们是否可用。'
             }
             action={
+              !sceneFilter &&
               canRegisterAssets && (
                 <button
                   className="button outline small"
@@ -1578,7 +1659,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             asset={detailAsset}
             datasetChoices={
               detailAsset.kind === 'DATASET' && detailAsset.norm_asset_id
-                ? (assets.data || []).filter(
+                ? sourceAssets.filter(
                     (asset) =>
                       asset.kind === 'DATASET' &&
                       asset.node_id === detailAsset.node_id &&
@@ -1592,7 +1673,7 @@ export function AssetsPage({ nodeFilter }: { nodeFilter?: string }) {
             assets={assets.data || []}
             profiles={profiles.data}
             validationChanged={assets.refresh}
-            close={() => setDetailId(undefined)}
+            close={closeAssetDetail}
             bindNorm={() => setBindingDataset(detailAsset)}
             editProfile={() => setEditingProfile(detailAsset)}
             sync={() => setSyncAsset(detailAsset)}
@@ -1682,7 +1763,14 @@ function DatasetAssetFeatures({ asset }: { asset: Asset }) {
   );
 }
 
-export function RegisterAsset(props: { close: () => void; initialNode?: string }) {
+interface RegisterAssetProps {
+  close: () => void;
+  initialNode?: string;
+  datasetDefaults?: { path: string; normAssetId?: string };
+  onRegistered?: (asset: Asset) => void;
+}
+
+export function RegisterAsset(props: RegisterAssetProps) {
   const { can, user } = useAuth();
   if (!can('assets.register') || !user?.id)
     return (
@@ -1707,12 +1795,10 @@ function assetNameFromPath(path: string) {
 function RegisterAssetContent({
   close,
   initialNode,
+  datasetDefaults,
+  onRegistered,
   owner,
-}: {
-  close: () => void;
-  initialNode?: string;
-  owner: string;
-}) {
+}: RegisterAssetProps & { owner: string }) {
   const { user, can } = useAuth();
   const { nodes, assets, refresh } = useData();
   const client = useRef(createOperationClient());
@@ -1732,20 +1818,20 @@ function RegisterAssetContent({
       operation.current?.abort();
     };
   }, []);
-  const [normAssetId, setNormAssetId] = useState('');
+  const [normAssetId, setNormAssetId] = useState(datasetDefaults?.normAssetId || '');
   const [normPath, setNormPath] = useState('');
   const [form, setForm] = useState({
-    name: '',
+    name: assetNameFromPath(datasetDefaults?.path || ''),
     kind: 'DATASET',
     node_id: initialNode || '',
-    path: '',
+    path: datasetDefaults?.path || '',
     version: 'v1',
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const [datasetProfile, setDatasetProfile] = useState(emptyDatasetProfile);
   const inspectionDraft = useDatasetInspectionDraft(datasetProfile, setDatasetProfile);
-  const [deferProfile, setDeferProfile] = useState(false);
+  const [deferProfile, setDeferProfile] = useState(!!datasetDefaults);
   const pending = useRef(false);
   const nameEdited = useRef(false);
   const profileErrors =
@@ -1833,7 +1919,7 @@ function RegisterAssetContent({
           setBusy(true);
           setError(undefined);
           try {
-            await client.current.post(
+            const asset = await client.current.post<Asset>(
               '/assets',
               {
                 ...form,
@@ -1857,6 +1943,7 @@ function RegisterAssetContent({
             );
             if (!active() || abort.signal.aborted) return;
             refresh();
+            onRegistered?.(asset);
             close();
           } catch (err) {
             if (active() && !abort.signal.aborted) setError(err as Error);
@@ -1881,7 +1968,7 @@ function RegisterAssetContent({
           <div className="form-grid">
             <Field label="资产类型">
               <select
-                disabled={busy}
+                disabled={busy || !!datasetDefaults}
                 value={form.kind}
                 onChange={(event) => set('kind', event.target.value)}
               >
@@ -1906,7 +1993,7 @@ function RegisterAssetContent({
           <Field label="所在机器" required>
             <select
               required
-              disabled={busy}
+              disabled={busy || !!datasetDefaults}
               value={form.node_id}
               onChange={(event) => set('node_id', event.target.value)}
             >
@@ -2055,6 +2142,7 @@ export function TemplatesPage({
           {templates.data.map((template) => {
             const info = algorithmInfo[template.algorithm.toUpperCase()] || algorithmInfo.SFT;
             const Icon = info.icon;
+            const kai0Stage = template.stages?.find((stage) => stage.id === 'stage_progress');
             return (
               <article
                 className={`template-card ${template.status !== 'AVAILABLE' ? 'planned' : ''}`}
@@ -2072,13 +2160,20 @@ export function TemplatesPage({
                 <span className="template-eyebrow">{info.text}</span>
                 <h2>{template.name}</h2>
                 <p>{template.description}</p>
-                {template.id === 'recap' && !!template.stages?.length && (
+                {!!template.stages?.length && (
                   <div className="template-stage-list">
-                    {template.stages.map((stage, index) => (
-                      <span key={stage.id}>
-                        {index + 1}. {stage.name}
-                      </span>
-                    ))}
+                    {template.id === 'recap' ? (
+                      <>
+                        <span>Value 训练 → 优势值标注 → ACP 训练</span>
+                        {kai0Stage && <span>备选 · {kai0Stage.name}</span>}
+                      </>
+                    ) : (
+                      template.stages.map((stage, index) => (
+                        <span key={stage.id}>
+                          {index + 1}. {stage.name}
+                        </span>
+                      ))
+                    )}
                   </div>
                 )}
                 <div className="template-inputs">

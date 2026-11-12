@@ -24,7 +24,7 @@ import {
 } from './components';
 import { assetKinds, useData } from './data';
 import { nodeAddressText } from './nodeAddress';
-import { PathAutocomplete } from './PathAutocomplete';
+import { AssetSyncDirectory } from './AssetSyncDirectory';
 import {
   boundDatasetNorm,
   defaultDatasetNormSync,
@@ -34,6 +34,7 @@ import {
 import { transferBytes, transferElapsed } from './checkpointTransfer';
 import {
   assetSyncBlocker,
+  assetSyncDirectory,
   assetTransferCreateRequest,
   assetTargetNameError,
   assetTargetPath,
@@ -42,7 +43,7 @@ import {
   assetTransferTerminal,
   defaultAssetTargetName,
 } from './assetTransfer';
-import type { AssetTransfer } from './assetTransfer';
+import type { AssetSyncDirectoryDraft, AssetTransfer } from './assetTransfer';
 import type { Asset } from './types';
 import './asset-transfers.css';
 import { AssetTransferDeleteAction } from './AssetTransferDeleteAction';
@@ -59,7 +60,7 @@ export function AssetSyncDialog({
   const { can } = useAuth();
   const { nodes, assets } = useData();
   const [targetId, setTargetId] = useState('');
-  const [directory, setDirectory] = useState('');
+  const [directoryDraft, setDirectoryDraft] = useState<AssetSyncDirectoryDraft>({ parent: '' });
   const [targetName, setTargetName] = useState(() => defaultAssetTargetName(asset));
   const [includeNormStats, setIncludeNormStats] = useState(() =>
     defaultDatasetNormSync(asset, assets.data || []),
@@ -73,8 +74,10 @@ export function AssetSyncDialog({
   const sourceNode = nodes.data?.find((node) => node.id === asset.node_id);
   const targetNode = nodes.data?.find((node) => node.id === targetId);
   const targets = (nodes.data || []).filter((node) => node.id !== asset.node_id);
+  const { directory, error: directoryError } = assetSyncDirectory(directoryDraft);
   const blocker =
     datasetNormTransferError(asset, assets.data || [], includeNormStats) ||
+    directoryError ||
     assetSyncBlocker({ asset, sourceNode, targetNode, directory, targetName });
   const preview = assetTargetPath(directory, targetName);
   if (!can('assets.transfer')) {
@@ -177,7 +180,7 @@ export function AssetSyncDialog({
             disabled={busy}
             onChange={(event) => {
               setTargetId(event.target.value);
-              setDirectory('');
+              setDirectoryDraft({ parent: '' });
               setError(undefined);
             }}
           >
@@ -196,16 +199,12 @@ export function AssetSyncDialog({
             暂无其他在线机器，请先在机器资源中接入或恢复目标机器。
           </p>
         )}
-        <PathAutocomplete
+        <AssetSyncDirectory
           key={targetId}
           node={targetNode}
-          label="目标父目录"
-          value={directory}
-          onChange={setDirectory}
-          disabled={busy || !targetNode}
-          required
-          placeholder="选择目标机器上的父目录"
-          hint="在目标父目录中新建下方子目录；父目录可以手动输入或使用目录联想。"
+          draft={directoryDraft}
+          onChange={setDirectoryDraft}
+          busy={busy}
         />
         <Field label="目标子目录名" required hint="仅填写一层目录名，不包含路径分隔符。">
           <input

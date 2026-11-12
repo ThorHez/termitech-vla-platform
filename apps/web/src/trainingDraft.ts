@@ -230,7 +230,7 @@ function validRequest(value: unknown): value is RunRequest {
     if (value[key] !== undefined && !text(value[key])) return false;
   if (
     value.training_stage !== undefined &&
-    !['sft', 'value', 'offline_rl'].includes(String(value.training_stage))
+    !['sft', 'value', 'stage_progress', 'offline_rl'].includes(String(value.training_stage))
   )
     return false;
   if (value.stage_config !== undefined && !numbers(value.stage_config)) return false;

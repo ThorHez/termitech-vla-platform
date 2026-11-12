@@ -9,6 +9,7 @@ import {
   LoaderCircle,
   LogOut,
   Menu,
+  PanelsTopLeft,
   RefreshCw,
   Rocket,
   Search,
@@ -33,8 +34,9 @@ import { backgroundTaskActiveCounts } from './backgroundTaskEntries';
 import RunWizard from './RunWizard';
 import { ResumeTrainingWizard } from './ResumeTrainingWizard';
 import PolicyDeployments from './PolicyDeployments';
+import ScenarioShowcase, { getSceneAssetFilter } from './ScenarioShowcase';
 import { ThemeControl, ThemeProvider, ThemeSettings } from './theme';
-import type { Run } from './types';
+import type { Asset, Run } from './types';
 
 const navigation = [
   { path: '/overview', label: '训练工作台', icon: LayoutDashboard },
@@ -43,6 +45,7 @@ const navigation = [
   { path: '/templates', label: '训练模板', icon: Layers3 },
   { path: '/runs', label: '训练任务', icon: Workflow },
   { path: '/deployments', label: '真机部署', icon: Rocket },
+  { path: '/scenes', label: '场景展示', icon: PanelsTopLeft },
 ];
 
 export default function App() {
@@ -83,9 +86,13 @@ function Shell() {
     nodeId?: string;
     templateId?: string;
     sourceRun?: Run;
+    recapDataset?: Asset;
     resume?: boolean;
   }>();
-  const { overview, alerts, runs, assetTransfers, refresh } = useData();
+  const data = useData();
+  const { overview, alerts, runs, assetTransfers, refresh } = data;
+  const assetSceneId = path === '/assets' ? queryParams.get('scene') : null;
+  const assetScene = assetSceneId ? getSceneAssetFilter(assetSceneId, data) : undefined;
   const activeTasks = backgroundTaskActiveCounts(runs.data, assetTransfers.data);
   const taskCountsReady = runs.data !== undefined && assetTransfers.data !== undefined;
   const section =
@@ -260,10 +267,25 @@ function Shell() {
                 createRun={createRun}
               />
             ) : path === '/assets' ? (
-              <AssetsPage
-                key={queryParams.get('node') || 'all'}
-                nodeFilter={queryParams.get('node') || undefined}
-              />
+              assetSceneId && !assetScene ? (
+                <>
+                  <PageHeading title="场景不存在" description="请从场景展示选择要查看的资产。" />
+                  <a className="button outline" href="#/scenes">
+                    返回场景展示
+                  </a>
+                </>
+              ) : (
+                <AssetsPage
+                  key={JSON.stringify([
+                    queryParams.get('node'),
+                    queryParams.get('asset'),
+                    assetSceneId,
+                  ])}
+                  nodeFilter={queryParams.get('node') || undefined}
+                  initialAssetId={queryParams.get('asset') || undefined}
+                  sceneFilter={assetScene}
+                />
+              )
             ) : path === '/templates' ? (
               <TemplatesPage
                 createRun={createRun}
@@ -286,6 +308,9 @@ function Shell() {
                 onResume={(sourceRun) => {
                   if (can('training.write')) setWizard({ sourceRun, resume: true });
                 }}
+                onRecapAcp={(sourceRun, recapDataset) => {
+                  if (can('training.write')) setWizard({ sourceRun, recapDataset });
+                }}
               />
             ) : path === '/deployments' || path.startsWith('/deployments/') ? (
               <PolicyDeployments
@@ -293,6 +318,8 @@ function Shell() {
                 tab={queryParams.get('tab') || 'overview'}
                 initialRun={queryParams.get('run') || undefined}
               />
+            ) : path === '/scenes' ? (
+              <ScenarioShowcase sceneId={queryParams.get('scene') || undefined} />
             ) : path === '/settings' ? (
               <SettingsPage />
             ) : path === '/users' ? (
@@ -320,10 +347,11 @@ function Shell() {
           <ResumeTrainingWizard sourceRun={wizard.sourceRun} close={() => setWizard(undefined)} />
         ) : (
           <RunWizard
-            key={wizard.sourceRun?.id || 'new-training'}
+            key={JSON.stringify([wizard.sourceRun?.id, wizard.recapDataset?.id])}
             initialNode={wizard.nodeId}
             initialTemplate={wizard.templateId}
             sourceRun={wizard.sourceRun}
+            recapDataset={wizard.recapDataset}
             close={() => setWizard(undefined)}
           />
         ))}

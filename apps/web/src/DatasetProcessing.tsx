@@ -9,9 +9,9 @@ import { recommendDatasetProcessor } from './datasetRecommendations';
 import {
   ComposedDatasetProcessing,
   composedChoice,
+  stageCompositionDraft,
   trainingProfileSeed,
 } from './ComposedDatasetProcessing';
-import { trainingCompositionDraft } from './composedProcessing';
 import type { ImageLayoutEdits } from './imageLayout';
 import { Field } from './components';
 import { trainingNormalizationLabel } from './trainingNormalization';
@@ -24,6 +24,7 @@ import type {
   RecipeDatasetSlot,
   RecipeLiteral,
   TrainingNormalizationMethod,
+  TrainingStage,
 } from './types';
 
 export type DatasetProcessingMode = 'recommended' | 'existing' | 'composed';
@@ -36,7 +37,7 @@ export function DatasetProcessing(props: {
   entries: DataProcessorEntry[];
   slots: RecipeDatasetSlot[];
   index: number;
-  stage: 'sft' | 'value' | 'offline_rl';
+  stage: 'sft' | TrainingStage;
   managedParameters: Record<string, RecipeLiteral>;
   automatic?: boolean;
   readOnly?: boolean;
@@ -70,7 +71,11 @@ export function DatasetProcessing(props: {
       {!props.readOnly && (
         <Field
           label={`数据处理方式 ${props.index + 1}`}
-          hint="每组数据独立配置，只保存到本次训练。"
+          hint={
+            props.stage === 'stage_progress'
+              ? '选择自定义字段组合，并声明数据中已有的 stage_progress_gt。'
+              : '每组数据独立配置，只保存到本次训练。'
+          }
         >
           <select
             value={mode}
@@ -84,7 +89,11 @@ export function DatasetProcessing(props: {
                   props.onChange({
                     ...assets,
                     processor: composedChoice(
-                      trainingCompositionDraft(trainingProfileSeed(props.dataset), props.purpose),
+                      stageCompositionDraft(
+                        trainingProfileSeed(props.dataset),
+                        props.stage,
+                        props.purpose,
+                      ),
                     ),
                   });
                 }
@@ -94,8 +103,12 @@ export function DatasetProcessing(props: {
               }
             }}
           >
-            <option value="recommended">自动推荐处理器</option>
-            <option value="existing">选择现有处理器</option>
+            <option value="recommended" disabled={props.stage === 'stage_progress'}>
+              自动推荐处理器
+            </option>
+            <option value="existing" disabled={props.stage === 'stage_progress'}>
+              选择现有处理器
+            </option>
             <option value="composed">自定义字段组合</option>
           </select>
         </Field>
@@ -182,7 +195,7 @@ function LegacyDatasetProcessing({
   entries: DataProcessorEntry[];
   slots: RecipeDatasetSlot[];
   index: number;
-  stage: 'sft' | 'value' | 'offline_rl';
+  stage: 'sft' | TrainingStage;
   managedParameters: Record<string, RecipeLiteral>;
   automatic?: boolean;
   recommend?: boolean;
@@ -240,6 +253,7 @@ function LegacyDatasetProcessing({
   // Validate existing choices again after a remount. A local ref cannot prove
   // that an old automatic choice was subsequently confirmed by the user.
   const selectionValid =
+    stage !== 'stage_progress' &&
     (!automaticMode || !!binding.processor) &&
     (!binding.processor ||
       !registered ||

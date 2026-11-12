@@ -10,6 +10,7 @@ import pytest
 
 from vla_adapters import recap_runtime, training_plan
 from vla_adapters.openpi_entry import resolve_config
+from vla_adapters.recap import RECAP_TORCH_ENTRY, STAGE_PROGRESS, STAGE_PROGRESS_ID_COLUMNS, recap_torch_module_paths
 from vla_adapters.training_plan import fingerprint, inspect_training_config, training_entrypoint
 from test_training_plan import Assets, Config, Data, training
 
@@ -94,6 +95,38 @@ def test_value_stage_preserves_value_loader_and_selects_value_training(recap):
     assert plan["recap_stage_contract"]["validation"]["val_ratio"] == 0.2
     assert all("value_target" in row["required_columns"] for row in plan["recap_stage_contract"]["datasets"])
     assert next(row for row in checks if row["name"] == "recap_stage")["ok"] is True
+
+
+def test_new_value_plan_resolves_native_torch_weights_and_freezes_the_backend(recap, monkeypatch):
+    from test_recap_torch_checkpoint import _weights
+
+    @dataclasses.dataclass
+    class TorchConfig(ReCapConfig):
+        pytorch_weight_path: str | None = None
+        recap_training_stage: str | None = None
+        ema_decay: float | None = 0.99
+
+    legacy, spec, module, loaders = recap
+    base = TorchConfig(**{field.name: getattr(legacy, field.name) for field in dataclasses.fields(legacy)})
+    base.model.action_dim, base.model.pi05 = 2, True
+    spec["recap_backend"] = "pytorch"
+    path = Path(spec["inputs"]["model"]["path"]) / "model.safetensors"
+    _weights(path, {"action_in_proj.weight": [3, 2], "action_out_proj.weight": [2, 3]})
+    for source in (RECAP_TORCH_ENTRY, *("src/openpi/" + name for name in recap_torch_module_paths("value"))):
+        file = Path(spec["code_dir"]) / source
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("def main(config, *, worker_setup=None): pass\ndef init_wandb(*a, **kw): pass\n")
+    monkeypatch.setattr(recap_runtime, "_value_runtime_cache", lambda *_: pytest.fail("PyTorch requested a JAX cache probe"))
+    monkeypatch.setattr(recap_runtime, "recap_torch_runtime_versions",
+                        lambda: {"torch": "2.7.1", "safetensors": "0.5.3", "transformers": "4.53.2"})
+    loaders.NoOpWeightLoader = object
+    config = resolve_config(base, spec, module, loaders)
+    plan = inspect_training_config(config, spec, checks=[])
+    assert config.recap_training_stage == "value" and config.pytorch_weight_path == str(path.parent)
+    assert config.ema_decay is None and config.fsdp_devices == 1
+    assert plan["model"]["format"] == "openpi-pytorch" and plan["entrypoint"].endswith("/" + RECAP_TORCH_ENTRY)
+    assert plan["recap_stage_contract"]["backend"] == "pytorch"
+    assert "'recap_backend': 'pytorch'" in plan["generated_config"]["source"]
 
 
 def as_acp(recap):
@@ -293,6 +326,26 @@ def test_basic_supervision_records_observed_range_and_binary_labels_without_trai
     assert evidence["checked_files"][0]["sample_rows"] == 2
     assert "actions" in evidence["checked_files"][0]["columns"]
     assert recap_runtime.require_cached_supervision(data, spec) == evidence
+
+
+def test_stage_progress_source_validation_checks_physical_ids_and_caches_range(supervision_source, monkeypatch):
+    data, spec, info = supervision_source
+    spec["training_stage"] = STAGE_PROGRESS
+    info["features"]["stage_progress_gt"] = {"shape": [1], "dtype": "float32"}
+    columns = ["value_target", "is_positive", "stage_progress_gt", *STAGE_PROGRESS_ID_COLUMNS]
+    values = {"value_target": [-.5, 0.], "is_positive": [0, 1], "stage_progress_gt": [0., 1.1]}
+    install_fake_parquet(monkeypatch, names=columns, values=values)
+    with pytest.raises(ValueError, match="RECAP_LABEL_INVALID.*stage_progress_gt"):
+        recap_runtime.prepare_source_supervision(data, spec, info)
+    values["stage_progress_gt"] = [0., 1.]
+    install_fake_parquet(monkeypatch, names=[key for key in columns if key != "task_index"], values=values)
+    with pytest.raises(ValueError, match="RECAP_DATA_SCHEMA_INVALID.*task_index"):
+        recap_runtime.prepare_source_supervision(data, spec, info)
+    install_fake_parquet(monkeypatch, names=columns, values=values)
+    recap_runtime.prepare_source_supervision(data, spec, info)
+    monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda *a, **kw: pytest.fail("No late supervision scanning"))
+    receipt = recap_runtime.require_cached_supervision(data, spec)
+    assert receipt["supervision_summary"] == {"stage_progress_gt": {"min": 0., "max": 1., "count": 2}}
 
 
 def test_value_submission_reuses_receipt_and_checks_current_range_without_parquet_reads(supervision_source, monkeypatch):

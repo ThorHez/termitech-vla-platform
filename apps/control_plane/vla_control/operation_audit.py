@@ -71,6 +71,7 @@ for action, label, category, target, method, path, parameter in (
     ("transfers.create_batch", "批量创建资产同步", "transfers", "asset_transfer_batch", "POST", "/asset-transfer-batches", None),
     ("runs.preflight", "发起训练预检", "training", "run_preview", "POST", "/run-previews", None),
     ("runs.create", "创建训练任务", "training", "run", "POST", "/runs", None),
+    ("runs.link_recap_annotation", "关联 ReCap 标注数据", "training", "run", "POST", "/runs/{run_id}/recap-annotations", "run_id"),
     ("runs.cancel", "取消训练任务", "training", "run", "POST", "/runs/{run_id}/cancel", "run_id"),
     ("runs.delete", "删除训练记录", "training", "run", "DELETE", "/runs/{run_id}", "run_id"),
     ("resources.reserve", "预留 GPU", "resources", "node", "PUT", "/nodes/{node_id}/gpu-reservations", "node_id"),

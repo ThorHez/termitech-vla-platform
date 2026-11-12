@@ -190,7 +190,7 @@ class PreviewInput(InputModel):
     profile_id: str
     template_id: str
     resume: bool = Field(default=False, strict=True)
-    training_stage: Literal["value", "offline_rl"] | None = None
+    training_stage: Literal["value", "offline_rl", "stage_progress"] | None = None
     stage_config: dict | None = None
     auto_config: dict | None = None
     normalization_method: Literal["minmax", "quantile", "zscore"] | None = None

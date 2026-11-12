@@ -105,5 +105,14 @@ def run_dict(session, run):
     result["attempts"] = [attempt_dict(a) for a in attempts]
     ids = [a.id for a in attempts]
     result["outputs"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.origin_attempt_id.in_(ids)))] if ids else []
-    result["input_assets"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.id.in_(list(run.inputs.values()))))] if run.inputs else []
+    result["input_assets"] = []
+    if run.inputs:
+        inputs = select(Asset, Attempt.run_id).outerjoin(Attempt, Asset.origin_attempt_id == Attempt.id).where(
+            Asset.id.in_(list(run.inputs.values())))
+        for asset, origin_run_id in session.execute(inputs):
+            payload = asset_dict(asset)
+            if (origin_run_id and asset.kind == "DATASET"
+                    and payload["metadata"].get("registration_source") == "recap_stage_progress"):
+                payload["origin_run_id"] = origin_run_id
+            result["input_assets"].append(payload)
     return result

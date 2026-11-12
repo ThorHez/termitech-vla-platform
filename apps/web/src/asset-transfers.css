@@ -5,6 +5,17 @@
 .asset-sync-form > .field {
   margin-bottom: 0;
 }
+.asset-sync-directory {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.asset-sync-directory > .field {
+  margin-bottom: 0;
+}
+.asset-sync-directory > .button {
+  justify-self: start;
+}
 .asset-sync-norm-option,
 .asset-transfer-norm {
   display: grid;

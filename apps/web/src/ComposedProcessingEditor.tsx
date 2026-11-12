@@ -13,10 +13,12 @@ import {
   composedProcessingSummary,
   draftComposedProcessing,
   inferSourceActionLayout,
+  matchComposedCameraSlots,
   resizeActionBlock,
   umiV4ComposedPreset,
   updateComposedProcessingFromProfile,
   withActionNormalizationMask,
+  COMPOSED_SUPERVISION_FIELDS,
   VISUAL_SLOTS,
   type ActionBlock,
   type ActionKind,
@@ -170,6 +172,10 @@ export function ComposedProcessingEditor({
   );
   const actionWidthMismatch =
     sourceAction.width !== undefined && sourceAction.width !== actionWidth;
+  const matchedCameras = matchComposedCameraSlots(value.cameras);
+  const canMatchCameras = matchedCameras.some(
+    (camera, index) => camera.slot !== value.cameras[index].slot,
+  );
   const [advanced, setAdvanced] = useState(() => errors.length > 0);
   return (
     <fieldset className="composed-processing-editor" disabled={disabled}>
@@ -629,6 +635,14 @@ export function ComposedProcessingEditor({
             <button
               type="button"
               className="button outline small"
+              disabled={disabled || !canMatchCameras}
+              onClick={() => set('cameras', matchedCameras)}
+            >
+              按相机字段匹配槽位
+            </button>
+            <button
+              type="button"
+              className="button outline small"
               disabled={disabled || value.cameras.length >= 3}
               onClick={() =>
                 set('cameras', [
@@ -654,7 +668,7 @@ export function ComposedProcessingEditor({
             </button>
           </div>
           <p className="field-hint">
-            每个模型槽位最多绑定一个真实字段。深度仅按显式显示范围映射为图像，不代表生成新的视角或转换测量单位。
+            新建方案会根据可识别的相机字段推荐槽位，可手动调整。每个模型槽位最多绑定一个真实字段。深度图按设置的显示范围映射。
           </p>
           {value.cameras.map((item, index) => (
             <div className="composed-row" key={index}>
@@ -987,7 +1001,7 @@ export function ComposedProcessingEditor({
         )}
         <div className="composed-aux">
           <strong>已有阶段监督字段</strong>
-          {(['value_target', 'is_positive'] as const).map((key) => (
+          {COMPOSED_SUPERVISION_FIELDS.map((key) => (
             <label className="checkbox-label" key={key}>
               <input
                 type="checkbox"

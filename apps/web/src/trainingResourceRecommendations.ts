@@ -21,6 +21,7 @@ const positiveInteger = (value: unknown): value is number =>
 export function recommendTrainingResources(
   gpuCount: number,
   metrics?: Record<string, unknown>,
+  { fsdp = true }: { fsdp?: boolean } = {},
 ): TrainingResourceRecommendations {
   const cpuCount = positiveInteger(metrics?.cpu_count) ? metrics.cpu_count : undefined;
   const availableCpuCount = positiveInteger(metrics?.available_cpu_count)
@@ -31,7 +32,7 @@ export function recommendTrainingResources(
     gpuCount,
     cpuCount,
     availableCpuCount,
-    fsdp_devices: gpuCount,
+    ...(fsdp ? { fsdp_devices: gpuCount } : {}),
     num_workers: Math.max(
       0,
       Math.min(

@@ -1,16 +1,19 @@
 """Data-only automatic model choices; construction runs in the training Python."""
 
 import dataclasses
+import importlib
 from pathlib import Path
 
 if __package__:
     from .dataset_bindings import validate_binding_assets
     from .data_processors import instantiate_data_processor
     from .composition_spec import COMPOSABLE_PROCESSOR, SLOTS, normalize_composition
+    from .recap import STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, uses_torch_recap, validate_stage_progress_selection
 else:
     from dataset_bindings import validate_binding_assets
     from data_processors import instantiate_data_processor
     from composition_spec import COMPOSABLE_PROCESSOR, SLOTS, normalize_composition
+    from recap import STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, uses_torch_recap, validate_stage_progress_selection
 
 
 AUTO_CONFIG_DEFAULTS = {"model_type": "pi05", "finetune_mode": "full", "action_horizon": 50, "action_dim": 32}
@@ -33,7 +36,7 @@ def normalize_auto_config(value):
 
 def automatic_recipe_name(auto_config, training_stage=None):
     clean = normalize_auto_config(auto_config)
-    if clean is None or training_stage not in (None, "sft", "value", "offline_rl"):
+    if clean is None or training_stage not in (None, "sft", "value", "offline_rl", STAGE_PROGRESS):
         raise ValueError("AUTO_CONFIG_INVALID: 自动配置或训练阶段无效")
     return (f"auto_{clean['model_type']}_{clean['finetune_mode']}_h{clean['action_horizon']}"
             f"_d{clean['action_dim']}_{training_stage or 'sft'}")
@@ -78,8 +81,18 @@ def automatic_data_layout(auto_config, bindings, *, norm_stats=False):
 def build_automatic_model(auto_config, config_module, bindings, training_stage=None, *, norm_stats=False):
     """Share the exact SFT model and declared camera/state layout semantics."""
     clean = normalize_auto_config(auto_config)
-    model_module = getattr(config_module, "pi0_value" if training_stage == "value" else "pi0_config", None)
-    model_cls = getattr(model_module, "Pi0ValueConfig" if training_stage == "value" else "Pi0Config", None)
+    if training_stage == STAGE_PROGRESS:
+        validate_stage_progress_selection(training_stage, bindings, clean)
+        try:
+            model_module = importlib.import_module("openpi.models.pi0_stage_progress")
+        except ModuleNotFoundError as exc:
+            if exc.name != "openpi.models.pi0_stage_progress":
+                raise
+            raise ValueError("RECAP_STAGE_MODEL_UNAVAILABLE: 请更新 OpenPI-UMI 至支持 Kai0 阶段进度的版本") from exc
+        model_cls = getattr(model_module, STAGE_PROGRESS_MODEL, None)
+    else:
+        model_module = getattr(config_module, "pi0_value" if training_stage == "value" else "pi0_config", None)
+        model_cls = getattr(model_module, "Pi0ValueConfig" if training_stage == "value" else "Pi0Config", None)
     if not isinstance(model_cls, type) or not dataclasses.is_dataclass(model_cls):
         raise ValueError("AUTO_CONFIG_UNSUPPORTED: 训练环境未导出所选 Pi0/Pi05 模型配置")
     kwargs = {"pi05": clean["model_type"] == "pi05", "action_dim": clean["action_dim"],
@@ -154,10 +167,11 @@ def build_automatic_base(spec, config_module, weight_loaders):
         values = {"name": name, "model": model, "data": seed}
         if clean["finetune_mode"] == "lora":
             values.update(freeze_filter=model.get_freeze_filter(), ema_decay=None)
-        if stage == "value":
-            loader = getattr(weight_loaders, "CheckpointWeightLoaderWithValueHead", None)
+        if stage in {"value", STAGE_PROGRESS} and not uses_torch_recap(spec):
+            loader_name = "CheckpointWeightLoaderWithValueHead" if stage == "value" else STAGE_PROGRESS_LOADER
+            loader = getattr(weight_loaders, loader_name, None)
             if loader is None:
-                raise ValueError("AUTO_CONFIG_UNSUPPORTED: 当前训练环境缺少价值头权重加载器")
+                raise ValueError(f"AUTO_CONFIG_UNSUPPORTED: 当前训练环境缺少估计器权重加载器 {loader_name}")
             values["weight_loader"] = loader("")
         return config_module.TrainConfig(**values)
     except (AttributeError, TypeError) as exc:

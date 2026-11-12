@@ -173,6 +173,7 @@ try {
           profileId: profile.id,
           changed() {},
           onPendingChange() {},
+          onRefreshedChange() {},
         }),
         true,
         auth,

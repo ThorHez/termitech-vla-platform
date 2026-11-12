@@ -50,7 +50,7 @@ SFT/ReCap 和 norm_stats 均支持登记为 `composite` 的「组合向量（多
 | 归一化 | quantile/zscore、逐分块归一化标志 | 使用本次绑定的归一化资产，校验原始拼接宽度及所需统计字段 |
 | 动作损失 | 真实动作块与补齐维度 | 真实动作维度参与训练，补齐维度屏蔽；逐样本掩码覆盖配方中旧动作维度的全局掩码 |
 | 模型变换 | 标准 Pi0/Pi05、Value、Gripper | 复用提示词、图像缩放、分词、动作补齐和状态展平；Pi0 禁止状态溢出截断 |
-| 训练阶段辅助字段 | `value_target` / `is_positive` | ReCap Value/ACP 阶段核验真实监督列；阶段及 ACP dropout 仍由训练任务管理 |
+| 训练阶段辅助字段 | `value_target` / `stage_progress_gt` / `is_positive` | ReCap 价值、Kai0 阶段进度、ACP 分别核验实际监督列。训练任务管理阶段参数。 |
 
 这里的 `state_history` 表示样本中**已经存在**的 `[history, width]`，不是自动向前采样历史。动作元信息 `[D]` 使用 LeRobot 的未来时间采样；已打包的 `[H,D]` 直接读取，`H` 必须等于模型预测长度。相机带时间轴时必须显式选择 `time_index`。
 

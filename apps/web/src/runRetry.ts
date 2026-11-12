@@ -4,6 +4,7 @@ import {
   type TrainingDraftSnapshot,
 } from './trainingDraft';
 import { TRAINING_TEMPLATE_PROCESSING_MARKER } from './trainingTemplate';
+import { withoutLegacyRecapSettings } from './recap';
 import { validRequestedGpuList } from './trainingGpuSelection';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
 import { validTrainingGpuPolicy } from './trainingGpuPolicy';
@@ -285,7 +286,7 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
       independentDatasets.some((binding) => !('processor' in binding))
     )
       throw new Error('原自动训练缺少独立数据处理器，请手动重新配置数据处理。');
-    if (text(requestedEntrypoint, 1024))
+    if (run.template_id !== 'recap' && text(requestedEntrypoint, 1024))
       throw new Error(
         '原训练同时使用自动配置和自定义训练入口，请在高级设置中重新确认入口后新建训练。',
       );
@@ -317,23 +318,24 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
   }
   const stage = setting('training_stage');
   if (run.template_id === 'recap') {
-    if (stage !== 'value' && stage !== 'offline_rl')
+    if (stage !== 'value' && stage !== 'stage_progress' && stage !== 'offline_rl')
       throw new Error('原训练 ReCap 阶段记录不完整。');
     request.training_stage = stage;
     const config = setting('stage_config');
     if (config != null) request.stage_config = numericControls(config);
   }
+  const newRequest = withoutLegacyRecapSettings(request);
   const snapshot: TrainingDraftSnapshot = {
-    request,
+    request: newRequest,
     step: 0,
     advancedRecipe: run.template_id !== 'smoke' && !request.auto_config,
     editedParameters: [
-      ...Object.keys(request.parameters),
+      ...Object.keys(newRequest.parameters),
       TRAINING_TEMPLATE_PROCESSING_MARKER,
       ...(request.auto_config ? ['auto_config.action_horizon'] : []),
     ],
     editedStageParameters: Object.keys(request.stage_config || {}),
-    entrypointEdited: !!request.entrypoint,
+    entrypointEdited: !!newRequest.entrypoint,
   };
   // The codec bounds JSON, rejects credentials/prototype keys and makes an
   // independent deep clone of the nested per-dataset processing configuration.

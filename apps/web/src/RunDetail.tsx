@@ -45,6 +45,7 @@ import { requestedGpuSummary } from './trainingGpuSelection';
 import { trainingGpuPolicySummary } from './trainingGpuPolicy';
 import { RunDeleteAction } from './RunDeleteAction';
 import { RunGpuReservationNotice } from './GpuReservations';
+import { RecapRunHandoff } from './RecapRunHandoff';
 import { TrainingEnvironmentDetails } from './TrainingEnvironment';
 
 const queueReasonLabels: Record<string, string> = {
@@ -85,10 +86,12 @@ export default function RunDetail({
   id,
   onRetry,
   onResume,
+  onRecapAcp,
 }: {
   id: string;
   onRetry?: (run: Run) => void;
   onResume?: (run: Run) => void;
+  onRecapAcp?: (run: Run, dataset: Asset) => void;
 }) {
   const { can, user } = useAuth();
   const { nodes, templates, assets, refresh } = useData();
@@ -145,6 +148,9 @@ export default function RunDetail({
   const actualEntrypoint =
     attempt?.code_snapshot?.automatic_preflight?.plan.entrypoint ||
     run?.code_expectation?.automatic_preflight?.plan.entrypoint;
+  const pytorchRecap =
+    (attempt?.code_snapshot?.automatic_preflight?.plan.recap_stage_contract?.backend ||
+      run?.code_expectation?.automatic_preflight?.plan.recap_stage_contract?.backend) === 'pytorch';
   const recipeDefinition =
     run?.recipe_definition ||
     attempt?.code_snapshot?.recipe_definition ||
@@ -226,6 +232,9 @@ export default function RunDetail({
         run && (
           <>
             <RunQueueReason reason={run.queue_reason} />
+            {run.template_id === 'recap' && (
+              <RecapRunHandoff key={run.id} run={run} onAcp={onRecapAcp} />
+            )}
             {run.state === 'UNKNOWN' && (
               <div className="inline-note amber">
                 <AlertCircle size={18} />
@@ -361,6 +370,12 @@ export default function RunDetail({
                         <div>
                           <dt>训练阶段</dt>
                           <dd>{trainingStageLabels[trainingStage] || trainingStage}</dd>
+                        </div>
+                      )}
+                      {pytorchRecap && (
+                        <div>
+                          <dt>训练框架</dt>
+                          <dd>PyTorch</dd>
                         </div>
                       )}
                       <div>
@@ -789,6 +804,7 @@ export default function RunDetail({
                               <div>
                                 <span>
                                   {assetKinds[output.kind] || output.kind}
+                                  {output.metadata?.format === 'openpi-pytorch' ? ' · PyTorch' : ''}
                                   {typeof step === 'number' && Number.isFinite(step)
                                     ? ` · 第 ${step.toLocaleString('zh-CN')} 步`
                                     : ''}

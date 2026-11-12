@@ -12,9 +12,9 @@ const server = await createServer({
   appType: 'custom',
 });
 try {
-  const { deploymentStartBlockedReason, deploymentDetailReceipt } = await server.ssrLoadModule(
-    '/src/policyDeployment.ts',
-  );
+  const {
+    deployableOutputs, deploymentStartBlockedReason, deploymentDetailReceipt, sourceDeploymentBlocker,
+  } = await server.ssrLoadModule('/src/policyDeployment.ts');
   const { DeploymentStartActions, DeploymentDetail, deploymentDetailTabs } =
     await server.ssrLoadModule('/src/PolicyDeployments.tsx');
   const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
@@ -46,6 +46,19 @@ try {
         ...overrides,
       }),
     );
+
+  await test('Kai0 scorer checkpoints cannot be selected as deployable action policies', () => {
+    const output = { kind: 'MODEL', state: 'READY', node_id: node.id };
+    const run = { template_id: 'recap', node_id: node.id, outputs: [output] };
+    for (const stage of [
+      { training_stage: 'stage_progress' },
+      { code_expectation: { automatic_preflight: { plan: { training_stage: 'stage_progress' } } } },
+    ]) {
+      assert.deepEqual(deployableOutputs({ ...run, ...stage }), []);
+      assert.match(sourceDeploymentBlocker({ ...run, ...stage }), /Kai0 阶段进度估计器/);
+    }
+    assert.deepEqual(deployableOutputs({ ...run, training_stage: 'offline_rl' }), [output]);
+  });
 
   await test('start is available only for stopped or explicitly failed online records without an operation', () => {
     for (const state of ['STOPPED', 'FAILED']) {

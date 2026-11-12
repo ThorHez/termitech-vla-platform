@@ -15,8 +15,8 @@ const server = await createServer({
 try {
   const { PreflightChecks, sharedNormIncompatibilityDetail } = await server.ssrLoadModule('/src/PreflightChecks.tsx');
   const { preflightValidationAsset } = await server.ssrLoadModule('/src/datasetValidationHelpers.ts');
-  const render = (checks, summarizedSharedNormError, showDatasetValidationNotice) => renderToStaticMarkup(
-    React.createElement(PreflightChecks, { checks, summarizedSharedNormError, showDatasetValidationNotice }),
+  const render = (checks, summarizedSharedNormError, datasetValidationNotice) => renderToStaticMarkup(
+    React.createElement(PreflightChecks, { checks, summarizedSharedNormError, datasetValidationNotice }),
   );
   const fps = { name: 'dataset_fps', ok: true, severity: 'warning', code: 'DATASET_FPS_MISMATCH', message: '登记 20 Hz，元信息 60 Hz；使用实际采样率。' };
 
@@ -134,10 +134,22 @@ try {
       { name: 'dataset_timestamps', ok: false, message: validationMessage },
       { name: 'validation', ok: false, message: validationMessage },
       { name: 'norm_contract', ok: false, message: '归一化参数维度不匹配' },
-    ], undefined, true);
+    ], undefined, 'required');
     assert.match(html, /请处理上方的数据集基础校验提示/);
     assert.match(html, /归一化参数维度不匹配/);
     assert.doesNotMatch(html, /DATASET_BASE_VALIDATION_REQUIRED|\/data\/项目 A/);
+  });
+
+  await test('refreshed evidence leaves the affected checks awaiting re-preflight and preserves other failures', () => {
+    const html = render([
+      { name: 'dataset_timestamps', ok: false, message: validationMessage },
+      { name: 'validation', ok: false, code: baseValidationCode },
+      { name: 'norm_contract', ok: false, message: '归一化参数维度不匹配' },
+    ], undefined, 'refreshed');
+    assert.match(html, /class="pending" role="group" aria-label="待重新预检：真实数据时间戳与采样率"/);
+    assert.match(html, /class="pending" role="group" aria-label="待重新预检：预检验证"/);
+    assert.match(html, /class="bad" role="group" aria-label="未通过：归一化参数"/);
+    assert.doesNotMatch(html, /请处理上方的数据集基础校验提示|DATASET_BASE_VALIDATION_REQUIRED/);
   });
 } finally {
   await server.close();

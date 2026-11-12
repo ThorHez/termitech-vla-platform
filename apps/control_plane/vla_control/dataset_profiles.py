@@ -154,11 +154,16 @@ def normalize_dataset_profile(value) -> dict:
     return DatasetProfile.model_validate(value).model_dump(mode="json", exclude_none=True)
 
 
+RECAP_ANNOTATION_SOURCE = "recap_annotation_source"
+
+
 def validate_asset_metadata(kind, metadata) -> dict:
     """Keep existing metadata intact; reserve one validated dataset namespace."""
     clean = deepcopy(metadata)
     if {"_dataset_validation", "_image_registration"} & set(clean):
         raise ValueError("_dataset_validation 与 _image_registration 是服务端保留的校验状态，不能从客户端提交")
+    if RECAP_ANNOTATION_SOURCE in clean:
+        raise ValueError("recap_annotation_source 由关联标注数据接口记录，不能随资产登记提交")
     if "dataset_profile" in clean:
         if kind != "DATASET":
             raise ValueError("只有数据集资产可以登记数据集描述")

@@ -19,6 +19,7 @@ export function PreflightDatasetValidation({
   profileId,
   changed,
   onPendingChange,
+  onRefreshedChange,
 }: {
   asset: Asset;
   node?: Node;
@@ -26,6 +27,7 @@ export function PreflightDatasetValidation({
   profileId: string;
   changed: () => void;
   onPendingChange: (pending: boolean) => void;
+  onRefreshedChange: (refreshed: boolean) => void;
 }) {
   const { can } = useAuth();
   const permitted = can('datasets.validate');
@@ -69,6 +71,9 @@ export function PreflightDatasetValidation({
     setPolling(waiting);
   }, [busy, waiting, onPendingChange]);
   useEffect(() => {
+    onRefreshedChange(permitted && !unavailable && succeeded);
+  }, [onRefreshedChange, permitted, unavailable, succeeded]);
+  useEffect(() => {
     if (!receipt && report?.status === 'PENDING' && report.profile_id === profileId) {
       setReceipt(report);
     }
@@ -83,6 +88,7 @@ export function PreflightDatasetValidation({
 
   if (unavailable) return <p>该数据集已归档或不可用。</p>;
   if (!permitted) return <p>当前账号没有提交数据集校验的权限，请联系操作员或管理员。</p>;
+  if (succeeded) return null;
 
   async function submit() {
     if (!ready || submitting.current) return;
@@ -112,19 +118,15 @@ export function PreflightDatasetValidation({
 
   return (
     <div>
-      {succeeded ? (
-        <p role="status">基础校验已通过，请点击「重新预检」。</p>
-      ) : (
-        <button
-          type="button"
-          className="button small outline"
-          disabled={!ready}
-          onClick={() => void submit()}
-        >
-          {busy || waiting ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />}
-          {busy ? '提交中…' : waiting ? '校验中…' : '刷新数据集校验'}
-        </button>
-      )}
+      <button
+        type="button"
+        className="button small outline"
+        disabled={!ready}
+        onClick={() => void submit()}
+      >
+        {busy || waiting ? <LoaderCircle size={14} className="spin" /> : <RefreshCw size={14} />}
+        {busy ? '提交中…' : waiting ? '校验中…' : '刷新数据集校验'}
+      </button>
       {waiting && (
         <p role="status">
           {report.profile_id === profileId
@@ -132,13 +134,13 @@ export function PreflightDatasetValidation({
             : '该数据集正在其他训练环境校验，请等待完成后再刷新。'}
         </p>
       )}
-      {!busy && !waiting && !succeeded && blockerMessage && <p>{blockerMessage}</p>}
+      {!busy && !waiting && blockerMessage && <p>{blockerMessage}</p>}
       {receipt?.status === 'PENDING' &&
         receipt.profile_id === profileId &&
         report &&
         !current &&
         !waiting && <p role="status">本次校验结果已被新的校验记录替换，请重新刷新校验。</p>}
-      {current && current.status !== 'PENDING' && !succeeded && (
+      {current && current.status !== 'PENDING' && (
         <p role="status">
           {current.error?.message || datasetValidationPresentation(current).label}
         </p>

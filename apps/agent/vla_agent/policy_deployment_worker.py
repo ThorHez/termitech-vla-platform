@@ -6,6 +6,7 @@ import fcntl
 import dataclasses
 import hashlib
 import importlib
+import importlib.util
 import json
 import logging
 import math
@@ -128,9 +129,10 @@ def resolve_inference_config(manifest, directory, registry):
             train_config, _ = prepare_config(spec)
             if generated_training_config(train_config, spec)["sha256"] != manifest["generated_sha256"]:
                 raise ValueError("CONFIG_CHANGED: resolved deployment configuration differs from training")
-        if (type(getattr(train_config, "model", None)).__name__ == "Pi0ValueConfig"
-                or getattr(train_config.data, "training_stage", None) == "value"):
-            raise ValueError("POLICY_VALUE_UNSUPPORTED: a value-only model cannot be served as an action policy")
+        from vla_adapters.recap import ESTIMATOR_MODELS
+        if (type(getattr(train_config, "model", None)).__name__ in ESTIMATOR_MODELS.values()
+                or getattr(train_config.data, "training_stage", None) in ESTIMATOR_MODELS):
+            raise ValueError("POLICY_VALUE_UNSUPPORTED: an estimator cannot be served as an action policy")
         if hasattr(train_config.data, "datasets") and len(train_config.data.datasets) > 1:
             raise ValueError("MULTI_DATASET_DEPLOY_UNSUPPORTED: choose a single inference data contract first")
         if frozen is None:
@@ -222,11 +224,18 @@ def validate_backend_model(manifest, train_config):
     if manifest.get("resolved_backend") != "pytorch":
         return
     model = train_config.model
-    # The registered OpenPI loader constructs PI0Pytorch for all torch files;
-    # FAST/value/memory families must not silently become a different policy.
-    if (type(model).__module__ != "openpi.models.pi0_config" or type(model).__name__ != "Pi0Config"
-            or getattr(model, "action_dim", None) != 32):
-        raise ValueError("POLICY_BACKEND_MODEL_UNSUPPORTED: 当前 PyTorch 加载器仅支持动作维度为 32 的 Pi0/Pi05 配置，请使用匹配的权重与配置")
+    family = (type(model).__module__, type(model).__name__)
+    standard = ("openpi.models.pi0_config", "Pi0Config")
+    dim = getattr(model, "action_dim", None)
+    if family == standard and dim == 32:
+        return
+    if family in {standard, ("openpi.models.pi0_gripper", "Pi0GripperConfig")} and type(dim) is int and dim > 0:
+        try:
+            if importlib.util.find_spec("openpi.models_pytorch.recap") is not None:
+                return
+        except (ImportError, ValueError):
+            pass
+    raise ValueError("POLICY_BACKEND_MODEL_UNSUPPORTED: 当前 PyTorch 训练环境不支持所选策略模型结构或动作维度")
 
 
 def verify_loaded_backend(manifest, policy):

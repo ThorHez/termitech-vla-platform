@@ -67,6 +67,7 @@ from .resource_history import capture_sample, register_routes as register_resour
 from .run_records import delete_run_record, require_replayable_run, require_visible_run
 from .training_metrics import register_routes as register_training_metric_routes
 from .training_resume import freeze_resume_source
+from .recap_annotations import RecapAnnotationInput, link_recap_annotation
 from .deployment_records import register_routes as register_deployment_record_routes
 from .gpu_reservations import (register_routes as register_gpu_reservation_routes, request_owner,
                                require_gpu_access, reservation_owners)
@@ -702,6 +703,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def run_detail(run_id: str):
         with db.read() as session:
             return run_dict(session, require_visible_run(session, run_id))
+
+    @app.post("/api/v1/runs/{run_id}/recap-annotations", dependencies=admin)
+    def recap_annotation_link(run_id: str, body: RecapAnnotationInput, request: Request):
+        with db.write() as session:
+            return asset_dict(link_recap_annotation(session, run_id, body, request))
 
     @app.delete("/api/v1/runs/{run_id}", dependencies=admin, status_code=204)
     def run_delete(run_id: str, request: Request):

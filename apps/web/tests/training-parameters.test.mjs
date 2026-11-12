@@ -15,6 +15,8 @@ try {
   const parameters = await server.ssrLoadModule('/src/trainingParameters.ts');
   const codec = await server.ssrLoadModule('/src/trainingDraft.ts');
   const templates = await server.ssrLoadModule('/src/trainingTemplate.ts');
+  const recap = await server.ssrLoadModule('/src/recap.ts');
+  const recommendations = await server.ssrLoadModule('/src/trainingResourceRecommendations.ts');
   const optional = { type: 'integer', optional: true, default: 2, min: 0 };
   const allSpecs = {
     steps: { type: 'integer', min: 1, max: 1e6, default: 10000 },
@@ -113,6 +115,34 @@ try {
     assert.equal(applied.snapshot.request.dataset_bindings[0].norm_asset_id, '');
     assert.deepEqual(applied.snapshot.request.dataset_bindings[0].processor, source.request.dataset_bindings[0].processor);
     assert.equal(applied.snapshot.advancedRecipe, false);
+  });
+
+  await test('legacy ReCap templates adopt the PyTorch entrypoint and prompt for new model weights', () => {
+    const source = snapshot({ fsdp_devices: 4, ema_decay: .99, num_workers: 3 });
+    source.request.template_id = 'recap';
+    source.request.training_stage = 'stage_progress';
+    source.request.entrypoint = 'scripts/acp/train_stage_progress.py';
+    source.entrypointEdited = true;
+    const original = { ...resources.assets[0], metadata: { format: 'openpi-orbax' } };
+    const applied = templates.applyTrainingTemplate(record(codec.encodeTrainingDraft(source)), {
+      ...resources, assets: [original],
+    });
+    assert.deepEqual(applied.snapshot.request.inputs, {});
+    assert.equal(applied.snapshot.request.entrypoint, undefined);
+    assert.equal(applied.snapshot.entrypointEdited, false);
+    assert.equal(applied.snapshot.request.parameters.fsdp_devices, undefined);
+    assert.equal(applied.snapshot.request.parameters.ema_decay, undefined);
+    assert.equal(applied.snapshot.request.parameters.num_workers, 3);
+    assert.match(applied.issues.join(' '), /model\.safetensors/);
+    assert.equal(recap.recapModelError({ ...original, metadata: undefined }, 'value'), undefined);
+    assert.equal(recap.recapModelError({ ...original, path: '/models/new/model.safetensors',
+      metadata: { format: 'openpi-pytorch', model_role: 'value_estimator' } }, 'value'), undefined);
+    assert.match(recap.recapModelError({ ...original,
+      metadata: { format: 'openpi-pytorch', model_role: 'value_estimator' } }, 'offline_rl'), /不匹配/);
+    assert.equal(recommendations.recommendTrainingResources(4).fsdp_devices, 4);
+    const pytorchResources = recommendations.recommendTrainingResources(4, {}, { fsdp: false });
+    assert.equal(pytorchResources.fsdp_devices, undefined);
+    assert.equal(pytorchResources.num_workers, 8);
   });
 
   await test('legacy draft and template restoration keep missing overrides absent for native inheritance', () => {

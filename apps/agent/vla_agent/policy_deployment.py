@@ -20,6 +20,7 @@ import tempfile
 import time
 
 import psutil
+from vla_adapters.recap import ESTIMATOR_MODELS
 
 from .config import get_profile
 from .runtime_checks import PLATFORM_CREDENTIALS
@@ -291,8 +292,9 @@ def _frozen(config, profile, payload):
         plan = automatic["plan"]
         if automatic["plan_digest"] != canonical_digest(plan):
             raise ValueError("Training preflight digest is invalid")
-        if len(plan.get("datasets", [])) > 1 or expected.get("training_stage") == "value":
-            raise AgentError("POLICY_CONFIG_UNSUPPORTED", "Multi-dataset or value-only training cannot be deployed as an action policy")
+        if (len(plan.get("datasets", [])) > 1 or expected.get("training_stage") in ESTIMATOR_MODELS
+                or plan.get("training_stage") in ESTIMATOR_MODELS):
+            raise AgentError("POLICY_CONFIG_UNSUPPORTED", "Multi-dataset training and estimators cannot be deployed as action policies")
         generated = plan["generated_config"]
         source = generated["source"]
         if len(source.encode()) > 384 * 1024 or hashlib.sha256(source.encode()).hexdigest() != generated["sha256"]:
@@ -303,8 +305,8 @@ def _frozen(config, profile, payload):
         if len(values) != 1 or not isinstance(values[0], dict):
             raise ValueError("Training configuration has no unique frozen request")
         frozen = values[0]
-        if frozen.get("training_stage") == "value":
-            raise AgentError("POLICY_CONFIG_UNSUPPORTED", "Value-only training cannot produce an action policy")
+        if frozen.get("training_stage") in ESTIMATOR_MODELS:
+            raise AgentError("POLICY_CONFIG_UNSUPPORTED", "Estimator training does not produce an action policy")
         current = capture_code(profile, config["roots"], recipe=frozen.get("recipe"),
                                recipe_definition=frozen.get("recipe_definition"), entrypoint=frozen.get("entrypoint"),
                                dataset_bindings=frozen.get("dataset_bindings"), training_stage=frozen.get("training_stage"),

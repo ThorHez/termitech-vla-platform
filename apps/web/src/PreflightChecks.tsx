@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, XCircle } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Circle, XCircle } from 'lucide-react';
 import { DATASET_BASE_VALIDATION_REQUIRED } from './datasetValidationHelpers';
 import type { PreflightCheck } from './types';
 
@@ -45,17 +45,16 @@ export function sharedNormIncompatibilityDetail(message?: string) {
 export function PreflightChecks({
   checks,
   summarizedSharedNormError,
-  showDatasetValidationNotice,
+  datasetValidationNotice,
 }: {
   checks: readonly PreflightCheck[];
   summarizedSharedNormError?: string;
-  showDatasetValidationNotice?: boolean;
+  datasetValidationNotice?: 'required' | 'refreshed';
 }) {
   return (
     <div className="preflight-checks">
       {checks.map((check, index) => {
         const warning = check.ok === true && check.severity === 'warning';
-        const state = !check.ok ? 'bad' : warning ? 'warning' : 'ok';
         const sharedNormDetail = check.ok
           ? undefined
           : sharedNormIncompatibilityDetail(check.message);
@@ -63,7 +62,7 @@ export function PreflightChecks({
           ? '数据集能否共用归一化参数'
           : labels[check.name] || check.name;
         const summarizedDatasetValidation =
-          showDatasetValidationNotice &&
+          datasetValidationNotice &&
           !check.ok &&
           (check.code === DATASET_BASE_VALIDATION_REQUIRED ||
             check.message?.startsWith(`${DATASET_BASE_VALIDATION_REQUIRED}:`));
@@ -72,8 +71,14 @@ export function PreflightChecks({
             ? '详见上方的失败原因。'
             : sharedNormDetail
           : check.message;
-        const message = summarizedDatasetValidation ? '请处理上方的数据集基础校验提示。' : detail;
-        const status = !check.ok ? '未通过' : warning ? '警告' : '通过';
+        const pending = summarizedDatasetValidation && datasetValidationNotice === 'refreshed';
+        const state = pending ? 'pending' : !check.ok ? 'bad' : warning ? 'warning' : 'ok';
+        const message = pending
+          ? '等待重新预检。'
+          : summarizedDatasetValidation
+            ? '请处理上方的数据集基础校验提示。'
+            : detail;
+        const status = pending ? '待重新预检' : !check.ok ? '未通过' : warning ? '警告' : '通过';
         return (
           <div
             className={state}
@@ -81,7 +86,9 @@ export function PreflightChecks({
             role="group"
             aria-label={`${status}：${label}`}
           >
-            {!check.ok ? (
+            {pending ? (
+              <Circle size={17} aria-hidden="true" />
+            ) : !check.ok ? (
               <XCircle size={17} aria-hidden="true" />
             ) : warning ? (
               <AlertTriangle size={17} aria-hidden="true" />

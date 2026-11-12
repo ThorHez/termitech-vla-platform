@@ -95,11 +95,33 @@ try {
   });
 
   await test('ReCap stage settings remain explicit on a new request', () => {
-    const source = { ...fixture(), template_id: 'recap', training_stage: 'offline_rl', stage_config: { acp_dropout: .4 } };
-    const snapshot = helper.retryTrainingSnapshot(source);
-    assert.equal(snapshot.request.training_stage, 'offline_rl');
-    assert.deepEqual(snapshot.request.stage_config, { acp_dropout: .4 });
-    assert.deepEqual(snapshot.editedStageParameters, ['acp_dropout']);
+    for (const [stage, config] of [['offline_rl', { acp_dropout: .4 }], ['stage_progress', { n_step: 50, positive_ratio: .3, stage_count: 2 }]]) {
+      const source = { ...fixture(), template_id: 'recap', training_stage: stage, stage_config: config };
+      const snapshot = helper.retryTrainingSnapshot(source);
+      assert.equal(snapshot.request.training_stage, stage);
+      assert.deepEqual(snapshot.request.stage_config, config);
+      assert.deepEqual(snapshot.editedStageParameters, Object.keys(config));
+    }
+  });
+
+  await test('ReCap retry omits historical JAX-only settings while retaining other controls', () => {
+    for (const advanced of [false, true]) {
+      const source = { ...fixture(), template_id: 'recap', training_stage: 'value',
+        stage_config: { val_ratio: .1 }, entrypoint: 'scripts/train_value.py' };
+      if (advanced) {
+        source.auto_config = null;
+        source.recipe = 'legacy-value';
+      }
+      const snapshot = helper.retryTrainingSnapshot(source);
+      assert.equal(snapshot.advancedRecipe, advanced);
+      assert.equal(snapshot.entrypointEdited, false);
+      assert.equal(snapshot.request.entrypoint, undefined);
+      assert.equal(snapshot.request.parameters.ema_decay, undefined);
+      assert.equal(snapshot.request.parameters.fsdp_devices, undefined);
+      assert.equal(snapshot.request.parameters.steps, source.parameters.steps);
+      assert.equal(source.entrypoint, 'scripts/train_value.py');
+      assert.equal(source.parameters.ema_decay, .99);
+    }
   });
 
   await test('ambiguous or conflicting old dataset mappings require manual configuration rather than inventing a recipe index', () => {

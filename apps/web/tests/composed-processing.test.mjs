@@ -13,7 +13,7 @@ try {
   const helpers = await server.ssrLoadModule('/src/composedProcessing.ts');
   const { composedProcessingErrors: errors, normalizeComposedProcessing: normalize, compositionSchemaKey } = helpers;
   const { readDatasetProfile, datasetProfileErrors, applyComposedProcessing, DatasetProfileForm } = await server.ssrLoadModule('/src/DatasetProfileForm.tsx');
-  const { compositionBindingState, composedChoice, compositionToken } = await server.ssrLoadModule('/src/ComposedDatasetProcessing.tsx');
+  const { compositionBindingState, composedChoice, compositionToken, stageCompositionDraft } = await server.ssrLoadModule('/src/ComposedDatasetProcessing.tsx');
   const { processorParameterErrors, filterDataProcessors } = await server.ssrLoadModule('/src/DataProcessorPicker.tsx');
   const { DatasetProcessing } = await server.ssrLoadModule('/src/DatasetProcessing.tsx');
   const { assetManagedOverridePaths, isAssetManagedField } = await server.ssrLoadModule('/src/recipeFieldPolicy.ts');
@@ -181,6 +181,43 @@ try {
     assert.deepEqual(draft.cameras.map((camera) => camera.key), seed.cameras.map((camera) => camera.key));
     assert.ok(errors(draft).length);
   });
+  await test('new single-view drafts use the wrist slot for the registered wrist field', () => {
+    for (const [key, slot] of [
+      ['observation.left_wrist_0_rgb_0', 'left_wrist_0_rgb'],
+      ['observation.images.hand_right', 'right_wrist_0_rgb'],
+    ]) {
+      const profile = { ...profileFor(spec), cameras: [{ name: '相机', key, kind: 'rgb' }] };
+      assert.equal(helpers.draftComposedProcessing(profile).cameras[0].slot, slot);
+      assert.equal(helpers.umiV4ComposedPreset(profile, 'single').cameras[0].slot, slot);
+    }
+  });
+  await test('named views keep their slots across camera order and unnamed fallback', () => {
+    const left = ['observation.images.hand_left', 'left_wrist_0_rgb'];
+    const right = ['observation.images.hand_right', 'right_wrist_0_rgb'];
+    const head = ['observation.images.top_head', 'base_0_rgb'];
+    const unnamed = ['observation.images.camera0_rgb', 'base_0_rgb'];
+    for (const entries of [[right, head, left], [left, right, head], [unnamed, right, left]]) {
+      const profile = { ...profileFor(spec), cameras: entries.map(([key]) => ({ name: key, key, kind: 'rgb' })) };
+      for (const draft of [helpers.draftComposedProcessing(profile), helpers.umiV4ComposedPreset(profile, 'bimanual')]) {
+        assert.deepEqual(draft.cameras.map(({ key, slot }) => [key, slot]), entries);
+      }
+    }
+  });
+  await test('existing camera mappings persist until explicitly matched by source field', async () => {
+    const key = 'observation.left_wrist_0_rgb_0';
+    const camera = { ...spec.cameras[0], key, slot: 'base_0_rgb', layout: 'hwc', time_index: 0 };
+    const saved = { ...spec, model_transform: 'flat_state', cameras: [camera] };
+    const profile = profileFor(saved);
+    assert.deepEqual(helpers.updateComposedProcessingFromProfile(profile, saved), saved);
+    const expanded = { ...profile, cameras: [{ name: '右腕', key: 'observation.images.hand_right', kind: 'rgb' }, ...profile.cameras] };
+    assert.deepEqual(helpers.updateComposedProcessingFromProfile(expanded, saved).cameras.map(({ slot }) => slot), ['right_wrist_0_rgb', 'base_0_rgb']);
+    assert.deepEqual(helpers.matchComposedCameraSlots(saved.cameras), [{ ...camera, slot: 'left_wrist_0_rgb' }]);
+    assert.equal(saved.cameras[0].slot, 'base_0_rgb');
+    const { ComposedProcessingEditor } = await server.ssrLoadModule('/src/ComposedProcessingEditor.tsx');
+    const render = (value) => renderToStaticMarkup(React.createElement(ComposedProcessingEditor, { value, profile, onChange() {} }));
+    assert.match(render(saved), /<button[^>]*class="button outline small">按相机字段匹配槽位<\/button>/);
+    assert.match(render({ ...saved, cameras: helpers.matchComposedCameraSlots(saved.cameras) }), /<button[^>]*disabled=""[^>]*>按相机字段匹配槽位<\/button>/);
+  });
   await test('UMI sample buttons provide explicit structure while critical facts remain user supplied', () => {
     const seed = profileFor(spec); seed.action_mode = 'unknown';
     const single = helpers.umiV4ComposedPreset(seed, 'single');
@@ -332,6 +369,19 @@ try {
     assert.ok(stateFor({ stage: 'offline_rl' }).errors.some((error) => error.includes('is_positive')));
     const supervised = { ...spec, aux_keys: ['value_target', 'is_positive'] };
     assert.deepEqual(stateFor({ stage: 'value', binding: configuredBinding(supervised) }).errors, []);
+  });
+  await test('Kai0 requires physical stage progress while the derived ACP input uses is_positive', () => {
+    const input = { ...spec, aux_keys: ['stage_progress_gt'] };
+    const derived = { ...input, aux_keys: [...input.aux_keys, 'is_positive'] };
+    assert.ok(stateFor({ stage: 'stage_progress' }).errors.some((error) => error.includes('stage_progress_gt')));
+    assert.equal(stateFor({ stage: 'stage_progress', binding: configuredBinding(input) }).valid, true);
+    assert.equal(stateFor({ stage: 'stage_progress', binding: configuredBinding({ ...input, model_transform: 'flat_state' }) }).valid, false);
+    assert.equal(stateFor({ stage: 'offline_rl', binding: configuredBinding(input) }).valid, false);
+    assert.equal(stateFor({ stage: 'offline_rl', binding: configuredBinding(derived) }).valid, true);
+    const profile = { ...profileFor(input), feature_keys: ['stage_progress_gt', 'is_positive'] };
+    assert.deepEqual(stageCompositionDraft(profile, 'stage_progress').aux_keys, ['stage_progress_gt']);
+    assert.deepEqual(stageCompositionDraft(profile, 'offline_rl').aux_keys, ['is_positive']);
+    assert.deepEqual(stageCompositionDraft({ ...profile, feature_keys: [] }, 'stage_progress').aux_keys, []);
   });
   await test('canonical comparison preserves row order but tolerates JSON property order', () => {
     const reordered = Object.fromEntries(Object.entries(spec).reverse());

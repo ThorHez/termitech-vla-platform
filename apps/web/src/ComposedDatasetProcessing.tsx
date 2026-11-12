@@ -10,6 +10,7 @@ import {
   type ImageLayoutEdits,
 } from './imageLayout';
 import { useDatasetImageMetadata } from './useDatasetImageMetadata';
+import { recapStageSupervision, trainingStageLabels } from './recap';
 import { trainingNormalizationLabel } from './trainingNormalization';
 import {
   fillMissingCompositionRepresentations,
@@ -33,6 +34,7 @@ import type {
   RecipeDatasetSlot,
   RecipeLiteral,
   TrainingNormalizationMethod,
+  TrainingStage,
   DataProcessorChoice,
   RunRequest,
 } from './types';
@@ -65,6 +67,18 @@ export function composedChoice(
 
 export function trainingProfileSeed(dataset?: Asset): ProcessingProfileSeed {
   return readDatasetProfile(dataset?.metadata?.dataset_profile) || emptyDatasetProfile();
+}
+
+export function stageCompositionDraft(
+  profile: ProcessingProfileSeed,
+  stage: 'sft' | TrainingStage,
+  purpose: 'training' | 'norm' = 'training',
+) {
+  const spec = trainingCompositionDraft(profile, purpose);
+  const supervision = stage === 'sft' ? undefined : recapStageSupervision[stage];
+  if (purpose === 'training' && supervision && profile.feature_keys?.includes(supervision))
+    spec.aux_keys.push(supervision);
+  return spec;
 }
 
 export function fillRunRepresentationDefaults(
@@ -153,7 +167,7 @@ export function compositionBindingState({
   entries: DataProcessorEntry[];
   slots: RecipeDatasetSlot[];
   index: number;
-  stage: 'sft' | 'value' | 'offline_rl';
+  stage: 'sft' | TrainingStage;
   imageFeatures?: readonly ImageFeature[];
   purpose?: 'training' | 'norm';
 }) {
@@ -181,10 +195,13 @@ export function compositionBindingState({
       factory?.reason ||
         '尚未确认当前训练环境支持版本 1 的 ComposableDataConfig，请读取处理器目录后继续预检。',
     );
-  if (spec && stage === 'value' && !spec.aux_keys.includes('value_target'))
-    errors.push('价值训练需要在本次处理方案中声明真实 value_target 辅助字段。');
-  if (spec && stage === 'offline_rl' && !spec.aux_keys.includes('is_positive'))
-    errors.push('离线强化学习需要在本次处理方案中声明真实 is_positive 辅助字段。');
+  const supervision = stage === 'sft' ? undefined : recapStageSupervision[stage];
+  if (spec && stage !== 'sft' && supervision && !spec.aux_keys.includes(supervision))
+    errors.push(
+      `${trainingStageLabels[stage]}需要在本次处理方案中声明真实 ${supervision} 辅助字段。`,
+    );
+  if (spec && stage === 'stage_progress' && spec.model_transform !== 'standard')
+    errors.push('Kai0 阶段进度估计器需要标准模型变换。');
   const expected = spec ? composedChoice(spec, purpose) : undefined;
   const matches =
     !!expected &&
@@ -211,7 +228,7 @@ export function ComposedDatasetProcessing(props: {
   entries: DataProcessorEntry[];
   slots: RecipeDatasetSlot[];
   index: number;
-  stage: 'sft' | 'value' | 'offline_rl';
+  stage: 'sft' | TrainingStage;
   readOnly?: boolean;
   normalizationOverride?: TrainingNormalizationMethod;
   purpose?: 'training' | 'norm';
@@ -222,6 +239,8 @@ export function ComposedDatasetProcessing(props: {
   const images = useDatasetImageMetadata(props.node, props.dataset, props.purpose !== 'norm');
   const features = images.inspection?.features;
   const state = compositionBindingState({ ...props, imageFeatures: features });
+  const spec = state.spec;
+  const supervision = props.stage === 'sft' ? undefined : recapStageSupervision[props.stage];
   const profile = { ...trainingProfileSeed(props.dataset), image_features: features };
   const manualLayouts = useRef(new Set<string>());
   const manualRepresentations = useRef(new Set<string>());
@@ -356,7 +375,7 @@ export function ComposedDatasetProcessing(props: {
             <button
               type="button"
               className="button outline small"
-              onClick={() => update(trainingCompositionDraft(profile, props.purpose))}
+              onClick={() => update(stageCompositionDraft(profile, props.stage, props.purpose))}
             >
               从登记字段标签重建草稿
             </button>
@@ -367,6 +386,24 @@ export function ComposedDatasetProcessing(props: {
                 onClick={() => update(legacy as ComposedProcessingSpec)}
               >
                 导入资产中的历史组合方案
+              </button>
+            )}
+            {spec && supervision && !spec.aux_keys.includes(supervision) && (
+              <button
+                type="button"
+                className="button outline small"
+                onClick={() => update({ ...spec, aux_keys: [...spec.aux_keys, supervision] })}
+              >
+                使用已有 {supervision} 字段
+              </button>
+            )}
+            {props.stage === 'stage_progress' && spec && spec.model_transform !== 'standard' && (
+              <button
+                type="button"
+                className="button outline small"
+                onClick={() => update({ ...spec, model_transform: 'standard' })}
+              >
+                使用标准模型变换
               </button>
             )}
           </div>

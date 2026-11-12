@@ -84,6 +84,19 @@ def test_single_norm_file_is_copied_and_asset_path_identifies_file(asset):
     assert [p.name for p in final.iterdir()] == [source.name]
 
 
+def test_sync_creates_missing_nested_parent_and_reuses_it_for_another_asset(asset):
+    parent = asset[2] / '新建' / '模型 备份'
+    assert not parent.parent.exists()
+
+    first = transfer(asset, target_parent=str(parent), target_name='first')
+    second = transfer(asset, target_parent=str(parent), target_name='second', transfer_id='asset-456')
+
+    for result, name in [(first, 'first'), (second, 'second')]:
+        final = parent / name
+        assert result['target_path'] == str(final)
+        assert (final / 'data' / 'episode.parquet').read_bytes() == (asset[1] / 'data' / 'episode.parquet').read_bytes()
+
+
 def test_empty_registered_directory_is_preserved(asset):
     source = asset[0] / 'empty'
     (source / 'camera-0').mkdir(parents=True)

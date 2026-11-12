@@ -1,6 +1,6 @@
 # 首个可运行版本：实现契约
 
-设计文档定义完整目标，本契约固定当前实现的接口。当前版本完成共享工作空间中按角色授权的资源、资产、预检、单阶段执行、取消、监控及代码追溯。ReCap 两个训练阶段分别创建独立作业；项目隔离、跨阶段自动编排和 checkpoint 恢复待后续验收。
+设计文档定义完整目标，本契约固定当前实现的接口。当前版本支持共享工作空间中按角色授权的资源、资产、预检、单阶段执行、取消、监控及代码追溯。ReCap 分阶段提交作业，Kai0 阶段进度作业同时生成后续 ACP 可用的派生数据。
 
 ## 代码布局
 
@@ -89,7 +89,7 @@ Run 状态 QUEUED → STARTING → RUNNING → SUCCEEDED/FAILED；取消 CANCELL
 
 `vla_protocol` 提供 `PROTOCOL_VERSION = 1` 和 `canonical_digest(value)`；无需依赖 ORM。Agent 与 API 可使用普通 dict 避免共享持久化模型。
 
-`vla_adapters` 提供 `get_templates() -> list[dict]`；`resolve_recipe(profile,requested=None,require_validated=True) -> str`；`build_launch(profile,template_id,inputs,parameters,output_dir,gpu_uuids,recipe=None,recipe_definition=None,entrypoint=None,dataset_bindings=None,training_stage=None,stage_config=None) -> dict`，返回 `{argv,cwd,env}`。控制面与 Agent 共用配方解析规则；`require_validated` 参数保留调用兼容，手工 `metadata.validated_recipes`、`validated_recipe_revisions` 和 `validated` 不再作为启动门槛。新接入环境可没有默认配方，SFT 预检必须明确配方，Agent 负责自动检查并返回绑定本次请求的证据，提交时再次校验。调用本包受控 wrapper，不接受 shell。`smoke` 为显式测试模板，记录为测试成果；真实 SFT 入口为 `openpi-sft`，调用已安装的 openpi 与训练脚本。ReCap 返回 AVAILABLE 并提供 value/offline_rl 阶段配置，复用 openpi-sft 本机运行环境；MEM/RLT 仍返回 PLANNED。AVAILABLE 只表示开放配置与预检入口，不表示真实算法训练已验收。
+`vla_adapters` 提供 `get_templates() -> list[dict]`；`resolve_recipe(profile,requested=None,require_validated=True) -> str`；`build_launch(profile,template_id,inputs,parameters,output_dir,gpu_uuids,recipe=None,recipe_definition=None,entrypoint=None,dataset_bindings=None,training_stage=None,stage_config=None) -> dict`，返回 `{argv,cwd,env}`。控制面与 Agent 共用配方解析规则；`require_validated` 参数保留调用兼容，手工 `metadata.validated_recipes`、`validated_recipe_revisions` 和 `validated` 不再作为启动门槛。新接入环境可没有默认配方，SFT 预检必须明确配方，Agent 负责自动检查并返回绑定本次请求的证据，提交时再次校验。调用本包受控 wrapper，不接受 shell。`smoke` 为显式测试模板，记录为测试成果；真实 SFT 入口为 `openpi-sft`，调用已安装的 openpi 与训练脚本。ReCap 返回 AVAILABLE，提供 `value`、`stage_progress` 和 `offline_rl` 阶段配置，复用 openpi-sft 本机运行环境。MEM/RLT 仍返回 PLANNED。AVAILABLE 表示开放配置与预检入口，真实算法训练需要单独验收。
 
 SFT 与 ReCap `code_snapshot.automatic_preflight` 固定 `{schema_version:1,scope:"configuration_and_local_assets",plan,plan_digest}`。`plan` 包含实际入口、全部数据集和归一化参数、模型检查点、输入、参数与 GPU 数量；Agent 使用指定训练解释器解析配置，检查受管路径、数据协议、模型与输出空间，不初始化 GPU 或启动训练。逐项检查包含 `recipe_configuration/data_contract/norm_contract/model_checkpoint/training_entrypoint/output_storage/gpu_capacity`。提交验证完整证据与请求绑定，实际启动再次生成并比较计划；旧 Agent 或旧预检缺少证据时需要升级并重新预检。此证据不表示梯度更新、checkpoint 保存或训练效果已经验收。
 
@@ -121,17 +121,18 @@ SFT 与 ReCap `code_snapshot.automatic_preflight` 固定 `{schema_version:1,scop
 
 ## ReCap 分阶段训练契约
 
-`template_id:recap` 必须选择 `training_stage:value|offline_rl`，`stage_config` 仅包含该阶段支持的字段；省略/null 规范化为 `{}`，保留配方值，不由 API 补入阶段默认值。其他模板拒绝非 null 的阶段字段。阶段不修改已登记 profile，使用 `runtime_adapter:openpi-sft` 匹配本机环境；每次作业仅执行所选训练阶段，不自动串联标注或后续训练。
+`template_id:recap` 必须选择 `training_stage:value|stage_progress|offline_rl`。`stage_config` 仅包含所选阶段支持的字段，省略或传入 null 时沿用配方值。新建 ReCap 作业统一使用 PyTorch，复用 `runtime_adapter:openpi-sft` 登记的本机环境。`stage_progress` 作业包含估计器训练和离线标注，ACP 由用户选择派生数据后单独提交。
 
 | 阶段 | 输入协议与模型 | 独立阶段参数 | 默认项目内入口 |
 | --- | --- | --- | --- |
-| `value` 价值函数训练 | 已含有限 `value_target` 的数据、初始权重及逐组归一化统计；配方模型必须为 `Pi0ValueConfig`，数据映射保留 `value_target` | `val_ratio` 数值 0–0.9；`eval_interval` 整数 1–1000000；`eval_batches` 整数 1–10000 | 单数据集 `scripts/train_value.py`；多数据集 `scripts/train_value_multi_dataset.py` |
-| `offline_rl` 离线强化学习／ACP | 已完成离线优势标注的派生数据、初始策略权重及逐组归一化统计；必须为读取 `is_positive` 的 ACP 策略配方，拒绝价值模型配方 | `acp_dropout` 数值 0–1，覆盖每个数据工厂的优势条件丢弃概率 | 单数据集 `scripts/train.py`；多数据集 `scripts/train_multi_dataset.py` |
+| `value` 价值函数训练 | 已含有限 `value_target` 的数据、初始权重及逐组归一化统计。配方模型为 `Pi0ValueConfig`，数据映射保留 `value_target` | `val_ratio` 数值 0–0.9，`eval_interval` 整数 1–1000000，`eval_batches` 整数 1–10000 | `scripts/acp/train_recap_pytorch.py` |
+| `stage_progress` Kai0 阶段进度与优势标注 | 单个 LeRobot 数据集，含 `[0,1]` 内的 `stage_progress_gt` 和真实帧、轨迹及任务索引。使用 `Pi0StageProgressConfig`、PyTorch π0.5 初始权重与对应的归一化统计 | `n_step` 优势窗口，默认 50 帧。`positive_ratio` 每阶段正例比例，默认 0.3。`stage_count` 阶段数，默认 2 | `scripts/acp/train_recap_pytorch.py` |
+| `offline_rl` 离线强化学习／ACP | 已完成离线优势标注的派生数据、初始策略权重及逐组归一化统计。ACP 配方读取 `is_positive` | `acp_dropout` 数值 0–1，覆盖每个数据工厂的优势条件丢弃概率 | `scripts/acp/train_recap_pytorch.py` |
 
-两阶段均要求显式 `dataset_bindings` 与 `inputs:{model:id}`，逐行绑定同机 DATASET/NORM 资产、原配方处理项和混采权重，不能省略绑定而隐含使用配方中的其他数据。公共训练步数、batch、学习率和 GPU 数量仍按模板规则校验；阶段参数拒绝未知字段、布尔伪数值、非有限数值及越界值。
+三个阶段均要求显式 `dataset_bindings` 与 `inputs:{model:id}`，逐行绑定同机 DATASET/NORM 资产及处理方式。公共训练步数、batch、学习率和 GPU 数量按模板规则校验，阶段参数拒绝未知字段、布尔伪数值、非有限数值及越界值。
 
-训练入口保持项目内相对 `.py` 路径、真实路径边界、`main(config)`／`init_wandb` 接口及源码摘要校验。ReCap 另外拒绝价值阶段使用已知策略入口、ACP 使用已知价值入口、多数据集价值阶段使用单数据集价值入口，以及 `train_advantage.py`、`train_multi_dataset_hybrid.py`。手选其他入口仍须通过实际配方、接口和阶段数据协议检查，文件存在本身不构成阶段匹配证明。
+初始权重使用登记范围内的 `model.safetensors` 文件或其所在目录。训练入口和相关 PyTorch 源码摘要在预检与启动时核对。多卡训练使用单机 DDP，按 GPU 数切分全局 batch。新作业的数字步 checkpoint 包含 `model.safetensors`、`recap_checkpoint.json` 和归一化资产。历史 JAX 作业保留原执行记录与部署行为。
 
-Agent 在 CPU 自动预检中核对模型类型、权重加载器和每组实际 parquet 的映射列、监督字段及有效标签；每组最多抽取 16 个均匀分布文件的前 64 行监督列，记录抽查范围，不声称遍历全部数据。价值阶段还检查入口实际使用的 `~/.cache/jax` 可写性。输出 `recap_stage` 检查和 `plan.recap_stage_contract:{stage,model_type,loader_type,datasets}`。`training_stage/stage_config` 同时冻结在请求、代码快照、runtime digest 和自动计划，经 PREFLIGHT/START 传递；提交与启动复核，阶段、参数或数据证据漂移时拒绝或取消，旧 Agent 缺少阶段证据不能返回 READY。无新增 Run 数据库列；任务详情从冻结快照恢复阶段配置。
+Agent 在 CPU 自动预检中核对模型类型、PyTorch 权重文件和实际 parquet 的映射列及监督字段。每组最多抽取 16 个均匀分布文件的前 64 行监督列。`recap_stage_contract` 记录阶段、后端、模型类型、权重加载方式及数据证据。阶段、参数和源码摘要随预检计划冻结，启动时复核。
 
-ACP 仅消费已登记的标注派生数据，不会自动运行 `lerobot_value_infer.py`，也不会向原始数据写入目标列或优势标签。目标列准备、价值模型推理与优势标注、派生版本发布及血缘仍是独立接入边界。配置入口可用、CPU 预检通过或测试 fixture 成功均不等于真实 ReCap 训练验收；真实价值模型与 ACP 策略的梯度、指标、checkpoint、取消及恢复边界需分别记录。
+回报价值路线的 `value_target` 准备和 `lerobot_value_infer_pytorch.py` 标注在训练作业外执行。Kai0 路线在最终估计器 checkpoint 保存后生成 `stage_advantage_dataset`，以首帧为锚计算 `absolute_advantage`，按阶段分位数写入 `is_positive`。派生目录保留原任务字段和视频，`meta/stage_advantage.json` 记录窗口、阈值与实际标签数量。成功作业登记估计器 checkpoint 和带来源血缘的派生数据资产。ACP 读取两条路线产出的 `is_positive`。估计器 checkpoint 用于评分，动作策略部署使用 ACP 的 checkpoint。

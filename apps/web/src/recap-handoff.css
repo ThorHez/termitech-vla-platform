@@ -1,0 +1,67 @@
+.recap-handoff-panel {
+  margin-bottom: 16px;
+}
+
+.recap-handoff-rows {
+  display: grid;
+  gap: 8px;
+  padding: 0 16px 14px;
+}
+
+.recap-handoff-row,
+.recap-handoff-attach,
+.recap-handoff-paths {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+
+.recap-handoff-row {
+  padding: 8px 12px;
+  border: 1px solid var(--border-default, #e7ecf0);
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.recap-handoff-row span,
+.recap-handoff-attach .field {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.recap-handoff-paths {
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  border-radius: 6px;
+  background: var(--bg-subtle, #f6fafb);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.recap-handoff-command {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.recap-handoff-command textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border-default, #e7ecf0);
+  border-radius: 6px;
+  background: var(--bg-subtle, #f6fafb);
+  color: var(--text-primary, #24333f);
+  font:
+    11px/1.6 'SFMono-Regular',
+    Consolas,
+    'Liberation Mono',
+    monospace;
+  resize: vertical;
+}
+
+.recap-handoff-attach {
+  align-items: center;
+  margin-top: 14px;
+}

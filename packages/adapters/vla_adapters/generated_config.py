@@ -12,8 +12,10 @@ from pathlib import Path
 
 if __package__:
     from .automatic_config import normalize_auto_config
+    from .recap import uses_torch_recap
 else:
     from automatic_config import normalize_auto_config
+    from recap import uses_torch_recap
 
 
 _VALUE_FIELDS = {"c_fail_coef", "value_clip_min", "value_clip_max", "episode_metadata_path", "task_max_lengths"}
@@ -24,6 +26,8 @@ _TASK_FIELDS = {"shellgame_cup_eval", "shellgame_memory_classifier", "uot"}
 
 def _recipe_family(spec, entrypoint):
     """Classify registered entrypoints; custom entrypoints remain conservative."""
+    if uses_torch_recap(spec):
+        return "recap_pytorch"
     selected = entrypoint or spec.get("entrypoint")
     if selected is None:
         return "value" if spec.get("training_stage") == "value" else "sft"
@@ -100,7 +104,8 @@ def _resolved_digest(config, output_root):
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return {"python_type": type(value).__module__ + "." + type(value).__qualname__,
                     **{field.name: project(getattr(value, field.name), depth + 1)
-                       for field in dataclasses.fields(value)[:128]}}
+                       for field in dataclasses.fields(value)[:128]
+                       if field.name != "recap_training_stage" or getattr(value, field.name) is not None}}
         if type(value) in {list, tuple}:
             rows = [project(item, depth + 1) for item in value[:128]]
             if len(value) > 128:
@@ -135,7 +140,8 @@ def configuration_snapshot(config):
             return str(value)[:4096]
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return {"_type": type(value).__module__ + "." + type(value).__qualname__,
-                    **{field.name: convert(getattr(value, field.name), depth + 1) for field in dataclasses.fields(value)[:128]}}
+                    **{field.name: convert(getattr(value, field.name), depth + 1) for field in dataclasses.fields(value)[:128]
+                       if field.name != "recap_training_stage" or getattr(value, field.name) is not None}}
         if isinstance(value, (tuple, list)):
             return {"items": [convert(item, depth + 1) for item in value[:128]], "truncated": len(value) > 128}
         if isinstance(value, dict):
@@ -155,6 +161,7 @@ def generated_training_config(config, spec, *, entrypoint=None):
     """
     output_root = str(Path(spec["output_dir"]).resolve())
     family = _recipe_family(spec, entrypoint)
+    value_family = family == "value" or family == "recap_pytorch" and spec.get("training_stage") == "value"
     parameters = spec.get("parameters") or {}
     root_explicit = {"steps": "num_train_steps", "learning_rate": "lr_schedule", "warmup_steps": "lr_schedule",
                      "decay_steps": "lr_schedule", "decay_lr": "lr_schedule", "clip_gradient_norm": "optimizer"}
@@ -177,11 +184,11 @@ def generated_training_config(config, spec, *, entrypoint=None):
             if not path:
                 known_root = type(value).__module__ == "openpi.training.config" and type(value).__name__ == "TrainConfig"
                 if known_root and not required and family != "custom":
-                    if field.name in _VALUE_FIELDS and family != "value":
+                    if field.name in _VALUE_FIELDS and not value_family:
                         continue
-                    if field.name in _EVAL_FIELDS and family not in {"value", "mem"}:
+                    if field.name in _EVAL_FIELDS and not value_family and family != "mem":
                         continue
-                    if field.name in _PYTORCH_FIELDS and family != "pytorch":
+                    if field.name in _PYTORCH_FIELDS and family not in {"pytorch", "recap_pytorch"}:
                         continue
                     if field.name == "log_perf_metrics" and family not in {"mem", "uot"}:
                         continue
@@ -190,6 +197,8 @@ def generated_training_config(config, spec, *, entrypoint=None):
                 pinned |= field.name in explicit_fields or field.name in {"name", "model", "data", "weight_loader", "optimizer", "lr_schedule"}
             if path == ("model",):
                 pinned |= field.name in {"pi05", "action_dim", "action_horizon"}
+                if spec.get("training_stage") == "stage_progress":
+                    pinned |= field.name in {"n_step", "positive_ratio", "stage_count"}
             if (type(value).__module__ == "openpi.training.config"
                     and type(value).__name__ == "ComposableDataConfig" and family != "custom"):
                 if field.name == "acp_dropout" and not required and value.training_stage != "offline_rl":
@@ -213,7 +222,8 @@ def generated_training_config(config, spec, *, entrypoint=None):
     # Keep the complete validated request needed by prepare_config. Exclude the
     # runtime attempt path and digest (which would otherwise be self-referential).
     keys = ("code_dir", "recipe", "inputs", "parameters", "gpu_count", "dataset_bindings", "auto_config",
-            "recipe_definition", "entrypoint", "template_id", "training_stage", "stage_config", "allowed_roots", "resume_source")
+            "recipe_definition", "entrypoint", "template_id", "training_stage", "stage_config", "allowed_roots", "resume_source",
+            "recap_backend")
     frozen = {key: spec[key] for key in keys if key in spec}
     if spec.get("normalization_method") is not None:
         frozen["normalization_method"] = spec["normalization_method"]

@@ -30,6 +30,8 @@ if __package__:
     from .dataset_timestamps import require_cached_dataset_timestamps
     from .submission_validation import MODE, require_cached_dataset_source, submission_evidence
     from .entrypoints import read_entrypoint, validate_entrypoint
+    from .recap import RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, recap_model_matches, uses_torch_recap
+    from .recap_checkpoint import RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
     from .recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
     from .resume import normalize_resume_source
     from .runtime_options import normalize_normalization_method
@@ -46,6 +48,8 @@ else:
     from dataset_timestamps import require_cached_dataset_timestamps
     from submission_validation import MODE, require_cached_dataset_source, submission_evidence
     from entrypoints import read_entrypoint, validate_entrypoint
+    from recap import RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, recap_model_matches, uses_torch_recap
+    from recap_checkpoint import RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
     from recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
     from resume import normalize_resume_source
     from runtime_options import normalize_normalization_method
@@ -262,7 +266,7 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
             raise ValueError("COMPOSITION_BINDING_MISMATCH: 实际组合处理配置与本次冻结的训练数据绑定不一致")
         validate_composition_profile_input(registered_profile, composition, norm_stats=norm_stats)
         model_type = type(model_config).__name__
-        if model_type not in {"Pi0Config", "Pi0GripperConfig", "Pi0ValueConfig"}:
+        if model_type not in {"Pi0Config", "Pi0GripperConfig", "Pi0ValueConfig", STAGE_PROGRESS_MODEL}:
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 组合处理首版支持标准 Pi0/Pi05、Value 和 Gripper 模型，MEM/Hybrid 使用原处理器")
         horizon, action_dim = getattr(model_config, "action_horizon", None), getattr(model_config, "action_dim", None)
         if type(horizon) is not int or horizon <= 0 or type(action_dim) is not int or action_dim <= 0:
@@ -275,9 +279,9 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: Pi0 展平状态宽度超过模型 action_dim，禁止截断")
         stage, _ = stage_request(spec)
         stage = stage or "sft"
-        if getattr(factory, "training_stage", None) != stage or (model_type == "Pi0ValueConfig") != (stage == "value"):
+        if getattr(factory, "training_stage", None) != stage or not recap_model_matches(stage, model_type):
             raise ValueError("COMPOSITION_STAGE_UNSUPPORTED: 组合处理的模型/阶段与任务不一致")
-        required_aux = {"value": "value_target", "offline_rl": "is_positive"}.get(stage)
+        required_aux = RECAP_SUPERVISION.get(stage)
         if required_aux and required_aux not in composition["aux_keys"]:
             raise ValueError("COMPOSITION_STAGE_UNSUPPORTED: 组合处理缺少阶段监督字段 " + required_aux)
         describe = getattr(factory, "processing_contract", None)
@@ -620,8 +624,48 @@ def auto_shared_norm_contract(config, spec):
             "status": "pending_training_start", "source_norm_assets": "reference_only"}
 
 
-def model_contract(spec):
+def _torch_recap_model_contract(checkpoint, spec, model_config):
+    weights = recap_weight_file(checkpoint)
+    if not weights.is_file() or weights.is_symlink() or local_path(weights, spec) != weights:
+        raise ValueError("MODEL_FORMAT: PyTorch ReCap 需要 model.safetensors 文件或包含该文件的检查点目录")
+    tensors, size, modified, header_sha = safetensors_header(weights)
+    dimension = model_config.action_dim
+    action_in = tensors.get("action_in_proj.weight", {}).get("shape", [])
+    action_out = tensors.get("action_out_proj.weight", {}).get("shape", [])
+    state = tensors.get("state_proj.weight", {}).get("shape")
+    if (len(action_in) != 2 or action_in[1] != dimension or action_out != [dimension, action_in[0]]
+            or (state is not None if model_config.pi05 else state != action_in)):
+        raise ValueError("MODEL_FORMAT: PyTorch 检查点的 Pi0/Pi0.5 结构或 action_dim 与本次配置不匹配")
+    stage = spec["training_stage"]
+    roles = set()
+    if any(name.startswith("value_head.") for name in tensors):
+        roles.add(STAGE_PROGRESS)
+    if any(name.startswith(("value_fc1.", "value_fc2.", "final_norm.")) for name in tensors):
+        roles.add("value")
+    if roles - {stage}:
+        raise ValueError("MODEL_FORMAT: 所选 PyTorch 权重的估计器类型与本次 ReCap 阶段不匹配")
+    if any(name.startswith("gripper_binary_head.") for name in tensors) and type(model_config).__name__ != "Pi0GripperConfig":
+        raise ValueError("MODEL_FORMAT: 所选 PyTorch 权重包含二值夹爪头，请选择对应的 Pi0GripperConfig 配方")
+    metadata = [{"path": str(weights), "sha256": header_sha, "scope": "safetensors_header"}]
+    commit = weights.parent / RECAP_TORCH_COMMIT
+    if commit.exists() or commit.is_symlink():
+        if commit.is_symlink():
+            raise ValueError("MODEL_FORMAT: PyTorch ReCap 检查点记录不能使用符号链接")
+        receipt, sha = read_json(commit, spec, limit=64 * 1024)
+        step = receipt.get("step")
+        if (type(step) is not int or step < 0 or not recap_commit_matches(receipt, step)
+                or receipt.get("stage") not in (stage, "offline_rl")):
+            raise ValueError("MODEL_FORMAT: 所选 PyTorch ReCap 检查点记录与本次阶段不匹配")
+        metadata.append({"path": str(commit), "sha256": sha})
+    manifest = fingerprint([weights.name, size, modified, header_sha, metadata[1:]])
+    return {"path": str(weights), "checkpoint_path": str(checkpoint), "metadata": metadata,
+            "parameter_bytes": size, "file_manifest_digest": manifest, "format": RECAP_TORCH_FORMAT}, size
+
+
+def model_contract(spec, model_config=None):
     checkpoint = local_path(spec["inputs"]["model"]["path"], spec)
+    if uses_torch_recap(spec):
+        return _torch_recap_model_contract(checkpoint, spec, model_config)
     params = checkpoint / "params" if (checkpoint / "params").is_dir() else checkpoint
     params = local_path(params, spec)
     rows, parameter_bytes, manifest = file_manifest(params, spec)
@@ -720,7 +764,7 @@ def storage_estimate(config, model, reference_bytes):
     # Existing train_state provides the best local estimate. A params-only input
     # needs a conservative allowance for optimizer state and EMA as well.
     parameter_bytes = model["parameter_bytes"]
-    checkpoint_bytes = max(reference_bytes, parameter_bytes * 5)
+    checkpoint_bytes = max(reference_bytes, parameter_bytes * (6 if model.get("format") == RECAP_TORCH_FORMAT else 5))
     interval = getattr(config, "save_interval", 1000)
     keep_period = getattr(config, "keep_period", None)
     if type(interval) is not int or interval <= 0:
@@ -824,12 +868,14 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
     stage_contract = inspect_stage(config, spec, factories, datasets)
     if stage_contract is not None:
         passed("recap_stage", "已核对 ReCap 阶段、模型和实际 parquet 监督字段：" + stage)
-    model, reference = model_contract(spec)
-    loader_path = getattr(config.weight_loader, "params_path", config.weight_loader)
-    if not isinstance(loader_path, (str, Path)) or Path(loader_path).resolve() != Path(model["path"]):
+    pytorch = uses_torch_recap(spec)
+    model, reference = model_contract(spec, config.model) if pytorch else model_contract(spec)
+    loader_path = getattr(config, "pytorch_weight_path", None) if pytorch else getattr(config.weight_loader, "params_path", config.weight_loader)
+    expected_path = Path(model["path"]).parent if pytorch else Path(model["path"])
+    if not isinstance(loader_path, (str, Path)) or Path(loader_path).resolve() != expected_path:
         raise ValueError("MODEL_BINDING_MISMATCH: 实际初始化权重目录与所选模型资产不一致")
     model["asset_id"] = spec["inputs"]["model"].get("id")
-    passed("model_checkpoint", f"Orbax 权重元数据与文件清单有效：{model['path']}")
+    passed("model_checkpoint", f"{'PyTorch Safetensors' if pytorch else 'Orbax'} 权重元数据与文件清单有效：{model['path']}")
     entry = training_entrypoint(config, spec)
     resume = resume_checkpoint_contract(config, spec, model, datasets)
     if resume:
@@ -840,6 +886,12 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
         raise ValueError("INVALID_PATH: 自动预检缺少 Agent 受管目录")
     cache = inspect_training_cache(datasets, spec)
     passed("training_cache", f"数据集缓存可写，已核对 {len(cache['builders'])} 组 parquet builder 文件锁：{cache['datasets_cache']}")
+    storage = storage_estimate(config, model, reference)
+    if stage == STAGE_PROGRESS:
+        _, dataset_bytes, digest = file_manifest(datasets[0]["path"], spec, max_entries=60000, timeout=15)
+        storage["derived_dataset_bytes"] = dataset_bytes + 20 * datasets[0]["frames"]
+        storage["required_bytes"] += math.ceil(storage["derived_dataset_bytes"] * 1.1)
+        stage_contract["annotation"]["source_manifest_digest"] = digest
     return {"recipe": spec["recipe"], "input_authority": "registered_assets", "recipe_definition_digest": (spec.get("recipe_definition") or {}).get("digest"),
             "dataset_fps_policy": resolve_registered_fps(spec),
             "dataset_fps_runtime": fps_runtime if fps_runtime and fps_runtime.get("installed") is True else None,
@@ -857,11 +909,11 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             "parameters": spec["parameters"], "gpu_count": spec["gpu_count"], "entrypoint": str(entry),
             "entrypoint_sha256": hashlib.sha256(read_entrypoint(entry)).hexdigest(),
             "adapter_sha256": fingerprint({name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "submission_validation.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py", "image_policy.py", "image_runtime.py", "resume.py")}),
+                                            for name in ("openpi_entry.py", "training_plan.py", "automatic_config.py", "generated_config.py", "recipe_definitions.py", "runtime_options.py", "entrypoints.py", "dataset_bindings.py", "dataset_contracts.py", "dataset_fps.py", "dataset_timestamps.py", "dataset_samples.py", "dataset_validation_cache.py", "submission_validation.py", "composition_spec.py", "data_processors.py", "cache_contract.py", "recap.py", "recap_runtime.py", "recap_checkpoint.py", "image_policy.py", "image_runtime.py", "resume.py")}),
             "data_validation_mode": MODE, "datasets": datasets, "weights": [row["weight"] for row in bindings] if bindings is not None else weights,
             "state_pad_dim": getattr(config.data, "state_pad_dim", None),
             "use_merged_norm_stats": bool(getattr(config.data, "use_merged_norm_stats", False)),
             **({"auto_shared_norm": True} if automatic_norm else {}),
             "normalization": normalization,
-            "model": model, "storage": storage_estimate(config, model, reference), "training_cache": cache,
+            "model": model, "storage": storage, "training_cache": cache,
             "evidence_scope": "metadata hashes, file path/size/mtime manifests, cached registered source/timestamp validation, and current configuration contracts; submission does not reload source rows, decode samples, or execute transforms; training validates actual transformed samples at runtime"}

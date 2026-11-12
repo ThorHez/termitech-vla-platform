@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import object_session
 
 from .common import APIError, digest, now, offset_time, require_path, uid
+from .dataset_profiles import RECAP_ANNOTATION_SOURCE
 from .models import Asset, Command, Node, Profile
 from .schemas import InputModel
 from .resource_authorization import bind_command_actor, execution_permission_authorized, require_active_actor
@@ -53,8 +54,10 @@ def _metadata(asset):
 def input_digest(asset, profile, node):
     runtime = None if profile is None else {key: getattr(profile, key) for key in (
         "id", "node_id", "code_dir", "python", "adapter", "recipe", "execution_mode", "docker_image", "active", "metadata_json")}
+    metadata = _metadata(asset)
+    metadata.pop(RECAP_ANNOTATION_SOURCE, None)
     return digest({"asset_id": asset.id, "node_id": asset.node_id, "path": asset.path,
-                   "version": asset.version, "kind": asset.kind, "metadata": _metadata(asset),
+                   "version": asset.version, "kind": asset.kind, "metadata": metadata,
                    "profile": runtime, "roots": node.roots if node is not None else None})
 
 
@@ -350,13 +353,18 @@ def _canonical_path(value):
 
 
 def validated_result(command, value):
+    return validated_source_result(command.payload, value)
+
+
+def validated_source_result(payload, value):
     try:
         if len(json.dumps(value, ensure_ascii=False, allow_nan=False).encode()) > MAX_RESULT_BYTES:
             raise ValueError("result too large")
         allowed = {"schema_version", "scope", "path", "profile_id", "source_fingerprint", "checks",
                    "timestamp_contract", "raw_samples", "runtime", "error"}
-        if not isinstance(value, dict) or set(value) - allowed:
+        if not isinstance(value, dict) or set(value) - (allowed | {"recap_supervision"}):
             raise ValueError("unexpected result fields")
+        value = {key: item for key, item in value.items() if key in allowed}
         if value.get("error") is not None:
             _keys(value["error"], ("code", "message"))
             code, message = _text(value["error"]["code"], 100), _text(value["error"]["message"])
@@ -365,8 +373,8 @@ def validated_result(command, value):
             return {"error": _error(code, message), "checks": _checks(value["checks"]) if value.get("checks") else []}
         _keys(value, allowed - {"error"})
         if (type(value["schema_version"]) is not int or value["schema_version"] != 1 or value["scope"] != SCOPE
-                or _canonical_path(value["path"]) != _canonical_path(command.payload["path"])
-                or value["profile_id"] != command.payload["profile_id"]):
+                or _canonical_path(value["path"]) != _canonical_path(payload["path"])
+                or value["profile_id"] != payload["profile_id"]):
             raise ValueError("result does not match command")
         _hash(value["source_fingerprint"])
         checks = _checks(value["checks"])
@@ -386,7 +394,7 @@ def validated_result(command, value):
                 raise ValueError("invalid timestamp numeric field")
         if not 0 < contract["effective_fps"] <= 1000 or not math.isclose(contract["expected_interval_seconds"], 1 / contract["effective_fps"], rel_tol=1e-10):
             raise ValueError("invalid timestamp frequency")
-        declared_fps = (command.payload.get("registered_profile") or {}).get("fps")
+        declared_fps = (payload.get("registered_profile") or {}).get("fps")
         if declared_fps is not None and contract["effective_fps"] != declared_fps:
             raise ValueError("timestamp evidence does not match the registered FPS")
         frames = _integer(contract["checked_rows"], 1)
@@ -432,6 +440,16 @@ def validated_result(command, value):
         return result
     except (ValueError, TypeError, KeyError, OverflowError, RecursionError, UnicodeError):
         return {"error": _error("DATASET_VALIDATION_INVALID_RESULT"), "checks": []}
+
+
+def store_derived_validation(asset, profile, node, result, timestamp):
+    """Record the source check run inside a successful derivation attempt."""
+    report = {"id": None, "scope": SCOPE, "status": "SUCCEEDED", "profile_id": profile.id,
+              "input_digest": input_digest(asset, profile, node), "requested_at": timestamp,
+              "completed_at": timestamp, "expires_at": None, "error": None,
+              **{key: deepcopy(result[key]) for key in ("source_fingerprint", "checks",
+                 "timestamp_contract", "raw_samples", "runtime")}}
+    _write(asset, report)
 
 
 def acknowledge(session, command, node, status, value):

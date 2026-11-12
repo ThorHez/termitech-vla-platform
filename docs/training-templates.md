@@ -17,6 +17,32 @@
 
 套用已保存的模板会替换当前账号在对应训练入口的草稿，并回到第一步。跨训练方式套用时，原入口草稿会先保存。需要保留目标入口的配置时，先另存个人模板。若另一设备已更新目标草稿，平台会提示处理草稿冲突，防止直接覆盖新内容。
 
+### ReCap 回报价值流程
+
+打开 ReCap 模板后，向导顶部展示「Value 训练 → 优势值标注 → ACP 训练」。Value 和 ACP 分别预检并提交，各自生成独立作业。
+
+1. 点击「Value 训练」，绑定带 `value_target` 的 LeRobot 数据、对应归一化统计和初始权重，预检后启动。作业输出价值模型 checkpoint 和本次训练配置。
+2. Value 训练成功后，在作业详情点击「配置优势值标注」。选择本次作业的检查点和原数据，输入派生目录，即可复制 PyTorch 标注命令到训练机执行。生成 `is_positive` 后，在同一处登记或选择派生数据并点击「关联标注数据」。平台记录 Value 作业、检查点和原数据。
+3. 在同一作业详情点「用此数据配置 ACP」，向导带入派生数据和来源归一化参数。选择初始**动作策略**权重，预检后启动。ACP 作业详情可查看上游训练作业。
+
+```bash
+uv run python scripts/acp/lerobot_value_infer_pytorch.py \
+  --config-file /path/to/run/training_config.py \
+  --checkpoint-dir /path/to/value/checkpoint_step \
+  --dataset-root /path/to/lerobot_with_value_target \
+  --output-dir /path/to/derived_dataset
+```
+
+多数据集配方可用 `--dataset-index` 选择与目标数据匹配的处理配置。
+
+### ReCap 的 Kai0 阶段进度
+
+1. 在 ReCap 向导中点击「使用 Kai0 进度标注」，绑定一组 LeRobot 数据、归一化统计和 PyTorch π0.5 初始权重。LeRobot 的 parquet 和 `meta/info.json` 都须有 `stage_progress_gt`。以两阶段为例，人工标记每条轨迹的阶段分界，在前后两段分别把逐帧进度线性映射到 `[0, 0.5]` 和 `[0.5, 1]`。
+2. 选择组合字段处理，确认阶段监督列和模型输入映射，设置优势窗口、阶段数和每阶段正例比例，预检后启动。作业训练双帧进度差估计器，并登记带 `is_positive` 的派生数据集。
+3. 在 Kai0 作业详情点「用此数据配置 ACP」，选择初始**动作策略**权重，预检后启动。
+
+Value、Kai0 和 ACP 训练均使用 `scripts/acp/train_recap_pytorch.py`，初始模型需登记含 `model.safetensors` 的 PyTorch 权重。若初始权重是 Orbax checkpoint，先用 OpenPI 的 `examples/convert_jax_model_to_pytorch.py` 转换，再登记转换结果。具体数据与产物契约见 [ReCap 分阶段训练契约](implementation-contract.md#recap-分阶段训练契约)。
+
 ## 共享到工作区
 
 选中自己的模板，点击「共享到工作区」并确认。有训练权限的工作区成员可以查看模板的名称、说明和配置，再将它套用到各自的训练草稿。成员套用后，可以清除模板选择并将当前训练配置另存为个人模板。

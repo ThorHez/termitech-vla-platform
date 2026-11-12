@@ -39,7 +39,7 @@ class _Generated:
 def _generated(run, attempt, output):
     metadata = _metadata(output)
     recipe, step, version = metadata.get("recipe"), metadata.get("step"), _field(output, "version")
-    if (_field(output, "kind") != "MODEL" or metadata.get("format") != "openpi-orbax"
+    if (_field(output, "kind") != "MODEL" or metadata.get("format") not in ("openpi-orbax", "openpi-pytorch")
             or not _text(recipe) or type(step) is not int or step < 0
             or not isinstance(version, str) or not version.isascii() or not version.isdecimal()
             or len(version) > 200 or int(version) != step):
