@@ -17,6 +17,7 @@ else:
 
 COMPOSABLE_PROCESSOR = "ComposableDataConfig"
 FLAT_STATE_MODEL_TRANSFORM = "flat_state"
+KAI0_PAD32_MODEL_TRANSFORM = "kai0_pad32"
 FIELDS = {"schema_version", "robot_model", "arm_mode", "state_representation", "state_fields", "state_history",
           "action_representation", "action_key", "action_layout", "action_mode", "rotation_representation",
           "position_unit", "joint_unit", "coordinate_frame", "gripper_range", "cameras", "prompt_key",
@@ -120,8 +121,10 @@ def normalize_composition(value, *, norm_stats=False):
     for key, choices in (("arm_mode", {"single", "bimanual"}), ("state_representation", representations),
                          ("action_representation", representations),
                          ("normalization", {"quantile", "zscore"}),
-                         ("model_transform", {"standard", FLAT_STATE_MODEL_TRANSFORM})):
+                         ("model_transform", {"standard", FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM})):
         result[key] = _enum(value[key], choices, key)
+    if norm_stats and result["model_transform"] == KAI0_PAD32_MODEL_TRANSFORM:
+        result["model_transform"] = "standard"
     result["state_history"] = _integer(value["state_history"], 1, 64, "state_history")
     arms = {"left"} if result["arm_mode"] == "single" else {"left", "right"}
     state = value["state_fields"]

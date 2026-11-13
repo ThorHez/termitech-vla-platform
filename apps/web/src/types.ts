@@ -471,11 +471,13 @@ export interface AutomaticPreflight {
     [key: string]: unknown;
   };
 }
+export type StateTokenLayout = 'flat_state' | 'kai0_pad32';
 export interface AutoTrainingConfig {
   model_type: 'pi0' | 'pi05';
   finetune_mode: 'full' | 'lora';
   action_horizon: number;
   action_dim: number;
+  state_token_layout?: StateTokenLayout;
 }
 export interface GeneratedTrainingConfig {
   schema_version: 1;

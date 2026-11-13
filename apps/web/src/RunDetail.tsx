@@ -42,6 +42,7 @@ import { deployableOutputs, sourceDeploymentBlocker } from './policyDeployment';
 import { TrainingMetrics } from './TrainingMetrics';
 import { resumeCheckpoints, retryableRun } from './runRetry';
 import { requestedGpuSummary } from './trainingGpuSelection';
+import { STATE_TOKEN_LAYOUT_LABELS } from './trainingConfiguration';
 import { trainingGpuPolicySummary } from './trainingGpuPolicy';
 import { RunDeleteAction } from './RunDeleteAction';
 import { RunGpuReservationNotice } from './GpuReservations';
@@ -140,6 +141,7 @@ export default function RunDetail({
   const recipe = run?.recipe || attempt?.code_snapshot?.recipe || run?.code_expectation?.recipe;
   const autoConfig =
     run?.auto_config || attempt?.code_snapshot?.auto_config || run?.code_expectation?.auto_config;
+  const stateTokenLayout = autoConfig?.state_token_layout;
   const reviewedConfig = run?.code_expectation?.automatic_preflight?.plan.generated_config;
   const requestedEntrypoint =
     run?.entrypoint ||
@@ -389,6 +391,12 @@ export default function RunDetail({
                           {autoConfig ? '平台自动组装' : recipe ? <code>{recipe}</code> : '未记录'}
                         </dd>
                       </div>
+                      {stateTokenLayout && (
+                        <div>
+                          <dt>状态 token 布局</dt>
+                          <dd>{STATE_TOKEN_LAYOUT_LABELS[stateTokenLayout]}</dd>
+                        </div>
+                      )}
                       <div>
                         <dt>执行次数</dt>
                         <dd>{run.attempts?.length || 0}</dd>
@@ -588,6 +596,12 @@ export default function RunDetail({
                         {autoConfig ? '平台自动组装' : recipe ? <code>{recipe}</code> : '未记录'}
                       </dd>
                     </div>
+                    {stateTokenLayout && (
+                      <div>
+                        <dt>状态 token 布局</dt>
+                        <dd>{STATE_TOKEN_LAYOUT_LABELS[stateTokenLayout]}</dd>
+                      </div>
+                    )}
                     {recipeDefinition && (
                       <>
                         <div>

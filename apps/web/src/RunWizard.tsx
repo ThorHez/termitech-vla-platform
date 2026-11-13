@@ -65,6 +65,13 @@ import {
   configurationConfirmed,
   DEFAULT_AUTO_CONFIG,
   inferDatasetActionHorizon,
+  isStateTokenLayout,
+  kai0StateTokenLayoutError,
+  normalizeAutoConfig,
+  STATE_TOKEN_LAYOUT_LABELS,
+  supportsStateTokenLayout,
+  withoutKai0StateTransform,
+  withoutStateTokenLayout,
 } from './trainingConfiguration';
 import {
   actionHorizonDraftParameters,
@@ -576,7 +583,9 @@ function RunWizardContent({
               auto_config: initialAdvancedRecipe
                 ? undefined
                 : {
-                    ...(initialDraft.request.auto_config || DEFAULT_AUTO_CONFIG),
+                    ...withoutStateTokenLayout(
+                      initialDraft.request.auto_config || DEFAULT_AUTO_CONFIG,
+                    ),
                     finetune_mode: 'full',
                   },
               norm_datasets: normDatasetsForRequest(initialDraft.request).map((row) =>
@@ -736,6 +745,12 @@ function RunWizardContent({
   const requiresConfigConfirmation = hasLocalTraining || isNorm;
   const normRows = normDatasetsForRequest(request);
   const automaticMode = hasLocalTraining && !advancedRecipe;
+  const chooseStateTokenLayout = automaticMode && supportsStateTokenLayout(request);
+  const kai0TokenLayoutError = chooseStateTokenLayout
+    ? kai0StateTokenLayoutError(request)
+    : undefined;
+  const reviewedRequest = preview?.request || request;
+  const reviewedStateTokenLayout = reviewedRequest.auto_config?.state_token_layout ?? 'flat_state';
   const automaticNorm = isNorm && !advancedRecipe;
   const automaticConfiguration = automaticMode || automaticNorm;
   const generatedConfig = automaticPreflight?.plan.generated_config;
@@ -1024,8 +1039,11 @@ function RunWizardContent({
       auto_config:
         (local || isNorm) && !advancedRecipe
           ? isNorm
-            ? { ...(value.auto_config || DEFAULT_AUTO_CONFIG), finetune_mode: 'full' }
-            : value.auto_config || { ...DEFAULT_AUTO_CONFIG }
+            ? {
+                ...withoutStateTokenLayout(value.auto_config || DEFAULT_AUTO_CONFIG),
+                finetune_mode: 'full',
+              }
+            : normalizeAutoConfig(value) || { ...DEFAULT_AUTO_CONFIG }
           : undefined,
       normalization_method: local ? value.normalization_method : undefined,
       requested_gpu_uuids: isNorm ? undefined : value.requested_gpu_uuids,
@@ -1201,9 +1219,17 @@ function RunWizardContent({
             }
           : {}),
       };
-      return key === 'normalization_method'
-        ? withTrainingNormalizationMethod(next, value as RunRequest['normalization_method'])
-        : next;
+      if (key === 'normalization_method')
+        return withTrainingNormalizationMethod(next, value as RunRequest['normalization_method']);
+      const autoConfig = normalizeAutoConfig(next);
+      if (autoConfig === next.auto_config) return next;
+      return {
+        ...next,
+        auto_config: autoConfig,
+        dataset_bindings: next.dataset_bindings?.map((row) =>
+          row.processor ? { ...row, processor: withoutKai0StateTransform(row.processor) } : row,
+        ),
+      };
     });
   };
   const updateGpuSelection = (
@@ -1237,6 +1263,13 @@ function RunWizardContent({
       recipe_revision_id: undefined,
       entrypoint: undefined,
       auto_config: enabled ? undefined : { ...DEFAULT_AUTO_CONFIG },
+      ...(enabled && value.dataset_bindings
+        ? {
+            dataset_bindings: value.dataset_bindings.map((row) =>
+              row.processor ? { ...row, processor: withoutKai0StateTransform(row.processor) } : row,
+            ),
+          }
+        : {}),
       ...(isNorm
         ? {
             norm_datasets: normDatasetsForRequest(value).map((row) =>
@@ -1402,7 +1435,7 @@ function RunWizardContent({
       entrypoint: undefined,
       auto_config: value.auto_config
         ? {
-            ...value.auto_config,
+            ...withoutStateTokenLayout(value.auto_config),
             model_type: stage === 'stage_progress' ? 'pi05' : value.auto_config.model_type,
             finetune_mode: 'full',
           }
@@ -1435,7 +1468,7 @@ function RunWizardContent({
               gpu_count: request.gpu_count,
               requested_gpu_uuids: request.requested_gpu_uuids,
               training_gpu_policy: hasLocalTraining ? request.training_gpu_policy : undefined,
-              auto_config: automaticMode ? request.auto_config : undefined,
+              auto_config: automaticMode ? normalizeAutoConfig(request) : undefined,
               ...(hasLocalTraining && request.normalization_method
                 ? { normalization_method: request.normalization_method }
                 : {}),
@@ -1910,6 +1943,13 @@ function RunWizardContent({
                 setError(new Error('PyTorch ReCap 自动配置需要选择全量微调。'));
                 return;
               }
+              if (
+                request.auto_config?.state_token_layout === 'kai0_pad32' &&
+                kai0TokenLayoutError
+              ) {
+                setError(new Error(kai0TokenLayoutError));
+                return;
+              }
               if (advancedRecipe && (!request.recipe?.trim() || recipeDirty || recipeReading)) {
                 setError(
                   new Error(
@@ -2291,6 +2331,32 @@ function RunWizardContent({
                         </option>
                       </select>
                     </Field>
+                    {chooseStateTokenLayout && (
+                      <Field
+                        label="状态 token 布局"
+                        hint={
+                          kai0TokenLayoutError ||
+                          'Kai0 兼容在 14 个归一化状态值后补 18 个 -1，再编码为状态 token。'
+                        }
+                      >
+                        <select
+                          value={request.auto_config.state_token_layout ?? 'flat_state'}
+                          onChange={(event) => {
+                            const layout = event.target.value;
+                            if (isStateTokenLayout(layout))
+                              update('auto_config', {
+                                ...request.auto_config!,
+                                state_token_layout: layout,
+                              });
+                          }}
+                        >
+                          <option value="flat_state">{STATE_TOKEN_LAYOUT_LABELS.flat_state}</option>
+                          <option value="kai0_pad32" disabled={!!kai0TokenLayoutError}>
+                            {STATE_TOKEN_LAYOUT_LABELS.kai0_pad32}
+                          </option>
+                        </select>
+                      </Field>
+                    )}
                     <Field
                       label="动作预测长度"
                       required
@@ -3048,6 +3114,12 @@ function RunWizardContent({
                 <dd>
                   {trainingNormalizationLabel((preview?.request || request).normalization_method)}
                 </dd>
+              </div>
+            )}
+            {supportsStateTokenLayout(reviewedRequest) && (
+              <div>
+                <dt>状态 token 布局</dt>
+                <dd>{STATE_TOKEN_LAYOUT_LABELS[reviewedStateTokenLayout]}</dd>
               </div>
             )}
             {frozenRecipe && (

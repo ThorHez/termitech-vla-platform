@@ -21,11 +21,11 @@ import types
 import typing
 
 if __package__:
-    from .composition_spec import COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, normalize_composition
+    from .composition_spec import COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM, normalize_composition
     from .dataset_contracts import static_dataset_contract
     from .recipe_definitions import is_asset_managed_field, validate_overrides
 else:
-    from composition_spec import COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, normalize_composition
+    from composition_spec import COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM, normalize_composition
     from dataset_contracts import static_dataset_contract
     from recipe_definitions import is_asset_managed_field, validate_overrides
 
@@ -344,6 +344,9 @@ def instantiate_data_processor(processor, config_module, code_dir, *, dataset_pa
         if (composition["model_transform"] == FLAT_STATE_MODEL_TRANSFORM
                 and getattr(cls, "SUPPORTS_FLAT_STATE_TOKENS", False) is not True):
             raise ValueError("STATE_TOKEN_FORMAT_UNSUPPORTED: 当前训练环境不支持一维状态 token 格式，请选择新版 OpenPI 环境")
+        if (not norm_stats and composition["model_transform"] == KAI0_PAD32_MODEL_TRANSFORM
+                and getattr(cls, "SUPPORTS_KAI0_PAD32_STATE_TOKENS", False) is not True):
+            raise ValueError("STATE_TOKEN_FORMAT_UNSUPPORTED: 当前训练环境不支持 Kai0 32 维状态编码，请升级 OpenPI")
         kwargs.update(composition=composition, training_stage=training_stage or "sft")
         if training_stage == "offline_rl" and stage_config and "acp_dropout" in stage_config:
             kwargs["acp_dropout"] = stage_config["acp_dropout"]

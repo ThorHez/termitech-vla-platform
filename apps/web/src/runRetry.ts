@@ -7,6 +7,7 @@ import { TRAINING_TEMPLATE_PROCESSING_MARKER } from './trainingTemplate';
 import { withoutLegacyRecapSettings } from './recap';
 import { validRequestedGpuList } from './trainingGpuSelection';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
+import { isStateTokenLayout, supportsStateTokenLayout } from './trainingConfiguration';
 import { validTrainingGpuPolicy } from './trainingGpuPolicy';
 import type {
   Asset,
@@ -295,6 +296,8 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
       !['pi0', 'pi05'].includes(String(rawAuto.model_type)) ||
       !['full', 'lora'].includes(String(rawAuto.finetune_mode)) ||
       (run.template_id === 'openpi-norm' && rawAuto.finetune_mode !== 'full') ||
+      (rawAuto.state_token_layout !== undefined &&
+        !isStateTokenLayout(rawAuto.state_token_layout)) ||
       !Number.isSafeInteger(rawAuto.action_horizon) ||
       (rawAuto.action_horizon as number) <= 0 ||
       !Number.isSafeInteger(rawAuto.action_dim) ||
@@ -306,7 +309,12 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
       finetune_mode: rawAuto.finetune_mode,
       action_horizon: rawAuto.action_horizon,
       action_dim: rawAuto.action_dim,
+      ...(rawAuto.state_token_layout !== undefined
+        ? { state_token_layout: rawAuto.state_token_layout }
+        : {}),
     } as AutoTrainingConfig;
+    if (request.auto_config.state_token_layout && !supportsStateTokenLayout(request))
+      throw new Error('原训练状态 token 布局与数据处理配置不匹配。');
   } else {
     const definition = setting('recipe_definition');
     if (plain(definition) && text(definition.id)) {

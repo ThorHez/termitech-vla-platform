@@ -59,6 +59,13 @@ def test_control_and_training_normalizers_agree_without_model_dependencies(core,
     assert composition_digest(value) == composition_digest(normalize_composition(value))
 
 
+def test_numeric_statistics_drop_only_the_new_token_layout(core):
+    base = normalize_composition(CORPUS["valid"][0])
+    selected = {**base, "model_transform": "kai0_pad32"}
+    assert normalize_composition(selected) == core.normalize_composition(selected)
+    assert normalize_composition(selected, norm_stats=True) == core.normalize_composition(base, norm_stats=True)
+
+
 @pytest.mark.parametrize("value", CORPUS["invalid"])
 def test_both_normalizers_reject_incomplete_or_ambiguous_compositions(core, value):
     for normalize in (normalize_composition, core.normalize_composition):

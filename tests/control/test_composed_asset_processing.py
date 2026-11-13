@@ -15,7 +15,7 @@ from .test_task_recipe import request_preview
 from .test_automatic_preflight import acknowledge, submit
 
 
-def description(*, action_layout=None, arm_mode="single", action_representation="eef"):
+def description(*, action_layout=None, arm_mode="single", action_representation="eef", state_dim=7):
     spec = json.loads((Path(__file__).resolve().parents[1] / "fixtures/composed-processing-v1.json").read_text())["valid"][0]
     spec["arm_mode"] = arm_mode
     spec["action_representation"] = action_representation
@@ -23,11 +23,14 @@ def description(*, action_layout=None, arm_mode="single", action_representation=
         spec["rotation_representation"] = "none"
     if action_layout is not None:
         spec["action_layout"] = deepcopy(action_layout)
+    if state_dim == 14:
+        spec["state_fields"] = [{"key": "observation.state", "width": 14, "arm": "shared",
+                                 "kind": "other", "normalize": True}]
     return {"schema_version": 1, "format": "lerobot", "robot_type": "ARX5", "arm_mode": arm_mode,
             "action_representation": action_representation,
             "cameras": [{"name": "wrist", "key": spec["cameras"][0]["key"], "kind": "rgb"}],
             "task_description": "Pick up cup", "action_dim": sum(row["width"] for row in spec["action_layout"]),
-            "state_dim": 7, "processing": spec}
+            "state_dim": state_dim, "processing": spec}
 
 
 def setup_composed(platform, *, source_only=False, **composition_options):
@@ -55,7 +58,7 @@ def setup_composed(platform, *, source_only=False, **composition_options):
 
 
 def pending(platform, *, source_only=False, customized=False, augmentation=None, automatic=False,
-            state_history=1, **composition_options):
+            state_history=1, state_token_layout=None, **composition_options):
     node, inputs, rows, profile = setup_composed(platform, source_only=source_only, **composition_options)
     selected = rows[0]["processor"]["parameters"]["composition"]
     selected["state_history"] = state_history
@@ -64,8 +67,11 @@ def pending(platform, *, source_only=False, customized=False, augmentation=None,
     if customized:
         selected["state_fields"].reverse()
         selected["normalization"] = "zscore"
+    auto_config = {"model_type": "pi05", "action_horizon": 16}
+    if state_token_layout is not None:
+        auto_config["state_token_layout"] = state_token_layout
     response = request_preview(platform, node, inputs=inputs, dataset_bindings=rows,
-                               **({"auto_config": {"model_type": "pi05", "action_horizon": 16}} if automatic else {}))
+                               **({"auto_config": auto_config} if automatic else {}))
     assert response.status_code == 202, response.text
     identifier = response.json()["id"]
     command = next(item for item in platform.commands(node) if item["type"] == "PREFLIGHT")
@@ -78,7 +84,8 @@ def pending(platform, *, source_only=False, customized=False, augmentation=None,
     data["composition"] = {"schema_version": 1, "spec": deepcopy(selected),
         "digest": composition_digest(selected), "training_stage": "sft", "model_type": "Pi0Config",
         "action_horizon": 16, "action_dim": 32,
-        "pi05": True, "raw_state_dim": 7, "raw_action_dim": raw_action, "state_history": state_history,
+        "pi05": True, "raw_state_dim": sum(field["width"] for field in selected["state_fields"]),
+        "raw_action_dim": raw_action, "state_history": state_history,
         "normalization": selected["normalization"],
         "image_keys": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"], "depth_keys": [],
         "action_metadata_sha256": data["metadata_sha256"], "action_sequence_keys": [],
@@ -111,6 +118,30 @@ def test_composition_is_frozen_with_asset_even_after_edits_and_reaches_start(pla
     start = next(item for item in platform.commands(node) if item["type"] == "START")
     assert start["payload"]["inputs"]["dataset_0"]["dataset_profile"] == profile
     assert start["payload"]["dataset_bindings"][0]["processor"] == processor
+
+
+def test_kai0_token_layout_is_frozen_and_reaches_start(platform):
+    node, identifier, command, code, profile = pending(
+        platform, automatic=True, state_dim=14, state_token_layout="kai0_pad32")
+    payload = command["payload"]
+    composition = payload["dataset_bindings"][0]["processor"]["parameters"]["composition"]
+    assert profile["processing"]["model_transform"] == "standard"
+    assert payload["auto_config"]["state_token_layout"] == composition["model_transform"] == "kai0_pad32"
+    assert acknowledge(platform, node, identifier, command, code)["status"] == "READY"
+    run = submit(platform, identifier)
+    assert run.status_code == 201, run.text
+    assert platform.schedule() == 1
+    start = next(item["payload"] for item in platform.commands(node) if item["type"] == "START")
+    assert start["auto_config"] == payload["auto_config"]
+    assert start["dataset_bindings"] == payload["dataset_bindings"]
+
+
+def test_kai0_token_layout_rejects_wrong_state_width(platform):
+    node, inputs, rows, _ = setup_composed(platform)
+    response = request_preview(platform, node, inputs=inputs, dataset_bindings=rows,
+                               auto_config={"model_type": "pi05", "state_token_layout": "kai0_pad32"})
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "STATE_TOKEN_LAYOUT_UNSUPPORTED"
 
 
 @pytest.mark.parametrize("tampered", [False, True])

@@ -7,7 +7,11 @@ import {
   normResourceRecommendationTracking,
   recommendNormResources,
 } from './trainingResourceRecommendations';
-import { DEFAULT_AUTO_CONFIG } from './trainingConfiguration';
+import {
+  DEFAULT_AUTO_CONFIG,
+  withoutKai0StateTransform,
+  withoutStateTokenLayout,
+} from './trainingConfiguration';
 import { DEFAULT_TRAINING_NORMALIZATION_METHOD } from './trainingNormalization';
 import { trainingDatasetNormId } from './datasetBindingHelpers';
 import type { TrainingDraftSnapshot } from './trainingDraft';
@@ -86,7 +90,8 @@ export function trainingTemplateEntry(
     rows.map((row) => {
       const dataset = asset(row.dataset_asset_id);
       const seeded = trainingCompositionDraft(trainingProfileSeed(dataset));
-      const processor = row.processor ? structuredClone(row.processor) : composedChoice(seeded);
+      let processor = row.processor ? structuredClone(row.processor) : composedChoice(seeded);
+      if (template.id !== 'openpi-sft') processor = withoutKai0StateTransform(processor);
       const composition = processor.parameters.composition;
       // Statistics deliberately omits vision; restore dataset camera defaults for training.
       if (
@@ -123,7 +128,9 @@ export function trainingTemplateEntry(
       ...(norm || local
         ? {
             auto_config: {
-              ...(previous.auto_config || DEFAULT_AUTO_CONFIG),
+              ...(template.id === 'openpi-sft'
+                ? previous.auto_config || DEFAULT_AUTO_CONFIG
+                : withoutStateTokenLayout(previous.auto_config || DEFAULT_AUTO_CONFIG)),
               ...(norm ? { finetune_mode: 'full' as const } : {}),
             },
           }

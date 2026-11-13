@@ -21,7 +21,7 @@ if __package__:
     from .automatic_config import normalize_auto_config
     from .generated_config import configuration_snapshot, generated_training_config
     from .image_runtime import image_processing_contract
-    from .composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
+    from .composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from .cache_contract import inspect_training_cache
     from .data_processors import processor_identity, validate_processor_instance
     from .dataset_bindings import validate_binding_assets
@@ -39,7 +39,7 @@ else:
     from automatic_config import normalize_auto_config
     from generated_config import configuration_snapshot, generated_training_config
     from image_runtime import image_processing_contract
-    from composition_spec import COMPOSABLE_PROCESSOR, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
+    from composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from cache_contract import inspect_training_cache
     from data_processors import processor_identity, validate_processor_instance
     from dataset_bindings import validate_binding_assets
@@ -360,8 +360,11 @@ def check_composed_mixture(data_factory, datasets, *, shared_validated=False):
         raise ValueError("COMPOSITION_MIXTURE_UNSUPPORTED: 组合数据集必须分别使用所绑定的归一化统计，不能跨布局合并")
     target = getattr(data_factory, "state_pad_dim", None)
     for composition in compositions:
-        actual = (composition["state_history"] * composition["raw_state_dim"]
-                  if composition["pi05"] else composition["action_dim"])
+        if composition.get("spec", {}).get("model_transform") == KAI0_PAD32_MODEL_TRANSFORM:
+            actual = 32
+        else:
+            actual = (composition["state_history"] * composition["raw_state_dim"]
+                      if composition["pi05"] else composition["action_dim"])
         if (type(target) is not int or target < actual or
                 not composition["pi05"] and target != composition["action_dim"]):
             raise ValueError(f"COMPOSITION_STATE_PADDING_INVALID: 配方 data.state_pad_dim={target} 与组合输出状态宽度 {actual} 不兼容；Pi05 至少需要 {actual}，Pi0 必须等于模型 action_dim")
@@ -868,8 +871,8 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
     stage_contract = inspect_stage(config, spec, factories, datasets)
     if stage_contract is not None:
         passed("recap_stage", "已核对 ReCap 阶段、模型和实际 parquet 监督字段：" + stage)
+    model, reference = model_contract(spec, config.model)
     pytorch = uses_torch_recap(spec)
-    model, reference = model_contract(spec, config.model) if pytorch else model_contract(spec)
     loader_path = getattr(config, "pytorch_weight_path", None) if pytorch else getattr(config.weight_loader, "params_path", config.weight_loader)
     expected_path = Path(model["path"]).parent if pytorch else Path(model["path"])
     if not isinstance(loader_path, (str, Path)) or Path(loader_path).resolve() != expected_path:

@@ -550,8 +550,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, validate_composition_profile_input,
             )
             processing_rows = data.get("norm_datasets") if body.template_id == "openpi-norm" else data.get("dataset_bindings")
-            new_state_format = (body.template_id == "openpi-sft" and data.get("resume_source") is None
-                                and (data.get("auto_config") or {}).get("model_type") == "pi05")
+            auto_config = data.get("auto_config") or {}
+            state_token_layout = (
+                auto_config.get("state_token_layout", FLAT_STATE_MODEL_TRANSFORM)
+                if body.template_id == "openpi-sft" and data.get("resume_source") is None
+                and auto_config.get("model_type") == "pi05" else None
+            )
             for index, binding in enumerate(processing_rows or []):
                 processor = binding.get("processor") or {}
                 if processor.get("name") != COMPOSABLE_PROCESSOR:
@@ -567,9 +571,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     message = str(exc)
                     code = message.split(":", 1)[0] if ":" in message else "INVALID_COMPOSITION"
                     raise APIError(422, code, message) from exc
-                if new_state_format:
+                if state_token_layout is not None:
                     # Freeze the token format with the run, independent of the asset's saved processing.
-                    processor["parameters"]["composition"] = {**composition, "model_transform": FLAT_STATE_MODEL_TRANSFORM}
+                    processor["parameters"]["composition"] = {**composition, "model_transform": state_token_layout}
             preview = Preview(id=uid(), owner_user_id=request_owner(request), node_id=node.id, request=data, status="PENDING", checks=[],
                               created_at=now(), expires_at=offset_time(settings.preview_ttl_seconds))
             session.add(preview)

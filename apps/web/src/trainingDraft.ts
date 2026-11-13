@@ -1,6 +1,7 @@
 import type { JsonObject, RecipeDatasetSlot, RunRequest } from './types';
 import { validRequestedGpuList } from './trainingGpuSelection';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
+import { isStateTokenLayout } from './trainingConfiguration';
 import { validTrainingGpuPolicy } from './trainingGpuPolicy';
 
 export const MAX_TRAINING_DRAFT_BYTES = 512 * 1024;
@@ -240,12 +241,23 @@ function validRequest(value: unknown): value is RunRequest {
     if (
       !plainObject(config) ||
       Object.keys(config).some(
-        (key) => !['model_type', 'finetune_mode', 'action_horizon', 'action_dim'].includes(key),
+        (key) =>
+          ![
+            'model_type',
+            'finetune_mode',
+            'action_horizon',
+            'action_dim',
+            'state_token_layout',
+          ].includes(key),
       ) ||
       !text(config.model_type) ||
       !text(config.finetune_mode) ||
       typeof config.action_horizon !== 'number' ||
-      typeof config.action_dim !== 'number'
+      typeof config.action_dim !== 'number' ||
+      (config.state_token_layout !== undefined &&
+        (value.template_id !== 'openpi-sft' ||
+          config.model_type !== 'pi05' ||
+          !isStateTokenLayout(config.state_token_layout)))
     )
       return false;
   }

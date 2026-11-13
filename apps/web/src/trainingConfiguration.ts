@@ -1,4 +1,12 @@
-import type { Asset, AutoTrainingConfig, DatasetBinding, GeneratedTrainingConfig } from './types';
+import type {
+  Asset,
+  AutoTrainingConfig,
+  DataProcessorChoice,
+  DatasetBinding,
+  GeneratedTrainingConfig,
+  RunRequest,
+  StateTokenLayout,
+} from './types';
 
 export const DEFAULT_AUTO_CONFIG: AutoTrainingConfig = {
   model_type: 'pi05',
@@ -6,6 +14,81 @@ export const DEFAULT_AUTO_CONFIG: AutoTrainingConfig = {
   action_horizon: 50,
   action_dim: 32,
 };
+
+export const STATE_TOKEN_LAYOUT_LABELS: Record<StateTokenLayout, string> = {
+  flat_state: '展平实际状态（默认）',
+  kai0_pad32: 'Kai0 兼容（32 维状态）',
+};
+
+export function isStateTokenLayout(value: unknown): value is StateTokenLayout {
+  return value === 'flat_state' || value === 'kai0_pad32';
+}
+
+type StateTokenRequest = Pick<
+  RunRequest,
+  'template_id' | 'auto_config' | 'dataset_bindings' | 'training_stage'
+>;
+
+export function supportsStateTokenLayout(request: StateTokenRequest): boolean {
+  return (
+    request.template_id === 'openpi-sft' &&
+    (request.training_stage === undefined || String(request.training_stage) === 'sft') &&
+    request.auto_config?.model_type === 'pi05' &&
+    !!request.dataset_bindings?.length &&
+    request.dataset_bindings.every((binding) => binding.processor?.name === 'ComposableDataConfig')
+  );
+}
+
+export function kai0StateTokenLayoutError(request: StateTokenRequest): string | undefined {
+  if (request.auto_config?.action_dim !== 32) return 'Kai0 兼容要求模型动作维度为 32。';
+  if (
+    request.dataset_bindings?.some((binding) => {
+      const composition = binding.processor?.parameters.composition;
+      if (!composition || typeof composition !== 'object' || Array.isArray(composition))
+        return true;
+      const fields = composition.state_fields;
+      return (
+        composition.state_history !== 1 ||
+        !Array.isArray(fields) ||
+        fields.reduce<number>((width, field) => {
+          if (!field || typeof field !== 'object' || Array.isArray(field)) return NaN;
+          return typeof field.width === 'number' ? width + field.width : NaN;
+        }, 0) !== 14
+      );
+    })
+  )
+    return 'Kai0 兼容要求每组数据使用单帧、14 维状态。';
+}
+
+export function withoutStateTokenLayout(config: AutoTrainingConfig): AutoTrainingConfig {
+  if (config.state_token_layout === undefined) return config;
+  const { state_token_layout: _layout, ...rest } = config;
+  return rest;
+}
+
+export function normalizeAutoConfig(request: StateTokenRequest): AutoTrainingConfig | undefined {
+  const config = request.auto_config;
+  return config && !supportsStateTokenLayout(request) ? withoutStateTokenLayout(config) : config;
+}
+
+export function withoutKai0StateTransform(processor: DataProcessorChoice): DataProcessorChoice {
+  const composition = processor.parameters.composition;
+  if (
+    processor.name !== 'ComposableDataConfig' ||
+    !composition ||
+    typeof composition !== 'object' ||
+    Array.isArray(composition) ||
+    composition.model_transform !== 'kai0_pad32'
+  )
+    return processor;
+  return {
+    ...processor,
+    parameters: {
+      ...processor.parameters,
+      composition: { ...composition, model_transform: 'standard' },
+    },
+  };
+}
 
 export interface DatasetActionHorizonSource {
   bindingIndex: number;
@@ -233,5 +316,7 @@ export function automaticConfigErrors(config: AutoTrainingConfig): string[] {
     errors.push('动作预测长度必须是 1–1000 的整数。');
   if (!Number.isSafeInteger(config.action_dim) || config.action_dim < 1 || config.action_dim > 4096)
     errors.push('模型动作维度必须是 1–4096 的整数。');
+  if (config.state_token_layout !== undefined && !isStateTokenLayout(config.state_token_layout))
+    errors.push('请选择支持的状态 token 布局。');
   return errors;
 }

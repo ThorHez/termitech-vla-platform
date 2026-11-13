@@ -181,6 +181,8 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
     except ValueError as exc:
         raise APIError(422, "DATASET_BINDINGS_INVALID", "数据集、归一化参数、配方位置和混采权重配置无效") from exc
     try:
+        from vla_adapters.automatic_config import validate_state_token_layout
+        validate_state_token_layout(data.get("auto_config"), bindings, template_id=template["id"], training_stage=stage)
         validate_stage_progress_selection(stage, bindings, data.get("auto_config"))
         if template["id"] == "recap":
             validate_recap_torch_selection(data.get("auto_config"), data.get("entrypoint"))

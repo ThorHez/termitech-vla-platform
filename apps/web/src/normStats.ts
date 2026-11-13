@@ -1,9 +1,14 @@
 import { composedChoice, trainingProfileSeed } from './ComposedDatasetProcessing';
 import { composedProcessingErrors, trainingCompositionDraft } from './composedProcessing';
-import { inferDatasetActionHorizon } from './trainingConfiguration';
+import {
+  inferDatasetActionHorizon,
+  withoutKai0StateTransform,
+  withoutStateTokenLayout,
+} from './trainingConfiguration';
 import type { Asset, DataProcessorChoice, DatasetBinding, NormDataset, RunRequest } from './types';
 
 export function normProcessorChoice(processor: DataProcessorChoice): DataProcessorChoice {
+  processor = withoutKai0StateTransform(processor);
   const raw = processor.parameters.composition;
   return processor.name === 'ComposableDataConfig' &&
     raw &&
@@ -133,7 +138,12 @@ export function buildNormPreviewRequest(request: RunRequest): RunRequest {
     profile_id: request.profile_id,
     template_id: 'openpi-norm',
     ...(request.auto_config
-      ? { auto_config: { ...request.auto_config, finetune_mode: 'full' as const } }
+      ? {
+          auto_config: {
+            ...withoutStateTokenLayout(request.auto_config),
+            finetune_mode: 'full' as const,
+          },
+        }
       : { recipe: request.recipe?.trim() }),
     inputs: {},
     norm_datasets: normDatasetsForRequest(request).map((row) =>

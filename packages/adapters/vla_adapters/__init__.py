@@ -10,7 +10,7 @@ from .dataset_bindings import validate_binding_assets
 from .norm_datasets import normalize_norm_datasets, validate_norm_assets, validate_norm_configuration
 from .recap import (STAGE_PROGRESS, recap_stages, runtime_adapter_for, validate_recap_torch_selection,
                     validate_stage_progress_selection, validate_training_stage)
-from .automatic_config import automatic_recipe_name, normalize_auto_config
+from .automatic_config import automatic_recipe_name, normalize_auto_config, validate_state_token_layout
 from .runtime_options import RUNTIME_PARAMETER_RULES, normalize_normalization_method, validate_runtime_parameter_relations
 from .resume import normalize_resume_source
 
@@ -137,6 +137,7 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
         validate_recap_torch_selection(auto_config, entrypoint)
     resume_source = normalize_resume_source(resume_source, inputs, template_id=template_id, entrypoint=entrypoint)
     dataset_bindings = validate_binding_assets(dataset_bindings, inputs)
+    validate_state_token_layout(auto_config, dataset_bindings, template_id=template_id, training_stage=training_stage)
     validate_stage_progress_selection(training_stage, dataset_bindings, auto_config)
     if auto_config is not None and template_id != "openpi-norm" and (not dataset_bindings or any("processor" not in row for row in dataset_bindings)):
         raise ValueError("AUTO_CONFIG_PROCESSOR_REQUIRED: 自动配置要求每组数据使用独立数据处理器")

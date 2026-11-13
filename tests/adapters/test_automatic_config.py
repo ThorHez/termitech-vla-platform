@@ -10,7 +10,9 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from vla_adapters import build_launch, resolve_recipe
-from vla_adapters.automatic_config import automatic_data_layout, automatic_recipe_name, build_automatic_base, normalize_auto_config
+from vla_adapters.automatic_config import (
+    automatic_data_layout, automatic_recipe_name, build_automatic_base, normalize_auto_config, validate_state_token_layout,
+)
 from vla_adapters.generated_config import generated_training_config
 from vla_adapters import openpi_entry
 from vla_adapters.openpi_entry import resolve_config
@@ -121,6 +123,20 @@ def test_automatic_layout_rejects_pi0_state_truncation_and_unknown_pi05_mixture_
             {"processor": {"name": "IndependentFactory", "parameters": {}}}])
 
 
+def test_kai0_token_layout_sets_collation_width_for_composed_mixture():
+    composition = composed_profile()["processing"]
+    composition.update(model_transform="kai0_pad32", state_history=1, state_fields=[
+        {"key": "observation.state", "width": 14, "arm": "shared", "kind": "other", "normalize": True}])
+    rows = [{"processor": {"name": "ComposableDataConfig", "parameters": {"composition": value}}}
+            for value in (composition, copy.deepcopy(composition))]
+    auto = normalize_auto_config({"state_token_layout": "kai0_pad32"})
+    validate_state_token_layout(auto, rows, template_id="openpi-sft")
+    assert automatic_data_layout(auto, rows)[1] == 32
+    rows[1]["processor"]["parameters"]["composition"]["state_history"] = 2
+    with pytest.raises(ValueError, match="STATE_TOKEN_LAYOUT_UNSUPPORTED"):
+        validate_state_token_layout(auto, rows, template_id="openpi-sft")
+
+
 def test_auto_builder_uses_real_model_and_independent_factories_with_per_dataset_norms(automatic):
     spec, module, loaders = automatic
     base = build_automatic_base(spec, module, loaders)
@@ -208,6 +224,26 @@ def test_auto_launch_freezes_choices_and_internal_identity_without_profile_recip
     assert resolve_recipe(profile, auto_config={}) == "auto_pi05_full_h50_d32_sft"
     with pytest.raises(ValueError, match="AUTO_CONFIG_CONFLICT"):
         resolve_recipe(profile, "old", auto_config={})
+
+
+def test_kai0_layout_survives_agent_launch_and_requires_matching_frozen_processor(automatic):
+    spec, module, loaders = automatic
+    spec["auto_config"] = normalize_auto_config({"state_token_layout": "kai0_pad32"})
+    spec["recipe"] = automatic_recipe_name(spec["auto_config"])
+    composition = composed_profile()["processing"]
+    composition.update(state_history=1, model_transform="kai0_pad32", state_fields=[
+        {"key": "observation.state", "width": 14, "arm": "shared", "kind": "other", "normalize": True}])
+    for row in spec["dataset_bindings"]:
+        row["processor"] = {"name": "ComposableDataConfig", "parameters": {"composition": copy.deepcopy(composition)}}
+    profile = {"adapter": "openpi-sft", "code_dir": spec["code_dir"], "python": sys.executable}
+    launch = build_launch(profile, "openpi-sft", spec["inputs"], spec["parameters"], spec["output_dir"], ["gpu-0"],
+                          dataset_bindings=spec["dataset_bindings"], auto_config=spec["auto_config"])
+    frozen = json.loads(launch["argv"][-1])
+    assert frozen["auto_config"] == spec["auto_config"]
+    assert automatic_data_layout(frozen["auto_config"], frozen["dataset_bindings"])[1] == 32
+    frozen["dataset_bindings"][0]["processor"]["parameters"]["composition"]["model_transform"] = "flat_state"
+    with pytest.raises(ValueError, match="STATE_TOKEN_LAYOUT_MISMATCH"):
+        build_automatic_base(frozen, module, loaders)
 
 
 def test_prepare_automatic_never_looks_up_named_recipe(automatic, monkeypatch):

@@ -94,7 +94,7 @@ export interface ComposedProcessingSpec {
   cameras: ComposedCamera[];
   prompt_key: string;
   normalization: 'quantile' | 'zscore';
-  model_transform: 'standard' | 'flat_state';
+  model_transform: 'standard' | 'flat_state' | 'kai0_pad32';
   aux_keys: (typeof COMPOSED_SUPERVISION_FIELDS)[number][];
 }
 export interface ProcessingProfileSeed {
@@ -291,7 +291,7 @@ export function composedProcessingErrors(
   )
     errors.push('夹爪范围需要是有限的最小值、最大值，且最小值小于最大值。');
   if (!choice(value.normalization, ['quantile', 'zscore'])) errors.push('请选择归一化方式。');
-  if (!choice(value.model_transform, ['standard', 'flat_state']))
+  if (!choice(value.model_transform, ['standard', 'flat_state', 'kai0_pad32']))
     errors.push('组件组合目前只支持标准 Pi0/Pi05 模型变换。');
   if (
     !Array.isArray(value.aux_keys) ||

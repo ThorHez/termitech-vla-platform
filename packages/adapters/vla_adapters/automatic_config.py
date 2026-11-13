@@ -7,23 +7,28 @@ from pathlib import Path
 if __package__:
     from .dataset_bindings import validate_binding_assets
     from .data_processors import instantiate_data_processor
-    from .composition_spec import COMPOSABLE_PROCESSOR, SLOTS, normalize_composition
+    from .composition_spec import (
+        COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, normalize_composition,
+    )
     from .recap import STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, uses_torch_recap, validate_stage_progress_selection
 else:
     from dataset_bindings import validate_binding_assets
     from data_processors import instantiate_data_processor
-    from composition_spec import COMPOSABLE_PROCESSOR, SLOTS, normalize_composition
+    from composition_spec import (
+        COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, normalize_composition,
+    )
     from recap import STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, uses_torch_recap, validate_stage_progress_selection
 
 
 AUTO_CONFIG_DEFAULTS = {"model_type": "pi05", "finetune_mode": "full", "action_horizon": 50, "action_dim": 32}
+STATE_TOKEN_LAYOUTS = (FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM)
 
 
 def normalize_auto_config(value):
     if value is None:
         return None
-    if not isinstance(value, dict) or set(value) - set(AUTO_CONFIG_DEFAULTS):
-        raise ValueError("AUTO_CONFIG_INVALID: 自动配置只接受模型、微调方式、动作预测长度与模型动作维度")
+    if not isinstance(value, dict) or set(value) - (set(AUTO_CONFIG_DEFAULTS) | {"state_token_layout"}):
+        raise ValueError("AUTO_CONFIG_INVALID: 自动配置只接受模型、微调方式、动作维度和状态编码选项")
     clean = {**AUTO_CONFIG_DEFAULTS, **value}
     if (not isinstance(clean["model_type"], str) or clean["model_type"] not in {"pi0", "pi05"}
             or not isinstance(clean["finetune_mode"], str) or clean["finetune_mode"] not in {"full", "lora"}):
@@ -31,6 +36,12 @@ def normalize_auto_config(value):
     if (type(clean["action_horizon"]) is not int or not 1 <= clean["action_horizon"] <= 1000
             or type(clean["action_dim"]) is not int or not 1 <= clean["action_dim"] <= 4096):
         raise ValueError("AUTO_CONFIG_INVALID: 预测长度应为 1–1000，模型动作维度应为 1–4096 的整数")
+    if "state_token_layout" in clean:
+        layout = clean["state_token_layout"]
+        if not isinstance(layout, str) or layout not in STATE_TOKEN_LAYOUTS or clean["model_type"] != "pi05":
+            raise ValueError("AUTO_CONFIG_INVALID: 状态编码只支持 Pi0.5 的展平或 Kai0 补齐方式")
+        if layout == KAI0_PAD32_MODEL_TRANSFORM and clean["action_dim"] != 32:
+            raise ValueError("AUTO_CONFIG_INVALID: Kai0 状态编码要求模型动作维度为 32")
     return clean
 
 
@@ -40,6 +51,21 @@ def automatic_recipe_name(auto_config, training_stage=None):
         raise ValueError("AUTO_CONFIG_INVALID: 自动配置或训练阶段无效")
     return (f"auto_{clean['model_type']}_{clean['finetune_mode']}_h{clean['action_horizon']}"
             f"_d{clean['action_dim']}_{training_stage or 'sft'}")
+
+
+def validate_state_token_layout(auto_config, bindings, *, template_id, training_stage=None):
+    layout = (auto_config or {}).get("state_token_layout")
+    if layout is None:
+        return
+    if template_id != "openpi-sft" or training_stage not in (None, "sft"):
+        raise ValueError("STATE_TOKEN_LAYOUT_UNSUPPORTED: 状态编码选项仅支持自动配置的 Pi0.5 SFT")
+    if not bindings or any((row.get("processor") or {}).get("name") != COMPOSABLE_PROCESSOR for row in bindings):
+        raise ValueError("STATE_TOKEN_LAYOUT_UNSUPPORTED: 状态编码选项要求所有数据组使用字段组合")
+    if layout == KAI0_PAD32_MODEL_TRANSFORM:
+        for row in bindings:
+            composition = row["processor"]["parameters"]["composition"]
+            if composition["state_history"] != 1 or sum(field["width"] for field in composition["state_fields"]) != 14:
+                raise ValueError("STATE_TOKEN_LAYOUT_UNSUPPORTED: Kai0 状态编码要求每组数据使用单帧 14 维状态")
 
 
 def automatic_data_layout(auto_config, bindings, *, norm_stats=False):
@@ -54,7 +80,8 @@ def automatic_data_layout(auto_config, bindings, *, norm_stats=False):
             continue
         composition = normalize_composition(processor["parameters"]["composition"], norm_stats=norm_stats)
         compositions.append(composition)
-        state_widths.append(composition["state_history"] * sum(item["width"] for item in composition["state_fields"]))
+        state_width = composition["state_history"] * sum(item["width"] for item in composition["state_fields"])
+        state_widths.append(32 if composition["model_transform"] == KAI0_PAD32_MODEL_TRANSFORM else state_width)
         if sum(item["width"] for item in composition["action_layout"]) > auto_config["action_dim"]:
             raise ValueError("AUTO_CONFIG_DIMENSION_MISMATCH: 模型动作维度小于已登记动作布局")
         for camera in composition["cameras"]:
@@ -140,6 +167,12 @@ def build_automatic_base(spec, config_module, weight_loaders):
     bindings = validate_binding_assets(spec.get("dataset_bindings"), spec["inputs"])
     if not bindings or any("processor" not in row for row in bindings):
         raise ValueError("AUTO_CONFIG_PROCESSOR_REQUIRED: 自动配置要求每组数据使用独立数据处理器")
+    validate_state_token_layout(clean, bindings, template_id=spec.get("template_id", "openpi-sft"), training_stage=stage)
+    layout = clean.get("state_token_layout")
+    if layout is not None and any(
+        row["processor"]["parameters"]["composition"]["model_transform"] != layout for row in bindings
+    ):
+        raise ValueError("STATE_TOKEN_LAYOUT_MISMATCH: 冻结的数据处理配置与所选状态编码不一致，请重新预检")
     try:
         model, state_padding = build_automatic_model(clean, config_module, bindings, stage)
         # Reuse the existing registered processor implementation. resolve_config
