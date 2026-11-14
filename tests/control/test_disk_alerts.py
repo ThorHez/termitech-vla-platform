@@ -5,6 +5,7 @@ import pytest
 from vla_control.common import now, offset_time
 from vla_control.models import Node
 from .conftest import ADMIN
+from .test_node_addresses import install
 
 ALERTS = "/api/v1/alerts"
 
@@ -71,7 +72,34 @@ def test_bad_rows_do_not_hide_a_valid_disk_warning_or_create_duplicate(platform)
     ])
     warning, = alerts(platform)
     assert warning["details"]["mountpoint"] == "/data"
-    assert warning["details"]["usage_percent"] == 95.5
+    assert warning["details"]["usage_percent"] == 93.5
+
+
+def test_newest_mount_sample_updates_one_warning_and_can_clear_it(platform):
+    first = platform.register(name="first-agent")
+    second = platform.register(name="second-agent")
+    install(platform, first, "192.0.2.11")
+    install(platform, second, "192.0.2.12", operation="upgrade")
+    report(platform, first, [mount("/data1", 997, 3)], sampled_at=offset_time(-5))
+    original, = alerts(platform)
+    report(platform, second, [mount("/data1/./", 929, 71), mount("/data2", 930, 70)])
+    updated = {row["details"]["mountpoint"]: row for row in alerts(platform)}
+    assert set(updated) == {"/data1", "/data2"}
+    assert updated["/data1"]["id"] == original["id"]
+    assert updated["/data1"]["node_id"] == second["node_id"]
+    assert updated["/data1"]["details"]["usage_percent"] == 92.9
+    report(platform, second, [mount("/data1", 888, 112), mount("/data2", 930, 70)])
+    unchanged, = alerts(platform)
+    assert unchanged["id"] == updated["/data2"]["id"]
+
+
+def test_identical_machine_labels_without_matching_identity_do_not_merge(platform):
+    first, second = platform.register(), platform.register()
+    report(platform, first, [mount("/data", 990, 10)])
+    report(platform, second, [mount("/data", 920, 80)])
+    rows = alerts(platform)
+    assert {row["node_id"] for row in rows} == {first["node_id"], second["node_id"]}
+    assert len({row["id"] for row in rows}) == 2
 
 
 @pytest.mark.parametrize("reported", [offset_time(-181), offset_time(120), "2026-01-01", "invalid"])

@@ -1203,6 +1203,12 @@ tbody tr:hover {
 .alert-list {
   padding: 4px 20px 12px;
 }
+.workspace-alert-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
 .alert-item {
   display: flex;
   gap: 10px;

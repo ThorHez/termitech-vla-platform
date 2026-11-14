@@ -30,7 +30,8 @@ import {
 } from 'lucide-react';
 import { createOperationClient, date, displayNumber, navigate, useApi } from './api';
 import { useAuth } from './auth';
-import { AlertList, isDiskCapacityAlert } from './WorkspaceAlerts';
+import { AlertList, WorkspaceAlerts } from './WorkspaceAlerts';
+import { isDiskCapacityAlert } from './workspaceAlertData';
 import {
   Back,
   Badge,
@@ -363,26 +364,13 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
             ))}
           </div>
         </Panel>
-        <Panel
-          id="workspace-alerts"
-          tabIndex={-1}
-          title="需要关注"
-          subtitle="来自机器和训练的实时异常"
-          action={<span className="count-pill">{alerts.data?.length ?? '—'}</span>}
-        >
-          <ErrorNotice error={alerts.error} retry={alerts.refresh} />
-          {alerts.data?.length ? (
-            <AlertList alerts={alerts.data} nodes={nodes.data} />
-          ) : (
-            <div className="healthy-state">
-              <div>
-                <ShieldCheck size={26} />
-              </div>
-              <strong>{enabled && alerts.data ? '当前没有待处理异常' : '等待资源状态上报'}</strong>
-              <p>{enabled && alerts.data ? '异常会在这里及时展示' : '连接管理服务后即可查看'}</p>
-            </div>
-          )}
-        </Panel>
+        <WorkspaceAlerts
+          alerts={alerts.data}
+          nodes={nodes.data}
+          enabled={enabled}
+          error={alerts.error}
+          refresh={alerts.refresh}
+        />
       </div>
     </>
   );

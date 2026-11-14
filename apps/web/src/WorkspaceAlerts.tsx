@@ -1,12 +1,11 @@
 import { useState } from 'react';
-import { AlertTriangle, HardDrive } from 'lucide-react';
-import { ViewLink } from './components';
+import { AlertTriangle, HardDrive, ShieldCheck } from 'lucide-react';
+import { ErrorNotice, Panel, ViewLink } from './components';
 import type { Alert, Node } from './types';
+import { isDiskCapacityAlert } from './workspaceAlertData';
 
-const regularPreviewCount = 4;
+const previewCount = 4;
 const percentFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
-
-export const isDiskCapacityAlert = (alert: Alert) => alert.code === 'DISK_CAPACITY_HIGH';
 
 export function focusWorkspaceAlerts() {
   const section = document.getElementById('workspace-alerts');
@@ -85,19 +84,16 @@ export function AlertList({
   alerts,
   nodes = [],
   showNodeLink = true,
+  id,
 }: {
   alerts: Alert[];
   nodes?: Pick<Node, 'id' | 'name'>[];
   showNodeLink?: boolean;
+  id?: string;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const disk = alerts.filter(isDiskCapacityAlert);
-  const regular = alerts.filter((alert) => !isDiskCapacityAlert(alert));
-  const visible = [...disk, ...(expanded ? regular : regular.slice(0, regularPreviewCount))];
-  const hidden = regular.length - regularPreviewCount;
   return (
-    <div className="alert-list">
-      {visible.map((alert, index) => (
+    <div className="alert-list" id={id}>
+      {alerts.map((alert, index) => (
         <AlertRow
           key={alert.id || index}
           alert={alert}
@@ -105,16 +101,64 @@ export function AlertList({
           showNodeLink={showNodeLink}
         />
       ))}
-      {hidden > 0 && (
-        <button
-          type="button"
-          className="button outline small"
-          aria-expanded={expanded}
-          onClick={() => setExpanded(!expanded)}
-        >
-          {expanded ? '收起其他异常' : `展开其余 ${hidden} 条异常`}
-        </button>
-      )}
     </div>
+  );
+}
+
+export function WorkspaceAlerts({
+  alerts,
+  nodes,
+  enabled,
+  error,
+  refresh,
+}: {
+  alerts?: Alert[];
+  nodes?: Pick<Node, 'id' | 'name'>[];
+  enabled: boolean;
+  error?: Error;
+  refresh: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const count = alerts?.length ?? 0;
+  return (
+    <Panel
+      id="workspace-alerts"
+      tabIndex={-1}
+      title="需要关注"
+      subtitle="来自机器和训练的实时异常"
+      action={
+        <div className="workspace-alert-actions">
+          <span className="count-pill">{alerts?.length ?? '—'}</span>
+          {count > previewCount && (
+            <button
+              type="button"
+              className="text-link"
+              aria-controls="workspace-alert-list"
+              aria-expanded={expanded}
+              onClick={() => setExpanded((value) => !value)}
+            >
+              {expanded ? '收起' : '查看全部'}
+            </button>
+          )}
+        </div>
+      }
+    >
+      <ErrorNotice error={error} retry={refresh} />
+      {alerts?.length ? (
+        <AlertList
+          id="workspace-alert-list"
+          alerts={expanded ? alerts : alerts.slice(0, previewCount)}
+          nodes={nodes}
+        />
+      ) : (
+        <div className="healthy-state">
+          <div>
+            <ShieldCheck size={26} />
+          </div>
+          <strong>{enabled && alerts ? '当前没有待处理异常' : '等待资源状态上报'}</strong>
+          <p>{enabled && alerts ? '异常会在这里及时展示' : '连接管理服务后即可查看'}</p>
+        </div>
+      )}
+    </Panel>
   );
 }

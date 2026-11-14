@@ -1,6 +1,7 @@
-import { createContext, useContext } from 'react';
+import { createContext, useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { useApi } from './api';
+import { deduplicateDiskAlerts } from './workspaceAlertData';
 import type { Alert, Asset, Gpu, Node, Overview, Profile, Run, Template } from './types';
 import type { AssetTransfer } from './assetTransfer';
 import type { MemberSummary } from './resourcePermissions';
@@ -18,6 +19,10 @@ function useResources(enabled: boolean) {
     3000,
   );
   const alerts = useApi<Alert[]>(enabled ? '/alerts' : null, 10000);
+  const currentAlerts = useMemo(
+    () => (alerts.data ? deduplicateDiskAlerts(alerts.data) : undefined),
+    [alerts.data],
+  );
   const refresh = () => {
     members.refresh();
     overview.refresh();
@@ -39,7 +44,7 @@ function useResources(enabled: boolean) {
     templates,
     runs,
     assetTransfers,
-    alerts,
+    alerts: { ...alerts, data: currentAlerts },
     refresh,
   };
 }
