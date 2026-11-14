@@ -1,9 +1,10 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { LoaderCircle, Plus, Trash2 } from 'lucide-react';
-import { api } from './api';
+import { createOperationClient } from './api';
 import { useAuth } from './auth';
 import { ErrorNotice, Field, Modal } from './components';
 import { useData } from './data';
+import { canEditDatasetAsset } from './datasetAssetPermissions';
 import type { Asset } from './types';
 import { DatasetFieldLabelsEditor } from './DatasetFieldLabelsEditor';
 import {
@@ -583,14 +584,14 @@ export function DatasetProfileForm({
 }
 
 export function DatasetProfileEditor(props: { asset: Asset; close: () => void }) {
-  const { can } = useAuth();
-  if (!can('assets.write'))
+  const { can, user } = useAuth();
+  if (!canEditDatasetAsset(user, props.asset, can))
     return (
       <Modal title="权限不足" close={props.close}>
-        编辑公共数据特征需要管理员权限。
+        管理员可以编辑数据特征，操作员可以编辑自己登记的数据集。
       </Modal>
     );
-  return <DatasetProfileEditorContent key={props.asset.id} {...props} />;
+  return <DatasetProfileEditorContent key={`${user?.id}:${props.asset.id}`} {...props} />;
 }
 
 function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: () => void }) {
@@ -607,6 +608,9 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
   const [error, setError] = useState<Error>();
   const errorArea = useRef<HTMLDivElement>(null);
   const pending = useRef(false);
+  const [client] = useState(createOperationClient);
+  const request = useRef<AbortController>(undefined);
+  useEffect(() => () => request.current?.abort(), []);
   const formId = useId();
   const errors = [
     ...datasetProfileErrors(value),
@@ -660,12 +664,15 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
         onSubmit={async (event) => {
           event.preventDefault();
           if (pending.current || errors.length) return;
+          const controller = new AbortController();
+          request.current = controller;
           pending.current = true;
           setBusy(true);
           setError(undefined);
           try {
-            await api<Asset>(`/assets/${encodeURIComponent(asset.id)}/dataset-profile`, {
+            await client.api<Asset>(`/assets/${encodeURIComponent(asset.id)}/dataset-profile`, {
               method: 'PATCH',
+              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]),
               body: JSON.stringify({
                 dataset_profile: normalizedDatasetProfile(value),
                 dataset_inspection_id: inspectionDraft.inspectionIdFor(asset.node_id, asset.path),
@@ -674,10 +681,11 @@ function DatasetProfileEditorContent({ asset, close }: { asset: Asset; close: ()
             assets.refresh();
             close();
           } catch (cause) {
-            setError(cause instanceof Error ? cause : new Error(String(cause)));
+            if (!controller.signal.aborted)
+              setError(cause instanceof Error ? cause : new Error(String(cause)));
           } finally {
             pending.current = false;
-            setBusy(false);
+            if (!controller.signal.aborted) setBusy(false);
           }
         }}
       >

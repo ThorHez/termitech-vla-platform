@@ -7,6 +7,7 @@ from sqlalchemy import select, text
 
 from .common import APIError, now, require_path, uid
 from .models import Asset, Node
+from .resource_authorization import require_dataset_registrar
 
 
 def canonical_norm_path(value):
@@ -104,7 +105,7 @@ def validate_norm_binding(session, *, kind, node_id, norm_asset_id):
     return norm
 
 
-def update_norm_binding(session, asset_id, norm_asset_id=None, *, norm_path=None):
+def update_norm_binding(session, asset_id, norm_asset_id=None, *, norm_path=None, actor_request=None):
     from .asset_transfers import active_asset_transfers
 
     dataset = session.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
@@ -112,6 +113,8 @@ def update_norm_binding(session, asset_id, norm_asset_id=None, *, norm_path=None
         raise APIError(404, "NOT_FOUND", "数据集资产不存在")
     if dataset.kind != "DATASET":
         raise APIError(409, "ASSET_KIND_MISMATCH", "只有数据集资产可以绑定 norm_stats")
+    if actor_request is not None:
+        require_dataset_registrar(actor_request, dataset)
     if dataset.state in {"ARCHIVED", "UNAVAILABLE"}:
         raise APIError(409, "DATASET_ASSET_UNAVAILABLE", "数据集已归档或不可用，不能修改 norm_stats 绑定")
     if norm_path is not None:

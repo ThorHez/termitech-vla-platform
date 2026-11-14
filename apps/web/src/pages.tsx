@@ -71,6 +71,7 @@ import {
 import { AssetDetail } from './AssetDetail';
 import { AssetArchiveDialog } from './AssetArchiveDialog';
 import { canArchiveAsset } from './assetArchive';
+import { canBindDatasetNorm, canEditDatasetAsset } from './datasetAssetPermissions';
 import { catalogAssetGroups } from './modelAssetGroups';
 import { AssetGroupRows } from './AssetGroupRows';
 import { datasetCatalogAssets, groupDatasetNormAssets } from './datasetAssetGroups';
@@ -1062,8 +1063,11 @@ export function AssetsPage({
   });
   const [batchSyncOwner, setBatchSyncOwner] = useState('');
   const [archiving, setArchiving] = useState<{ asset: Asset; owner: string }>();
-  const [editingProfile, setEditingProfile] = useState<Asset>();
-  const [bindingDataset, setBindingDataset] = useState<Asset>();
+  const [datasetEdit, setDatasetEdit] = useState<{
+    id: string;
+    owner: string;
+    mode: 'profile' | 'norm';
+  }>();
   const [templateAsset, setTemplateAsset] = useState<Asset>();
   const [personalFormatsOpen, setPersonalFormatsOpen] = useState(false);
   const [detailId, setDetailId] = useState(initialAssetId);
@@ -1110,10 +1114,27 @@ export function AssetsPage({
   const catalogAssets = catalogProjection.assets;
   const selectableCatalogAssets = catalogProjection.selectionAssets;
   const canTransferAssets = can('assets.transfer');
-  const canWriteAssets = can('assets.write');
   const canRegisterDatasets = can('datasets.register');
   const canRegisterAssets = can('assets.register');
   const selectionOwner = user?.id || '';
+  const editingAsset =
+    datasetEdit?.owner === selectionOwner
+      ? assets.data?.find((asset) => asset.id === datasetEdit.id)
+      : undefined;
+  const editingProfile =
+    editingAsset && datasetEdit?.mode === 'profile' && canEditDatasetAsset(user, editingAsset, can)
+      ? editingAsset
+      : undefined;
+  const bindingDataset =
+    editingAsset && datasetEdit?.mode === 'norm' && canBindDatasetNorm(user, editingAsset, can)
+      ? editingAsset
+      : undefined;
+  const openDatasetEdit = (asset: Asset, mode: 'profile' | 'norm') => {
+    const allowed = mode === 'profile' ? canEditDatasetAsset : canBindDatasetNorm;
+    if (selectionOwner && allowed(user, asset, can))
+      setDatasetEdit({ id: asset.id, owner: selectionOwner, mode });
+  };
+  const closeDatasetEdit = () => setDatasetEdit(undefined);
   const archiveAsset =
     archiving?.owner === selectionOwner
       ? assets.data?.find((asset) => asset.id === archiving.asset.id) || archiving.asset
@@ -1157,10 +1178,8 @@ export function AssetsPage({
     if (!canTransferAssets || batchSyncOwner !== selectionOwner) setBatchSyncOwner('');
   }, [selectionOwner, canTransferAssets, selectableCatalogAssets, nodes.data, batchSyncOwner]);
   useEffect(() => {
-    if (canWriteAssets) return;
-    setEditingProfile(undefined);
-    setBindingDataset(undefined);
-  }, [canWriteAssets]);
+    if (datasetEdit && !editingProfile && !bindingDataset) setDatasetEdit(undefined);
+  }, [datasetEdit, editingProfile, bindingDataset]);
   useEffect(() => {
     if (!canRegisterDatasets) setBatchRegister(false);
   }, [canRegisterDatasets]);
@@ -1674,8 +1693,8 @@ export function AssetsPage({
             profiles={profiles.data}
             validationChanged={assets.refresh}
             close={closeAssetDetail}
-            bindNorm={() => setBindingDataset(detailAsset)}
-            editProfile={() => setEditingProfile(detailAsset)}
+            bindNorm={() => openDatasetEdit(detailAsset, 'norm')}
+            editProfile={() => openDatasetEdit(detailAsset, 'profile')}
             sync={() => setSyncAsset(detailAsset)}
             saveTemplate={() => setTemplateAsset(detailAsset)}
             remove={() => openArchive(detailAsset)}
@@ -1713,15 +1732,9 @@ export function AssetsPage({
           close={() => setRegister(false)}
         />
       )}
-      {can('assets.write') && editingProfile && (
-        <DatasetProfileEditor asset={editingProfile} close={() => setEditingProfile(undefined)} />
-      )}
-      {can('assets.write') && bindingDataset && (
-        <DatasetNormBindingDialog
-          key={bindingDataset.id}
-          asset={bindingDataset}
-          close={() => setBindingDataset(undefined)}
-        />
+      {editingProfile && <DatasetProfileEditor asset={editingProfile} close={closeDatasetEdit} />}
+      {bindingDataset && (
+        <DatasetNormBindingDialog asset={bindingDataset} close={closeDatasetEdit} />
       )}
       {can('dataset-templates.write') && personalFormatsOpen && (
         <PersonalDatasetFormats close={() => setPersonalFormatsOpen(false)} />

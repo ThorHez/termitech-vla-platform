@@ -1,4 +1,4 @@
-"""Manual asset registrants may archive their assets, but cannot edit shared settings."""
+"""Dataset edits and asset archiving use the recorded registrant."""
 
 import pytest
 from sqlalchemy import delete, func, select
@@ -38,29 +38,113 @@ def test_registration_is_granted_for_all_supported_kinds_to_admin_and_operator(t
         assert counts(platform) == before
 
 
-@pytest.mark.parametrize("creator", ["alice", "team-admin"])
-@pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
-def test_operator_can_archive_only_own_registered_assets_and_cannot_edit_existing_assets(team, creator, kind):
+def test_registrant_can_edit_then_archive_own_dataset(team):
     platform, node, _, clients = team
-    metadata = {"dataset_profile": profile()} if kind == "DATASET" else {}
-    evidence = ({"dataset_inspection_id": profile_inspection(platform, node["node_id"], "/machine/datasets/new", profile())}
-                if kind == "DATASET" else {})
-    created = clients[creator].post("/api/v1/assets", json=body(node, kind=kind, metadata=metadata, **evidence))
+    alice, admin = clients["alice"], clients["team-admin"]
+    created = alice.post("/api/v1/assets", json=body(node, metadata={"custom": "preserve"}))
     assert created.status_code == 201, created.text
     asset = created.json()
     root = f"/api/v1/assets/{asset['id']}"
-    for method, suffix, payload in (
-        ("PATCH", "/dataset-profile", {"dataset_profile": {**profile(), "fps": 10}}),
-        ("PUT", "/norm-binding", {"norm_path": "/machine/norms/replacement"}),
-        ("POST", "/validation/cancel", {}),
-    ):
-        response = clients["alice"].request(method, root + suffix, json=payload)
-        assert response.status_code == 403, (method, suffix, response.text)
-    current = next(row for row in clients["alice"].get("/api/v1/assets").json() if row["id"] == asset["id"])
-    assert current == asset
-    response = clients["alice"].post(root + "/archive")
-    assert response.status_code == (200 if creator == "alice" else 403), response.text
-    assert clients["team-admin"].post(root + "/archive").status_code == 200
+    declared = profile(fps=10)
+    patch = {"dataset_profile": declared,
+             "dataset_inspection_id": profile_inspection(platform, node["node_id"], asset["path"], declared)}
+    updated = alice.patch(root + "/dataset-profile", json=patch)
+    assert updated.status_code == 200, updated.text
+    changed = updated.json()
+    assert changed["metadata"]["dataset_profile"]["fps"] == 10
+    assert changed["metadata"]["custom"] == "preserve"
+    for key in ("id", "path", "node_id", "name", "version", "registered_by_user_id"):
+        assert changed[key] == asset[key]
+
+    shared = admin.post("/api/v1/assets", json=body(node, kind="NORM", path="/machine/norms/shared"))
+    assert shared.status_code == 201, shared.text
+    original_norm = shared.json()
+    for binding in ({"norm_asset_id": original_norm["id"]}, {"norm_path": original_norm["path"]}):
+        bound = alice.put(root + "/norm-binding", json=binding)
+        assert bound.status_code == 200, bound.text
+        assert bound.json()["norm_asset_id"] == original_norm["id"]
+    assets = {row["id"]: row for row in admin.get("/api/v1/assets").json()}
+    assert assets[original_norm["id"]] == original_norm
+
+    fresh_binding = alice.put(root + "/norm-binding", json={"norm_path": "/machine/norms/new"})
+    assert fresh_binding.status_code == 200, fresh_binding.text
+    fresh_id = fresh_binding.json()["norm_asset_id"]
+    assets = {row["id"]: row for row in alice.get("/api/v1/assets").json()}
+    assert assets[fresh_id]["kind"] == "NORM"
+    assert assets[fresh_id]["registered_by_user_id"] is None
+    assert alice.post(f"/api/v1/assets/{fresh_id}/archive").status_code == 403
+    unbound = alice.put(root + "/norm-binding", json={"norm_asset_id": None})
+    assert unbound.status_code == 200 and unbound.json()["norm_asset_id"] is None
+
+    assert alice.post(root + "/validation/cancel").status_code == 403
+    assert alice.post(root + "/archive").status_code == 200
+    assert alice.patch(root + "/dataset-profile", json=patch).status_code == 409
+    assert alice.put(root + "/norm-binding", json={"norm_asset_id": None}).status_code == 409
+
+
+@pytest.mark.parametrize("target", ["other-dataset", "historical-dataset", "viewer-dataset", "own-model", "own-norm"])
+def test_dataset_write_is_limited_to_a_live_operator_owning_the_target_dataset(team, target):
+    platform, node, users, clients = team
+    kind = {"own-model": "MODEL", "own-norm": "NORM"}.get(target, "DATASET")
+    creator = "bob" if target == "other-dataset" else "alice"
+    created = clients[creator].post("/api/v1/assets", json=body(
+        node, kind=kind, metadata={"registered_by_user_id": users["alice"]["id"]}))
+    assert created.status_code == 201, created.text
+    asset = created.json()
+    if target in {"historical-dataset", "viewer-dataset"}:
+        with platform.app.state.db.write() as session:
+            session.get(Asset, asset["id"]).registered_by_user_id = (
+                users["reader"]["id"] if target == "viewer-dataset" else None)
+    client = clients["reader" if target == "viewer-dataset" else "alice"]
+    root = f"/api/v1/assets/{asset['id']}"
+    before = client.get("/api/v1/assets").json()
+    before_counts = counts(platform)
+    patch = client.patch(root + "/dataset-profile", json={"dataset_profile": profile(fps=10)})
+    bind = client.put(root + "/norm-binding", json={"norm_path": "/machine/norms/new"})
+    if kind != "DATASET":
+        status, code = 409, "ASSET_KIND_MISMATCH"
+    elif target == "viewer-dataset":
+        status, code = 403, "FORBIDDEN"
+    else:
+        status, code = 403, "RESOURCE_ACCESS_DENIED"
+    for response in (patch, bind):
+        assert response.status_code == status, response.text
+        assert response.json()["error"]["code"] == code
+    assert client.get("/api/v1/assets").json() == before
+    assert counts(platform) == before_counts
+
+
+@pytest.mark.parametrize("method,suffix", [("PATCH", "/dataset-profile"), ("PUT", "/norm-binding")])
+def test_dataset_edits_recheck_the_current_account_before_writing(team, monkeypatch, method, suffix):
+    platform, node, users, clients = team
+    client = clients["alice"]
+    created = client.post("/api/v1/assets", json=body(node))
+    assert created.status_code == 201, created.text
+    asset = created.json()
+    path = f"/api/v1/assets/{asset['id']}{suffix}"
+    declared = profile(fps=10)
+    payload = ({"dataset_profile": declared,
+                "dataset_inspection_id": profile_inspection(platform, node["node_id"], asset["path"], declared)}
+               if method == "PATCH" else {"norm_path": "/machine/norms/new"})
+    original = platform.app.state.auth.require
+    revoked = False
+
+    def revoke_after_admission(request, permission=None):
+        nonlocal revoked
+        principal = original(request, permission)
+        if request.method == method and request.url.path == path and not revoked:
+            revoked = True
+            platform.app.state.auth.update_user(None, users["alice"]["id"], {"role": "viewer"})
+        return principal
+
+    admin = clients["team-admin"]
+    before = admin.get("/api/v1/assets").json()
+    before_counts = counts(platform)
+    monkeypatch.setattr(platform.app.state.auth, "require", revoke_after_admission)
+    response = client.request(method, path, json=payload)
+    assert revoked and response.status_code in {401, 403}, response.text
+    assert admin.get("/api/v1/assets").json() == before
+    assert counts(platform) == before_counts
 
 
 @pytest.mark.parametrize("binding", ["existing", "path"])

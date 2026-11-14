@@ -100,6 +100,8 @@ def test_same_idempotency_key_is_independent_per_account_and_replays_own_run(tea
 @pytest.mark.parametrize("name", ["alice", "bob", "reader"])
 @pytest.mark.parametrize("kind", ["DATASET", "NORM", "MODEL"])
 def test_existing_public_assets_and_recipes_are_admin_managed(team, name, kind):
+    from .test_dataset_profiles import profile
+
     _, node, _, clients = team
     admin = clients["team-admin"]
     asset = admin.post("/api/v1/assets", json={"node_id": node["node_id"], "name": "public dataset",
@@ -109,15 +111,16 @@ def test_existing_public_assets_and_recipes_are_admin_managed(team, name, kind):
     assert asset.json()["registered_by_user_id"] == team[2]["team-admin"]["id"]
     for method, path, body in (
         ("POST", f"/assets/{identifier}/archive", {}),
-        ("PATCH", f"/assets/{identifier}/dataset-profile", {}),
-        ("PUT", f"/assets/{identifier}/norm-binding", {}),
+        ("PATCH", f"/assets/{identifier}/dataset-profile", {"dataset_profile": profile()}),
+        ("PUT", f"/assets/{identifier}/norm-binding", {"norm_asset_id": None}),
         ("POST", "/recipes", {}),
         ("POST", "/recipes/unknown/revisions", {}),
     ):
         result = clients[name].request(method, "/api/v1" + path, json=body)
-        assert result.status_code == 403, (method, path, result.text)
+        expected = 409 if name != "reader" and kind != "DATASET" and method in {"PATCH", "PUT"} else 403
+        assert result.status_code == expected, (method, path, result.text)
     validation = clients[name].post(f"/api/v1/assets/{identifier}/validations", json={})
-    assert validation.status_code == (403 if name == "reader" or kind == "DATASET" else 404), validation.text
+    assert validation.status_code == (403 if name == "reader" else 202 if kind == "DATASET" else 404), validation.text
     assert clients[name].get("/api/v1/assets").status_code == 200
     assert clients[name].get("/api/v1/recipes").status_code == 200
     assert admin.post(f"/api/v1/assets/{identifier}/archive").status_code == 200

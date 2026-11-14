@@ -1,9 +1,10 @@
-import { useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { Link2, LoaderCircle } from 'lucide-react';
-import { api } from './api';
+import { createOperationClient } from './api';
 import { useAuth } from './auth';
 import { ErrorNotice, Field, Modal } from './components';
 import { useData } from './data';
+import { canBindDatasetNorm } from './datasetAssetPermissions';
 import { PathAutocomplete } from './PathAutocomplete';
 import {
   DATASET_NORM_PATH,
@@ -121,26 +122,29 @@ export function DatasetNormField({
   );
 }
 
-export function DatasetNormBindingDialog({ asset, close }: { asset: Asset; close: () => void }) {
+export function DatasetNormBindingDialog(props: { asset: Asset; close: () => void }) {
+  const { can, user } = useAuth();
+  if (!canBindDatasetNorm(user, props.asset, can))
+    return (
+      <Modal title="无法修改绑定" close={props.close}>
+        管理员可以修改可用数据集的 norm_stats 绑定，操作员可以修改自己登记的数据集的绑定。
+      </Modal>
+    );
+  return <DatasetNormBindingContent key={`${user?.id}:${props.asset.id}`} {...props} />;
+}
+
+function DatasetNormBindingContent({ asset, close }: { asset: Asset; close: () => void }) {
   const { assets, nodes } = useData();
-  const { can } = useAuth();
   const [value, setValue] = useState(asset.norm_asset_id || '');
   const [path, setPath] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const pending = useRef(false);
+  const [client] = useState(createOperationClient);
+  const request = useRef<AbortController>(undefined);
+  useEffect(() => () => request.current?.abort(), []);
   const formId = useId();
   const blocker = datasetNormInputError(asset.node_id, value, path, assets.data || []);
-  const writable =
-    can('assets.write') &&
-    asset.kind === 'DATASET' &&
-    !['ARCHIVED', 'UNAVAILABLE'].includes(asset.status || asset.state || '');
-  if (!writable)
-    return (
-      <Modal title="无法修改绑定" close={close}>
-        只有具备资产编辑权限的账号可以修改可用数据集的 norm_stats 绑定。
-      </Modal>
-    );
   return (
     <Modal
       title="绑定 norm_stats"
@@ -170,22 +174,26 @@ export function DatasetNormBindingDialog({ asset, close }: { asset: Asset; close
         className="dataset-norm-form"
         onSubmit={async (event) => {
           event.preventDefault();
-          if (pending.current || blocker || !writable) return;
+          if (pending.current || blocker) return;
+          const controller = new AbortController();
+          request.current = controller;
           pending.current = true;
           setBusy(true);
           setError(undefined);
           try {
-            await api(`/assets/${encodeURIComponent(asset.id)}/norm-binding`, {
+            await client.api(`/assets/${encodeURIComponent(asset.id)}/norm-binding`, {
               method: 'PUT',
+              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]),
               body: JSON.stringify(datasetNormBindingPayload(value, path)),
             });
             assets.refresh();
             close();
           } catch (err) {
-            setError(err instanceof Error ? err : new Error(String(err)));
+            if (!controller.signal.aborted)
+              setError(err instanceof Error ? err : new Error(String(err)));
           } finally {
             pending.current = false;
-            setBusy(false);
+            if (!controller.signal.aborted) setBusy(false);
           }
         }}
       >

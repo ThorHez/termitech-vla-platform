@@ -72,7 +72,7 @@ from .deployment_records import register_routes as register_deployment_record_ro
 from .gpu_reservations import (register_routes as register_gpu_reservation_routes, request_owner,
                                require_gpu_access, reservation_owners)
 from .resource_authorization import (execution_permission_authorized, require_active_actor,
-                                     require_resource_owner, scoped_request_key)
+                                     require_dataset_registrar, require_resource_owner, scoped_request_key)
 
 logger = logging.getLogger(__name__)
 RETIRED_NODE_STATES = {"DISCONNECTED", "REMOVED"}
@@ -468,8 +468,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.put("/api/v1/assets/{asset_id}/norm-binding", dependencies=admin)
     def put_dataset_norm_binding(asset_id: str, body: schemas.AssetNormBindingInput, request: Request):
         with db.write() as session:
-            require_active_actor(session, request, "assets.write")
-            return asset_dict(update_norm_binding(session, asset_id, body.norm_asset_id, norm_path=body.norm_path))
+            require_active_actor(session, request, "datasets.write")
+            return asset_dict(update_norm_binding(session, asset_id, body.norm_asset_id,
+                                                  norm_path=body.norm_path, actor_request=request))
 
     @app.post("/api/v1/assets/{asset_id}/archive", dependencies=admin)
     def archive_asset(asset_id: str, request: Request):
@@ -500,12 +501,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.patch("/api/v1/assets/{asset_id}/dataset-profile", dependencies=admin)
     def update_dataset_profile(asset_id: str, body: schemas.AssetDatasetProfileInput, request: Request):
         with db.write() as session:
-            require_active_actor(session, request, "assets.write")
+            require_active_actor(session, request, "datasets.write")
             asset = session.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
             if asset is None:
                 raise APIError(404, "NOT_FOUND", "Asset not found")
             if asset.kind != "DATASET":
                 raise APIError(409, "ASSET_KIND_MISMATCH", "只有数据集资产可以编辑数据集描述")
+            require_dataset_registrar(request, asset)
             if asset.state == "ARCHIVED":
                 raise APIError(409, "ASSET_ARCHIVED", "已归档资产不能编辑数据集描述")
             if active_asset_transfers(session, asset_id=asset_id):

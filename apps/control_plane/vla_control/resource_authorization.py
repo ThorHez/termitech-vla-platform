@@ -33,6 +33,14 @@ def require_resource_owner(request, owner_user_id):
         raise APIError(403, "RESOURCE_ACCESS_DENIED", "只能管理自己创建的任务；历史无归属任务由管理员管理")
 
 
+def require_dataset_registrar(request, asset):
+    if request.state.principal.role == "admin":
+        return
+    registrar = asset.registered_by_user_id
+    if registrar is None or registrar != request_user_id(request):
+        raise APIError(403, "RESOURCE_ACCESS_DENIED", "只能编辑自己登记的数据集；未记录登记人的数据集由管理员管理")
+
+
 def require_active_actor(session, request, permission="training.write"):
     """Serialize admission with account revocation before taking resource locks.
 

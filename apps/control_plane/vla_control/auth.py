@@ -26,13 +26,13 @@ COOKIE_NAME = "vla_session"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 ROLES = ("admin", "operator", "viewer")
 PERMISSIONS = frozenset({"platform.read", "training.write", "assets.write", "assets.register", "assets.archive",
-                         "datasets.register", "datasets.archive", "datasets.validate", "recipes.write",
+                         "datasets.register", "datasets.archive", "datasets.write", "datasets.validate", "recipes.write",
                          "assets.query", "assets.transfer", "dataset-templates.write", "recipes.query",
                          "machines.manage", "recipes.writeback", "users.manage", "audit.read"})
 ROLE_PERMISSIONS = {
     "admin": PERMISSIONS,
     "operator": frozenset({"platform.read", "training.write", "assets.register", "assets.archive",
-                           "datasets.register", "datasets.archive", "datasets.validate", "assets.query", "assets.transfer",
+                           "datasets.register", "datasets.archive", "datasets.write", "datasets.validate", "assets.query", "assets.transfer",
                            "dataset-templates.write", "recipes.query"}),
     "viewer": frozenset({"platform.read"}),
 }

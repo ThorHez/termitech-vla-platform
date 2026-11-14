@@ -44,6 +44,7 @@ try {
       'assets.archive',
       'datasets.register',
       'datasets.archive',
+      'datasets.write',
       'assets.query',
       'assets.transfer',
       'dataset-templates.write',
@@ -124,12 +125,28 @@ try {
     const dataset = { id: 'dataset', node_id: 'node', kind: 'DATASET', state: 'REGISTERED' };
     assert.match(
       render('operator', DatasetProfileEditor, { asset: dataset, close() {} }, false),
-      /管理员权限/,
+      /权限不足/,
     );
     assert.match(
       render('operator', DatasetNormBindingDialog, { asset: dataset, close() {} }),
       /无法修改绑定/,
     );
+  });
+
+  await test('dataset editing dialogs admit their operator registrant and reject other accounts', () => {
+    const owned = {
+      id: 'dataset', name: 'Dataset', node_id: 'node', kind: 'DATASET', state: 'REGISTERED',
+      path: '/datasets/demo', registered_by_user_id: 'operator',
+    };
+    const other = { ...owned, registered_by_user_id: 'someone-else' };
+    for (const [component, action, denial] of [
+      [DatasetProfileEditor, /保存数据特征/, /权限不足/],
+      [DatasetNormBindingDialog, /保存为不绑定/, /无法修改绑定/],
+    ]) {
+      assert.match(render('operator', component, { asset: owned, close() {} }), action);
+      assert.match(render('operator', component, { asset: other, close() {} }, false), denial);
+      assert.match(render('viewer', component, { asset: { ...owned, registered_by_user_id: 'viewer' }, close() {} }, false), denial);
+    }
   });
 
   await test('single registration requires the common asset permission while batch keeps its dataset scope', () => {

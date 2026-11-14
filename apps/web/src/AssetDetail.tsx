@@ -5,6 +5,7 @@ import { canArchiveAsset } from './assetArchive';
 import { Badge, Modal } from './components';
 import { assetKinds } from './data';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
+import { canBindDatasetNorm, canEditDatasetAsset } from './datasetAssetPermissions';
 import { imageProcessingSummary } from './imageProcessingPolicy';
 import { datasetFormatProfile } from './datasetFormatTemplateData';
 import { boundDatasetNorm, datasetNormSelectionError } from './datasetNormAssets';
@@ -46,7 +47,8 @@ export function AssetDetail({
   const state = asset.status || asset.state || 'REGISTERED';
   const archived = state === 'ARCHIVED';
   const unavailable = state === 'UNAVAILABLE';
-  const writable = can('assets.write') && !archived;
+  const editable = canEditDatasetAsset(user, asset, can);
+  const normBindable = canBindDatasetNorm(user, asset, can);
   const transferable = can('assets.transfer') && !archived;
   const canSaveTemplate = can('dataset-templates.write') && !archived;
   const dataset = asset.kind === 'DATASET';
@@ -105,17 +107,17 @@ export function AssetDetail({
           </select>
         </label>
       )}
-      {(writable || transferable || canSaveTemplate) && (
+      {(editable || transferable || canSaveTemplate) && (
         <section className="asset-detail-section asset-detail-action-section">
           <h4>资产操作</h4>
           <div className="asset-detail-actions">
-            {writable && dataset && !unavailable && (
+            {normBindable && (
               <button type="button" className="button outline" onClick={bindNorm}>
                 <Link2 size={15} />
                 {asset.norm_asset_id ? '修改 norm_stats' : '绑定 norm_stats'}
               </button>
             )}
-            {writable && dataset && (
+            {editable && (
               <button type="button" className="button outline" onClick={editProfile}>
                 <Pencil size={15} />
                 {profile ? '编辑数据特征' : '补录数据特征'}

@@ -51,7 +51,7 @@ _allow("platform.read", "GET",
 _allow("assets.register", "POST", "/assets", "/runs/{run_id}/recap-annotations")
 _allow("assets.archive", "POST", "/assets/{asset_id}/archive")
 _allow("assets.query", "POST", "/nodes/{node_id}/path-suggestions")
-_allow("assets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
+_allow("datasets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
 _allow("datasets.validate", "POST", "/assets/{asset_id}/validations")
 _allow("assets.write", "POST", "/assets/{asset_id}/validation/cancel")
 _allow("platform.read", "GET", "/assets/{asset_id}/validation")
@@ -64,7 +64,7 @@ _allow("dataset-templates.write", "DELETE", "/dataset-format-templates/{template
 _allow("datasets.register", "POST", "/nodes/{node_id}/dataset-scans",
        "/nodes/{node_id}/dataset-scans/{scan_id}/register")
 _allow("datasets.register", "GET", "/nodes/{node_id}/dataset-scans/{scan_id}")
-_allow("assets.write", "PUT", "/assets/{asset_id}/norm-binding")
+_allow("datasets.write", "PUT", "/assets/{asset_id}/norm-binding")
 _allow("assets.query", "POST", "/nodes/{node_id}/dataset-inspections")
 _allow("assets.query", "GET", "/nodes/{node_id}/dataset-inspections/{query_id}")
 _allow("platform.read", "GET", "/asset-transfers", "/asset-transfers/{transfer_id}")

@@ -99,6 +99,7 @@ try {
                     'assets.archive',
                     'datasets.register',
                     'datasets.archive',
+                    'datasets.write',
                     'assets.transfer',
                     'dataset-templates.write',
                   ].includes(permission),
@@ -180,6 +181,20 @@ try {
     assert.ok(button(operator, /同步到其他机器/));
     for (const label of [normAction, /数据特征/, /删除/])
       assert.equal(button(operator, label), undefined);
+  });
+
+  await test('operators can edit and bind their own dataset, with the same archive control', () => {
+    const own = { ...dataset, registered_by_user_id: 'operator' };
+    const html = render(own, node, 'operator');
+    for (const label of [normAction, /编辑数据特征/, /删除登记/]) {
+      assert.ok(button(html, label), `missing operation ${label}`);
+      assert.equal(button(render({ ...own, registered_by_user_id: 'someone-else' }, node, 'operator'), label), undefined);
+    }
+    const unavailable = render({ ...own, status: 'UNAVAILABLE' }, node, 'operator');
+    assert.ok(button(unavailable, /编辑数据特征/));
+    assert.equal(button(unavailable, normAction), undefined);
+    const archived = render({ ...own, state: 'ARCHIVED', status: 'ARCHIVED' }, node, 'operator');
+    assert.equal(buttons(archived).filter((value) => mutation.test(value.label)).length, 0);
   });
 
   await test('viewers can inspect every detail without being offered mutations', () => {

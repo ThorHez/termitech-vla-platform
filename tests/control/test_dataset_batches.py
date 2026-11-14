@@ -19,6 +19,8 @@ from vla_control.models import Asset, Command, Node, Run
 from vla_control.remote_models import RemoteConnection, RemoteDeployment
 from vla_control.settings import Settings
 
+from .conftest import Platform, profile_inspection
+
 
 PASSWORD = "isolated-dataset-batch-password"
 PROFILE = {"schema_version": 1, "format": "lerobot", "robot_type": "ARX5", "arm_mode": "single",
@@ -362,7 +364,7 @@ def test_scan_permission_and_csrf_are_enforced(batch, role, status):
         assert client.post(base(batch), json=payload, headers={"X-CSRF-Token": login["csrf_token"], "Origin": "https://foreign.invalid"}).status_code == 403
 
 
-def test_operator_can_scan_and_register_new_datasets_with_initial_norm_but_cannot_modify_assets(operator_batch):
+def test_operator_can_scan_register_edit_and_archive_own_datasets(operator_batch):
     app, client, _, _, _, authenticated, _ = operator_batch
     assert "datasets.register" in authenticated["permissions"] and "assets.write" not in authenticated["permissions"]
     value = scan(operator_batch)
@@ -379,17 +381,22 @@ def test_operator_can_scan_and_register_new_datasets_with_initial_norm_but_canno
     assert len(before) == 2 and {row["kind"] for row in before} == {"DATASET", "NORM"}
     assert created["norm_asset_id"] == next(row["id"] for row in before if row["kind"] == "NORM")
     assert all(created["metadata"]["dataset_profile"][key] == value for key, value in PROFILE.items())
-    for method, path, body in (
-        ("PATCH", "/dataset-profile", {"profile": deepcopy(PROFILE)}),
-        ("PUT", "/norm-binding", {"norm_asset_id": None}),
-        ("POST", "/validation/cancel", {}),
-    ):
-        denied = client.request(method, "/api/v1/assets/" + created["id"] + path, json=body)
-        assert denied.status_code == 403, (method, path, denied.text)
-    assert assets(operator_batch) == before
+    root = "/api/v1/assets/" + created["id"]
+    declared = {**deepcopy(PROFILE), "task_description": "Fold and stack cloth."}
+    platform = Platform(client, app, app.state.settings)
+    inspection = profile_inspection(platform, created["node_id"], created["path"], declared)
+    edited = client.patch(root + "/dataset-profile",
+                          json={"dataset_profile": declared, "dataset_inspection_id": inspection})
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["metadata"]["dataset_profile"]["task_description"] == declared["task_description"]
+    unbound = client.put(root + "/norm-binding", json={"norm_asset_id": None})
+    assert unbound.status_code == 200 and unbound.json()["norm_asset_id"] is None
+    assert client.post(root + "/validation/cancel").status_code == 403
+    assert next(row for row in assets(operator_batch) if row["kind"] == "NORM") == next(
+        row for row in before if row["kind"] == "NORM")
     with app.state.db.read() as session:
         assert session.get(DatasetScan, value["id"]).user_id == authenticated["user"]["id"]
-    archived = client.post("/api/v1/assets/" + created["id"] + "/archive")
+    archived = client.post(root + "/archive")
     assert archived.status_code == 200, archived.text
     assert archived.json()["registered_by_user_id"] == authenticated["user"]["id"]
     assert archived.json()["state"] == "ARCHIVED"
