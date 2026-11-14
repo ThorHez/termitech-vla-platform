@@ -597,8 +597,17 @@ export interface Alert {
   message?: string;
   title?: string;
   node_id?: string;
-  run_id?: string;
+  run_id?: string | null;
   created_at?: string;
+  timestamp?: string;
+  details?: {
+    mountpoint?: string;
+    usage_percent?: number;
+    used_bytes?: number;
+    free_bytes?: number;
+    total_bytes?: number;
+    threshold_percent?: number;
+  };
 }
 export interface TrainingGpuPolicy {
   mode: 'shared';

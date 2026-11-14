@@ -25,6 +25,7 @@ from vla_protocol.training_gpu_policy import TRAINING_SHARED_GPU_CAPABILITY
 from .artifacts import ArtifactMonitor
 from .asset_purge import CAPABILITIES as ASSET_PURGE_COMMANDS, execute_asset_purge_command
 from .config import load_config
+from .disk_capacity import DiskCapacityMonitor
 from .metrics import gpu_inventory, process_metrics, system_metrics
 from .path_suggestions import suggest_paths
 from .preflight import run_preflight
@@ -163,6 +164,7 @@ class Agent:
         self.training_runtime = installed_runtime()
         self.last_profile_sync = None
         self.runtime_monitor = RuntimeMonitor(config["roots"])
+        self.disk_capacity_monitor = DiskCapacityMonitor()
         self.artifact_monitor = ArtifactMonitor(self.state, config["output_root"],
                                                 output_roots=config.get("_output_root_history", []))
         self._preflight_worker = None
@@ -438,7 +440,10 @@ class Agent:
                 for process in gpu["processes"]:
                     process["attempt_id"] = owned_pids.get(process["pid"])
                     process["ownership"] = "platform" if process["attempt_id"] else "external"
-        metrics = {**system_metrics(self.config["output_root"]), "gpu_monitoring": availability,
+        system = system_metrics(None)
+        disk = self.disk_capacity_monitor.heartbeat_metrics(self.config["output_root"])
+        errors = {**system.get("collection_errors", {}), **disk.pop("collection_errors", {})}
+        metrics = {**system, **disk, "collection_errors": errors, "gpu_monitoring": availability,
                    "attempt_processes": process_samples, "sampled_at": utc_now(),
                    "runtime_checks": self.runtime_monitor.snapshot(self.config["profiles"]),
                    "capabilities": CAPABILITIES,

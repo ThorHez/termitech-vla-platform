@@ -30,6 +30,7 @@ import { DataProvider, useData } from './data';
 import { AssetsPage, NodePage, NodesPage, OverviewPage, RunsPage, TemplatesPage } from './pages';
 import RunDetail from './RunDetail';
 import { AssetDeletionsPage } from './AssetDeletions';
+import { focusWorkspaceAlerts } from './WorkspaceAlerts';
 import { assetDeletionsPath } from './assetPurge';
 import { AssetTransferTaskDetail } from './AssetTransfers';
 import { backgroundTaskActiveCounts } from './backgroundTaskEntries';
@@ -97,6 +98,7 @@ function Shell() {
   const assetScene = assetSceneId ? getSceneAssetFilter(assetSceneId, data) : undefined;
   const activeTasks = backgroundTaskActiveCounts(runs.data, assetTransfers.data);
   const taskCountsReady = runs.data !== undefined && assetTransfers.data !== undefined;
+  const viewingAlerts = path === '/overview' && queryParams.get('view') === 'alerts';
   const section =
     (path === assetDeletionsPath ? { label: '已删除资产' } : undefined) ||
     navigation.find((item) => path.startsWith(item.path)) ||
@@ -107,6 +109,9 @@ function Shell() {
     contentRef.current?.scrollTo(0, 0);
     document.title = `${section?.label || '平台设置'} · Termitech VLA`;
   }, [path, section?.label]);
+  useEffect(() => {
+    if (viewingAlerts) focusWorkspaceAlerts();
+  }, [viewingAlerts]);
   const createRun = (nodeId?: string, templateId?: string) => {
     if (can('training.write')) setWizard({ nodeId, templateId });
   };
@@ -239,7 +244,10 @@ function Shell() {
             </button>
             <a
               className="icon-button notifications"
-              href="#/overview"
+              href="#/overview?view=alerts"
+              onClick={() => {
+                if (viewingAlerts) focusWorkspaceAlerts();
+              }}
               aria-label={`当前 ${alerts.data?.length || 0} 条异常`}
               title="查看异常"
             >

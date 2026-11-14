@@ -17,7 +17,7 @@ function useResources(enabled: boolean) {
     enabled ? '/asset-transfers?limit=200' : null,
     3000,
   );
-  const alerts = useApi<Alert[]>(enabled ? '/alerts' : null);
+  const alerts = useApi<Alert[]>(enabled ? '/alerts' : null, 10000);
   const refresh = () => {
     members.refresh();
     overview.refresh();

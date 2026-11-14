@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 import hmac
 import logging
 import os
@@ -25,6 +26,7 @@ from .auth import AuthManager, register_auth_routes
 from .authorization import permission_for, request_route_path
 from .common import ACTIVE, APIError, TERMINAL, digest, now, offset_time, require_path, token_hash, uid, valid_snapshot
 from .db import Database
+from .disk_alerts import disk_capacity_alerts
 from .models import Allocation, Asset, Attempt, Command, Event, GPUReservation, Idempotency, Node, Preview, Profile, Run, RunInput
 from .onboarding import generate_agent_config, resolve_agent_config_defaults
 from .path_suggestions import acknowledge as acknowledge_path_query, create_query, expire_pending as expire_path_queries, matching_profile as matching_path_profile, query_dict as path_query_dict
@@ -793,9 +795,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def alerts():
         with db.read() as session:
             result = []
-            for node in session.scalars(select(Node).where(Node.status.in_(["OFFLINE", "RECOVERING"]))):
-                result.append({"id": "node:" + node.id, "severity": "error", "code": "NODE_" + node.status,
-                               "node_id": node.id, "run_id": None, "message": f"{node.effective_name}: {node.status}", "timestamp": node.last_seen})
+            moment = datetime.now(timezone.utc)
+            disk_alerts = []
+            for node in session.scalars(select(Node).where(Node.status.in_(["ONLINE", "OFFLINE", "RECOVERING"]))):
+                if node.status in {"OFFLINE", "RECOVERING"}:
+                    result.append({"id": "node:" + node.id, "severity": "error", "code": "NODE_" + node.status,
+                                   "node_id": node.id, "run_id": None, "message": f"{node.effective_name}: {node.status}", "timestamp": node.last_seen})
+                disk_alerts.extend(disk_capacity_alerts(node, moment, settings.heartbeat_timeout_seconds))
+            result.extend(sorted(disk_alerts, key=lambda alert: (-alert["details"]["usage_percent"], alert["id"])))
             for run in session.scalars(select(Run).where(Run.deleted_at.is_(None), Run.state.in_(["FAILED", "UNKNOWN"])).order_by(Run.updated_at.desc()).limit(100)):
                 error = run.error or {"code": "EXECUTION_UNKNOWN", "message": "Awaiting agent reconciliation; GPU reservation is retained"}
                 result.append({"id": "run:" + run.id, "severity": "error", "code": error.get("code", "TRAINING_FAILED"),

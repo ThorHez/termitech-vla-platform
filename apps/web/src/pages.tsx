@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
-  AlertTriangle,
   ArrowDownRight,
   ArrowRight,
   Box,
@@ -31,6 +30,7 @@ import {
 } from 'lucide-react';
 import { createOperationClient, date, displayNumber, navigate, useApi } from './api';
 import { useAuth } from './auth';
+import { AlertList, isDiskCapacityAlert } from './WorkspaceAlerts';
 import {
   Back,
   Badge,
@@ -364,27 +364,15 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
           </div>
         </Panel>
         <Panel
+          id="workspace-alerts"
+          tabIndex={-1}
           title="需要关注"
           subtitle="来自机器和训练的实时异常"
           action={<span className="count-pill">{alerts.data?.length ?? '—'}</span>}
         >
           <ErrorNotice error={alerts.error} retry={alerts.refresh} />
           {alerts.data?.length ? (
-            <div className="alert-list">
-              {alerts.data.slice(0, 4).map((alert, index) => (
-                <div className="alert-item" key={alert.id || index}>
-                  <AlertTriangle size={17} />
-                  <div>
-                    <strong>{alert.title || alert.code || '运行异常'}</strong>
-                    <p>{alert.message}</p>
-                    {alert.run_id && <ViewLink to={`/runs/${alert.run_id}`}>查看训练</ViewLink>}
-                    {!alert.run_id && alert.node_id && (
-                      <ViewLink to={`/nodes/${alert.node_id}`}>查看机器</ViewLink>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
+            <AlertList alerts={alerts.data} nodes={nodes.data} />
           ) : (
             <div className="healthy-state">
               <div>
@@ -663,7 +651,7 @@ export function NodesPage() {
 
 export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: string) => void }) {
   const { can } = useAuth();
-  const { nodes, assets, profiles, runs } = useData();
+  const { nodes, assets, profiles, runs, alerts } = useData();
   const details = useApi<NodeDetail | { node: Node; assets: Asset[] }>(`/nodes/${id}`);
   const [showManagement, setShowManagement] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
@@ -680,6 +668,8 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
   );
   const nodeProfiles = profiles.data?.filter((profile) => profile.node_id === id) || [];
   const nodeRuns = runs.data?.filter((run) => run.node_id === id) || [];
+  const diskAlerts =
+    alerts.data?.filter((alert) => alert.node_id === id && isDiskCapacityAlert(alert)) || [];
   return (
     <>
       <Back to="/nodes" label="返回机器资源" />
@@ -784,6 +774,11 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               <strong>{nodeRuns.filter((run) => activeStates.has(run.state)).length}</strong>
             </div>
           </div>
+          {diskAlerts.length > 0 && (
+            <Panel title="磁盘空间告警" className="node-disk-alerts">
+              <AlertList alerts={diskAlerts} nodes={[node]} showNodeLink={false} />
+            </Panel>
+          )}
           <ResourceHistory key={`history-${id}`} nodeId={id} status={node.status} />
           <div className="detail-columns">
             <div>

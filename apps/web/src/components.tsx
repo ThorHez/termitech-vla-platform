@@ -149,15 +149,19 @@ export function Panel({
   action,
   children,
   className = '',
+  id,
+  tabIndex,
 }: {
   title: string;
   subtitle?: string;
   action?: ReactNode;
   children: ReactNode;
   className?: string;
+  id?: string;
+  tabIndex?: number;
 }) {
   return (
-    <section className={`panel ${className}`}>
+    <section className={`panel ${className}`} id={id} tabIndex={tabIndex}>
       <div className="panel-heading">
         <div>
           <h2>{title}</h2>

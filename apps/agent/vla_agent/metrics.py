@@ -96,7 +96,7 @@ def _cpu_capacity(errors: dict) -> dict:
     return {"cpu_count": logical, "available_cpu_count": available}
 
 
-def system_metrics(output_root: str) -> dict:
+def system_metrics(output_root: str | None) -> dict:
     errors = {}
     def sample(name, callback):
         try:
@@ -105,7 +105,7 @@ def system_metrics(output_root: str) -> dict:
             errors[name] = type(exc).__name__
             return None
     memory = sample("memory", psutil.virtual_memory)
-    disk = sample("disk", lambda: psutil.disk_usage(output_root))
+    disk = sample("disk", lambda: psutil.disk_usage(output_root)) if output_root is not None else None
     return {"cpu_percent": sample("cpu", lambda: psutil.cpu_percent(interval=None)),
             **_cpu_capacity(errors),
             "memory_total_bytes": memory.total if memory else None,
