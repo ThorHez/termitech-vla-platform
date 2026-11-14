@@ -79,7 +79,7 @@ def test_newest_mount_sample_updates_one_warning_and_can_clear_it(platform):
     first = platform.register(name="first-agent")
     second = platform.register(name="second-agent")
     install(platform, first, "192.0.2.11")
-    install(platform, second, "192.0.2.12", operation="upgrade")
+    install(platform, second, "192.0.2.11", operation="upgrade")
     report(platform, first, [mount("/data1", 997, 3)], sampled_at=offset_time(-5))
     original, = alerts(platform)
     report(platform, second, [mount("/data1/./", 929, 71), mount("/data2", 930, 70)])
@@ -100,6 +100,15 @@ def test_identical_machine_labels_without_matching_identity_do_not_merge(platfor
     rows = alerts(platform)
     assert {row["node_id"] for row in rows} == {first["node_id"], second["node_id"]}
     assert len({row["id"] for row in rows}) == 2
+
+
+def test_shared_ssh_key_on_distinct_hosts_does_not_merge_alerts(platform):
+    first, second = platform.register(), platform.register()
+    install(platform, first, "192.0.2.11")
+    install(platform, second, "192.0.2.12")
+    report(platform, first, [mount("/data1", 997, 3)])
+    report(platform, second, [mount("/data1", 929, 71)])
+    assert {row["node_id"] for row in alerts(platform)} == {first["node_id"], second["node_id"]}
 
 
 @pytest.mark.parametrize("reported", [offset_time(-181), offset_time(120), "2026-01-01", "invalid"])

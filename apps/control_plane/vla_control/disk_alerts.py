@@ -73,16 +73,17 @@ def _observed_mounts(node, moment, heartbeat_timeout_seconds):
 
 
 def _machine_keys(session, node_ids):
-    """Merge only Agent records with the same verified SSH host key."""
-    query = (select(RemoteDeployment.node_id, RemoteConnection.fingerprint, RemoteDeployment.agent_config)
+    """SSH keys may be cloned across machines. Require the endpoint too."""
+    query = (select(RemoteDeployment.node_id, RemoteConnection.host, RemoteConnection.port,
+                    RemoteConnection.fingerprint, RemoteDeployment.agent_config)
              .join(RemoteConnection, RemoteConnection.id == RemoteDeployment.connection_id)
              .where(RemoteDeployment.node_id.in_(node_ids), RemoteDeployment.state == "SUCCEEDED",
                     RemoteConnection.fingerprint != "")
              .order_by(RemoteDeployment.created_at.desc(), RemoteDeployment.id.desc()))
     keys = {}
-    for node_id, fingerprint, config in session.execute(query):
+    for node_id, host, port, fingerprint, config in session.execute(query):
         if (config or {}).get("_operation", "install") in {"install", "upgrade"}:
-            keys.setdefault(node_id, "ssh:" + fingerprint)
+            keys.setdefault(node_id, "ssh:" + digest([host.casefold(), port, fingerprint]))
     return keys
 
 
