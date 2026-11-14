@@ -632,6 +632,7 @@ export interface PreflightCheck {
   message?: string;
   severity?: 'warning' | 'error';
   code?: string;
+  dataset_asset_id?: string;
 }
 export interface Preview {
   id: string;

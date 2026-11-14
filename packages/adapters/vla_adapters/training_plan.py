@@ -21,14 +21,15 @@ if __package__:
     from .automatic_config import normalize_auto_config
     from .generated_config import configuration_snapshot, generated_training_config
     from .image_runtime import image_processing_contract
-    from .composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
+    from .composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_action_loss_mask, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from .cache_contract import inspect_training_cache
     from .data_processors import processor_identity, validate_processor_instance
     from .dataset_bindings import validate_binding_assets
     from .dataset_contracts import verify_registered_dataset_profile
     from .dataset_fps import resolve_registered_fps
     from .dataset_timestamps import require_cached_dataset_timestamps
-    from .submission_validation import MODE, require_cached_dataset_source, submission_evidence
+    from .submission_validation import (MODE, record_base_validation_failure, require_base_validation_results,
+                                        require_cached_dataset_source, submission_evidence)
     from .entrypoints import read_entrypoint, validate_entrypoint
     from .recap import RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, recap_model_matches, uses_torch_recap
     from .recap_checkpoint import RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
@@ -39,14 +40,15 @@ else:
     from automatic_config import normalize_auto_config
     from generated_config import configuration_snapshot, generated_training_config
     from image_runtime import image_processing_contract
-    from composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
+    from composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_action_loss_mask, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from cache_contract import inspect_training_cache
     from data_processors import processor_identity, validate_processor_instance
     from dataset_bindings import validate_binding_assets
     from dataset_contracts import verify_registered_dataset_profile
     from dataset_fps import resolve_registered_fps
     from dataset_timestamps import require_cached_dataset_timestamps
-    from submission_validation import MODE, require_cached_dataset_source, submission_evidence
+    from submission_validation import (MODE, record_base_validation_failure, require_base_validation_results,
+                                       require_cached_dataset_source, submission_evidence)
     from entrypoints import read_entrypoint, validate_entrypoint
     from recap import RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, recap_model_matches, uses_torch_recap
     from recap_checkpoint import RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
@@ -272,7 +274,8 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
         if type(horizon) is not int or horizon <= 0 or type(action_dim) is not int or action_dim <= 0:
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 模型动作维度和预测长度无效")
         verify_composition_metadata(composition, info, derived_features=derived.get("derived_features", ()), action_horizon=horizon, norm_stats=norm_stats)
-        if sum(field["width"] for field in composition["action_layout"]) > action_dim:
+        raw_action_dim = sum(field["width"] for field in composition["action_layout"])
+        if raw_action_dim > action_dim:
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: 数据动作宽度超过模型 action_dim")
         if (getattr(model_config, "pi05", False) is not True and
                 composition["state_history"] * sum(field["width"] for field in composition["state_fields"]) > action_dim):
@@ -294,10 +297,9 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
         expected_runtime = {"training_stage": stage, "model_type": model_type,
             "pi05": getattr(model_config, "pi05", False) is True, "action_dim": action_dim, "action_horizon": horizon,
             "raw_state_dim": sum(field["width"] for field in composition["state_fields"]),
-            "raw_action_dim": sum(field["width"] for field in composition["action_layout"]),
+            "raw_action_dim": raw_action_dim,
             "state_history": composition["state_history"], "normalization": composition["normalization"],
-            "action_loss_mask": [1.] * sum(field["width"] for field in composition["action_layout"]) +
-                                [0.] * (action_dim - sum(field["width"] for field in composition["action_layout"])),
+            "action_loss_mask": composition_action_loss_mask(composition["model_transform"], raw_action_dim, action_dim),
             "acp_dropout": float(getattr(factory, "acp_dropout", .1)),
             "image_keys": image_keys, "depth_keys": depth_keys,
             "action_sequence_keys": [action_key] if len(actions) == 1 else [], "action_metadata_sha256": metadata_sha}
@@ -821,14 +823,35 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
         data = dataset_contract(factory, spec, spec["inputs"][dataset_role].get("dataset_profile"),
                                 model_config=getattr(config, "model", None),
                                 binding=bindings[index] if bindings is not None else None, checks=checks)
+        data["dataset_asset_id"] = spec["inputs"][dataset_role].get("id")
         datasets.append(data)
-    passed("data_contract", "已核对所有数据集的 LeRobot 元数据与 parquet 文件：" + "、".join(d["path"] for d in datasets))
+    passed("data_contract", "已核对所有数据集的 LeRobot 元数据与 parquet 文件：" + "、".join(d["path"] for d in datasets)[:2000])
+    # Look up receipts without rescanning data. One failed receipt is enough
+    # per asset, but must not stop the remaining datasets from being checked.
+    base_validation_failures = {}
+    sources = []
     for data in datasets:
         try:
             data["timestamp_contract"] = require_cached_dataset_timestamps(data, spec)
         except ValueError as exc:
+            if record_base_validation_failure(base_validation_failures, "dataset_timestamps", data, exc):
+                continue
             checks.append({"name": "dataset_timestamps", "ok": False, "message": str(exc)[:2000]})
             raise
+        try:
+            sources.append(require_cached_dataset_source(data, spec))
+        except ValueError as exc:
+            if record_base_validation_failure(base_validation_failures, "dataset_samples", data, exc):
+                continue
+            checks.append({"name": "dataset_samples", "ok": False, "message": str(exc)[:2000]})
+            raise
+    stage, stage_config = stage_request(spec)
+    try:
+        stage_contract = inspect_stage(config, spec, factories, datasets, base_validation_failures)
+    except ValueError:
+        require_base_validation_results(base_validation_failures, checks)
+        raise
+    require_base_validation_results(base_validation_failures, checks)
     passed("dataset_timestamps", "已复用与当前数据、生效 FPS 及加载器容差匹配的基础时间戳校验结果")
     automatic_norm = multi and getattr(config.data, "auto_shared_norm", False) is True and len(factories) > 1
     for data, factory in zip(datasets, factories):
@@ -846,7 +869,6 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
         norm = norm / "norm_stats.json" if norm.is_dir() else norm
         if data["norm_path"] != str(norm.resolve(strict=True)):
             raise ValueError("DATASET_BINDINGS_INVALID: 实际训练的数据与归一化参数配对不一致")
-        data["dataset_asset_id"] = spec["inputs"][dataset_role].get("id")
         data["norm_asset_id"] = spec["inputs"][norm_role].get("id")
         if automatic_norm:
             data["norm_usage"] = "reference_only"
@@ -859,20 +881,17 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             data["recipe_index"] = binding["recipe_index"]
     passed("norm_contract", ("已核对参考统计；训练启动前将按本次数据与权重完整计算一份共享统计，所有数据集统一使用"
                              if automatic_norm else "所有数据集归一化统计可读，数值有限且维度一致"))
-    for data in datasets:
+    for data, source in zip(datasets, sources, strict=True):
         try:
-            source = require_cached_dataset_source(data, spec)
             data["submission_validation"] = submission_evidence(data, source)
         except ValueError as exc:
             checks.append({"name": "dataset_samples", "ok": False, "message": str(exc)[:2000]})
             raise
     passed("dataset_samples", "已复用数据集基础校验结果，并检查本次字段组合、相机映射和模型配置；提交阶段未重新加载或解码数据")
-    stage, stage_config = stage_request(spec)
-    stage_contract = inspect_stage(config, spec, factories, datasets)
     if stage_contract is not None:
         passed("recap_stage", "已核对 ReCap 阶段、模型和实际 parquet 监督字段：" + stage)
-    model, reference = model_contract(spec, config.model)
     pytorch = uses_torch_recap(spec)
+    model, reference = model_contract(spec, config.model) if pytorch else model_contract(spec)
     loader_path = getattr(config, "pytorch_weight_path", None) if pytorch else getattr(config.weight_loader, "params_path", config.weight_loader)
     expected_path = Path(model["path"]).parent if pytorch else Path(model["path"])
     if not isinstance(loader_path, (str, Path)) or Path(loader_path).resolve() != expected_path:

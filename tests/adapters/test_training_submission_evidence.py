@@ -102,8 +102,42 @@ def test_missing_basic_evidence_blocks_submission_without_revalidation_fallback(
     assert key is not None
     (Path(spec["validation_cache_dir"]) / f"{kind}-{key}.json").unlink()
     before = receipt_files(spec)
+    checks = []
     with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED.*基础校验"):
-        training_plan.inspect_training_config(config, spec, checks=[])
+        training_plan.inspect_training_config(config, spec, checks=checks)
+    assert checks[-1]["dataset_asset_id"] == spec["inputs"]["dataset_1"]["id"]
+    assert receipt_files(spec) == before
+
+
+def test_preflight_lists_all_affected_assets_with_distinct_missing_or_stale_receipts(submitted, monkeypatch, capsys):
+    config, spec, datasets = submitted
+    runtime, tolerance = dataset_timestamps._runtime()
+    source_context = {"scope": "dataset_source"}
+    timestamp_context = {"runtime": runtime, "tolerance_s": tolerance}
+    for kind, dataset, context in (
+        ("timestamps", datasets[0], timestamp_context),
+        ("source", datasets[1], source_context),
+    ):
+        key = cache.cache_key(kind, dataset, spec, context=context)
+        assert key is not None
+        (Path(spec["validation_cache_dir"]) / f"{kind}-{key}.json").unlink()
+    (Path(datasets[2]["path"]) / "data/episode_000000.parquet").write_bytes(b"changed source rows")
+    before = receipt_files(spec)
+    monkeypatch.setattr(openpi_entry, "prepare_config", lambda request: (config, None))
+    with pytest.raises(SystemExit) as stopped:
+        openpi_entry._run_spec(spec, validate_only=True)
+    assert stopped.value.code == 2
+    response = json.loads(capsys.readouterr().out.split("VLA_PREFLIGHT:")[-1])
+    assert "plan" not in response
+    assert response["error"]["code"] == "DATASET_BASE_VALIDATION_REQUIRED"
+    assert "3 个数据集" in response["error"]["message"]
+    failures = [check for check in response["checks"] if "dataset_asset_id" in check]
+    assert [(check["dataset_asset_id"], check["name"]) for check in failures] == [
+        (spec["inputs"]["dataset_0"]["id"], "dataset_timestamps"),
+        (spec["inputs"]["dataset_1"]["id"], "dataset_samples"),
+        (spec["inputs"]["dataset_2"]["id"], "dataset_timestamps"),
+    ]
+    assert all(check["ok"] is False and check["code"] == response["error"]["code"] for check in failures)
     assert receipt_files(spec) == before
 
 

@@ -178,6 +178,26 @@ def test_missing_base_validation_blocks_before_model_or_cache_validation(trainin
     assert checks[-1]["name"] == "dataset_samples" and checks[-1]["ok"] is False
 
 
+def test_duplicate_bindings_report_a_missing_asset_once(training, monkeypatch):
+    base, spec, module, loaders = training
+    spec["dataset_bindings"][1]["dataset_asset_id"] = spec["dataset_bindings"][0]["dataset_asset_id"]
+    spec["inputs"]["dataset_1"] = copy.deepcopy(spec["inputs"]["dataset_0"])
+    config = resolve_config(base, spec, module, loaders)
+    original = training_plan.require_cached_dataset_timestamps
+
+    def timestamp(data, spec):
+        if data["dataset_asset_id"] == spec["inputs"]["dataset_0"]["id"]:
+            raise ValueError("DATASET_BASE_VALIDATION_REQUIRED: 请先完成基础校验")
+        return original(data, spec)
+
+    monkeypatch.setattr(training_plan, "require_cached_dataset_timestamps", timestamp)
+    checks = []
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED"):
+        inspect_training_config(config, spec, checks=checks)
+    failures = [check for check in checks if not check["ok"]]
+    assert [check["dataset_asset_id"] for check in failures] == [spec["inputs"]["dataset_0"]["id"]]
+
+
 def test_single_dataset_binding_uses_selected_dataset_and_single_entry(training):
     base, spec, module, loaders = training
     base.data = base.data.datasets[0]

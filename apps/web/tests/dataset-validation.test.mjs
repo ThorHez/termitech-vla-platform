@@ -18,7 +18,7 @@ try {
   const { DatasetValidation, DatasetValidationBadge } = await server.ssrLoadModule(
     '/src/DatasetValidation.tsx',
   );
-  const { PreflightDatasetValidation } = await server.ssrLoadModule(
+  const { PreflightDatasetValidation, PreflightDatasetValidationBatch } = await server.ssrLoadModule(
     '/src/PreflightDatasetValidation.tsx',
   );
   const { AssetDetail } = await server.ssrLoadModule('/src/AssetDetail.tsx');
@@ -171,9 +171,6 @@ try {
           node,
           profiles: [profile],
           profileId: profile.id,
-          changed() {},
-          onPendingChange() {},
-          onRefreshedChange() {},
         }),
         true,
         auth,
@@ -193,6 +190,28 @@ try {
     const denied = renderRefresh('alice', { ...operator, can: () => false });
     assert.doesNotMatch(denied, /<button/);
     assert.match(denied, /当前账号没有提交数据集校验的权限/);
+  });
+
+  await test('batch preflight refresh lists affected and optional legacy datasets with distinct actions', () => {
+    const html = render(
+      React.createElement(PreflightDatasetValidationBatch, {
+        affected: [asset, { ...asset, id: 'second', name: '第二个数据集' }],
+        additional: [{ ...asset, id: 'third', name: '旧版候选' }],
+        unresolved: 0,
+        node,
+        profiles: [profile],
+        profileId: profile.id,
+        changed() {},
+        onStatusChange() {},
+      }),
+      true,
+      { can: (permission) => permission === 'datasets.validate' },
+    );
+    assert.match(html, /本次已完成 0 \/ 2 个数据集的基础校验/);
+    assert.match(html, /刷新待校验数据集/);
+    assert.match(html, /刷新本次所有数据集/);
+    assert.match(html, /第二个数据集/);
+    assert.match(html, /同一训练环境已有通过记录（1 个）/);
   });
 
   await test('cancelled validation is neutral, retains its receipt and permits an authorized retry', () => {

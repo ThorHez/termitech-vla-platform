@@ -35,6 +35,13 @@ saved separately under the Agent's private `state/dataset-validation-cache`.
 Runner startup and the training entrypoint continue to run their normal checks,
 but reuse evidence when the source and processing fingerprints still match.
 
+When a training preview finds missing or stale source evidence, it lists the
+affected datasets for the selected training environment. Use the batch refresh
+button to queue validation for the listed datasets and follow each result in the
+preview. Once they pass, run the training preview again to check the full
+configuration. Agents that report one dataset at a time can still refresh all
+datasets selected for that preview in one action.
+
 Fingerprints include canonical data paths, metadata content, source-file versions
 (including device, inode, size, mtime and ctime), relevant Python source, runtime
 library versions and effective FPS. Composed samples also bind the normalization

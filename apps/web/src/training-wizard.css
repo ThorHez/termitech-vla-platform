@@ -374,6 +374,37 @@
   background: var(--bg-warning, #fff8e6);
   color: var(--text-warning, #8a5f10);
 }
+
+.preflight-validation-batch > div {
+  min-width: 0;
+}
+
+.preflight-validation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.preflight-validation-actions .button {
+  margin-left: 0;
+}
+
+.preflight-validation-list {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
+.preflight-validation-list li > div {
+  margin-top: 4px;
+}
+
+.preflight-validation-optional {
+  margin-top: 10px;
+}
 .preflight-checks > .warning strong,
 .preflight-checks > .warning span {
   color: var(--text-warning, #8a5f10);

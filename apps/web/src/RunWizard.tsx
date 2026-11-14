@@ -34,10 +34,10 @@ import { DatasetBindings, DatasetBindingSummary } from './DatasetBindings';
 import { newDatasetBindings } from './datasetBindingHelpers';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { PreflightChecks, sharedNormIncompatibilityDetail } from './PreflightChecks';
-import { PreflightDatasetValidation } from './PreflightDatasetValidation';
+import { PreflightDatasetValidationBatch } from './PreflightDatasetValidation';
 import {
   DATASET_BASE_VALIDATION_REQUIRED,
-  preflightValidationAsset,
+  preflightValidationAssets,
 } from './datasetValidationHelpers';
 import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft';
 import type { ImageLayoutEdits } from './imageLayout';
@@ -714,16 +714,24 @@ function RunWizardContent({
   const datasetValidationRequired =
     preview?.status === 'FAILED' && preview.error?.code === DATASET_BASE_VALIDATION_REQUIRED;
   const validationRequest = datasetValidationRequired ? preview.request : undefined;
-  const validationAsset = datasetValidationRequired
-    ? preflightValidationAsset(preview, assets.data || [])
-    : undefined;
+  const validationAssets =
+    datasetValidationRequired && assets.data
+      ? preflightValidationAssets(preview, assets.data)
+      : undefined;
   const validationKey =
-    validationRequest && validationAsset
-      ? JSON.stringify([previewId, validationAsset.id, validationRequest.profile_id])
+    validationRequest && validationAssets
+      ? JSON.stringify([
+          previewId,
+          validationRequest.profile_id,
+          [...validationAssets.affected, ...validationAssets.additional].map(({ id }) => id).sort(),
+        ])
       : undefined;
   const datasetValidationRefreshed = !!validationKey && refreshedValidationKey === validationKey;
   const datasetValidationChanged = useCallback(
-    (refreshed: boolean) => setRefreshedValidationKey(refreshed ? validationKey : undefined),
+    (pending: boolean, refreshed: boolean) => {
+      setDatasetValidationPending(pending);
+      setRefreshedValidationKey(refreshed ? validationKey : undefined);
+    },
     [validationKey],
   );
   const previewReadError = previewId ? previewResource.error : undefined;
@@ -2940,40 +2948,24 @@ function RunWizardContent({
               </div>
             </div>
           )}
-          {datasetValidationRequired && (
-            <div className={datasetValidationRefreshed ? undefined : 'error-notice'}>
-              {!datasetValidationRefreshed && <XCircle size={18} aria-hidden="true" />}
-              <div>
-                {!datasetValidationRefreshed && (
-                  <>
-                    <strong role="alert" title={DATASET_BASE_VALIDATION_REQUIRED}>
-                      数据集基础校验缺失或已失效
-                    </strong>
-                    {validationAsset && (
-                      <p>数据集「{validationAsset.name}」需要在本次训练环境刷新校验。</p>
-                    )}
-                  </>
-                )}
-                {validationAsset && validationRequest ? (
-                  <PreflightDatasetValidation
-                    key={validationKey}
-                    asset={validationAsset}
-                    node={nodes.data?.find((item) => item.id === validationRequest.node_id)}
-                    profiles={profiles.data || []}
-                    profileId={validationRequest.profile_id}
-                    changed={assets.refresh}
-                    onPendingChange={setDatasetValidationPending}
-                    onRefreshedChange={datasetValidationChanged}
-                  />
-                ) : (
-                  <p>
-                    {preview.error?.message?.replace(/^[A-Z_]+:\s*/u, '') ||
-                      '请在数据集详情完成基础校验，再重新预检。'}
-                  </p>
-                )}
+          {datasetValidationRequired &&
+            (validationAssets && validationRequest ? (
+              <PreflightDatasetValidationBatch
+                key={validationKey}
+                {...validationAssets}
+                fallback={preview.error?.message?.replace(/^[A-Z_]+:\s*/u, '')}
+                node={nodes.data?.find((item) => item.id === validationRequest.node_id)}
+                profiles={profiles.data || []}
+                profileId={validationRequest.profile_id}
+                changed={assets.refresh}
+                onStatusChange={datasetValidationChanged}
+              />
+            ) : (
+              <div className="error-notice" role="alert">
+                {preview.error?.message?.replace(/^[A-Z_]+:\s*/u, '') ||
+                  '请在数据集详情完成基础校验，再重新预检。'}
               </div>
-            </div>
-          )}
+            ))}
           {preview?.checks?.length ? (
             <PreflightChecks
               checks={preview.checks}

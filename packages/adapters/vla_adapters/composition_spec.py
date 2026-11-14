@@ -35,6 +35,11 @@ def canonical_text_trim(value):
     return value.strip(TRIM_CHARACTERS)
 
 
+def composition_action_loss_mask(model_transform, raw_action_dim, action_dim):
+    supervised_dim = action_dim if model_transform == KAI0_PAD32_MODEL_TRANSFORM else raw_action_dim
+    return [1.0] * supervised_dim + [0.0] * (action_dim - supervised_dim)
+
+
 def _fail(message):
     raise ValueError("COMPOSITION_INVALID: " + message)
 

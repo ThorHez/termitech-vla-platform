@@ -18,6 +18,33 @@ else:
 
 MODE = "registered_source"
 SCOPE = "registered_source_and_configuration"
+BASE_VALIDATION_REQUIRED = "DATASET_BASE_VALIDATION_REQUIRED"
+
+
+def base_validation_asset_key(dataset):
+    return dataset.get("dataset_asset_id") or dataset["path"]
+
+
+def record_base_validation_failure(failures, name, dataset, error):
+    message = str(error)
+    if message.partition(":")[0] != BASE_VALIDATION_REQUIRED:
+        return False
+    asset_key = base_validation_asset_key(dataset)
+    if asset_key not in failures:
+        check = {"name": name, "ok": False, "code": BASE_VALIDATION_REQUIRED, "message": message[:2000]}
+        if dataset.get("dataset_asset_id"):
+            check["dataset_asset_id"] = dataset["dataset_asset_id"]
+        failures[asset_key] = check
+    return True
+
+
+def require_base_validation_results(failures, checks):
+    if not failures:
+        return
+    checks.extend(failures.values())
+    if len(failures) == 1:
+        raise ValueError(next(iter(failures.values()))["message"])
+    raise ValueError(f"{BASE_VALIDATION_REQUIRED}: {len(failures)} 个数据集的基础校验缺失或已失效，请刷新校验后重新预检。")
 
 
 def _digest(value):

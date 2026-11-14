@@ -14,7 +14,7 @@ const server = await createServer({
 
 try {
   const { PreflightChecks, sharedNormIncompatibilityDetail } = await server.ssrLoadModule('/src/PreflightChecks.tsx');
-  const { preflightValidationAsset } = await server.ssrLoadModule('/src/datasetValidationHelpers.ts');
+  const { preflightValidationAssets } = await server.ssrLoadModule('/src/datasetValidationHelpers.ts');
   const render = (checks, summarizedSharedNormError, datasetValidationNotice) => renderToStaticMarkup(
     React.createElement(PreflightChecks, { checks, summarizedSharedNormError, datasetValidationNotice }),
   );
@@ -104,29 +104,53 @@ try {
   };
 
   await test('missing receipts resolve the matching frozen dataset for current and legacy error wording', () => {
-    const assets = [{ ...validationAsset, id: 'other', path: '/data/项目 A/demo-longer' }, validationAsset];
+    const passed = { scope: 'dataset_source', status: 'SUCCEEDED', profile_id: 'runtime-2' };
+    const other = { ...validationAsset, id: 'other', path: '/data/项目 A/demo-longer', validation: passed };
+    const assets = [other, { ...validationAsset, validation: passed }];
     for (const reason of [
       '的基础校验证据缺失或已失效，请先在数据集配置中执行基础校验',
       '缺少匹配的基础校验结果，或数据、登记配置、校验环境已变化',
       '的 ReCap 监督基础校验证据缺失或已失效，请先在数据集配置中执行基础校验',
     ]) {
       const preview = { ...failedValidationPreview, error: { code: baseValidationCode, message: `数据集 /data/项目 A/demo ${reason}` } };
-      assert.equal(preflightValidationAsset(preview, assets), validationAsset);
+      const targets = preflightValidationAssets(preview, assets);
+      assert.deepEqual(targets.affected, [assets[1]]);
+      assert.deepEqual(targets.additional, [other]);
+      assert.equal(targets.unresolved, 0);
     }
-    assert.equal(preflightValidationAsset(failedValidationPreview, assets), validationAsset);
+    const stale = { ...other, validation: { ...passed, status: 'STALE' } };
+    const foreign = { ...other, validation: { ...passed, profile_id: 'other-runtime' } };
+    for (const extra of [stale, foreign, { ...other, validation: null }]) {
+      assert.deepEqual(preflightValidationAssets(failedValidationPreview, [extra, assets[1]]).affected, [extra, assets[1]]);
+    }
   });
 
-  await test('refresh does not target unrelated assets, other machines, or ambiguous paths', () => {
+  await test('legacy refresh does not target unrelated assets or infer which duplicate path was reported', () => {
+    const passed = { scope: 'dataset_source', status: 'SUCCEEDED', profile_id: 'runtime-2' };
     const otherAssets = [
       { ...validationAsset, node_id: 'another-node' },
-      { ...validationAsset, id: 'other', path: '/data/项目 A/demo-longer' },
+      { ...validationAsset, id: 'other', path: '/data/项目 A/demo-longer', validation: passed },
       { ...validationAsset, id: 'unselected' },
       { ...validationAsset, id: 'norm' },
     ];
-    assert.equal(preflightValidationAsset(failedValidationPreview, otherAssets), undefined);
-    assert.equal(preflightValidationAsset(failedValidationPreview, [validationAsset, { ...validationAsset, id: 'other' }]), undefined);
-    assert.equal(preflightValidationAsset(failedValidationPreview, [{ ...validationAsset, path: '/data/项目 A/demo/../demo' }]), undefined);
-    assert.equal(preflightValidationAsset({ ...failedValidationPreview, status: 'READY' }, [validationAsset]), undefined);
+    assert.deepEqual(preflightValidationAssets(failedValidationPreview, otherAssets).affected, []);
+    assert.deepEqual(preflightValidationAssets(failedValidationPreview, [validationAsset, { ...validationAsset, id: 'other' }].map(asset => ({ ...asset, validation: passed }))).affected, []);
+    assert.deepEqual(preflightValidationAssets(failedValidationPreview, [{ ...validationAsset, path: '/data/项目 A/demo/../demo', validation: passed }]).affected, []);
+    assert.equal(preflightValidationAssets({ ...failedValidationPreview, status: 'READY' }, [validationAsset]), undefined);
+  });
+
+  await test('structured receipts refresh only reported dataset IDs bound to the frozen preview', () => {
+    const preview = { ...failedValidationPreview,
+      checks: ['target', 'target', 'unselected', 'norm'].map(dataset_asset_id => ({
+        code: baseValidationCode, name: 'dataset_samples', ok: false, dataset_asset_id,
+      })),
+    };
+    const assets = [validationAsset, ...['other', 'unselected', 'norm'].map(id => ({ ...validationAsset, id }))];
+    assert.deepEqual(preflightValidationAssets(preview, assets), {
+      affected: [validationAsset], additional: [], unresolved: 2, legacy: false,
+    });
+    preview.checks.push({ code: baseValidationCode, name: 'dataset_timestamps', ok: false, dataset_asset_id: 'other' });
+    assert.deepEqual(preflightValidationAssets(preview, assets).affected.map(asset => asset.id), ['other', 'target']);
   });
 
   await test('missing-receipt checks point to one action while unrelated failures keep their detail', () => {

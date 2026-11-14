@@ -97,6 +97,36 @@ def test_value_stage_preserves_value_loader_and_selects_value_training(recap):
     assert next(row for row in checks if row["name"] == "recap_stage")["ok"] is True
 
 
+def test_preflight_combines_source_and_recap_supervision_cache_misses(recap, monkeypatch):
+    base, spec, module, loaders = recap
+    config = resolve_config(base, spec, module, loaders)
+    source_lookup = training_plan.require_cached_dataset_source
+    supervision_lookup = recap_runtime.require_cached_supervision
+
+    def source(data, spec):
+        if data["path"] == spec["inputs"]["dataset_0"]["path"]:
+            raise ValueError("DATASET_BASE_VALIDATION_REQUIRED: 请先完成基础校验")
+        return source_lookup(data, spec)
+
+    def supervision(data, spec):
+        if data["path"] == spec["inputs"]["dataset_2"]["path"]:
+            return supervision_lookup(data, spec)
+        assert data["path"] == spec["inputs"]["dataset_1"]["path"]
+        recap_runtime._base_validation_required(data)
+
+    monkeypatch.setattr(training_plan, "require_cached_dataset_source", source)
+    monkeypatch.setattr(recap_runtime, "require_cached_supervision", supervision)
+    monkeypatch.setattr(recap_runtime, "_value_runtime_cache",
+                        lambda *_: pytest.fail("Do not probe training caches while dataset receipts are missing"))
+    checks = []
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED.*2 个数据集"):
+        inspect_training_config(config, spec, checks=checks)
+    assert [(check["dataset_asset_id"], check["name"]) for check in checks if not check["ok"]] == [
+        (spec["inputs"]["dataset_0"]["id"], "dataset_samples"),
+        (spec["inputs"]["dataset_1"]["id"], "recap_stage"),
+    ]
+
+
 def test_new_value_plan_resolves_native_torch_weights_and_freezes_the_backend(recap, monkeypatch):
     from test_recap_torch_checkpoint import _weights
 

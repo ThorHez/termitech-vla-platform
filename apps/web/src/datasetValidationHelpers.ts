@@ -1,5 +1,12 @@
-import { api, post } from './api';
-import type { Asset, DatasetSourceValidation, Node, Preview, Profile } from './types';
+import { api } from './api';
+import type {
+  Asset,
+  DatasetSourceValidation,
+  Node,
+  PreflightCheck,
+  Preview,
+  Profile,
+} from './types';
 
 export const DATASET_BASE_VALIDATION_REQUIRED = 'DATASET_BASE_VALIDATION_REQUIRED';
 
@@ -9,7 +16,15 @@ function validationPath(path: string) {
   return `/${parts.filter((part) => part && part !== '.').join('/')}`;
 }
 
-export function preflightValidationAsset(preview: Preview, assets: readonly Asset[]) {
+export function isPreflightDatasetValidationCheck(check: PreflightCheck) {
+  return (
+    !check.ok &&
+    (check.code === DATASET_BASE_VALIDATION_REQUIRED ||
+      check.message?.startsWith(`${DATASET_BASE_VALIDATION_REQUIRED}:`))
+  );
+}
+
+export function preflightValidationAssets(preview: Preview, assets: readonly Asset[]) {
   const request = preview.request;
   if (
     preview.status !== 'FAILED' ||
@@ -17,27 +32,57 @@ export function preflightValidationAsset(preview: Preview, assets: readonly Asse
     !request?.profile_id
   )
     return undefined;
-  // Older Agents report the resolved path in the message. Match it only to
-  // dataset IDs frozen in this preview, never the mutable draft or a basename.
-  const message = preview.error.message?.replace(/^DATASET_BASE_VALIDATION_REQUIRED:\s*/u, '');
-  const match = message?.match(
-    /^数据集 (\/[^\r\n]*) (?:的基础校验证据缺失或已失效|缺少匹配的基础校验结果|的 ReCap 监督基础校验证据缺失或已失效)(?:[，；。]|$)/u,
+  const registered = new Map(
+    assets
+      .filter((asset) => asset.kind === 'DATASET' && asset.node_id === request.node_id)
+      .map((asset) => [asset.id, asset]),
   );
-  const path = match && validationPath(match[1]);
-  if (!path) return undefined;
   const boundIds = new Set(
     Object.entries(request.inputs || {}).flatMap(([role, id]) =>
       /^dataset(?:_\d+)?$/u.test(role) ? [id] : [],
     ),
   );
-  const candidates = assets.filter(
-    (asset) =>
-      asset.kind === 'DATASET' &&
-      asset.node_id === request.node_id &&
-      boundIds.has(asset.id) &&
-      validationPath(asset.path) === path,
+  const bound = [...boundIds].flatMap((id) => {
+    const asset = registered.get(id);
+    return asset ? [asset] : [];
+  });
+  const reportedIds = new Set(
+    preview.checks?.flatMap((check) =>
+      isPreflightDatasetValidationCheck(check) && check.dataset_asset_id
+        ? [check.dataset_asset_id]
+        : [],
+    ),
   );
-  return candidates.length === 1 ? candidates[0] : undefined;
+  if (reportedIds.size) {
+    const affected = bound.filter((asset) => reportedIds.has(asset.id));
+    return {
+      affected,
+      additional: [],
+      unresolved: reportedIds.size - affected.length,
+      legacy: false,
+    };
+  }
+
+  // Older Agents identify only the first failure by its resolved path.
+  const message = preview.error.message?.replace(/^DATASET_BASE_VALIDATION_REQUIRED:\s*/u, '');
+  const match = message?.match(
+    /^数据集 (\/[^\r\n]*) (?:的基础校验证据缺失或已失效|缺少匹配的基础校验结果|的 ReCap 监督基础校验证据缺失或已失效)(?:[，；。]|$)/u,
+  );
+  const path = match && validationPath(match[1]);
+  const candidates = path ? bound.filter((asset) => validationPath(asset.path) === path) : [];
+  const reported = candidates.length === 1 ? candidates[0] : undefined;
+  const affected = bound.filter(
+    (asset) =>
+      asset === reported ||
+      asset.validation?.status !== 'SUCCEEDED' ||
+      asset.validation.profile_id !== request.profile_id,
+  );
+  return {
+    affected,
+    additional: bound.filter((asset) => !affected.includes(asset)),
+    unresolved: Number(!reported) + boundIds.size - bound.length,
+    legacy: true,
+  };
 }
 
 export function datasetValidationPresentation(report?: DatasetSourceValidation | null) {
@@ -122,9 +167,14 @@ export function readDatasetValidation(assetId: string, signal?: AbortSignal) {
   });
 }
 
-export function requestDatasetValidation(assetId: string, profileId?: string) {
-  return post<DatasetSourceValidation>(
-    `/assets/${encodeURIComponent(assetId)}/validations`,
-    profileId ? { profile_id: profileId } : {},
-  );
+export function requestDatasetValidation(
+  assetId: string,
+  profileId?: string,
+  signal?: AbortSignal,
+) {
+  return api<DatasetSourceValidation>(`/assets/${encodeURIComponent(assetId)}/validations`, {
+    method: 'POST',
+    body: JSON.stringify(profileId ? { profile_id: profileId } : {}),
+    signal,
+  });
 }

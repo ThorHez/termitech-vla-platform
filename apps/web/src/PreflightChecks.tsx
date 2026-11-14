@@ -1,5 +1,5 @@
 import { AlertTriangle, CheckCircle2, Circle, XCircle } from 'lucide-react';
-import { DATASET_BASE_VALIDATION_REQUIRED } from './datasetValidationHelpers';
+import { isPreflightDatasetValidationCheck } from './datasetValidationHelpers';
 import type { PreflightCheck } from './types';
 
 const labels: Record<string, string> = {
@@ -12,6 +12,7 @@ const labels: Record<string, string> = {
   dataset_fps: '数据集采样频率',
   dataset_timestamps: '真实数据时间戳与采样率',
   dataset_samples: '基础校验证据与数据处理配置',
+  recap_stage: 'ReCap 阶段校验',
   norm_contract: '归一化参数',
   model_checkpoint: '模型检查点',
   resume_checkpoint: '续训检查点',
@@ -62,10 +63,7 @@ export function PreflightChecks({
           ? '数据集能否共用归一化参数'
           : labels[check.name] || check.name;
         const summarizedDatasetValidation =
-          datasetValidationNotice &&
-          !check.ok &&
-          (check.code === DATASET_BASE_VALIDATION_REQUIRED ||
-            check.message?.startsWith(`${DATASET_BASE_VALIDATION_REQUIRED}:`));
+          datasetValidationNotice && isPreflightDatasetValidationCheck(check);
         const detail = sharedNormDetail
           ? check.message === summarizedSharedNormError
             ? '详见上方的失败原因。'

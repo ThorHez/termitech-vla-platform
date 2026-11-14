@@ -18,6 +18,7 @@ if __package__:
     from .composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
     from .cache_contract import _managed_path
     from .dataset_validation_cache import get_or_validate, lookup_cached
+    from .submission_validation import base_validation_asset_key, record_base_validation_failure
     from .recap import (RECAP_SUPERVISION, RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_ENTRY,
                         STAGE_PROGRESS_ID_COLUMNS, STAGE_PROGRESS_KEYS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL,
                         STAGE_PROGRESS_MODULES, STAGE_PROGRESS_SUPPORT_ENTRY,
@@ -27,6 +28,7 @@ else:
     from composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
     from cache_contract import _managed_path
     from dataset_validation_cache import get_or_validate, lookup_cached
+    from submission_validation import base_validation_asset_key, record_base_validation_failure
     from recap import (RECAP_SUPERVISION, RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_ENTRY,
                        STAGE_PROGRESS_ID_COLUMNS, STAGE_PROGRESS_KEYS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL,
                        STAGE_PROGRESS_MODULES, STAGE_PROGRESS_SUPPORT_ENTRY,
@@ -330,7 +332,7 @@ def _value_runtime_cache(spec):
                 raise ValueError(f"TRAINING_CACHE_UNWRITABLE: 无法清理价值训练 JAX 缓存探针 {probe}: {exc}") from exc
 
 
-def inspect_stage(config, spec, factories, datasets):
+def inspect_stage(config, spec, factories, datasets, base_validation_failures=None):
     stage, requested = stage_request(spec)
     if stage is None:
         return None
@@ -350,6 +352,8 @@ def inspect_stage(config, spec, factories, datasets):
         raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值目标范围无效")
     rows = []
     for factory, dataset in zip(factories, datasets):
+        if base_validation_failures and base_validation_asset_key(dataset) in base_validation_failures:
+            continue
         if stage == "offline_rl" and (isinstance(factory.acp_dropout, bool) or
                 not isinstance(factory.acp_dropout, (int, float)) or not math.isfinite(factory.acp_dropout) or
                 not 0 <= factory.acp_dropout <= 1):
@@ -364,10 +368,16 @@ def inspect_stage(config, spec, factories, datasets):
             supervised = [required_supervision]
         else:
             supervised = [key for key in ("value_target", "is_positive") if key in required]
-        cached = require_cached_supervision(dataset, spec)
-        summary = cached["supervision_summary"]
-        if not set(supervised) <= set(summary):
-            _base_validation_required(dataset)
+        try:
+            cached = require_cached_supervision(dataset, spec)
+            summary = cached["supervision_summary"]
+            if not set(supervised) <= set(summary):
+                _base_validation_required(dataset)
+        except ValueError as exc:
+            if base_validation_failures is None or not record_base_validation_failure(
+                    base_validation_failures, "recap_stage", dataset, exc):
+                raise
+            continue
         for checked in cached["checked_files"]:
             missing = sorted(set(required) - set(checked["columns"]))
             if missing:
@@ -383,6 +393,8 @@ def inspect_stage(config, spec, factories, datasets):
         if stage == "offline_rl":
             row["acp_dropout"] = factory.acp_dropout
         rows.append(row)
+    if base_validation_failures:
+        return None
     result = {"stage": stage, "model_type": type(config.model).__name__,
               "loader_type": type(config.weight_loader).__name__, "datasets": rows}
     if stage == "value":
