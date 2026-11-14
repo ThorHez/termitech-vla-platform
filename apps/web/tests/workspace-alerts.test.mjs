@@ -43,10 +43,11 @@ try {
     assert.match(html, /href="#\/runs\/training-0"/);
     assert.doesNotMatch(html, /机器 2 的磁盘|训练 2 失败/);
     assert.match(html, /class="count-pill">6<\/span>/);
-    assert.match(html, /aria-controls="workspace-alert-list" aria-expanded="false">查看全部/);
+    assert.match(html, /href="#\/alerts">查看全部/);
+    assert.doesNotMatch(html, /aria-expanded|收起/);
   });
 
-  await test('there is no expand control when all alerts already fit in the preview', () => {
+  await test('the full-page link is available when all alerts already fit in the preview', () => {
     const html = renderToStaticMarkup(
       React.createElement(WorkspaceAlerts, {
         alerts: Array.from({ length: 4 }, (_, i) => diskAlert(i)),
@@ -55,7 +56,7 @@ try {
       }),
     );
     assert.equal(html.match(/class="alert-item"/g).length, 4);
-    assert.doesNotMatch(html, /查看全部/);
+    assert.match(html, /href="#\/alerts">查看全部/);
   });
 
   await test('disk dedup accepts equivalent canonical mounts on the same node only', () => {

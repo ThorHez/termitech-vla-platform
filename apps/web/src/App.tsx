@@ -30,7 +30,7 @@ import { DataProvider, useData } from './data';
 import { AssetsPage, NodePage, NodesPage, OverviewPage, RunsPage, TemplatesPage } from './pages';
 import RunDetail from './RunDetail';
 import { AssetDeletionsPage } from './AssetDeletions';
-import { focusWorkspaceAlerts } from './WorkspaceAlerts';
+import { alertsPath, AlertsPage, focusWorkspaceAlerts } from './WorkspaceAlerts';
 import { assetDeletionsPath } from './assetPurge';
 import { AssetTransferTaskDetail } from './AssetTransfers';
 import { backgroundTaskActiveCounts } from './backgroundTaskEntries';
@@ -101,6 +101,7 @@ function Shell() {
   const viewingAlerts = path === '/overview' && queryParams.get('view') === 'alerts';
   const section =
     (path === assetDeletionsPath ? { label: '已删除资产' } : undefined) ||
+    (path === alertsPath ? { label: '全部异常' } : undefined) ||
     navigation.find((item) => path.startsWith(item.path)) ||
     (path === '/users' ? { label: '用户与权限' } : undefined);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -244,11 +245,9 @@ function Shell() {
             </button>
             <a
               className="icon-button notifications"
-              href="#/overview?view=alerts"
-              onClick={() => {
-                if (viewingAlerts) focusWorkspaceAlerts();
-              }}
+              href={`#${alertsPath}`}
               aria-label={`当前 ${alerts.data?.length || 0} 条异常`}
+              aria-current={path === alertsPath ? 'page' : undefined}
               title="查看异常"
             >
               <Bell size={18} />
@@ -269,6 +268,8 @@ function Shell() {
             <ErrorNotice error={sessionError} title="会话验证暂时不可用" />
             {path === '/overview' ? (
               <OverviewPage createRun={() => createRun()} />
+            ) : path === alertsPath ? (
+              <AlertsPage />
             ) : path === '/nodes' ? (
               <NodesPage />
             ) : path.startsWith('/nodes/') ? (
