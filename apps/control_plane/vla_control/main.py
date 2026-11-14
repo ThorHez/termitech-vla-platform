@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from vla_adapters import get_templates
 
 from . import schemas
+from . import asset_deletions
 from .auth import AuthManager, register_auth_routes
 from .authorization import permission_for, request_route_path
 from .common import ACTIVE, APIError, TERMINAL, digest, now, offset_time, require_path, token_hash, uid, valid_snapshot
@@ -211,6 +212,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return key
 
     admin = [Depends(require_human)]
+    asset_deletions.register_routes(app, admin, db, settings)
     register_training_draft_routes(app, admin, db, auth)
     register_training_template_routes(app, admin, db, auth)
     register_dataset_template_routes(app, admin, db, auth)
@@ -231,6 +233,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise APIError(404, "NOT_FOUND", "Node not found")
         if node.status != "ONLINE":
             raise APIError(409, "NODE_OFFLINE", "机器当前不可用，请重新接入或等待节点恢复在线")
+        asset_deletions.require_no_file_purge(session, [node.id])
         if session.scalar(select(RemoteDeployment.id).where(
             RemoteDeployment.node_id == node_id,
             RemoteDeployment.state.in_({"QUEUED", "RUNNING", "WAITING_AGENT"}),
@@ -430,6 +433,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Manual registration does not grant edits to existing shared assets.
             require_active_actor(session, request, "assets.register")
             node = get_required(session, Node, body.node_id, "Node")
+            asset_deletions.require_no_file_purge(session, [node.id])
             require_path(body.path, node.roots)
             metadata = deepcopy(body.metadata)
             if body.kind == "DATASET":
@@ -483,6 +487,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     asset.kind not in {"DATASET", "MODEL", "NORM"} or asset.registered_by_user_id is None
                     or asset.registered_by_user_id != request_owner(request)):
                 raise APIError(403, "RESOURCE_ACCESS_DENIED", "只能删除自己登记的资产")
+            if asset.state == "ARCHIVED":
+                return asset_dict(asset)
             session.scalar(select(Node).where(Node.id == asset.node_id).with_for_update())
             from .assets_usage import require_no_active_checkpoint_reference
             require_no_active_checkpoint_reference(session, asset)
@@ -494,8 +500,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if asset.kind == "NORM" and session.scalar(select(Asset.id).where(
                     Asset.kind == "MODEL", Asset.norm_asset_id == asset.id, Asset.state != "ARCHIVED").limit(1)):
                 raise APIError(409, "MODEL_NORM_IN_USE", "此 norm_stats 与模型训练结果绑定，请先归档关联模型")
-            invalidate_validation(session, asset)
+            invalidate_validation(session, asset, preserve_delivered=True)
             asset.state = "ARCHIVED"
+            asset_deletions.record_archive(session, asset, request)
             return asset_dict(asset)
 
     @app.patch("/api/v1/assets/{asset_id}/dataset-profile", dependencies=admin)
@@ -907,6 +914,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             for row in rows:
                 if row.delivered_at is None:
                     required = {"STORAGE_CONFIGURE": "machines.manage", "PROFILE_REBIND": "machines.manage",
+                                asset_deletions.INSPECT: asset_deletions.PERMISSION, asset_deletions.PURGE: asset_deletions.PERMISSION,
                                 "RECIPE_WRITE": "recipes.writeback", "POLICY_DEPLOY_TEST": "training.write",
                                 "PATH_SUGGEST": "assets.query", "DATASET_INSPECT": "assets.query",
                                 "RECIPE_DETAIL": "recipes.query", "DATA_PROCESSORS": "recipes.query",
@@ -940,6 +948,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 deployment.test_result = {"status": "FAILED", "error": error,
                                                           "observation_path": row.payload.get("observation_path")}
                             continue
+                    if row.type in asset_deletions.COMMANDS and not asset_deletions.prepare_delivery(
+                            session, row, settings.heartbeat_timeout_seconds):
+                        continue
                 if row.delivered_at is None and row.type in {"START", "POLICY_DEPLOY_START", "POLICY_EXPORT", "PREFLIGHT"}:
                     model, identifier = {
                         "START": (Run, row.payload.get("run_id")),
@@ -1005,6 +1016,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 acknowledge_profile_rebind(session, command, node, body.status, body.result)
             elif command.type == "STORAGE_CONFIGURE":
                 acknowledge_storage_configuration(session, command, node, body.status, body.result)
+            elif command.type in asset_deletions.COMMANDS:
+                asset_deletions.acknowledge(session, command, body.status, body.result)
             elif command.type in POLICY_DEPLOYMENT_COMMANDS:
                 acknowledge_policy_deployment(session, command, node, body.status, body.result)
             elif command.type in EXPORT_COMMANDS:

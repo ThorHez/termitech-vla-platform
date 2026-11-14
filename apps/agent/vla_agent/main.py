@@ -23,6 +23,7 @@ from vla_protocol.agent_release import installed_agent_release
 from vla_protocol.training_gpu_policy import TRAINING_SHARED_GPU_CAPABILITY
 
 from .artifacts import ArtifactMonitor
+from .asset_purge import CAPABILITIES as ASSET_PURGE_COMMANDS, execute_asset_purge_command
 from .config import load_config
 from .metrics import gpu_inventory, process_metrics, system_metrics
 from .path_suggestions import suggest_paths
@@ -44,7 +45,7 @@ CAPABILITIES = ["PATH_SUGGEST", "RECIPE_SUGGEST", "RECIPE_DETAIL", "DATA_PROCESS
                 "POLICY_DEPLOY_PORTABLE_V1", "POLICY_DEPLOY_SHARED_GPU_V1", "POLICY_CHECKPOINT_SOURCE_WARNING_V1",
                 "POLICY_CHECKPOINT_INFERENCE_CONTENTS_V1",
                 "POLICY_DEPLOY_RESTART_V1", "POLICY_DEPLOY_BACKEND_V1",
-                "POLICY_EXPORT", "POLICY_EXPORT_STATUS", "POLICY_EXPORT_CANCEL"]
+                "POLICY_EXPORT", "POLICY_EXPORT_STATUS", "POLICY_EXPORT_CANCEL", *ASSET_PURGE_COMMANDS]
 
 
 def _execute_preflight_command(config: dict, command: dict):
@@ -105,6 +106,8 @@ def _execute_preflight_command(config: dict, command: dict):
             elif command["type"] == "DATASET_VALIDATE":
                 from .dataset_validation import validate_dataset
                 result = validate_dataset(config, command["payload"])
+            elif command["type"] in ASSET_PURGE_COMMANDS:
+                result = execute_asset_purge_command(config, state, command["type"], command["payload"])
             else:
                 result = run_preflight(config, command["payload"])
             status = "REJECTED" if result.get("error") else "APPLIED"
@@ -209,6 +212,9 @@ class Agent:
             elif command["type"] == "DATASET_VALIDATE":
                 from .dataset_validation import validate_dataset
                 result = validate_dataset(self.config, payload)
+                status = "REJECTED" if result.get("error") else "APPLIED"
+            elif command["type"] in ASSET_PURGE_COMMANDS:
+                result = execute_asset_purge_command(self.config, self.state, command["type"], payload)
                 status = "REJECTED" if result.get("error") else "APPLIED"
             elif command["type"] == "RECIPE_WRITE":
                 from .recipe_writeback import write_recipe
@@ -331,7 +337,7 @@ class Agent:
             acknowledgement = self.state.command(command["id"])
             if acknowledgement is None and command["type"] == "DATASET_VALIDATE" and self.state.active_attempts():
                 continue
-            if acknowledgement is None and command["type"] in {"PREFLIGHT", "RECIPE_WRITE", "DATA_PROCESSORS", "DATASET_INSPECT", "DATASET_VALIDATE", "POLICY_DEPLOY_START", "POLICY_EXPORT"}:
+            if acknowledgement is None and command["type"] in {"PREFLIGHT", "RECIPE_WRITE", "DATA_PROCESSORS", "DATASET_INSPECT", "DATASET_VALIDATE", "POLICY_DEPLOY_START", "POLICY_EXPORT", *ASSET_PURGE_COMMANDS}:
                 if self._preflight_worker is None and not self._closed:
                     worker = multiprocessing.get_context("spawn").Process(
                         target=_execute_preflight_command, args=(self.config, command),

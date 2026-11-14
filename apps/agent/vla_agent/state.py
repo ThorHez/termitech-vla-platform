@@ -26,6 +26,7 @@ class State:
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS credentials (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS commands (id TEXT PRIMARY KEY, status TEXT NOT NULL, result TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS asset_purges (asset_id TEXT PRIMARY KEY, record TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS attempts (id TEXT PRIMARY KEY, payload TEXT NOT NULL, state TEXT NOT NULL,
                     runner_identity TEXT, child_identity TEXT, output_dir TEXT, cancel_requested INTEGER NOT NULL DEFAULT 0,
                     last_seq INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, runner_runtime TEXT);
@@ -73,6 +74,17 @@ class State:
     def save_command(self, command_id: str, status: str, result: dict):
         with self.connect() as db:
             db.execute("INSERT OR IGNORE INTO commands VALUES(?,?,?)", (command_id, status, json.dumps(result)))
+
+    def asset_purge(self, asset_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT record FROM asset_purges WHERE asset_id=?", (asset_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def save_asset_purge(self, asset_id: str, record: dict):
+        with self.connect() as db:
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("INSERT INTO asset_purges VALUES(?,?) ON CONFLICT(asset_id) DO UPDATE SET record=excluded.record",
+                       (asset_id, json.dumps(record)))
 
     def create_attempt(self, payload: dict, output_dir: str, runner_runtime: dict | None = None) -> bool:
         with self.connect() as db:

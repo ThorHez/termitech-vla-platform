@@ -50,6 +50,8 @@ _allow("platform.read", "GET",
        "/runs/{run_id}/events", "/runs/{run_id}/logs", "/runs/{run_id}/metrics", "/alerts")
 _allow("assets.register", "POST", "/assets", "/runs/{run_id}/recap-annotations")
 _allow("assets.archive", "POST", "/assets/{asset_id}/archive")
+_allow("assets.purge", "GET", "/assets/deletions")
+_allow("assets.purge", "POST", "/assets/{asset_id}/purge-inspections", "/assets/{asset_id}/purge")
 _allow("assets.query", "POST", "/nodes/{node_id}/path-suggestions")
 _allow("datasets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
 _allow("datasets.validate", "POST", "/assets/{asset_id}/validations")
@@ -127,6 +129,7 @@ SENSITIVE_ROUTES = {
     (method, path) for (method, path), permission in PERMISSIONS.items()
     if method not in {"GET", "HEAD", "OPTIONS"} and (
         permission in {"users.manage", "recipes.writeback"}
+        or path == "/api/v1/assets/{asset_id}/purge"
         or permission == "machines.manage" and not path.endswith("/path-suggestions")
         and (method, path) != ("PATCH", "/api/v1/nodes/{node_id}"))
 }

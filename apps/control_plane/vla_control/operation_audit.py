@@ -48,6 +48,8 @@ for action, label, category, target, method, path, parameter in (
     ("users.reset_password", "重置用户密码", "users", "user", "POST", "/users/{user_id}/reset-password", "user_id"),
     ("assets.register", "登记资产", "assets", "asset", "POST", "/assets", None),
     ("assets.archive", "删除资产登记", "assets", "asset", "POST", "/assets/{asset_id}/archive", "asset_id"),
+    ("assets.purge_inspect", "检查待删除资产文件", "assets", "asset", "POST", "/assets/{asset_id}/purge-inspections", "asset_id"),
+    ("assets.purge", "永久删除资产文件", "assets", "asset", "POST", "/assets/{asset_id}/purge", "asset_id"),
     ("assets.update_profile", "修改数据集特征", "assets", "asset", "PATCH", "/assets/{asset_id}/dataset-profile", "asset_id"),
     ("assets.bind_norm", "修改归一化绑定", "assets", "asset", "PUT", "/assets/{asset_id}/norm-binding", "asset_id"),
     ("assets.validate", "发起数据集校验", "assets", "asset", "POST", "/assets/{asset_id}/validations", "asset_id"),

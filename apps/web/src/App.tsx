@@ -29,6 +29,8 @@ import { Badge, ErrorNotice, Field, PageHeading, Panel } from './components';
 import { DataProvider, useData } from './data';
 import { AssetsPage, NodePage, NodesPage, OverviewPage, RunsPage, TemplatesPage } from './pages';
 import RunDetail from './RunDetail';
+import { AssetDeletionsPage } from './AssetDeletions';
+import { assetDeletionsPath } from './assetPurge';
 import { AssetTransferTaskDetail } from './AssetTransfers';
 import { backgroundTaskActiveCounts } from './backgroundTaskEntries';
 import RunWizard from './RunWizard';
@@ -96,6 +98,7 @@ function Shell() {
   const activeTasks = backgroundTaskActiveCounts(runs.data, assetTransfers.data);
   const taskCountsReady = runs.data !== undefined && assetTransfers.data !== undefined;
   const section =
+    (path === assetDeletionsPath ? { label: '已删除资产' } : undefined) ||
     navigation.find((item) => path.startsWith(item.path)) ||
     (path === '/users' ? { label: '用户与权限' } : undefined);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -286,6 +289,8 @@ function Shell() {
                   sceneFilter={assetScene}
                 />
               )
+            ) : path === assetDeletionsPath ? (
+              <AssetDeletionsPage />
             ) : path === '/templates' ? (
               <TemplatesPage
                 createRun={createRun}

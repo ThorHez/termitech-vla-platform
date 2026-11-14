@@ -70,6 +70,7 @@ import {
 } from './DatasetNormBinding';
 import { AssetDetail } from './AssetDetail';
 import { AssetArchiveDialog } from './AssetArchiveDialog';
+import { assetDeletionsPath, canManageAssetDeletions } from './assetPurge';
 import { canArchiveAsset } from './assetArchive';
 import { canBindDatasetNorm, canEditDatasetAsset } from './datasetAssetPermissions';
 import { catalogAssetGroups } from './modelAssetGroups';
@@ -1378,6 +1379,12 @@ export function AssetsPage({
         actions={
           !sceneFilter && (
             <>
+              {canManageAssetDeletions(user, can) && (
+                <a className="button outline" href={`#${assetDeletionsPath}`}>
+                  <Trash2 size={17} />
+                  已删除资产
+                </a>
+              )}
               {can('dataset-templates.write') && (
                 <button
                   type="button"

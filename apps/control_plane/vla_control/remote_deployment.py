@@ -494,6 +494,9 @@ class DeploymentManager:
     def _assert_idle(session, node_id: str | None):
         if not node_id:
             return
+        from .asset_deletions import require_no_file_purge
+
+        require_no_file_purge(session, [node_id])
         session.scalar(select(Node).where(Node.id == node_id).with_for_update().execution_options(populate_existing=True))
         run = session.scalar(select(Run.id).where(Run.node_id == node_id, Run.state.not_in(TERMINAL)).limit(1))
         command = session.scalar(select(Command.id).where(Command.node_id == node_id, Command.status == "PENDING").limit(1))
@@ -518,6 +521,9 @@ class DeploymentManager:
         """
         if not node_id:
             return
+        from .asset_deletions import require_no_file_purge
+
+        require_no_file_purge(session, [node_id])
         node = session.scalar(select(Node).where(Node.id == node_id).with_for_update().execution_options(populate_existing=True))
         command = session.scalar(select(Command.id).where(Command.node_id == node_id, Command.status == "PENDING").limit(1))
         from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES

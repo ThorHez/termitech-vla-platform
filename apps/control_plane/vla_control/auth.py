@@ -25,7 +25,7 @@ from .settings import Settings
 COOKIE_NAME = "vla_session"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 ROLES = ("admin", "operator", "viewer")
-PERMISSIONS = frozenset({"platform.read", "training.write", "assets.write", "assets.register", "assets.archive",
+PERMISSIONS = frozenset({"platform.read", "training.write", "assets.write", "assets.register", "assets.archive", "assets.purge",
                          "datasets.register", "datasets.archive", "datasets.write", "datasets.validate", "recipes.write",
                          "assets.query", "assets.transfer", "dataset-templates.write", "recipes.query",
                          "machines.manage", "recipes.writeback", "users.manage", "audit.read"})

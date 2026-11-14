@@ -95,14 +95,15 @@ def validation_dict(asset, session=None):
     return report
 
 
-def invalidate_validation(session, asset, reason="DATASET_VALIDATION_INPUT_CHANGED"):
+def invalidate_validation(session, asset, reason="DATASET_VALIDATION_INPUT_CHANGED", *, preserve_delivered=False):
     stored = (asset.metadata_json or {}).get(INTERNAL_KEY)
     if not isinstance(stored, dict):
         return
     report = {**stored, "status": "STALE", "error": _error(reason)}
     _write(asset, report)
     command = session.get(Command, stored.get("id")) if stored.get("id") else None
-    if command is not None and command.type == COMMAND and command.status == "PENDING":
+    if (command is not None and command.type == COMMAND and command.status == "PENDING"
+            and not (preserve_delivered and command.delivered_at is not None)):
         command.status, command.result, command.acknowledged_at = "REJECTED", {"error": _error(reason)}, now()
 
 
@@ -244,6 +245,9 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
                      actor_user_id=None, source_transfer_id=None, source_registration=False):
     if asset.kind != "DATASET":
         return None
+    from .asset_deletions import require_no_file_purge
+
+    require_no_file_purge(session, [asset.node_id])
     if source_registration and source_transfer_id is not None:
         raise ValueError("dataset validation must have exactly one source")
     manual = not source_registration and source_transfer_id is None

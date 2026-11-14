@@ -23,6 +23,7 @@ try {
   const { NodeOnboarding } = await server.ssrLoadModule('/src/NodeOnboarding.tsx');
   const { default: RunWizard } = await server.ssrLoadModule('/src/RunWizard.tsx');
   const { RecipeLibrary } = await server.ssrLoadModule('/src/RecipeLibrary.tsx');
+  const { AssetDeletionsPage } = await server.ssrLoadModule('/src/AssetDeletions.tsx');
   const grants = {
     admin: [
       'machines.manage',
@@ -30,6 +31,7 @@ try {
       'assets.write',
       'assets.register',
       'assets.archive',
+      'assets.purge',
       'datasets.register',
       'datasets.archive',
       'assets.transfer',
@@ -103,6 +105,29 @@ try {
     assert.doesNotMatch(render('viewer', OverviewPage, { createRun() {} }), />新建训练</);
     assert.match(render('viewer', AssetsPage), /数据与模型/);
     assert.match(render('viewer', RunsPage, { createRun() {} }), /训练任务/);
+  });
+
+  await test('only administrators with the file deletion permission can open the deletion ledger', () => {
+    assert.match(render('admin', AssetsPage), /href="#\/assets\/deletions"/);
+    assert.match(render('admin', AssetDeletionsPage, {}, false), /<h1>已删除资产<\/h1>/);
+    for (const role of ['operator', 'viewer']) {
+      assert.doesNotMatch(render(role, AssetsPage), /href="#\/assets\/deletions"/);
+      assert.match(render(role, AssetDeletionsPage, {}, false), /<h1>权限不足<\/h1>/);
+    }
+    for (const [role, permission] of [
+      ['admin', false],
+      ['operator', true],
+    ]) {
+      const denied = renderToStaticMarkup(
+        React.createElement(
+          AuthContext.Provider,
+          { value: { ...auth(role), can: () => permission } },
+          React.createElement(AssetDeletionsPage),
+        ),
+      );
+      assert.match(denied, /<h1>权限不足<\/h1>/);
+      assert.doesNotMatch(denied, /刷新列表|永久删除文件/);
+    }
   });
 
   await test('operator registration offers all three asset types and complete dataset configuration without existing edits', () => {

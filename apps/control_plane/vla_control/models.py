@@ -195,6 +195,15 @@ class Command(Base):
     required_permission: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
+class AssetDeletion(Base):
+    __tablename__ = "asset_deletions"
+    asset_id: Mapped[str] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), primary_key=True)
+    archived_at: Mapped[str | None] = mapped_column(String(40))
+    archived_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    inspection_command_id: Mapped[str | None] = mapped_column(ForeignKey("commands.id", ondelete="RESTRICT"))
+    purge_command_id: Mapped[str | None] = mapped_column(ForeignKey("commands.id", ondelete="RESTRICT"))
+
+
 class Event(Base):
     __tablename__ = "events"
     __table_args__ = (Index("ix_events_attempt_type_seq", "attempt_id", "type", "seq"),)

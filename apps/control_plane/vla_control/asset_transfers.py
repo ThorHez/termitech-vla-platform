@@ -148,9 +148,12 @@ def _identity(connection):
 
 
 def _bindings(session, body, settings):
+    from .asset_deletions import require_no_file_purge
+
     asset = session.scalar(select(Asset).where(Asset.id == body.source_asset_id).with_for_update())
     if asset is None:
         raise APIError(404, 'NOT_FOUND', '来源资产不存在')
+    require_no_file_purge(session, [asset.node_id, body.target_node_id])
     if asset.kind not in {'DATASET', 'NORM', 'MODEL'} or asset.state in {'ARCHIVED', 'UNAVAILABLE'}:
         raise APIError(409, 'ASSET_TRANSFER_SOURCE_UNAVAILABLE', '来源资产已归档、不可用或不支持同步')
     if body.exclude_train_state and asset.kind != 'MODEL':

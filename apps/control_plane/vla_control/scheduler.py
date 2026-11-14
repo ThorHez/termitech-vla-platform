@@ -25,6 +25,7 @@ from .training_resume import queued_resume_error
 from .gpu_selection import requested_gpu_uuids
 from .gpu_reservations import reservation_owners
 from .account_lifecycle import lock_execution_guard, training_execution_authorized
+from .asset_deletions import file_purge_pending
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,8 @@ def tick(db: Database, settings: Settings) -> int:
             if maintenance:
                 for run in queued:
                     run.queue_reason = "NODE_MAINTENANCE"
+                continue
+            if file_purge_pending(session, node_id):
                 continue
             if node.status != "ONLINE":
                 for run in queued:

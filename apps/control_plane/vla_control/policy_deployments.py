@@ -716,6 +716,9 @@ def register_routes(app, admin, db, require_available_node, settings):
         with db.write() as session:
             require_active_actor(session, request)
             row = required(session, deployment_id, request)
+            from .asset_deletions import require_no_file_purge
+
+            require_no_file_purge(session, [row.node_id])
             node = session.get(Node, row.node_id)
             capabilities = (node.metrics or {}).get("capabilities")
             if not isinstance(capabilities, list) or "POLICY_DEPLOY_RESTART_V1" not in capabilities:

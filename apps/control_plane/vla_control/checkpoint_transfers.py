@@ -139,11 +139,13 @@ def _connection(session, node_id):
 
 
 def _bindings(session, body, settings):
+    from .asset_deletions import require_no_file_purge
     from .policy_deployments import _source_training
 
     run = session.get(Run, body.source_run_id)
     if run is None:
         raise APIError(404, "NOT_FOUND", "来源训练任务不存在")
+    require_no_file_purge(session, [run.node_id, body.target_node_id])
     if run.template_id != "openpi-sft":
         raise APIError(422, "TRANSFER_SOURCE_UNSUPPORTED", "当前支持 OpenPI 动作策略权重同步")
     if run.node_id == body.target_node_id:

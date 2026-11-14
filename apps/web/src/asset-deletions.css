@@ -1,0 +1,33 @@
+.asset-deletions-table {
+  min-width: 650px;
+}
+
+.asset-deletions-table td {
+  vertical-align: top;
+}
+
+.asset-purge-path {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.asset-deletions-table .asset-purge-path {
+  max-width: 36ch;
+  margin-top: 6px;
+}
+
+.asset-purge-inspection {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-block: 12px;
+}
+
+.asset-purge-inspection > p {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+}

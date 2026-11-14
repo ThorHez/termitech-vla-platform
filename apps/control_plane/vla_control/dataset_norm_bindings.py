@@ -48,6 +48,9 @@ def resolve_norm_path(session, *, node_id, path, dataset_name, preferred_id=None
     caller must commit the dataset and binding in the same transaction, so a
     later validation failure also rolls back a newly created NORM.
     """
+    from .asset_deletions import require_no_file_purge
+
+    require_no_file_purge(session, [node_id])
     canonical = canonical_norm_path(path)
     node = session.get(Node, node_id)
     if node is None:

@@ -107,9 +107,12 @@ def _identity(connection):
 
 
 def _binding(session, node_id, path):
+    from .asset_deletions import require_no_file_purge
+
     node = session.get(Node, node_id)
     if node is None:
         raise APIError(404, "NOT_FOUND", "机器不存在")
+    require_no_file_purge(session, [node_id])
     if node.status in {"DISCONNECTED", "REMOVED"}:
         raise APIError(409, "NODE_CONNECTION_REMOVED", "机器已断开，请重新接入后扫描")
     if session.scalar(select(RemoteDeployment.id).where(RemoteDeployment.node_id == node_id,
