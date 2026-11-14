@@ -109,7 +109,7 @@ try {
 
   await test('only administrators with the file deletion permission can open the deletion ledger', () => {
     assert.match(render('admin', AssetsPage), /href="#\/assets\/deletions"/);
-    assert.match(render('admin', AssetDeletionsPage, {}, false), /<h1>已删除资产<\/h1>/);
+    assert.match(render('admin', AssetDeletionsPage), /<h1>已删除资产<\/h1>/);
     for (const role of ['operator', 'viewer']) {
       assert.doesNotMatch(render(role, AssetsPage), /href="#\/assets\/deletions"/);
       assert.match(render(role, AssetDeletionsPage, {}, false), /<h1>权限不足<\/h1>/);

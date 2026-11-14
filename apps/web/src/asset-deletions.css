@@ -6,6 +6,12 @@
   vertical-align: top;
 }
 
+.asset-deletion-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .asset-purge-path {
   display: block;
   overflow-wrap: anywhere;

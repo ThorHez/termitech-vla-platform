@@ -51,7 +51,8 @@ _allow("platform.read", "GET",
 _allow("assets.register", "POST", "/assets", "/runs/{run_id}/recap-annotations")
 _allow("assets.archive", "POST", "/assets/{asset_id}/archive")
 _allow("assets.purge", "GET", "/assets/deletions")
-_allow("assets.purge", "POST", "/assets/{asset_id}/purge-inspections", "/assets/{asset_id}/purge")
+_allow("assets.purge", "POST", "/assets/{asset_id}/purge-inspections", "/assets/{asset_id}/purge",
+       "/asset-deletions/{asset_id}/restore")
 _allow("assets.query", "POST", "/nodes/{node_id}/path-suggestions")
 _allow("datasets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
 _allow("datasets.validate", "POST", "/assets/{asset_id}/validations")

@@ -1,12 +1,14 @@
 """Registration removal and permanent file deletion use different authority."""
 
+import pytest
 from sqlalchemy import select
 
 from vla_agent.asset_purge import execute_asset_purge_command
 from vla_agent.state import State
-from vla_control.asset_deletions import INSPECT, PURGE
+from vla_control.asset_deletions import INSPECT, PURGE, RESTORE_CANCELLED
+from vla_control.auth_models import AuditEvent
 from vla_control.common import offset_time
-from vla_control.models import Asset, Command, Node, Profile
+from vla_control.models import Asset, AssetDeletion, Command, Node, Profile
 from .test_dataset_archive_permissions import archive_path, registered
 from .test_dataset_registration_permissions import body
 from .test_multiuser_task_permissions import PASSWORD, team  # noqa: F401
@@ -17,6 +19,154 @@ PIN = "a" * 64
 
 def path(asset, action):
     return f"/api/v1/assets/{asset['id']}/{action}"
+
+
+def restore_path(asset):
+    return f"/api/v1/asset-deletions/{asset['id']}/restore"
+
+
+def restore(team, asset, **body):
+    admin = team[-1]["team-admin"]
+    item = next(item for item in admin.get(LEDGER).json() if item["id"] == asset["id"])
+    return admin.post(restore_path(asset), json={"expected_archived_at": item["archived_at"], **body})
+
+
+@pytest.mark.parametrize("state", ["REGISTERED", "READY", "AVAILABLE", "UNAVAILABLE"])
+def test_restore_keeps_original_asset_state_registrar_and_history(team, state):
+    platform, node, _, clients = team
+    asset = registered(team, metadata={"label": "original"})
+    with platform.app.state.db.write() as session:
+        session.get(Asset, asset["id"]).state = state
+    admin, operator = clients["team-admin"], clients["alice"]
+    assert operator.post(archive_path(asset)).status_code == 200
+    item, = admin.get(LEDGER).json()
+    assert item["can_restore"] is True and item["restore_block_reason"] is None
+    assert operator.post(restore_path(asset), json={"expected_archived_at": item["archived_at"]}).status_code == 403
+    response = restore(team, asset)
+    assert response.status_code == 200, response.text
+    restored = response.json()
+    assert restored["state"] == state
+    for key in ("id", "created_at", "metadata", "registered_by_user_id", "path", "version", "name"):
+        assert restored[key] == asset[key]
+    assert admin.get(LEDGER).json() == [] and platform.commands(node) == []
+    with platform.app.state.db.read() as session:
+        assert session.get(AssetDeletion, asset["id"]) is None
+        audit = session.scalar(select(AuditEvent).where(AuditEvent.action == "assets.restore", AuditEvent.status == 200))
+        assert audit.details["target_id"] == asset["id"]
+    assert operator.post(archive_path(asset)).status_code == 200
+    assert restore(team, asset, expected_archived_at=item["archived_at"]).json()["error"]["code"] == "ASSET_RESTORE_ARCHIVE_CHANGED"
+    assert restore(team, asset).status_code == 200
+
+
+@pytest.mark.parametrize("removed", [False, True])
+def test_restore_legacy_archive_without_ledger_row(team, removed):
+    platform, _, _, _ = team
+    asset = registered(team, kind="NORM")
+    with platform.app.state.db.write() as session:
+        row = session.get(Asset, asset["id"])
+        row.state = "ARCHIVED"
+        if removed:
+            row.metadata_json = {**row.metadata_json, "availability": "removed"}
+    restored = restore(team, asset)
+    if removed:
+        assert restored.status_code == 409 and restored.json()["error"]["code"] == "ASSET_RESTORE_FILES_MISSING"
+    else:
+        assert restored.status_code == 200 and restored.json()["state"] == "REGISTERED", restored.text
+
+
+def test_restore_cancels_undelivered_purge_and_rejects_stale_delivery(team):
+    platform, node, _, clients = team
+    enable(platform, node)
+    admin = clients["team-admin"]
+    asset = registered(team, kind="NORM")
+    assert admin.post(archive_path(asset)).status_code == 200
+    confirmation = inspect(team, asset)
+    reauth(admin)
+    receipt = admin.post(path(asset, "purge"), json=confirmation).json()
+    assert receipt["status"] == "PENDING"
+    assert admin.get(LEDGER).json()[0]["can_restore"] is True
+    assert restore(team, asset).status_code == 200
+    assert platform.commands(node) == []
+    assert ack(platform, node, receipt["id"], {}).status_code == 200
+    with platform.app.state.db.read() as session:
+        command = session.get(Command, receipt["id"])
+        assert command.status == "REJECTED" and command.delivered_at is None
+        assert command.result["error"]["code"] == RESTORE_CANCELLED
+
+
+def test_restore_late_delivered_inspection_cannot_affect_new_archive(team):
+    platform, node, _, clients = team
+    enable(platform, node)
+    admin = clients["team-admin"]
+    asset = registered(team, kind="NORM")
+    assert admin.post(archive_path(asset)).status_code == 200
+    pending = admin.post(path(asset, "purge-inspections")).json()
+    assert platform.commands(node)[0]["id"] == pending["id"]
+    assert restore(team, asset).status_code == 200
+    assert admin.post(archive_path(asset)).status_code == 200
+    result = {"asset_id": asset["id"], "path": asset["path"], "status": "MISSING", "identity": None}
+    assert ack(platform, node, pending["id"], result).status_code == 200
+    assert admin.get(LEDGER).json()[0]["inspection"] is None
+    assert restore(team, asset).status_code == 200
+
+
+@pytest.mark.parametrize("outcome", ["DELETED", "MISSING", "INDETERMINATE", "STAGED", "SAFE_REJECTION"])
+def test_restore_requires_proof_a_delivered_purge_left_files_in_place(team, outcome):
+    platform, node, _, clients = team
+    enable(platform, node)
+    admin = clients["team-admin"]
+    asset = registered(team, kind="NORM")
+    assert admin.post(archive_path(asset)).status_code == 200
+    confirmation = inspect(team, asset)
+    reauth(admin)
+    receipt = admin.post(path(asset, "purge"), json=confirmation).json()
+    assert platform.commands(node)[0]["id"] == receipt["id"]
+    assert restore(team, asset).json()["error"]["code"] == "ASSET_RESTORE_PURGE_RUNNING"
+    if outcome in {"DELETED", "MISSING"}:
+        result = {"asset_id": asset["id"], "path": asset["path"], "status": outcome}
+        assert ack(platform, node, receipt["id"], result).status_code == 200
+    else:
+        error_code = "ASSET_PURGE_INDETERMINATE" if outcome == "INDETERMINATE" else "ASSET_PURGE_IDENTITY_CHANGED"
+        result = {"error": {"code": error_code}, "staged": outcome == "STAGED"}
+        assert ack(platform, node, receipt["id"], result, "REJECTED").status_code == 200
+    can_restore = outcome == "SAFE_REJECTION"
+    item, = admin.get(LEDGER).json()
+    assert item["can_restore"] is can_restore and bool(item["restore_block_reason"]) is not can_restore
+    result = restore(team, asset)
+    assert result.status_code == (200 if can_restore else 409), result.text
+
+
+def test_restore_rejects_known_missing_files_and_active_equivalent_paths(team):
+    platform, _, _, clients = team
+    admin = clients["team-admin"]
+    enable(platform, team[1])
+    missing = registered(team, kind="NORM", path="/machine/missing")
+    assert admin.post(archive_path(missing)).status_code == 200
+    inspect(team, missing, "MISSING")
+    assert restore(team, missing).json()["error"]["code"] == "ASSET_RESTORE_FILES_MISSING"
+    source = registered(team, kind="NORM", path="/machine/norm")
+    assert admin.post(archive_path(source)).status_code == 200
+    replacement = admin.post("/api/v1/assets", json=body(team[1], kind="NORM", path="/machine/norm/./"))
+    assert replacement.status_code == 201, replacement.text
+    assert restore(team, source).json()["error"]["code"] == "ASSET_RESTORE_PATH_CONFLICT"
+
+
+def test_restore_keeps_earlier_destructive_evidence_after_retry(team):
+    platform, node, _, clients = team
+    admin = clients["team-admin"]
+    enable(platform, node)
+    asset = registered(team, kind="NORM")
+    assert admin.post(archive_path(asset)).status_code == 200
+    confirmation = inspect(team, asset)
+    reauth(admin)
+    receipt = admin.post(path(asset, "purge"), json=confirmation).json()
+    assert platform.commands(node)[0]["id"] == receipt["id"]
+    failure = {"error": {"code": "ASSET_PURGE_FAILED"}, "staged": True}
+    assert ack(platform, node, receipt["id"], failure, "REJECTED").status_code == 200
+    retry = admin.post(path(asset, "purge"), json=confirmation)
+    assert retry.status_code == 202 and retry.json()["id"] != receipt["id"]
+    denied = restore(team, asset)
+    assert denied.status_code == 409 and denied.json()["error"]["code"] == "ASSET_RESTORE_PURGE_UNCERTAIN"
 
 
 def enable(platform, node):

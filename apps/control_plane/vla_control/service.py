@@ -843,16 +843,18 @@ def mark_removed_outputs(session, node: Node, attempt: Attempt, paths, timestamp
     if valid_paths:
         for asset in session.scalars(select(Asset).where(Asset.origin_attempt_id == attempt.id,
                 Asset.node_id == node.id, Asset.kind == "MODEL", Asset.path.in_(valid_paths))):
-            asset.state = "UNAVAILABLE"
+            if asset.state != "ARCHIVED":
+                asset.state = "UNAVAILABLE"
             asset.metadata_json = {**asset.metadata_json, "availability": "removed", "removed_at": timestamp}
             # The model's embedded statistics disappear with this checkpoint.
             # Never alter unrelated input/default norms or another attempt's
             # assets even if a historical FK was populated incorrectly.
             norm = session.get(Asset, asset.norm_asset_id) if asset.norm_asset_id else None
             if (norm is not None and norm.kind == "NORM" and norm.node_id == node.id
-                    and norm.origin_attempt_id == attempt.id and norm.state != "ARCHIVED"
+                    and norm.origin_attempt_id == attempt.id
                     and PurePosixPath(norm.path) == PurePosixPath(asset.path) / "assets/shared/norm_stats.json"):
-                norm.state = "UNAVAILABLE"
+                if norm.state != "ARCHIVED":
+                    norm.state = "UNAVAILABLE"
                 norm.metadata_json = {**norm.metadata_json, "availability": "removed", "removed_at": timestamp}
             changed = True
     return changed

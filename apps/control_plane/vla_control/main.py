@@ -503,8 +503,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     Asset.kind == "MODEL", Asset.norm_asset_id == asset.id, Asset.state != "ARCHIVED").limit(1)):
                 raise APIError(409, "MODEL_NORM_IN_USE", "此 norm_stats 与模型训练结果绑定，请先归档关联模型")
             invalidate_validation(session, asset, preserve_delivered=True)
-            asset.state = "ARCHIVED"
             asset_deletions.record_archive(session, asset, request)
+            asset.state = "ARCHIVED"
             return asset_dict(asset)
 
     @app.patch("/api/v1/assets/{asset_id}/dataset-profile", dependencies=admin)

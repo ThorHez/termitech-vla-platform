@@ -33,6 +33,8 @@ export interface ArchivedAsset {
   requires_new_inspection?: boolean;
   can_purge: boolean;
   purge_block_reason?: string | null;
+  can_restore?: boolean;
+  restore_block_reason?: string | null;
 }
 
 export function canManageAssetDeletions(

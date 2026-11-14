@@ -233,6 +233,32 @@ def test_rotated_checkpoints_keep_provenance_and_reappearing_path_reuses_asset(p
     assert outputs["100"]["metadata"]["availability"] == "available"
 
 
+def test_checkpoint_retention_preserves_archived_model_and_embedded_norm(platform):
+    from vla_control.models import Asset
+
+    node, run, attempt = running(platform)
+    output = checkpoint(attempt)
+    assert platform.emit(node, attempt["id"], 2, "ARTIFACT", {"outputs": [output]}).status_code == 200
+    model_id = platform.get_run(run)["outputs"][0]["id"]
+    norm_id = uid()
+    with platform.app.state.db.write() as session:
+        norm = Asset(id=norm_id, node_id=node["node_id"], kind="NORM", name="embedded norm",
+                     path=output["path"] + "/assets/shared/norm_stats.json", version="1", state="ARCHIVED",
+                     metadata_json={}, created_at=now(), origin_attempt_id=attempt["id"])
+        session.add(norm)
+        session.flush()
+        model = session.get(Asset, model_id)
+        model.state = "ARCHIVED"
+        model.norm_asset_id = norm_id
+    response = platform.emit(node, attempt["id"], 3, "ARTIFACT", {"removed_paths": [output["path"]]})
+    assert response.status_code == 200, response.text
+    with platform.app.state.db.read() as session:
+        for asset_id in (model_id, norm_id):
+            archived = session.get(Asset, asset_id)
+            assert archived.state == "ARCHIVED"
+            assert archived.metadata_json["availability"] == "removed"
+
+
 def test_removal_reports_are_path_scoped_and_do_not_mutate_terminal_outputs(platform):
     node, run, attempt = running(platform)
     output = checkpoint(attempt)

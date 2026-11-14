@@ -96,6 +96,9 @@ class Database:
                 # NULL rather than inheriting an unrelated task author.
                 connection.exec_driver_sql("ALTER TABLE assets ADD COLUMN registered_by_user_id "
                                            "VARCHAR(36) REFERENCES users(id) ON DELETE RESTRICT")
+            deletion_columns = {column["name"] for column in inspect(connection).get_columns("asset_deletions")}
+            if "previous_state" not in deletion_columns:
+                connection.exec_driver_sql("ALTER TABLE asset_deletions ADD COLUMN previous_state VARCHAR(32)")
             transfer_columns = {column["name"] for column in inspect(connection).get_columns("asset_transfers")}
             if "deleted_at" not in transfer_columns:
                 connection.exec_driver_sql("ALTER TABLE asset_transfers ADD COLUMN deleted_at VARCHAR(40)")
