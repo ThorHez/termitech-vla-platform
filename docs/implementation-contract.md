@@ -27,6 +27,7 @@
 - POST `/api/v1/run-previews`: `{name,node_id,profile_id,template_id,recipe?,training_stage?,stage_config?,inputs:{dataset:id,model:id,norm:id},dataset_bindings?,parameters:{steps,batch_size,learning_rate},gpu_count}`。配方为 ASCII 命名配置，匹配 `[A-Za-z0-9_-]{1,255}`；省略时仅可使用旧环境默认配方，smoke 固定为 `smoke`。服务端解析并冻结 `request.recipe`。返回 `{id,status:"PENDING"}`；GET `/run-previews/{id}` 返回 `{id,status,checks,code_snapshot,error,request}`。Agent 异步预检，成功 READY，失败 FAILED；有效期 15 分钟。
 - POST `/api/v1/runs`: `{preflight_id}` + `Idempotency-Key`；服务器冻结预检请求与代码基线。
 - GET `/api/v1/runs`；GET `/runs/{id}`：Run 含 `id,name,node_id,profile_id,template_id,recipe,state,created_at,inputs,parameters,gpu_count,code_expectation,attempts,outputs,queue_reason`。recipe 来自冻结的 `code_expectation.recipe`；历史无记录返回 null，不推测当前环境默认值，无需新增数据库列。
+- 网页轮询使用 GET `/api/v1/runs?view=summary`，任务分页和机器详情中的训练列表也请求 `view=summary`。摘要包含任务标识、状态、时间、步数和用于关联资源的 ID。进入单个训练详情后由 GET `/api/v1/runs/{id}` 返回该任务的完整配置与产物。省略 `view` 的既有接口继续返回原结构。
 - POST `/api/v1/runs/{id}/cancel`；GET `/runs/{id}/events?after_seq=0`: 事件数组；GET `/runs/{id}/logs?after_seq=0`: `{items:[{seq,text,timestamp}],next_seq}`。
 - GET `/api/v1/alerts`：当前异常数组。
 - POST `/api/v1/ssh-connections/test`：`{host,port:22,username,password,install_dir}`，管理员密码 SSH 检查。返回 `{connection_id,host,port,username,fingerprint,hostname,checks,can_install,existing_agent?,expires_at}`；existing_agent 只包含白名单本地配置和节点 ID，无节点 token。密码加密持久化，不在任何响应返回。

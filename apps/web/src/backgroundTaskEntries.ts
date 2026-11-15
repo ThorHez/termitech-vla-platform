@@ -1,10 +1,10 @@
 import type { AssetTransfer } from './assetTransfer';
 import { assetTransferLabels } from './assetTransfer';
-import type { Node, Run } from './types';
+import type { Node, RunSummary } from './types';
 import { transferBytes } from './checkpointTransfer';
 
 export type BackgroundTask =
-  | { key: string; kind: 'training'; item: Run }
+  | { key: string; kind: 'training'; item: RunSummary }
   | { key: string; kind: 'data-sync'; item: AssetTransfer };
 
 export type BackgroundTaskType = 'ALL' | BackgroundTask['kind'];
@@ -26,7 +26,7 @@ export function backgroundTaskPath(task: BackgroundTask) {
     : `/runs/sync/${encodeURIComponent(task.item.id)}`;
 }
 
-export function buildBackgroundTasks(runs: Run[] = [], transfers: AssetTransfer[] = []) {
+export function buildBackgroundTasks(runs: RunSummary[] = [], transfers: AssetTransfer[] = []) {
   const items: BackgroundTask[] = [
     ...runs.map((item): BackgroundTask => ({ key: `training:${item.id}`, kind: 'training', item })),
     ...transfers.map(
@@ -53,7 +53,10 @@ export function backgroundTaskActive(task: BackgroundTask) {
   return (task.kind === 'training' ? activeTraining : activeSync).has(task.item.state);
 }
 
-export function backgroundTaskActiveCounts(runs: Run[] = [], transfers: AssetTransfer[] = []) {
+export function backgroundTaskActiveCounts(
+  runs: RunSummary[] = [],
+  transfers: AssetTransfer[] = [],
+) {
   const counts = { training: 0, sync: 0, total: 0 };
   for (const task of buildBackgroundTasks(runs, transfers)) {
     if (!backgroundTaskActive(task)) continue;

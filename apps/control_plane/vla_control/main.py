@@ -55,7 +55,7 @@ from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES as POLIC
 from .remote_deployment import DeploymentManager, register_remote_routes
 from .remote_models import RemoteDeployment
 from .scheduler import enqueue, gpu_available, resolve_inputs, tick
-from .serialization import asset_dict, node_dict, preview_dict, profile_dict, run_dict
+from .serialization import RunListView, asset_dict, node_dict, preview_dict, profile_dict, run_dict, run_summaries
 from .service import apply_ack, automatic_preflight_error, config_confirmation_error, get_required, ingest_events, sync_profiles, validate_request
 from .settings import Settings
 from .operation_audit import OperationAuditMiddleware, prime_context
@@ -323,12 +323,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return [node_dict(session, node) for node in session.scalars(query)]
 
     @app.get("/api/v1/nodes/{node_id}", dependencies=admin)
-    def node_detail(node_id: str):
+    def node_detail(node_id: str, view: RunListView = "full"):
         with db.read() as session:
             result = node_dict(session, get_required(session, Node, node_id, "Node"))
             result["assets"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.node_id == node_id))]
             result["profiles"] = [profile_dict(p) for p in session.scalars(select(Profile).where(Profile.node_id == node_id))]
-            result["runs"] = [run_dict(session, r) for r in session.scalars(select(Run).where(Run.node_id == node_id, Run.deleted_at.is_(None)).order_by(Run.created_at.desc()).limit(100))]
+            if view == "summary":
+                result["runs"] = run_summaries(session, node_id=node_id, limit=100)
+            else:
+                result["runs"] = [run_dict(session, r) for r in session.scalars(select(Run).where(Run.node_id == node_id, Run.deleted_at.is_(None)).order_by(Run.created_at.desc()).limit(100))]
             return result
 
     @app.patch("/api/v1/nodes/{node_id}", dependencies=admin)
@@ -710,8 +713,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return run_dict(session, run)
 
     @app.get("/api/v1/runs", dependencies=admin)
-    def runs():
+    def runs(view: RunListView = "full"):
         with db.read() as session:
+            if view == "summary":
+                return run_summaries(session)
             return [run_dict(session, run) for run in session.scalars(select(Run).where(Run.deleted_at.is_(None)).order_by(Run.created_at.desc()).limit(500))]
 
     @app.get("/api/v1/runs/{run_id}", dependencies=admin)

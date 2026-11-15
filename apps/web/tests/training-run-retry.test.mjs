@@ -172,6 +172,49 @@ try {
     assert.equal(helper.resumeTrainingRequest(source, firstCheckpoint, 2, '继续').parameters.steps, 2);
   });
 
+  await test('resume choices join compact run attempts to checkpoint assets without full run details', () => {
+    const run = {
+      id: 'run',
+      state: 'SUCCEEDED',
+      owner_user_id: 'operator',
+      node_id: 'node-a',
+      template_id: 'openpi-sft',
+      resume_candidate: true,
+      attempts: [
+        { id: 'ready', state: 'FAILED' },
+        { id: 'active', state: 'RUNNING' },
+        { id: 'changed', state: 'SUCCEEDED', code_changed_during_run: true },
+      ],
+    };
+    const checkpoint = {
+      id: 'checkpoint',
+      kind: 'MODEL',
+      state: 'READY',
+      node_id: 'node-a',
+      origin_attempt_id: 'ready',
+      metadata: { format: 'openpi-orbax', step: 50 },
+    };
+    const catalog = [
+      checkpoint,
+      { ...checkpoint, id: 'active-checkpoint', origin_attempt_id: 'active' },
+      { ...checkpoint, id: 'changed-checkpoint', origin_attempt_id: 'changed' },
+      { ...checkpoint, id: 'removed-checkpoint', state: 'UNAVAILABLE' },
+      { ...checkpoint, id: 'other-machine', node_id: 'node-b' },
+    ];
+    assert.deepEqual(helper.resumeCheckpointChoices([run], catalog, 'operator', false), [
+      { run, checkpoint, step: 50 },
+    ]);
+    assert.deepEqual(helper.resumeCheckpointChoices([run], catalog, 'other-user', false), []);
+    assert.deepEqual(
+      helper.resumeCheckpointChoices([{ ...run, resume_candidate: false }], catalog, 'operator', false),
+      [],
+    );
+    const legacy = { ...run, resume_candidate: undefined, outputs: [checkpoint] };
+    assert.deepEqual(helper.resumeCheckpointChoices([legacy], [], 'operator', false), [
+      { run: legacy, checkpoint, step: 50 },
+    ]);
+  });
+
   await test('draft comparison detects changed training settings but ignores wizard UI position and field tracking', () => {
     const first = helper.retryTrainingSnapshot(fixture()), second = structuredClone(first);
     second.step = 1; second.editedParameters = ['resource_recommendation.auto.num_workers'];

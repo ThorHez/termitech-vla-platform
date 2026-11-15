@@ -5,14 +5,14 @@ import { useAuth } from './auth';
 import { canManageResource } from './resourcePermissions';
 import { ErrorNotice, Modal } from './components';
 import { canDeleteRunRecord, deleteRunRecord } from './runDeletion';
-import type { Run } from './types';
+import type { RunSummary } from './types';
 
 export function RunDeleteAction({
   run,
   compact = false,
   onDeleted,
 }: {
-  run: Run;
+  run: Pick<RunSummary, 'id' | 'name' | 'owner_user_id' | 'state'>;
   compact?: boolean;
   onDeleted?: () => void;
 }) {

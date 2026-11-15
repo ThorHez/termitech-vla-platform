@@ -61,6 +61,7 @@ try {
     );
     assert.equal(paths.length, 1);
     assert.match(paths[0], /^\/api\/v1\/background-tasks\?/);
+    assert.equal(new URL(paths[0], 'https://example.test').searchParams.get('view'), 'summary');
   });
 
   await test('only a missing pagination endpoint loads both legacy sources and keeps fixed twenty-row pages', async () => {
@@ -71,7 +72,7 @@ try {
       assert.equal(options.signal, controller.signal);
       if (path.startsWith('/api/v1/background-tasks?'))
         return jsonResponse({ detail: 'Not Found' }, 404);
-      if (path === '/api/v1/runs') return jsonResponse(runs);
+      if (path === '/api/v1/runs?view=summary') return jsonResponse(runs);
       if (path === '/api/v1/asset-transfers?limit=200') return jsonResponse(transfers);
       throw new Error(`Unexpected path: ${path}`);
     };
@@ -80,7 +81,10 @@ try {
       nodes,
       controller.signal,
     );
-    assert.deepEqual(paths.slice(1).sort(), ['/api/v1/asset-transfers?limit=200', '/api/v1/runs']);
+    assert.deepEqual(paths.slice(1).sort(), [
+      '/api/v1/asset-transfers?limit=200',
+      '/api/v1/runs?view=summary',
+    ]);
     assert.equal(result.items.length, 20);
     assert.equal(result.total, 23);
     assert.equal(result.total_all, 23);
@@ -177,7 +181,7 @@ try {
     globalThis.fetch = async (path) => {
       paths.push(path);
       if (path.startsWith('/api/v1/background-tasks?')) return jsonResponse({}, 404);
-      if (path === '/api/v1/runs')
+      if (path === '/api/v1/runs?view=summary')
         return jsonResponse(
           { error: { code: 'READ_FAILED', message: 'training source unavailable' } },
           500,

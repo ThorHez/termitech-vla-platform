@@ -3,6 +3,7 @@ import { ArrowRight, ArrowUpRight, Box, Database, Workflow } from 'lucide-react'
 import { Badge, Modal, PageHeading } from './components';
 import { useData } from './data';
 import { sceneBindings } from './scenarioBindings';
+import type { Run } from './types';
 import './scenario-showcase.css';
 
 const featuredScene = {
@@ -155,8 +156,13 @@ function sceneResources(sceneId: string, { runs, assets }: ReturnType<typeof use
 
   const datasetIds = new Set(binding?.datasetIds);
   for (const run of linkedRuns) {
-    for (const row of run.dataset_bindings || []) datasetIds.add(row.dataset_asset_id);
-    for (const [role, asset] of Object.entries(run.inputs || {})) {
+    if (run.dataset_asset_ids) {
+      for (const id of run.dataset_asset_ids) datasetIds.add(id);
+      continue;
+    }
+    const legacyRun: Run = run;
+    for (const row of legacyRun.dataset_bindings || []) datasetIds.add(row.dataset_asset_id);
+    for (const [role, asset] of Object.entries(legacyRun.inputs || {})) {
       if (role !== 'dataset' && !role.startsWith('dataset_')) continue;
       const id = typeof asset === 'string' ? asset : asset?.id;
       if (id) datasetIds.add(id);
@@ -184,9 +190,15 @@ function sceneResources(sceneId: string, { runs, assets }: ReturnType<typeof use
   if (modelsFromRunOutputs) {
     // Without a curated model list, show the latest available checkpoint per linked run.
     for (const run of linkedRuns) {
-      const outputs = new Set(run.outputs?.map((output) => output.id));
+      const legacyRun: Run = run;
+      const outputs = legacyRun.outputs ? new Set(legacyRun.outputs.map(({ id }) => id)) : null;
+      const attempts = new Set(run.attempts?.map(({ id }) => id));
       const latest = availableModels
-        .filter((model) => outputs.has(model.id))
+        .filter((model) =>
+          outputs
+            ? outputs.has(model.id)
+            : !!model.origin_attempt_id && attempts.has(model.origin_attempt_id),
+        )
         .sort((left, right) => {
           const byStep = Number(right.metadata?.step ?? 0) - Number(left.metadata?.step ?? 0);
           return byStep || (right.created_at || '').localeCompare(left.created_at || '');

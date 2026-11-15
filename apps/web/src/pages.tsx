@@ -46,7 +46,7 @@ import {
   ViewLink,
 } from './components';
 import { activeStates, assetKinds, gpuAverage, gpuIdle, requiredInputs, useData } from './data';
-import type { Asset, Gpu, Node, NodeDetail, Run } from './types';
+import type { Asset, Gpu, Node, NodeDetail, RunSummary } from './types';
 import { NodeOnboarding, RuntimeCheckView, runtimeCheckFor } from './NodeOnboarding';
 import { NodeManagement } from './NodeManagement';
 import { NodeRename } from './NodeRename';
@@ -104,7 +104,7 @@ import {
   readDatasetProfile,
 } from './DatasetProfileForm';
 
-export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boolean }) {
+export function RunTable({ runs, compact = false }: { runs: RunSummary[]; compact?: boolean }) {
   const { nodes, templates, refresh } = useData();
   return (
     <div className="table-scroll">
@@ -640,7 +640,9 @@ export function NodesPage() {
 export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: string) => void }) {
   const { can } = useAuth();
   const { nodes, assets, profiles, runs, alerts } = useData();
-  const details = useApi<NodeDetail | { node: Node; assets: Asset[] }>(`/nodes/${id}`);
+  const details = useApi<NodeDetail | { node: Node; assets: Asset[] }>(
+    `/nodes/${encodeURIComponent(id)}?view=summary`,
+  );
   const [showManagement, setShowManagement] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showRename, setShowRename] = useState(false);

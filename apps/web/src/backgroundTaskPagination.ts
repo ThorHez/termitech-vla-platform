@@ -1,7 +1,7 @@
 import { ApiError, api } from './api';
 import { buildBackgroundTasks, filterBackgroundTasks } from './backgroundTaskEntries';
 import type { AssetTransfer } from './assetTransfer';
-import type { Node, Run } from './types';
+import type { Node, RunSummary } from './types';
 import type {
   BackgroundTask,
   BackgroundTaskStatus,
@@ -36,6 +36,7 @@ export const initialBackgroundTaskQuery: BackgroundTaskQuery = {
 
 export function backgroundTaskPagePath(value: BackgroundTaskQuery) {
   const query = new URLSearchParams({
+    view: 'summary',
     page: String(value.page),
     page_size: String(BACKGROUND_TASK_PAGE_SIZE),
     type: value.type,
@@ -78,7 +79,7 @@ export function backgroundTaskPageRange(
 }
 export function legacyBackgroundTaskPage(
   request: BackgroundTaskQuery,
-  runs: Run[],
+  runs: RunSummary[],
   transfers: AssetTransfer[],
   nodes: Node[] = [],
 ): BackgroundTaskPage {
@@ -114,7 +115,7 @@ export async function fetchBackgroundTaskPage(
     if (!(error instanceof ApiError) || error.status !== 404) throw error;
   }
   const [runs, transfers] = await Promise.all([
-    api<Run[]>('/runs', { signal }),
+    api<RunSummary[]>('/runs?view=summary', { signal }),
     api<AssetTransfer[]>('/asset-transfers?limit=200', { signal }),
   ]);
   return legacyBackgroundTaskPage(request, runs, transfers, nodes);

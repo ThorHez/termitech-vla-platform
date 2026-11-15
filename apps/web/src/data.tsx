@@ -2,7 +2,7 @@ import { createContext, useContext, useMemo } from 'react';
 import type { ReactNode } from 'react';
 import { useApi } from './api';
 import { deduplicateDiskAlerts } from './workspaceAlertData';
-import type { Alert, Asset, Gpu, Node, Overview, Profile, Run, Template } from './types';
+import type { Alert, Asset, Gpu, Node, Overview, Profile, RunSummary, Template } from './types';
 import type { AssetTransfer } from './assetTransfer';
 import type { MemberSummary } from './resourcePermissions';
 
@@ -13,7 +13,7 @@ function useResources(enabled: boolean) {
   const assets = useApi<Asset[]>(enabled ? '/assets' : null);
   const profiles = useApi<Profile[]>(enabled ? '/profiles' : null, 15000);
   const templates = useApi<Template[]>(enabled ? '/templates' : null, 30000);
-  const runs = useApi<Run[]>(enabled ? '/runs' : null);
+  const runs = useApi<RunSummary[]>(enabled ? '/runs?view=summary' : null);
   const assetTransfers = useApi<AssetTransfer[]>(
     enabled ? '/asset-transfers?limit=200' : null,
     3000,

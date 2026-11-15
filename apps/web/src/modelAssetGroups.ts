@@ -1,4 +1,4 @@
-import type { Asset, Run } from './types';
+import type { Asset, RunSummary } from './types';
 
 export interface ModelAssetGroup {
   kind: 'model-group';
@@ -34,7 +34,7 @@ export function checkpointStep(asset: Asset): number | undefined {
 interface ModelSource {
   key: string;
   runId?: string;
-  run?: Run;
+  run?: RunSummary;
   asset: Asset;
 }
 
@@ -42,11 +42,11 @@ interface ModelSource {
 export function catalogAssetGroups(
   filteredAssets: Asset[],
   allAssets: Asset[],
-  runs: Run[] = [],
+  runs: RunSummary[] = [],
 ): CatalogAssetEntry[] {
   const assetsById = new Map(allAssets.map((asset) => [asset.id, asset]));
   const runsById = new Map(runs.map((run) => [run.id, run]));
-  const attemptRuns = new Map<string, Run>();
+  const attemptRuns = new Map<string, RunSummary>();
   for (const run of runs)
     for (const attempt of run.attempts || []) attemptRuns.set(attempt.id, run);
 

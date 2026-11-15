@@ -1,12 +1,17 @@
 import ipaddress
+import math
+from typing import Literal
 
 from sqlalchemy import func, select
 
-from .models import Allocation, Asset, Attempt
+from .models import Allocation, Asset, Attempt, Run
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .remote_models import RemoteConnection, RemoteDeployment
 from .remote_schemas import SSHAuthenticationInput
 from .gpu_reservations import reservation_dicts
+
+
+RunListView = Literal["full", "summary"]
 
 
 def _connection_address(session, node):
@@ -77,6 +82,73 @@ def attempt_dict(attempt):
     return {key: getattr(attempt, key) for key in ("id", "run_id", "node_id", "number", "state",
             "created_at", "started_at", "finished_at", "pid", "code_snapshot", "gpu_uuids",
             "output_dir", "latest_metrics", "resources", "error", "exit_code", "code_changed_during_run")}
+
+
+def _numeric_fields(**fields):
+    return {name: value for name, value in fields.items()
+            if type(value) is int or (type(value) is float and math.isfinite(value))}
+
+
+def _dataset_ids(inputs, bindings):
+    ids = {}
+    if isinstance(inputs, dict):
+        for role, value in inputs.items():
+            if role == "dataset" or role.startswith("dataset_"):
+                asset_id = value.get("id") if isinstance(value, dict) else value
+                if isinstance(asset_id, str) and asset_id:
+                    ids[asset_id] = None
+    if isinstance(bindings, list):
+        for binding in bindings:
+            asset_id = binding.get("dataset_asset_id") if isinstance(binding, dict) else None
+            if isinstance(asset_id, str) and asset_id:
+                ids[asset_id] = None
+    return list(ids)
+
+
+def run_summaries(session, *, node_id=None, run_ids=None, limit=500):
+    """Read only the fields used by run lists, progress, and asset lineage."""
+    query = select(
+        Run.id, Run.name, Run.node_id, Run.profile_id, Run.template_id, Run.state,
+        Run.owner_user_id, Run.created_at, Run.updated_at, Run.finished_at, Run.gpu_count,
+        Run.inputs, Run.parameters["steps"].label("steps"),
+        Run.code_expectation["dataset_bindings"].label("bindings"),
+        Run.code_expectation["requested_entrypoint"].as_string().label("entrypoint"),
+    ).where(Run.deleted_at.is_(None))
+    if node_id is not None:
+        query = query.where(Run.node_id == node_id)
+    if run_ids is not None:
+        query = query.where(Run.id.in_(run_ids))
+    summaries = {}
+    for row in session.execute(query.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit)).mappings():
+        summary = dict(row)
+        bindings = summary.pop("bindings")
+        entrypoint = summary.pop("entrypoint")
+        summary["dataset_asset_ids"] = _dataset_ids(summary.pop("inputs"), bindings)
+        summary["resume_candidate"] = (
+            summary["template_id"] == "openpi-sft" and not entrypoint
+            and (not isinstance(bindings, list) or len(bindings) <= 1)
+        )
+        summary["parameters"] = _numeric_fields(steps=summary.pop("steps"))
+        summary["attempts"] = []
+        summaries[summary["id"]] = summary
+    if not summaries:
+        return []
+
+    attempts = select(
+        Attempt.run_id, Attempt.id, Attempt.state, Attempt.code_changed_during_run,
+        Attempt.latest_metrics["step"].label("step"),
+        Attempt.latest_metrics["total_steps"].label("total_steps"),
+    ).where(Attempt.run_id.in_(summaries)).order_by(Attempt.run_id, Attempt.number)
+    metrics = {}
+    for row in session.execute(attempts):
+        summaries[row.run_id]["attempts"].append({
+            "id": row.id, "state": row.state, "code_changed_during_run": row.code_changed_during_run,
+        })
+        metrics[row.run_id] = _numeric_fields(step=row.step, total_steps=row.total_steps)
+    for run_id, latest_metrics in metrics.items():
+        if latest_metrics:
+            summaries[run_id]["attempts"][-1]["latest_metrics"] = latest_metrics
+    return list(summaries.values())
 
 
 def run_dict(session, run):

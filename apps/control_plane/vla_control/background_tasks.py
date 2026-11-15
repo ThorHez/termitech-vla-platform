@@ -9,7 +9,7 @@ from sqlalchemy.orm import aliased, defer
 from .asset_transfer_models import AssetTransfer
 from .asset_transfers import asset_transfer_dict
 from .models import Node, Run
-from .serialization import run_dict
+from .serialization import RunListView, run_dict, run_summaries
 
 
 TaskType = Literal["ALL", "training", "data-sync"]
@@ -60,7 +60,7 @@ def _task_queries(task_type="ALL", status="ALL", search=""):
     return runs, copies
 
 
-def task_page(session, *, page=1, page_size=20, task_type="ALL", status="ALL", query=""):
+def task_page(session, *, page=1, page_size=20, task_type="ALL", status="ALL", query="", view="full"):
     visible = union_all(*_task_queries()).subquery()
     total_all = session.scalar(select(func.count()).select_from(visible))
     filtered = union_all(*_task_queries(task_type, status, query.strip())).subquery()
@@ -72,10 +72,12 @@ def task_page(session, *, page=1, page_size=20, task_type="ALL", status="ALL", q
         .offset((page - 1) * page_size).limit(page_size)))
     run_ids = [row.id for row in rows if row.kind == "training"]
     copy_ids = [row.id for row in rows if row.kind == "data-sync"]
-    # Fetch large configuration/asset details only for the selected page. The
-    # transfer serializer needs neither the file manifest nor SSH bindings.
-    runs = {row.id: row for row in session.scalars(select(Run).where(
-        Run.id.in_(run_ids), Run.deleted_at.is_(None)))} if run_ids else {}
+    if view == "summary":
+        runs = {row["id"]: row for row in run_summaries(session, run_ids=run_ids)} if run_ids else {}
+    else:
+        runs = {row.id: run_dict(session, row) for row in session.scalars(select(Run).where(
+            Run.id.in_(run_ids), Run.deleted_at.is_(None)))} if run_ids else {}
+    # The transfer serializer needs neither the file manifest nor SSH bindings.
     copies = {row.id: row for row in session.scalars(select(AssetTransfer).options(
         defer(AssetTransfer.manifest), defer(AssetTransfer.binding_snapshot)).where(
             AssetTransfer.id.in_(copy_ids), AssetTransfer.deleted_at.is_(None)))} if copy_ids else {}
@@ -85,7 +87,7 @@ def task_page(session, *, page=1, page_size=20, task_type="ALL", status="ALL", q
         # A concurrent deletion can disappear between the ID and detail reads.
         if item is not None:
             items.append({"key": f"{row.kind}:{row.id}", "kind": row.kind,
-                          "item": run_dict(session, item) if row.kind == "training" else asset_transfer_dict(item)})
+                          "item": item if row.kind == "training" else asset_transfer_dict(item)})
     return {"items": items, "total": total, "total_all": total_all, "page": page,
             "page_size": page_size, "total_pages": total_pages}
 
@@ -96,7 +98,8 @@ def register_routes(app, admin, db):
                          page_size: int = Query(default=20, ge=1, le=100),
                          type: TaskType = Query(default="ALL"),
                          status: TaskStatus = Query(default="ALL"),
-                         q: str | None = Query(default=None, max_length=200)):
+                         q: str | None = Query(default=None, max_length=200),
+                         view: RunListView = "full"):
         with db.read() as session:
             return task_page(session, page=page, page_size=page_size, task_type=type,
-                             status=status, query=q or "")
+                             status=status, query=q or "", view=view)

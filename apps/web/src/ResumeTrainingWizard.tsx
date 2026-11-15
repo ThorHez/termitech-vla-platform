@@ -1,24 +1,34 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createOperationClient, navigate, useApi } from './api';
 import { useAuth } from './auth';
 import { ErrorNotice, Field, Modal } from './components';
 import { useData } from './data';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { PreflightChecks } from './PreflightChecks';
-import { resumeCheckpoints, resumeTrainingRequest, retryTrainingName } from './runRetry';
+import {
+  resumeCheckpointChoices,
+  resumeCheckpoints,
+  resumeTrainingRequest,
+  retryTrainingName,
+} from './runRetry';
 import { submitTrainingRun } from './runSubmission';
 import { configurationConfirmed } from './trainingConfiguration';
 import type { Preview, Run } from './types';
 
 export function ResumeTrainingWizard({ sourceRun, close }: { sourceRun?: Run; close: () => void }) {
   const { user, can } = useAuth();
-  const { nodes, runs, refresh } = useData();
-  const candidates = (sourceRun ? [sourceRun] : (runs.data ?? [])).flatMap((run) =>
-    resumeCheckpoints(run, user?.id ?? '', user?.role === 'admin').map((checkpoint) => ({
-      run,
-      checkpoint,
-      step: Number(checkpoint.metadata?.step),
-    })),
+  const { assets, nodes, runs, refresh } = useData();
+  const userId = user?.id ?? '';
+  const isAdmin = user?.role === 'admin';
+  const candidates = useMemo(
+    () =>
+      resumeCheckpointChoices(
+        sourceRun ? [sourceRun] : (runs.data ?? []),
+        sourceRun ? [] : (assets.data ?? []),
+        userId,
+        isAdmin,
+      ),
+    [sourceRun, runs.data, assets.data, userId, isAdmin],
   );
   const [checkpointId, setCheckpointId] = useState(() =>
     sourceRun ? (candidates[0]?.checkpoint.id ?? '') : '',
@@ -41,7 +51,23 @@ export function ResumeTrainingWizard({ sourceRun, close }: { sourceRun?: Run; cl
   const result = useApi<Preview>(pending ? `/run-previews/${pending.id}` : null, 1800);
   const preview = result.data?.id === pending?.id ? result.data : pending;
   const config = preview?.code_snapshot?.automatic_preflight?.plan?.generated_config;
-  const selected = candidates.find(({ checkpoint }) => checkpoint.id === checkpointId);
+  const choice = candidates.find(({ checkpoint }) => checkpoint.id === checkpointId);
+  const sourceDetail = useApi<Run>(
+    !sourceRun && choice ? `/runs/${encodeURIComponent(choice.run.id)}` : null,
+    0,
+  );
+  const selectedSource =
+    sourceRun ?? (sourceDetail.data?.id === choice?.run.id ? sourceDetail.data : undefined);
+  const checkpoint =
+    selectedSource &&
+    resumeCheckpoints(selectedSource, userId, isAdmin).find(({ id }) => id === checkpointId);
+  const selected =
+    selectedSource && checkpoint
+      ? { run: selectedSource, checkpoint, step: Number(checkpoint.metadata?.step) }
+      : undefined;
+  const loadingChoices =
+    !sourceRun && ((runs.loading && !runs.data) || (assets.loading && !assets.data));
+  const sourceError = !sourceRun && choice ? sourceDetail.error : undefined;
   const minSteps = selected ? selected.step + 2 : 1;
   const previousTotal = selected?.run.parameters?.steps ?? 0;
   const totalSteps =
@@ -139,7 +165,10 @@ export function ResumeTrainingWizard({ sourceRun, close }: { sourceRun?: Run; cl
         支持已结束的标准原生单数据集
         SFT。续训沿用源任务的数据、归一化、模型结构、优化器和学习率计划。
       </p>
-      <ErrorNotice error={error || result.error || (!sourceRun ? runs.error : undefined)} />
+      <ErrorNotice
+        error={error || result.error || (!sourceRun ? runs.error || assets.error : undefined)}
+      />
+      <ErrorNotice error={sourceError} retry={sourceDetail.refresh} />
       <Field label="续训检查点" required>
         <select
           value={checkpointId}
@@ -151,9 +180,7 @@ export function ResumeTrainingWizard({ sourceRun, close }: { sourceRun?: Run; cl
             resetPreview();
           }}
         >
-          <option value="">
-            {runs.loading && !sourceRun ? '正在读取训练记录…' : '选择已登记的检查点'}
-          </option>
+          <option value="">{loadingChoices ? '正在读取训练记录…' : '选择已登记的检查点'}</option>
           {candidates.map(({ run, checkpoint, step }) => (
             <option key={checkpoint.id} value={checkpoint.id}>
               {run.name} · 检查点 {step}
@@ -161,7 +188,9 @@ export function ResumeTrainingWizard({ sourceRun, close }: { sourceRun?: Run; cl
           ))}
         </select>
       </Field>
-      {!candidates.length && (sourceRun || !runs.loading) && <p>当前没有可续训的 SFT 检查点。</p>}
+      {!candidates.length && !loadingChoices && <p>当前没有可续训的 SFT 检查点。</p>}
+      {choice && !selectedSource && !sourceError && <p role="status">正在读取源训练配置…</p>}
+      {choice && selectedSource && !selected && <p>当前检查点已不可用于续训，请重新选择。</p>}
       {selected && (
         <>
           <p className="field-hint">

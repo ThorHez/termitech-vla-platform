@@ -544,7 +544,7 @@ export interface Attempt {
   gpu_uuids?: string[];
   latest_metrics?: JsonObject;
   resources?: JsonObject;
-  code_changed_during_run?: boolean;
+  code_changed_during_run?: boolean | null;
 }
 export interface Run {
   resume?: boolean;
@@ -581,6 +581,28 @@ export interface Run {
   queue_reason?: string | null;
   error?: { code?: string; message?: string };
 }
+export type RunSummary = Pick<
+  Run,
+  | 'id'
+  | 'name'
+  | 'node_id'
+  | 'profile_id'
+  | 'template_id'
+  | 'owner_user_id'
+  | 'state'
+  | 'created_at'
+  | 'updated_at'
+  | 'gpu_count'
+> & {
+  finished_at?: string | null;
+  parameters?: { steps?: number };
+  attempts?: Pick<
+    Attempt,
+    'id' | 'state' | 'status' | 'code_changed_during_run' | 'latest_metrics'
+  >[];
+  dataset_asset_ids?: string[];
+  resume_candidate?: boolean;
+};
 export interface Overview {
   nodes_online: number;
   nodes_total: number;
@@ -670,5 +692,5 @@ export interface Logs {
 export interface NodeDetail extends Node {
   assets?: Asset[];
   profiles?: Profile[];
-  runs?: Run[];
+  runs?: RunSummary[];
 }
