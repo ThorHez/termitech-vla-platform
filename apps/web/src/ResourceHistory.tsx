@@ -607,6 +607,7 @@ export function NetworkProcessTraffic({
 function HistoryContent({
   nodeId,
   window,
+  refreshIntervalMs,
   status,
   gpuIds,
   selectGpus,
@@ -616,6 +617,7 @@ function HistoryContent({
 }: {
   nodeId: string;
   window: HistoryWindow;
+  refreshIntervalMs: number;
   status: string;
   gpuIds: string[] | null;
   selectGpus: (uuids: string[] | null) => void;
@@ -625,7 +627,7 @@ function HistoryContent({
 }) {
   const history = useApi<ResourceHistoryResponse>(
     `/nodes/${encodeURIComponent(nodeId)}/resource-history?window=${window}`,
-    30000,
+    refreshIntervalMs,
   );
   const data =
     history.data?.node_id === nodeId && history.data.window === window ? history.data : undefined;
@@ -653,7 +655,9 @@ function HistoryContent({
       <div className="resource-history-status">
         <span>
           <span className={`status-dot ${status === 'ONLINE' ? 'online' : ''}`} />
-          {status === 'ONLINE' ? '每 30 秒自动刷新' : '机器当前未在线，已有历史仍可查看'}
+          {status === 'ONLINE'
+            ? `每 ${refreshIntervalMs / 1000} 秒自动刷新`
+            : '机器当前未在线，已有历史仍可查看'}
         </span>
         <button
           type="button"
@@ -735,6 +739,7 @@ function HistoryContent({
 export function ResourceHistory({
   nodeId,
   status,
+  historyRefreshMs = 30_000,
   processReport,
   lastSeen,
   processReportReceivedAt,
@@ -742,6 +747,7 @@ export function ResourceHistory({
 }: {
   nodeId: string;
   status: string;
+  historyRefreshMs?: number;
   processReport?: NetworkProcessReport;
   lastSeen?: string | null;
   processReportReceivedAt?: Date;
@@ -780,6 +786,7 @@ export function ResourceHistory({
         key={`${nodeId}-${window}`}
         nodeId={nodeId}
         window={window}
+        refreshIntervalMs={historyRefreshMs}
         status={status}
         gpuIds={gpuSelection?.nodeId === nodeId ? gpuSelection.uuids : null}
         selectGpus={(uuids) => setGpuSelection({ nodeId, uuids })}

@@ -20,7 +20,7 @@ const pageRequests: Record<string, DataRequests> = {
   '/overview': { overview: 15000, nodes: 15000, runs: 15000, alerts: 10000 },
   '/alerts': { alerts: 10000, nodes: 0 },
   '/nodes': { nodes: 15000 },
-  '/assets': { assets: 30000, nodes: 15000, profiles: 0, runs: 0, members: 0 },
+  '/assets': { assets: 60000, nodes: 15000, profiles: 0, runs: 0, members: 0 },
   '/templates': { templates: 30000 },
   '/runs': { nodes: 0, templates: 0, members: 0 },
   '/deployments': { nodes: 0, members: 0 },

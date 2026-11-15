@@ -864,6 +864,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
             key={`history-${id}`}
             nodeId={id}
             status={node.status}
+            historyRefreshMs={isServer169 ? 60_000 : undefined}
             processReport={node.metrics?.network_processes}
             lastSeen={node.last_seen}
             processReportReceivedAt={details.updatedAt}
