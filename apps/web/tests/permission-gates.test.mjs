@@ -15,8 +15,15 @@ const server = await createServer({
 try {
   const { AuthContext } = await server.ssrLoadModule('/src/auth.tsx');
   const { DataProvider } = await server.ssrLoadModule('/src/data.tsx');
-  const { NodesPage, NodePage, AssetsPage, OverviewPage, RunsPage, RegisterAsset } =
-    await server.ssrLoadModule('/src/pages.tsx');
+  const {
+    NodesPage,
+    NodePage,
+    MachineNetworkTraffic,
+    AssetsPage,
+    OverviewPage,
+    RunsPage,
+    RegisterAsset,
+  } = await server.ssrLoadModule('/src/pages.tsx');
   const { DatasetProfileEditor } = await server.ssrLoadModule('/src/DatasetProfileForm.tsx');
   const { DatasetNormBindingDialog } = await server.ssrLoadModule('/src/DatasetNormBinding.tsx');
   const { NodeManagement } = await server.ssrLoadModule('/src/NodeManagement.tsx');
@@ -85,6 +92,32 @@ try {
       const detail = render(role, NodePage, { id: 'fixture', createRun() {} });
       assert.doesNotMatch(detail, /管理连接/);
     }
+  });
+
+  await test('machine cards show the default interface and suppress stale network rates', () => {
+    const node = {
+      status: 'ONLINE',
+      last_seen: new Date().toISOString(),
+      metrics: {
+        network: {
+          default_interface: 'eth0',
+          interfaces: [
+            { name: 'vmbr0', rx_bytes_per_second: 15000000, tx_bytes_per_second: 10000000 },
+            { name: 'eth0', rx_bytes_per_second: 1250000, tx_bytes_per_second: 0 },
+          ],
+        },
+      },
+    };
+    const html = (value) =>
+      renderToStaticMarkup(React.createElement(MachineNetworkTraffic, { node: value }));
+    assert.match(html(node), /eth0/);
+    assert.match(html(node), /10 Mbps/);
+    assert.match(html(node), />0 Mbps</);
+    assert.doesNotMatch(html(node), /vmbr0|120 Mbps/);
+    const stale = html({ ...node, last_seen: new Date(0).toISOString() });
+    assert.match(stale, /暂无实时数据/);
+    assert.doesNotMatch(stale, /Mbps/);
+    assert.match(html({ ...node, metrics: {} }), /等待网卡数据/);
   });
 
   await test('operators can register all asset types while viewers keep a shared readonly catalog', () => {

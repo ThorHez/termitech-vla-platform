@@ -28,13 +28,14 @@ try {
     validPercent,
     seriesValues,
     chartSegments,
+    formatNetworkRate,
+    networkMbps,
     seriesSummary,
     historicalGpus,
     nearestPointIndex,
   } = await server.ssrLoadModule('/src/resourceHistoryData.ts');
-  const { ResourceTrendChart, ResourceHistory, GpuHistoryCharts } = await server.ssrLoadModule(
-    '/src/ResourceHistory.tsx',
-  );
+  const { ResourceTrendChart, ResourceHistory, GpuHistoryCharts, NetworkHistoryCharts } =
+    await server.ssrLoadModule('/src/ResourceHistory.tsx');
   const gpu = (uuid, usage, memory = null) => ({
     uuid,
     name: 'same GPU model',
@@ -281,6 +282,79 @@ try {
     const noHistory = renderGpus(gpuHistory([point(0, null)]));
     assert.match(noHistory, /此时段暂无 GPU 历史指标，未知值保留为空。/);
     assert.doesNotMatch(noHistory, /<svg\b|<input\b/);
+  });
+
+  await test('network rates preserve valid zeros and handle Mbps values over 100', () => {
+    assert.equal(formatNetworkRate(0), '0 Mbps');
+    assert.equal(formatNetworkRate(1), '< 0.001 Mbps');
+    assert.equal(formatNetworkRate(125_000_000), '1,000 Mbps');
+    assert.equal(formatNetworkRate(Infinity), '—');
+    assert.equal(formatNetworkRate(null), '—');
+    assert.equal(networkMbps(125_000_000), 1000);
+  });
+
+  await test('network history selects the default route and displays only one interface', () => {
+    const nic = (name, rx, tx) => ({
+      name,
+      rx_bytes_per_second: rx,
+      tx_bytes_per_second: tx,
+    });
+    const history = {
+      ...gpuHistory([
+        point(0, null, {
+          network_interfaces: [nic('eth1', 800, 300), nic('eth0', 125_000_000, 0)],
+        }),
+        point(30, null, { network_interfaces: [nic('eth1', 900, 60)] }),
+        point(60, null, { network_interfaces: [nic('eth0', 250_000_000, 20_000_000)] }),
+      ]),
+      network: {
+        default_interface: 'eth0',
+        day_date: '2026-10-27',
+        day_timezone: 'Asia/Shanghai',
+        interfaces: [
+          { name: 'eth1', day_rx_bytes: null, day_tx_bytes: null, day_partial: false },
+          { name: 'eth0', day_rx_bytes: 2_500_000_000, day_tx_bytes: 0, day_partial: true },
+        ],
+      },
+    };
+    const renderNetwork = (interfaceName) =>
+      renderToStaticMarkup(
+        React.createElement(NetworkHistoryCharts, {
+          history,
+          interfaceName,
+          selectInterface: () => {},
+        }),
+      );
+    const defaultHtml = renderNetwork(null);
+    assert.match(defaultHtml, /value="eth0" selected="">eth0（默认出口）/);
+    assert.match(defaultHtml, /2\.5 GB/);
+    assert.match(defaultHtml, /0 GB/);
+    assert.match(defaultHtml, /2026-10-27 北京时间/);
+    assert.match(defaultHtml, /今日采样覆盖不完整/);
+    assert.match(defaultHtml, /纵轴单位为 Mbps/);
+    assert.match(defaultHtml, />2,000<\/text>/);
+    assert.equal((defaultHtml.match(/<circle\b/g) || []).length, 4);
+    assert.doesNotMatch(defaultHtml, /<path\b/);
+    const explicitHtml = renderNetwork('eth1');
+    assert.match(explicitHtml, /value="eth1" selected="">eth1/);
+    assert.doesNotMatch(explicitHtml, /2\.5 GB|今日采样覆盖不完整/);
+    assert.equal((explicitHtml.match(/<path\b/g) || []).length, 2);
+    const missingHtml = renderNetwork('renamed-nic');
+    assert.match(missingHtml, /value="renamed-nic" selected="">renamed-nic/);
+    assert.match(missingHtml, /该时段未采集到可用指标/);
+    assert.doesNotMatch(missingHtml, /<svg\b/);
+  });
+
+  await test('history from an older controller shows no network data', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(NetworkHistoryCharts, {
+        history: gpuHistory([point(0, null)]),
+        interfaceName: null,
+        selectInterface: () => {},
+      }),
+    );
+    assert.match(html, /暂无网卡流量数据/);
+    assert.doesNotMatch(html, /<svg\b|0 GB|0 Mbps/);
   });
 
   await test('history panel offers bounded ranges to read-only machine viewers', () => {

@@ -1458,6 +1458,49 @@ tbody tr:hover {
   color: var(--text-primary, #577383);
   white-space: nowrap;
 }
+.machine-network {
+  margin: 9px 20px 0;
+  padding: 10px 11px;
+  border: 1px solid var(--border-default, #eef2f5);
+  border-radius: 6px;
+  background: var(--bg-subtle, #f8fafb);
+  color: var(--text-secondary, #526f7e);
+  font-size: 11px;
+}
+.machine-network-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.machine-network-header code {
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary, #49626e);
+}
+.machine-network-rates {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 4px 12px;
+  margin: 8px 0 0;
+}
+.machine-network-rates > div {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.machine-network-rates dd {
+  margin: 0;
+  color: var(--text-primary, #49626e);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.machine-network-empty {
+  display: block;
+  margin-top: 8px;
+}
 .machine-stats {
   display: flex;
   padding: 22px 12px;

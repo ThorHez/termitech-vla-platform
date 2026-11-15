@@ -67,6 +67,7 @@ from .dataset_batches import DatasetBatchManager, register_routes as register_da
 from .asset_transfer_batches import register_routes as register_asset_transfer_batch_routes
 from .background_tasks import register_routes as register_background_task_routes
 from .resource_history import capture_sample, register_routes as register_resource_history_routes
+from .network_metrics import with_network_metrics
 from .run_records import delete_run_record, require_replayable_run, require_visible_run
 from .training_metrics import register_routes as register_training_metric_routes
 from .training_resume import freeze_resume_source
@@ -221,7 +222,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_dataset_batch_routes(app, admin, dataset_batch_manager)
     register_asset_transfer_batch_routes(app, admin, asset_transfer_manager, auth)
     register_gpu_reservation_routes(app, admin, db, auth, settings)
-    register_resource_history_routes(app, admin, db)
+    register_resource_history_routes(app, admin, db, settings.heartbeat_timeout_seconds)
     register_training_metric_routes(app, admin, db)
     register_background_task_routes(app, admin, db)
     register_dataset_validation_routes(app, admin, db, settings)
@@ -865,7 +866,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with db.write() as session:
             node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
             assert_agent_connected(node)
-            node.last_seen, node.gpus, node.metrics = now(), [gpu.model_dump() for gpu in body.gpus], body.metrics
+            received_at = now()
+            node.metrics = with_network_metrics(body.metrics, node.metrics, received_at, node.last_seen,
+                                                settings.heartbeat_timeout_seconds)
+            node.last_seen, node.gpus = received_at, [gpu.model_dump() for gpu in body.gpus]
             capture_sample(session, node)
             reported_ids = {active.attempt_id for active in body.active_attempts}
 

@@ -1,4 +1,5 @@
 import type { DatasetProfile } from './DatasetProfileForm';
+import type { NetworkMetrics } from './resourceHistoryData';
 
 export type JsonObject = Record<string, unknown>;
 export interface GpuReservation {
@@ -44,7 +45,7 @@ export interface Node {
   output_root?: string;
   cache_root?: string | null;
   gpus?: Gpu[];
-  metrics?: JsonObject;
+  metrics?: JsonObject & { network?: NetworkMetrics | null };
 }
 export interface DatasetSourceValidation {
   id?: string | null;

@@ -52,6 +52,7 @@ import { NodeManagement } from './NodeManagement';
 import { NodeRename } from './NodeRename';
 import { NodeTerminal } from './NodeTerminal';
 import { ResourceHistory } from './ResourceHistory';
+import { formatNetworkRate } from './resourceHistoryData';
 import { GpuReservations } from './GpuReservations';
 import { NodeGpuResources } from './NodeGpuResources';
 import { ProfileRebinding } from './ProfileRebinding';
@@ -473,6 +474,44 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
   );
 }
 
+export function MachineNetworkTraffic({ node }: { node: Node }) {
+  const network = node.metrics?.network;
+  const interfaces = Array.isArray(network?.interfaces)
+    ? network.interfaces.filter((item) => typeof item?.name === 'string')
+    : [];
+  const defaultInterface = interfaces.find((item) => item.name === network?.default_interface);
+  const selected = defaultInterface ?? (interfaces.length === 1 ? interfaces[0] : undefined);
+  const fresh =
+    (node.status === 'ONLINE' || node.status === 'RECOVERING') &&
+    Date.now() - Date.parse(node.last_seen ?? '') <= 30000;
+
+  return (
+    <div className="machine-network">
+      <div className="machine-network-header">
+        <Activity size={14} aria-hidden="true" />
+        <span>网络流量</span>
+        {selected && <code title={selected.name}>{selected.name}</code>}
+      </div>
+      {fresh && selected ? (
+        <dl className="machine-network-rates">
+          <div>
+            <dt>入站</dt>
+            <dd>{formatNetworkRate(selected.rx_bytes_per_second)}</dd>
+          </div>
+          <div>
+            <dt>出站</dt>
+            <dd>{formatNetworkRate(selected.tx_bytes_per_second)}</dd>
+          </div>
+        </dl>
+      ) : (
+        <span className="machine-network-empty">
+          {!fresh ? '暂无实时数据' : interfaces.length ? '在详情中选择网卡' : '等待网卡数据'}
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function NodesPage() {
   const { can } = useAuth();
   const { nodes, assets, profiles, enabled } = useData();
@@ -544,6 +583,7 @@ export function NodesPage() {
                   <span>{node.gpus?.[0]?.name || '尚无 GPU 信息'}</span>
                   <strong>× {node.gpus?.length || 0}</strong>
                 </div>
+                <MachineNetworkTraffic node={node} />
                 <div className="machine-stats">
                   <div>
                     <strong>

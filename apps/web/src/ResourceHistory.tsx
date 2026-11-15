@@ -4,9 +4,13 @@ import { date, useApi } from './api';
 import { Empty, ErrorNotice, Loading, Panel } from './components';
 import {
   chartSegments,
+  formatNetworkBytes,
+  formatNetworkMbps,
   historicalGpus,
   historyWindows,
   nearestPointIndex,
+  networkAxisMaximum,
+  networkMbps,
   seriesSummary,
   seriesValues,
 } from './resourceHistoryData';
@@ -20,6 +24,8 @@ const palette = {
   disk: 'var(--chart-disk, #bc862f)',
   gpu: 'var(--chart-gpu, #0b8c87)',
   vram: 'var(--chart-ram, #8b62c4)',
+  receive: 'var(--chart-memory, #5578d7)',
+  transmit: 'var(--chart-cpu, #0b8c87)',
 };
 
 interface ChartSeries {
@@ -54,24 +60,29 @@ export function ResourceTrendChart({
   history,
   series,
   compact = false,
+  unit = '%',
 }: {
   title: string;
   history: ResourceHistoryResponse;
   series: ChartSeries[];
   compact?: boolean;
+  unit?: '%' | 'Mbps';
 }) {
   const labelId = useId();
   const [selected, setSelected] = useState<number | null>(null);
   const start = Date.parse(history.start);
   const duration = Math.max(1, Date.parse(history.end) - start);
   const canvasWidth = compact ? 560 : 800;
-  const left = 43,
+  const percentAxis = unit === '%';
+  const maximum = percentAxis ? 100 : networkAxisMaximum(series.map((item) => item.values));
+  const labelValue = percentAxis ? percent : formatNetworkMbps;
+  const left = percentAxis ? 43 : 62,
     top = 15,
-    width = canvasWidth - 70,
+    width = canvasWidth - left - 27,
     height = 152;
   const x = (timestamp: string) =>
     left + Math.max(0, Math.min(1, (Date.parse(timestamp) - start) / duration)) * width;
-  const y = (value: number) => top + height * (1 - value / 100);
+  const y = (value: number) => top + height * (1 - value / maximum);
   const point = selected === null ? undefined : history.points[selected];
   const known = series.some((item) => item.values.some((value) => value.value !== null));
   return (
@@ -127,22 +138,26 @@ export function ResourceTrendChart({
               );
             }}
           >
-            <title id={`${labelId}-title`}>{`${title}，百分比趋势图`}</title>
+            <title id={`${labelId}-title`}>
+              {`${title}，${percentAxis ? '百分比' : 'Mbps'}趋势图`}
+            </title>
             <desc id={`${labelId}-desc`}>
-              纵轴 0 至 100%。无有效指标的聚合时段保留断点。使用左右方向键逐点查看，Home 和 End
-              跳转首尾。
+              {percentAxis ? '纵轴 0 至 100%。' : '纵轴单位为 Mbps。'}
+              无有效指标的聚合时段保留断点。使用左右方向键逐点查看，Home 和 End 跳转首尾。
             </desc>
-            {[0, 25, 50, 75, 100].map((value) => (
-              <g key={value}>
+            {[0, 0.25, 0.5, 0.75, 1].map((fraction) => (
+              <g key={fraction}>
                 <line
                   x1={left}
                   x2={left + width}
-                  y1={y(value)}
-                  y2={y(value)}
+                  y1={y(maximum * fraction)}
+                  y2={y(maximum * fraction)}
                   className="resource-chart-grid"
                 />
-                <text x={left - 9} y={y(value) + 4} textAnchor="end">
-                  {value}%
+                <text x={left - 9} y={y(maximum * fraction) + 4} textAnchor="end">
+                  {percentAxis
+                    ? `${maximum * fraction}%`
+                    : (maximum * fraction).toLocaleString('zh-CN', { maximumFractionDigits: 3 })}
                 </text>
               </g>
             ))}
@@ -219,7 +234,7 @@ export function ResourceTrendChart({
                   <span key={item.label}>
                     <i style={{ background: item.color }} />
                     {item.label}{' '}
-                    <strong>{percent(item.values[selected as number]?.value ?? null)}</strong>
+                    <strong>{labelValue(item.values[selected as number]?.value ?? null)}</strong>
                   </span>
                 ))}
                 {!point.sample_count && <span>此时段无采样</span>}
@@ -335,18 +350,132 @@ export function GpuHistoryCharts({
   );
 }
 
+export function NetworkHistoryCharts({
+  history,
+  interfaceName,
+  selectInterface,
+}: {
+  history: ResourceHistoryResponse;
+  interfaceName: string | null;
+  selectInterface: (name: string) => void;
+}) {
+  const network = history.network;
+  const names = new Set(network?.interfaces.map((item) => item.name));
+  for (const point of history.points) {
+    for (const item of point.network_interfaces ?? []) names.add(item.name);
+  }
+  if (interfaceName !== null) names.add(interfaceName);
+  const interfaces = [...names];
+  const defaultInterface = network?.default_interface;
+  const selected =
+    interfaceName ??
+    (defaultInterface && names.has(defaultInterface) ? defaultInterface : interfaces[0]);
+  const today = network?.interfaces.find((item) => item.name === selected);
+  const observedUntil = Date.parse(today?.observed_until ?? '');
+  return (
+    <section className="resource-network-history" aria-label="网卡流量">
+      <div className="resource-network-heading">
+        <h3>网卡流量</h3>
+        {selected && (
+          <label>
+            网卡
+            <select value={selected} onChange={(event) => selectInterface(event.target.value)}>
+              {interfaces.map((name) => (
+                <option value={name} key={name}>
+                  {name === defaultInterface ? `${name}（默认出口）` : name}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
+      {selected ? (
+        <>
+          <div className="resource-history-summaries resource-network-summaries">
+            <div>
+              <span>
+                <i style={{ background: palette.receive }} />
+                今日入站
+              </span>
+              <strong>{formatNetworkBytes(today?.day_rx_bytes)}</strong>
+            </div>
+            <div>
+              <span>
+                <i style={{ background: palette.transmit }} />
+                今日出站
+              </span>
+              <strong>{formatNetworkBytes(today?.day_tx_bytes)}</strong>
+            </div>
+          </div>
+          <p className="resource-network-note">
+            {network
+              ? `${network.day_date} ${network.day_timezone === 'Asia/Shanghai' ? '北京时间' : network.day_timezone}。 `
+              : ''}
+            {Number.isFinite(observedUntil)
+              ? `统计截至 ${new Date(observedUntil).toLocaleTimeString('zh-CN', {
+                  timeZone: 'Asia/Shanghai',
+                  hour12: false,
+                })}。 `
+              : ''}
+            {today?.day_partial ? '今日采样覆盖不完整，累计值仅包含已观测流量。 ' : ''}
+            数值来自所选网卡，公网计费用量以云厂商记录为准。
+          </p>
+          <ResourceTrendChart
+            key={selected}
+            title="收发速率（Mbps）"
+            history={history}
+            unit="Mbps"
+            series={[
+              {
+                label: '入站',
+                color: palette.receive,
+                values: seriesValues(
+                  history.points,
+                  (point) =>
+                    point.network_interfaces?.find((item) => item.name === selected)
+                      ?.rx_bytes_per_second,
+                  networkMbps,
+                ),
+              },
+              {
+                label: '出站',
+                color: palette.transmit,
+                values: seriesValues(
+                  history.points,
+                  (point) =>
+                    point.network_interfaces?.find((item) => item.name === selected)
+                      ?.tx_bytes_per_second,
+                  networkMbps,
+                ),
+              },
+            ]}
+          />
+        </>
+      ) : (
+        <div className="resource-chart-unavailable">
+          暂无网卡流量数据，等待支持流量采集的 Agent 上报。
+        </div>
+      )}
+    </section>
+  );
+}
+
 function HistoryContent({
   nodeId,
   window,
   status,
   gpuIds,
   selectGpus,
+  interfaceName,
+  selectInterface,
 }: {
   nodeId: string;
   window: HistoryWindow;
   status: string;
   gpuIds: string[] | null;
   selectGpus: (uuids: string[] | null) => void;
+  interfaceName: string | null;
+  selectInterface: (name: string) => void;
 }) {
   const history = useApi<ResourceHistoryResponse>(
     `/nodes/${encodeURIComponent(nodeId)}/resource-history?window=${window}`,
@@ -400,43 +529,56 @@ function HistoryContent({
       />
       {!data ? (
         history.loading && <Loading label="正在读取资源历史…" />
-      ) : !data.points.length ? (
-        <Empty
-          icon={Activity}
-          title="此时段暂无资源历史"
-          description="历史记录从功能启用后的 Agent 心跳开始积累；更早的数据无法补录。机器在线后可稍后刷新，或切换时间范围。"
-        />
       ) : (
         <>
-          <div className="resource-history-summaries">
-            {systemSeries.map((item) => {
-              const summary = seriesSummary(item.values);
-              return (
-                <div key={item.label}>
-                  <span>
-                    <i style={{ background: item.color }} />
-                    {item.label}
-                  </span>
-                  <strong>{percent(summary.latest)}</strong>
-                  <small>
-                    最近有效时段 {summary.timestamp ? date(summary.timestamp) : '—'} · 时段均值{' '}
-                    {percent(summary.average)}
-                  </small>
-                </div>
-              );
-            })}
-          </div>
-          <ResourceTrendChart title="整机资源占用" history={data} series={systemSeries} />
-          <GpuHistoryCharts history={data} gpuIds={gpuIds} selectGpus={selectGpus} />
-          <p className="resource-history-note">
-            保存近 {data.retention_days} 天记录，最多每 {data.sample_interval_seconds} 秒采样一次。
-            当前按{' '}
-            {data.bucket_seconds < 60
-              ? `${data.bucket_seconds} 秒`
-              : `${data.bucket_seconds / 60} 分钟`}
-            聚合均值；时段均值为图中有效聚合点的平均值。
-            无有效指标的聚合时段显示断点；时段内短暂中断可能被聚合。磁盘对应产出目录所在文件系统。时间按浏览器本地时区显示。
-          </p>
+          {data.points.length ? (
+            <>
+              <div className="resource-history-summaries">
+                {systemSeries.map((item) => {
+                  const summary = seriesSummary(item.values);
+                  return (
+                    <div key={item.label}>
+                      <span>
+                        <i style={{ background: item.color }} />
+                        {item.label}
+                      </span>
+                      <strong>{percent(summary.latest)}</strong>
+                      <small>
+                        最近有效时段 {summary.timestamp ? date(summary.timestamp) : '—'} · 时段均值{' '}
+                        {percent(summary.average)}
+                      </small>
+                    </div>
+                  );
+                })}
+              </div>
+              <ResourceTrendChart title="整机资源占用" history={data} series={systemSeries} />
+            </>
+          ) : (
+            <Empty
+              icon={Activity}
+              title="此时段暂无资源历史"
+              description="历史记录从功能启用后的 Agent 心跳开始积累；更早的数据无法补录。机器在线后可稍后刷新，或切换时间范围。"
+            />
+          )}
+          <NetworkHistoryCharts
+            history={data}
+            interfaceName={interfaceName}
+            selectInterface={selectInterface}
+          />
+          {!!data.points.length && (
+            <>
+              <GpuHistoryCharts history={data} gpuIds={gpuIds} selectGpus={selectGpus} />
+              <p className="resource-history-note">
+                保存近 {data.retention_days} 天记录，最多每 {data.sample_interval_seconds}{' '}
+                秒采样一次。 当前按{' '}
+                {data.bucket_seconds < 60
+                  ? `${data.bucket_seconds} 秒`
+                  : `${data.bucket_seconds / 60} 分钟`}
+                聚合均值；时段均值为图中有效聚合点的平均值。
+                无有效指标的聚合时段显示断点；时段内短暂中断可能被聚合。磁盘对应产出目录所在文件系统。时间按浏览器本地时区显示。
+              </p>
+            </>
+          )}
         </>
       )}
     </div>
@@ -449,11 +591,14 @@ export function ResourceHistory({ nodeId, status }: { nodeId: string; status: st
     nodeId: string;
     uuids: string[] | null;
   } | null>(null);
+  const [networkSelection, setNetworkSelection] = useState<{ nodeId: string; name: string } | null>(
+    null,
+  );
   return (
     <Panel
       className="resource-history"
       title="资源占用历史"
-      subtitle="查看 CPU、内存、磁盘与各张 GPU 的使用趋势"
+      subtitle="查看 CPU、内存、磁盘、网卡流量与各张 GPU 的使用趋势"
       action={
         <div className="resource-history-windows" role="group" aria-label="资源历史时间范围">
           {historyWindows.map((item) => (
@@ -477,6 +622,8 @@ export function ResourceHistory({ nodeId, status }: { nodeId: string; status: st
         status={status}
         gpuIds={gpuSelection?.nodeId === nodeId ? gpuSelection.uuids : null}
         selectGpus={(uuids) => setGpuSelection({ nodeId, uuids })}
+        interfaceName={networkSelection?.nodeId === nodeId ? networkSelection.name : null}
+        selectInterface={(name) => setNetworkSelection({ nodeId, name })}
       />
     </Panel>
   );

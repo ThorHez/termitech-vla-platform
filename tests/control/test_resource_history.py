@@ -195,3 +195,110 @@ def test_history_is_read_only_platform_permission_and_validates_inputs(platform,
         assert client.get(url).status_code == 200
     finally:
         client.close()
+
+
+def network_report(rx, tx, *, boot="boot-1", ifindex=2, default="eth0", rx_rate=None, tx_rate=None):
+    return {
+        "network": {
+            "boot_id": boot,
+            "default_interface": default,
+            "interfaces": [{
+                "name": "eth0", "ifindex": ifindex, "rx_bytes": rx, "tx_bytes": tx,
+                "rx_bytes_per_second": rx_rate, "tx_bytes_per_second": tx_rate,
+            }],
+        },
+    }
+
+
+def test_network_history_averages_rates_but_usage_includes_all_accepted_heartbeats(platform, monkeypatch):
+    node = platform.register()
+    clear_samples(platform)
+    rows = [
+        (-86, 1000, 4000, None, None),
+        (-56, 1300, 4500, 1_000_000, 0),
+        (-46, 1400, 5500, 7_000_000, 30),
+        (-24, 1500, 6000, 3_000_000, 0),
+    ]
+    for seconds, rx, tx, rx_rate, tx_rate in rows:
+        metrics = network_report(rx, tx, rx_rate=rx_rate, tx_rate=tx_rate)
+        metrics["network"]["interfaces"].extend([
+            {"name": "eth1", "ifindex": 4, "rx_bytes": 70, "tx_bytes": 100, "rx_bytes_per_second": -1},
+            {"name": "bad-counter", "rx_bytes": True, "tx_bytes": 100},
+        ])
+        assert heartbeat_at(platform, node, monkeypatch, END + timedelta(seconds=seconds), metrics=metrics).status_code == 200
+    latest = platform.client.get(f"/api/v1/nodes/{node['node_id']}", headers=ADMIN).json()["metrics"]["network"]
+    assert latest == {"default_interface": "eth0", "interfaces": [
+        {"name": "eth0", "rx_bytes_per_second": 3_000_000, "tx_bytes_per_second": 0},
+        {"name": "eth1", "rx_bytes_per_second": None, "tx_bytes_per_second": None},
+    ]}
+
+    result = get_history(platform, node, monkeypatch, "6h").json()
+    assert result["points"][-2]["network_interfaces"][0]["rx_bytes_per_second"] is None
+    assert result["points"][-1]["sample_count"] == 2
+    assert result["points"][-1]["network_interfaces"] == [
+        {"name": "eth0", "rx_bytes_per_second": 2_000_000, "tx_bytes_per_second": 0},
+        {"name": "eth1", "rx_bytes_per_second": None, "tx_bytes_per_second": None},
+    ]
+    network = result["network"]
+    assert (network["default_interface"], network["day_date"], network["day_timezone"]) == (
+        "eth0", "2026-10-27", "Asia/Shanghai")
+    assert network["interfaces"][0] == {
+        "name": "eth0", "day_rx_bytes": 500, "day_tx_bytes": 2000, "day_partial": True,
+        "observed_from": timestamp(END - timedelta(seconds=86)),
+        "observed_until": timestamp(END - timedelta(seconds=24)),
+    }
+    assert network["interfaces"][1]["day_rx_bytes"] == 0
+    assert network["interfaces"][1]["day_tx_bytes"] == 0
+
+
+def test_network_day_usage_skips_midnight_restarts_interface_replacement_and_gaps(platform, monkeypatch):
+    node = platform.register()
+    clear_samples(platform)
+    midnight = END + timedelta(hours=4)
+    rows = [
+        (-10, 500, 900, "boot-1", 2),
+        (0, 600, 1000, "boot-1", 2),
+        (10, 650, 1050, "boot-1", 2),
+        (20, 1600, 2200, "boot-2", 2),
+        (30, 1610, 2220, "boot-2", 2),
+        (130, 2000, 2800, "boot-2", 2),
+        (140, 2010, 2840, "boot-2", 2),
+        (150, 3010, 3840, "boot-2", 3),
+        (160, 3030, 3900, "boot-2", 3),
+        (170, 60, 100, "boot-2", 3),
+        (180, 70, 200, "boot-2", 3),
+    ]
+    for seconds, rx, tx, boot, ifindex in rows:
+        end = midnight + timedelta(seconds=seconds)
+        metrics = network_report(rx, tx, boot=boot, ifindex=ifindex)
+        assert heartbeat_at(platform, node, monkeypatch, end, metrics=metrics).status_code == 200
+    # An older Agent can continue reporting without presenting stale live rates.
+    assert heartbeat_at(platform, node, monkeypatch, midnight + timedelta(seconds=190)).status_code == 200
+    latest = platform.client.get(f"/api/v1/nodes/{node['node_id']}", headers=ADMIN).json()["metrics"]
+    assert "network" not in latest
+    result = get_history(platform, node, monkeypatch, "1h", midnight + timedelta(seconds=190)).json()
+    assert result["network"]["day_date"] == "2026-10-28"
+    assert result["network"]["interfaces"] == [{
+        "name": "eth0", "day_rx_bytes": 100, "day_tx_bytes": 270, "day_partial": True,
+        "observed_from": timestamp(midnight), "observed_until": timestamp(midnight + timedelta(seconds=180)),
+    }]
+    next_day = get_history(platform, node, monkeypatch, "30d", midnight + timedelta(days=1)).json()["network"]
+    assert next_day["day_date"] == "2026-10-29"
+    assert next_day["interfaces"][0]["day_rx_bytes"] is None
+
+
+def test_network_stale_usage_is_partial_and_removed_default_is_not_restored(platform, monkeypatch):
+    node = platform.register()
+    clear_samples(platform)
+    midnight = END + timedelta(hours=4)
+    assert heartbeat_at(platform, node, monkeypatch, midnight, metrics=network_report(5, 10)).status_code == 200
+    end = midnight + timedelta(seconds=10)
+    assert heartbeat_at(platform, node, monkeypatch, end, metrics=network_report(9, 20, default=None)).status_code == 200
+    fresh = get_history(platform, node, monkeypatch, "1h", end).json()["network"]
+    assert fresh["default_interface"] is None
+    assert fresh["interfaces"][0]["day_partial"] is False
+    stale_at = end + timedelta(seconds=platform.settings.heartbeat_timeout_seconds + 1)
+    stale = get_history(platform, node, monkeypatch, "1h", stale_at).json()["network"]["interfaces"][0]
+    assert stale["day_partial"] is True
+    assert stale["day_rx_bytes"] == 4
+    assert stale["observed_until"] == timestamp(end)

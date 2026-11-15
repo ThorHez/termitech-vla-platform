@@ -13,6 +13,7 @@ from sqlalchemy import delete, select, tuple_
 
 from .common import APIError, now
 from .models import Node, NodeResourceSample
+from .network_metrics import MAX_INTERFACES, RATE_FIELDS, network_snapshot, network_summary, rate
 
 
 SAMPLE_INTERVAL_SECONDS = 30
@@ -57,7 +58,7 @@ def snapshot(metrics, gpus):
     disk_percent = None
     if total is not None and free is not None and total > 0 and 0 <= free <= total:
         disk_percent = 100 * (1 - free / total)
-    return {
+    result = {
         "cpu_percent": percent(metrics.get("cpu_percent")),
         "memory_percent": percent(metrics.get("memory_percent")),
         "disk_percent": disk_percent,
@@ -67,6 +68,10 @@ def snapshot(metrics, gpus):
             "memory_percent": ratio_percent(gpu.get("memory_used_mb"), gpu.get("memory_total_mb")),
         } for gpu in gpus],
     }
+    network = network_snapshot(metrics)
+    if network:
+        result["network"] = network
+    return result
 
 
 def capture_sample(session, node):
@@ -94,9 +99,9 @@ def _accumulator(keys):
     return {key: [0.0, 0] for key in keys}
 
 
-def _add(accumulator, value):
+def _add(accumulator, value, validator=percent):
     for key, pair in accumulator.items():
-        metric = percent(value.get(key))
+        metric = validator(value.get(key))
         if metric is not None:
             pair[0] += metric
             pair[1] += 1
@@ -106,8 +111,9 @@ def _means(accumulator):
     return {key: round(total / count, 3) if count else None for key, (total, count) in accumulator.items()}
 
 
-def history(session, node_id, window, end):
-    if session.get(Node, node_id) is None:
+def history(session, node_id, window, end, network_freshness_seconds):
+    node = session.get(Node, node_id)
+    if node is None:
         raise APIError(404, "NOT_FOUND", "Node not found")
     duration, bucket_seconds = WINDOWS[window]
     end_moment = datetime.fromisoformat(end)
@@ -115,6 +121,9 @@ def history(session, node_id, window, end):
     start = start_moment.isoformat(timespec="microseconds")
     bucket_count = math.ceil(duration / bucket_seconds)
     buckets = {}
+    latest_network = network_snapshot(node.metrics or {}) or {}
+    network_names = {item["name"] for item in latest_network.get("interfaces", [])}
+    network_default = None
     # At most one sample per 30 seconds and a 30-day window bound this scan;
     # streaming avoids materializing every snapshot in application memory.
     samples = session.scalars(select(NodeResourceSample).where(
@@ -123,7 +132,9 @@ def history(session, node_id, window, end):
     ).order_by(NodeResourceSample.timestamp).execution_options(yield_per=1000))
     for sample in samples:
         index = min(bucket_count - 1, int((datetime.fromisoformat(sample.timestamp) - start_moment).total_seconds() // bucket_seconds))
-        bucket = buckets.setdefault(index, {"sample_count": 0, "metrics": _accumulator(SCALAR_METRICS), "gpus": {}})
+        bucket = buckets.setdefault(index, {
+            "sample_count": 0, "metrics": _accumulator(SCALAR_METRICS), "gpus": {}, "network": {},
+        })
         bucket["sample_count"] += 1
         _add(bucket["metrics"], sample.metrics)
         for gpu in sample.metrics["gpus"]:
@@ -131,6 +142,15 @@ def history(session, node_id, window, end):
                 "uuid": gpu["uuid"], "name": gpu["name"], "metrics": _accumulator(GPU_METRICS)})
             gpu_bucket["name"] = gpu["name"]
             _add(gpu_bucket["metrics"], gpu)
+        network = sample.metrics.get("network", {})
+        for item in network.get("interfaces", []):
+            name = item["name"]
+            if len(network_names) < MAX_INTERFACES:
+                network_names.add(name)
+            if name in network_names:
+                _add(bucket["network"].setdefault(name, _accumulator(RATE_FIELDS)), item, rate)
+        if network:
+            network_default = network["default_interface"] if network.get("default_interface") in network_names else None
     points = []
     if buckets:
         for index in range(bucket_count):
@@ -141,14 +161,18 @@ def history(session, node_id, window, end):
                 **(_means(bucket["metrics"]) if bucket else dict.fromkeys(SCALAR_METRICS)),
                 "gpus": [{"uuid": gpu["uuid"], "name": gpu["name"], **_means(gpu["metrics"])}
                          for gpu in sorted(bucket["gpus"].values(), key=lambda item: item["uuid"])] if bucket else [],
+                "network_interfaces": [{"name": name, **_means(rates)}
+                                       for name, rates in sorted(bucket["network"].items())] if bucket else [],
             })
     return {"node_id": node_id, "window": window, "start": start, "end": end,
             "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS, "bucket_seconds": bucket_seconds,
-            "retention_days": RETENTION_DAYS, "points": points}
+            "retention_days": RETENTION_DAYS, "points": points,
+            "network": network_summary(node.metrics or {}, end_moment, network_names, network_default,
+                                       network_freshness_seconds)}
 
 
-def register_routes(app, dependencies, db):
+def register_routes(app, dependencies, db, network_freshness_seconds):
     @app.get("/api/v1/nodes/{node_id}/resource-history", dependencies=dependencies)
     def resource_history(node_id: str, window: Literal["1h", "6h", "24h", "7d", "30d"] = Query(default="24h")):
         with db.read() as session:
-            return history(session, node_id, window, now())
+            return history(session, node_id, window, now(), network_freshness_seconds)

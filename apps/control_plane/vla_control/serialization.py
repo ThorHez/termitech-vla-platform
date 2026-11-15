@@ -5,6 +5,7 @@ from typing import Literal
 from sqlalchemy import func, select
 
 from .models import Allocation, Asset, Attempt, Run
+from .network_metrics import network_snapshot
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .remote_models import RemoteConnection, RemoteDeployment
 from .remote_schemas import SSHAuthenticationInput
@@ -46,12 +47,18 @@ def node_dict(session, node):
             PolicyDeployment.node_id == node.id, PolicyDeployment.state.in_(RESOURCE_STATES))):
         if item.gpu_uuid:
             reserved.setdefault(item.gpu_uuid, f"deployment:{item.id}")
+    metrics = node.metrics
+    if "network" in metrics:
+        network = network_snapshot(metrics)
+        metrics = {key: value for key, value in metrics.items() if key != "network"}
+        if network is not None:
+            metrics["network"] = network
     return {"id": node.id, "name": node.effective_name, "hostname": node.hostname, "status": node.status,
             "connection_address": _connection_address(session, node),
             "last_seen": node.last_seen, "roots": node.roots, "output_root": node.output_root, "cache_root": node.cache_root,
             "gpus": [{**gpu, "reserved_by": reserved.get(gpu["uuid"]),
                       "user_reservation": user_reservations.get(gpu["uuid"])} for gpu in node.gpus],
-            "metrics": node.metrics, "created_at": node.created_at}
+            "metrics": metrics, "created_at": node.created_at}
 
 
 def profile_dict(profile):

@@ -27,6 +27,7 @@ from .asset_purge import CAPABILITIES as ASSET_PURGE_COMMANDS, execute_asset_pur
 from .config import load_config
 from .disk_capacity import DiskCapacityMonitor
 from .metrics import gpu_inventory, process_metrics, system_metrics
+from .network_metrics import NetworkMonitor
 from .path_suggestions import suggest_paths
 from .preflight import run_preflight
 from .recipe_details import recipe_details
@@ -165,6 +166,7 @@ class Agent:
         self.last_profile_sync = None
         self.runtime_monitor = RuntimeMonitor(config["roots"])
         self.disk_capacity_monitor = DiskCapacityMonitor()
+        self.network_monitor = NetworkMonitor()
         self.artifact_monitor = ArtifactMonitor(self.state, config["output_root"],
                                                 output_roots=config.get("_output_root_history", []))
         self._preflight_worker = None
@@ -442,8 +444,11 @@ class Agent:
                     process["ownership"] = "platform" if process["attempt_id"] else "external"
         system = system_metrics(None)
         disk = self.disk_capacity_monitor.heartbeat_metrics(self.config["output_root"])
+        network = self.network_monitor.sample()
         errors = {**system.get("collection_errors", {}), **disk.pop("collection_errors", {})}
-        metrics = {**system, **disk, "collection_errors": errors, "gpu_monitoring": availability,
+        if error := network.pop("error", None):
+            errors["network"] = error
+        metrics = {**system, **disk, "network": network, "collection_errors": errors, "gpu_monitoring": availability,
                    "attempt_processes": process_samples, "sampled_at": utc_now(),
                    "runtime_checks": self.runtime_monitor.snapshot(self.config["profiles"]),
                    "capabilities": CAPABILITIES,
