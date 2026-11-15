@@ -34,8 +34,13 @@ try {
     historicalGpus,
     nearestPointIndex,
   } = await server.ssrLoadModule('/src/resourceHistoryData.ts');
-  const { ResourceTrendChart, ResourceHistory, GpuHistoryCharts, NetworkHistoryCharts } =
-    await server.ssrLoadModule('/src/ResourceHistory.tsx');
+  const {
+    ResourceTrendChart,
+    ResourceHistory,
+    GpuHistoryCharts,
+    NetworkHistoryCharts,
+    NetworkProcessTraffic,
+  } = await server.ssrLoadModule('/src/ResourceHistory.tsx');
   const gpu = (uuid, usage, memory = null) => ({
     uuid,
     name: 'same GPU model',
@@ -61,6 +66,42 @@ try {
       uuid: match[1].match(/<code>([^<]+)<\/code>/)?.[1],
       checked: /<input\b[^>]*\bchecked=""/.test(match[1]),
     }));
+
+  await test('process traffic shows measured TCP rates and hides offline or stale rows', () => {
+    const report = {
+      status: 'ready',
+      partial: true,
+      processes: [{ pid: 412, name: 'sshd', rx_bytes_per_second: 0, tx_bytes_per_second: 1250000 }],
+    };
+    const recent = new Date().toISOString();
+    const render = (props) =>
+      renderToStaticMarkup(
+        React.createElement(NetworkProcessTraffic, {
+          report,
+          lastSeen: recent,
+          nodeStatus: 'ONLINE',
+          ...props,
+        }),
+      );
+    const html = render();
+    assert.match(html, /进程网络流量（TCP）/);
+    assert.match(html, /<strong>sshd<\/strong>/);
+    assert.match(html, />412</);
+    assert.match(html, />0 Mbps</);
+    assert.match(html, />10 Mbps</);
+    assert.match(html, /部分连接的归属无法确认/);
+    for (const props of [
+      { nodeStatus: 'OFFLINE' },
+      { receivedAt: new Date(0) },
+      { report: { ...report, status: 'stale' } },
+    ]) {
+      const stale = render(props);
+      assert.match(stale, /暂无近期的进程流量数据/);
+      assert.doesNotMatch(stale, /sshd|Mbps/);
+    }
+    assert.match(render({ report: undefined }), /尚未上报进程流量/);
+    assert.match(render({ report: { status: 'warming_up', processes: [] } }), /等待下一次上报/);
+  });
 
   await test('zero is an observed percentage; absent, malformed and out-of-range values stay unknown', () => {
     assert.equal(validPercent(0), 0);

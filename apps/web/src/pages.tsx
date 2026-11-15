@@ -809,7 +809,14 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               <AlertList alerts={diskAlerts} nodes={[node]} showNodeLink={false} />
             </Panel>
           )}
-          <ResourceHistory key={`history-${id}`} nodeId={id} status={node.status} />
+          <ResourceHistory
+            key={`history-${id}`}
+            nodeId={id}
+            status={node.status}
+            processReport={node.metrics?.network_processes}
+            lastSeen={node.last_seen}
+            processReportReceivedAt={details.updatedAt}
+          />
           <div className="detail-columns">
             <div>
               <NodeGpuResources

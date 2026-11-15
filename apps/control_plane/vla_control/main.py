@@ -67,7 +67,7 @@ from .dataset_batches import DatasetBatchManager, register_routes as register_da
 from .asset_transfer_batches import register_routes as register_asset_transfer_batch_routes
 from .background_tasks import register_routes as register_background_task_routes
 from .resource_history import capture_sample, register_routes as register_resource_history_routes
-from .network_metrics import with_network_metrics
+from .network_metrics import PROCESS_METRICS_KEY, network_process_snapshot, with_network_metrics
 from .run_records import delete_run_record, require_replayable_run, require_visible_run
 from .training_metrics import register_routes as register_training_metric_routes
 from .training_resume import freeze_resume_source
@@ -326,7 +326,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/nodes/{node_id}", dependencies=admin)
     def node_detail(node_id: str, view: RunListView = "full"):
         with db.read() as session:
-            result = node_dict(session, get_required(session, Node, node_id, "Node"))
+            node = get_required(session, Node, node_id, "Node")
+            result = node_dict(session, node)
+            processes = network_process_snapshot(node.metrics, node.status, node.last_seen, now(),
+                                                 settings.heartbeat_timeout_seconds)
+            if processes is not None:
+                result["metrics"][PROCESS_METRICS_KEY] = processes
             result["assets"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.node_id == node_id))]
             result["profiles"] = [profile_dict(p) for p in session.scalars(select(Profile).where(Profile.node_id == node_id))]
             if view == "summary":

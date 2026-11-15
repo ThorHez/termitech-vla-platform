@@ -302,3 +302,90 @@ def test_network_stale_usage_is_partial_and_removed_default_is_not_restored(plat
     assert stale["day_partial"] is True
     assert stale["day_rx_bytes"] == 4
     assert stale["observed_until"] == timestamp(end)
+
+
+def process_sample(pid, name="python3", rx=0, tx=250, **extra):
+    return {"pid": pid, "name": name, "rx_bytes_per_second": rx, "tx_bytes_per_second": tx, **extra}
+
+
+def node_detail(platform, node, *, params=None):
+    return platform.client.get(f"/api/v1/nodes/{node['node_id']}", headers=ADMIN, params=params).json()
+
+
+def test_network_processes_are_sanitized_and_scoped_to_authenticated_node_detail(platform, monkeypatch):
+    node = platform.register()
+    clear_samples(platform)
+    monitored = process_sample(101, "data-sync_1")
+    report = {"status": "ready", "processes": [
+        {**monitored, "command": "private-arguments", "peer": "192.0.2.24:443"},
+        process_sample(101, "duplicate"),
+        process_sample(True),
+        process_sample(50, "tool --password=private"),
+        process_sample(51, "/private/app/path"),
+        process_sample(52, "192.0.2.24"),
+        process_sample(53, "endpoint:443"),
+        process_sample(54, rx=-1),
+        process_sample(55, tx=True),
+        process_sample(56, tx=2**64),
+    ], "sampled_at": "agent-private-time"}
+    assert heartbeat_at(platform, node, monkeypatch, END,
+                        metrics={"network_processes": report}).status_code == 200
+    expected = {"status": "ready", "processes": [monitored], "partial": True}
+    for view in ("full", "summary"):
+        assert node_detail(platform, node, params={"view": view})["metrics"]["network_processes"] == expected
+    assert "network_processes" not in platform.client.get("/api/v1/nodes", headers=ADMIN).json()[0]["metrics"]
+    assert "network_processes" not in samples(platform)[0].metrics
+    history = get_history(platform, node, monkeypatch, "1h")
+    assert history.status_code == 200
+    assert "network_processes" not in history.text
+    with platform.app.state.db.read() as session:
+        assert session.get(Node, node["node_id"]).metrics["network_processes"] == expected
+
+    url = f"/api/v1/nodes/{node['node_id']}"
+    assert platform.client.get(url).status_code == 401
+    assert platform.client.get(url, headers=node["headers"]).status_code == 401
+    platform.app.state.auth.create_user("process-viewer", "process-viewer-password-123", "viewer")
+    client = TestClient(platform.app, base_url="https://testserver")
+    try:
+        assert client.post("/api/v1/auth/login", json={
+            "username": "process-viewer", "password": "process-viewer-password-123",
+        }).status_code == 200
+        assert client.get(url).json()["metrics"]["network_processes"] == expected
+    finally:
+        client.close()
+
+
+def test_network_processes_are_bounded_and_fresh_for_connected_nodes(platform, monkeypatch):
+    node = platform.register()
+    rows = [process_sample(pid) for pid in range(101, 120)]
+    assert heartbeat_at(platform, node, monkeypatch, END, metrics={
+        "network_processes": {"status": "ready", "processes": rows},
+    }).status_code == 200
+    fresh = {"status": "ready", "processes": rows[:10], "partial": False}
+    assert node_detail(platform, node)["metrics"]["network_processes"] == fresh
+    with platform.app.state.db.write() as session:
+        session.get(Node, node["node_id"]).status = "RECOVERING"
+    assert node_detail(platform, node)["metrics"]["network_processes"] == fresh
+
+    stale = {"status": "stale", "processes": [], "partial": False}
+    monkeypatch.setattr(main_module, "now", lambda: timestamp(END + timedelta(seconds=31)))
+    assert node_detail(platform, node)["metrics"]["network_processes"] == stale
+    monkeypatch.setattr(main_module, "now", lambda: timestamp(END + timedelta(seconds=20)))
+    with platform.app.state.db.write() as session:
+        session.get(Node, node["node_id"]).status = "OFFLINE"
+    assert node_detail(platform, node)["metrics"]["network_processes"] == stale
+
+
+@pytest.mark.parametrize("status", ["warming_up", "unavailable"])
+def test_network_process_unready_status_and_older_agent_heartbeat(platform, monkeypatch, status):
+    node = platform.register()
+    assert "network_processes" not in node_detail(platform, node)["metrics"]
+    assert heartbeat_at(platform, node, monkeypatch, END, metrics={
+        "network_processes": {"status": status, "processes": [process_sample(101)], "partial": True},
+    }).status_code == 200
+    assert node_detail(platform, node)["metrics"]["network_processes"] == {
+        "status": status, "processes": [], "partial": True,
+    }
+    assert heartbeat_at(platform, node, monkeypatch, END + timedelta(seconds=10),
+                        metrics={"cpu_percent": 5}).status_code == 200
+    assert "network_processes" not in node_detail(platform, node)["metrics"]

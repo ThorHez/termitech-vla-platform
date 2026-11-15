@@ -5,7 +5,7 @@ from typing import Literal
 from sqlalchemy import func, select
 
 from .models import Allocation, Asset, Attempt, Run
-from .network_metrics import network_snapshot
+from .network_metrics import PROCESS_METRICS_KEY, network_snapshot
 from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES
 from .remote_models import RemoteConnection, RemoteDeployment
 from .remote_schemas import SSHAuthenticationInput
@@ -48,9 +48,9 @@ def node_dict(session, node):
         if item.gpu_uuid:
             reserved.setdefault(item.gpu_uuid, f"deployment:{item.id}")
     metrics = node.metrics
-    if "network" in metrics:
+    if "network" in metrics or PROCESS_METRICS_KEY in metrics:
         network = network_snapshot(metrics)
-        metrics = {key: value for key, value in metrics.items() if key != "network"}
+        metrics = {key: value for key, value in metrics.items() if key not in ("network", PROCESS_METRICS_KEY)}
         if network is not None:
             metrics["network"] = network
     return {"id": node.id, "name": node.effective_name, "hostname": node.hostname, "status": node.status,

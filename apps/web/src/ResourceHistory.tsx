@@ -6,6 +6,7 @@ import {
   chartSegments,
   formatNetworkBytes,
   formatNetworkMbps,
+  formatNetworkRate,
   historicalGpus,
   historyWindows,
   nearestPointIndex,
@@ -14,7 +15,12 @@ import {
   seriesSummary,
   seriesValues,
 } from './resourceHistoryData';
-import type { ChartValue, HistoryWindow, ResourceHistoryResponse } from './resourceHistoryData';
+import type {
+  ChartValue,
+  HistoryWindow,
+  NetworkProcessReport,
+  ResourceHistoryResponse,
+} from './resourceHistoryData';
 import './resource-history.css';
 
 const percent = (value: number | null) => (value === null ? '—' : `${value.toFixed(1)}%`);
@@ -460,6 +466,81 @@ export function NetworkHistoryCharts({
   );
 }
 
+type NetworkProcessTrafficProps = {
+  report?: NetworkProcessReport;
+  lastSeen?: string | null;
+  nodeStatus: string;
+  receivedAt?: Date;
+};
+
+const processTrafficMessages = {
+  ready: '本次采样暂无可归属到进程的 TCP 流量。',
+  warming_up: '正在建立采样基线，等待下一次上报。',
+  unavailable: 'Agent 暂时无法采集进程流量。',
+  stale: '暂无近期的进程流量数据。',
+};
+
+export function NetworkProcessTraffic({
+  report,
+  lastSeen,
+  nodeStatus,
+  receivedAt,
+}: NetworkProcessTrafficProps) {
+  const active = nodeStatus === 'ONLINE' || nodeStatus === 'RECOVERING';
+  const status =
+    !active || (receivedAt && Date.now() - receivedAt.getTime() > 30_000)
+      ? 'stale'
+      : report?.status;
+  const rows = status === 'ready' ? (report?.processes ?? []) : [];
+  const emptyMessage = status ? processTrafficMessages[status] : '这台机器尚未上报进程流量。';
+
+  return (
+    <section
+      className="resource-network-history resource-network-processes"
+      aria-label="进程网络流量"
+    >
+      <div className="resource-network-heading">
+        <h3>进程网络流量（TCP）</h3>
+        {status === 'ready' && (
+          <span className="resource-process-timestamp">最近上报 {date(lastSeen ?? undefined)}</span>
+        )}
+      </div>
+      {rows.length ? (
+        <div className="table-scroll">
+          <table aria-label="进程 TCP 收发速率排行榜">
+            <thead>
+              <tr>
+                <th scope="col">进程</th>
+                <th scope="col">PID</th>
+                <th scope="col">入站</th>
+                <th scope="col">出站</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.pid}>
+                  <td>
+                    <strong>{row.name}</strong>
+                  </td>
+                  <td className="mono">{row.pid}</td>
+                  <td>{formatNetworkRate(row.rx_bytes_per_second)}</td>
+                  <td>{formatNetworkRate(row.tx_bytes_per_second)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="resource-chart-unavailable">{emptyMessage}</div>
+      )}
+      <p className="resource-network-note">
+        按全机收发合计排序，仅估算两次采样均能归属的 TCP 连接。UDP 和短连接可通过网卡总量观察。
+        {status === 'ready' && report?.partial && '部分连接的归属无法确认。'}
+      </p>
+    </section>
+  );
+}
+
 function HistoryContent({
   nodeId,
   window,
@@ -468,6 +549,7 @@ function HistoryContent({
   selectGpus,
   interfaceName,
   selectInterface,
+  networkProcesses,
 }: {
   nodeId: string;
   window: HistoryWindow;
@@ -476,6 +558,7 @@ function HistoryContent({
   selectGpus: (uuids: string[] | null) => void;
   interfaceName: string | null;
   selectInterface: (name: string) => void;
+  networkProcesses: NetworkProcessTrafficProps;
 }) {
   const history = useApi<ResourceHistoryResponse>(
     `/nodes/${encodeURIComponent(nodeId)}/resource-history?window=${window}`,
@@ -565,27 +648,40 @@ function HistoryContent({
             interfaceName={interfaceName}
             selectInterface={selectInterface}
           />
-          {!!data.points.length && (
-            <>
-              <GpuHistoryCharts history={data} gpuIds={gpuIds} selectGpus={selectGpus} />
-              <p className="resource-history-note">
-                保存近 {data.retention_days} 天记录，最多每 {data.sample_interval_seconds}{' '}
-                秒采样一次。 当前按{' '}
-                {data.bucket_seconds < 60
-                  ? `${data.bucket_seconds} 秒`
-                  : `${data.bucket_seconds / 60} 分钟`}
-                聚合均值；时段均值为图中有效聚合点的平均值。
-                无有效指标的聚合时段显示断点；时段内短暂中断可能被聚合。磁盘对应产出目录所在文件系统。时间按浏览器本地时区显示。
-              </p>
-            </>
-          )}
+        </>
+      )}
+      <NetworkProcessTraffic {...networkProcesses} />
+      {!!data?.points.length && (
+        <>
+          <GpuHistoryCharts history={data} gpuIds={gpuIds} selectGpus={selectGpus} />
+          <p className="resource-history-note">
+            保存近 {data.retention_days} 天记录，最多每 {data.sample_interval_seconds} 秒采样一次。
+            当前按{' '}
+            {data.bucket_seconds < 60
+              ? `${data.bucket_seconds} 秒`
+              : `${data.bucket_seconds / 60} 分钟`}
+            聚合均值；时段均值为图中有效聚合点的平均值。
+            无有效指标的聚合时段显示断点；时段内短暂中断可能被聚合。磁盘对应产出目录所在文件系统。时间按浏览器本地时区显示。
+          </p>
         </>
       )}
     </div>
   );
 }
 
-export function ResourceHistory({ nodeId, status }: { nodeId: string; status: string }) {
+export function ResourceHistory({
+  nodeId,
+  status,
+  processReport,
+  lastSeen,
+  processReportReceivedAt,
+}: {
+  nodeId: string;
+  status: string;
+  processReport?: NetworkProcessReport;
+  lastSeen?: string | null;
+  processReportReceivedAt?: Date;
+}) {
   const [window, setWindow] = useState<HistoryWindow>('24h');
   const [gpuSelection, setGpuSelection] = useState<{
     nodeId: string;
@@ -624,6 +720,12 @@ export function ResourceHistory({ nodeId, status }: { nodeId: string; status: st
         selectGpus={(uuids) => setGpuSelection({ nodeId, uuids })}
         interfaceName={networkSelection?.nodeId === nodeId ? networkSelection.name : null}
         selectInterface={(name) => setNetworkSelection({ nodeId, name })}
+        networkProcesses={{
+          report: processReport,
+          lastSeen,
+          nodeStatus: status,
+          receivedAt: processReportReceivedAt,
+        }}
       />
     </Panel>
   );

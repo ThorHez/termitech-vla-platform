@@ -11,6 +11,17 @@ export interface NetworkMetrics {
   interfaces: NetworkInterfaceRates[];
 }
 
+export interface NetworkProcessReport {
+  status: 'ready' | 'warming_up' | 'unavailable' | 'stale';
+  partial?: boolean;
+  processes: {
+    pid: number;
+    name: string;
+    rx_bytes_per_second: number;
+    tx_bytes_per_second: number;
+  }[];
+}
+
 export interface ResourceHistoryPoint {
   timestamp: string;
   sample_count: number;

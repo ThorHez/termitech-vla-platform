@@ -208,6 +208,22 @@
   font-size: 11px;
   line-height: 1.6;
 }
+.resource-process-timestamp {
+  color: var(--text-secondary, #687888);
+  font-size: 11px;
+}
+.resource-network-processes table {
+  min-width: 320px;
+}
+.resource-network-processes th:nth-last-child(-n + 2),
+.resource-network-processes td:nth-last-child(-n + 2) {
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.resource-network-processes .resource-network-note {
+  margin: 10px 0 0;
+}
 .resource-history-gpu-heading {
   margin-top: 24px;
   padding-top: 19px;
