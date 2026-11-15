@@ -11,7 +11,7 @@ import {
 } from './assetPurge';
 import type { ArchivedAsset, AssetFileDeletion, AssetPurgeInspection } from './assetPurge';
 import { Back, Badge, Empty, ErrorNotice, Field, Loading, Modal, PageHeading } from './components';
-import { assetKinds, useData } from './data';
+import { assetKinds } from './data';
 import type { Asset } from './types';
 import './asset-deletions.css';
 
@@ -44,7 +44,6 @@ export function AssetDeletionsPage() {
 }
 
 function AssetDeletionsContent() {
-  const { assets, overview } = useData();
   const ledger = useApi<ArchivedAsset[]>(assetDeletionsPath, 4000);
   const [selection, setSelection] = useState<
     {
@@ -75,8 +74,6 @@ function AssetDeletionsContent() {
   const onRestored = (asset: Asset) => {
     setRestored({ asset, previous: latestRows.current });
     setSelection(undefined);
-    assets.refresh();
-    overview.refresh();
     ledger.refresh();
   };
 

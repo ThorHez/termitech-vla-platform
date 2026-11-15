@@ -26,14 +26,14 @@ import { AuthProvider, roleLabels, useAuth } from './auth';
 import { AccountIdentity, UserManagement, UserManagementLink } from './UserManagement';
 import './auth.css';
 import { Badge, ErrorNotice, Field, PageHeading, Panel } from './components';
-import { DataProvider, useData } from './data';
+import { DataProvider, useData, useDataRequests } from './data';
 import { AssetsPage, NodePage, NodesPage, OverviewPage, RunsPage, TemplatesPage } from './pages';
 import RunDetail from './RunDetail';
 import { AssetDeletionsPage } from './AssetDeletions';
 import { alertsPath, AlertsPage, focusWorkspaceAlerts } from './WorkspaceAlerts';
 import { assetDeletionsPath } from './assetPurge';
 import { AssetTransferTaskDetail } from './AssetTransfers';
-import { backgroundTaskActiveCounts } from './backgroundTaskEntries';
+import { backgroundTaskListPath, backgroundTaskQueryFromSearch } from './backgroundTaskPagination';
 import RunWizard from './RunWizard';
 import { ResumeTrainingWizard } from './ResumeTrainingWizard';
 import PolicyDeployments from './PolicyDeployments';
@@ -50,6 +50,11 @@ const navigation = [
   { path: '/deployments', label: '真机部署', icon: Rocket },
   { path: '/scenes', label: '场景展示', icon: PanelsTopLeft },
 ];
+
+const trainingRequests = { nodes: 15000, assets: 30000, profiles: 30000, templates: 0 };
+const resumeRequests = { nodes: 0, assets: 0, runs: 0 };
+const exactResumeRequests = { nodes: 0 };
+const searchRequests = { nodes: 0, assets: 0, runs: 0 };
 
 export default function App() {
   return (
@@ -72,18 +77,23 @@ function SessionGate() {
     );
   if (!user) return <LoginPage />;
   if (user.must_change_password) return <RequiredPasswordChange />;
+  return <Shell key={user.id} />;
+}
+
+function Shell() {
+  const route = useRoute();
   return (
-    <DataProvider enabled key={user.id}>
-      <Shell />
+    <DataProvider enabled route={route}>
+      <Workspace route={route} />
     </DataProvider>
   );
 }
 
-function Shell() {
+function Workspace({ route }: { route: string }) {
   const { user, can, error: sessionError } = useAuth();
-  const route = useRoute();
   const path = route.split('?')[0];
-  const queryParams = new URLSearchParams(route.split('?')[1] || '');
+  const search = route.split('?')[1] || '';
+  const queryParams = new URLSearchParams(search);
   const [mobileNav, setMobileNav] = useState(false);
   const [wizard, setWizard] = useState<{
     nodeId?: string;
@@ -93,11 +103,24 @@ function Shell() {
     resume?: boolean;
   }>();
   const data = useData();
-  const { overview, alerts, runs, assetTransfers, refresh } = data;
+  const { overview, alerts, refresh } = data;
+  const showWizard = wizard && can('training.write');
+  useDataRequests(
+    showWizard
+      ? wizard.resume
+        ? wizard.sourceRun
+          ? exactResumeRequests
+          : resumeRequests
+        : trainingRequests
+      : undefined,
+  );
   const assetSceneId = path === '/assets' ? queryParams.get('scene') : null;
   const assetScene = assetSceneId ? getSceneAssetFilter(assetSceneId, data) : undefined;
-  const activeTasks = backgroundTaskActiveCounts(runs.data, assetTransfers.data);
-  const taskCountsReady = runs.data !== undefined && assetTransfers.data !== undefined;
+  const checkingOverview = path === '/overview';
+  const serviceError = sessionError || (checkingOverview && overview.error);
+  const serviceOnline = !serviceError && (!checkingOverview || Boolean(overview.data));
+  const activeTasks = path === '/overview' ? overview.data?.active_tasks : undefined;
+  const alertCount = path === '/overview' || path === alertsPath ? alerts.data?.length : undefined;
   const viewingAlerts = path === '/overview' && queryParams.get('view') === 'alerts';
   const section =
     (path === assetDeletionsPath ? { label: '已删除资产' } : undefined) ||
@@ -166,7 +189,7 @@ function Shell() {
             >
               <item.icon size={19} strokeWidth={1.7} />
               <span>{item.label}</span>
-              {item.path === '/runs' && taskCountsReady && activeTasks.total > 0 && (
+              {item.path === '/runs' && activeTasks && activeTasks.total > 0 && (
                 <b title={`进行中：${activeTasks.training} 个训练，${activeTasks.sync} 个数据同步`}>
                   {activeTasks.total}
                 </b>
@@ -201,13 +224,15 @@ function Shell() {
             <span>平台设置</span>
           </a>
           <div className="sidebar-status">
-            <span className={`status-dot ${overview.data && !overview.error ? 'online' : ''}`} />
+            <span className={`status-dot ${serviceOnline ? 'online' : ''}`} />
             <span>
-              {overview.error
+              {serviceError
                 ? '管理服务连接异常'
-                : overview.data
-                  ? '管理服务已连接'
-                  : '正在连接服务'}
+                : checkingOverview
+                  ? overview.data
+                    ? '管理服务已连接'
+                    : '正在连接服务'
+                  : '已登录管理服务'}
             </span>
             <small>v0.1</small>
           </div>
@@ -241,17 +266,20 @@ function Shell() {
               aria-label="刷新数据"
               onClick={refresh}
             >
-              <RefreshCw size={17} className={overview.loading && overview.data ? 'spin' : ''} />
+              <RefreshCw
+                size={17}
+                className={checkingOverview && overview.loading && overview.data ? 'spin' : ''}
+              />
             </button>
             <a
               className="icon-button notifications"
               href={`#${alertsPath}`}
-              aria-label={`当前 ${alerts.data?.length || 0} 条异常`}
+              aria-label={alertCount === undefined ? '查看异常' : `当前 ${alertCount} 条异常`}
               aria-current={path === alertsPath ? 'page' : undefined}
               title="查看异常"
             >
               <Bell size={18} />
-              {!!alerts.data?.length && <span />}
+              {!!alertCount && <span />}
             </a>
             <a
               className="avatar"
@@ -306,7 +334,7 @@ function Shell() {
                 resumeTraining={() => setWizard({ resume: true })}
               />
             ) : path === '/runs' ? (
-              <RunsPage createRun={() => createRun()} />
+              <RunsPage key={search} createRun={() => createRun()} search={search} />
             ) : path.startsWith('/runs/sync/') ? (
               <AssetTransferTaskDetail
                 key={path}
@@ -316,6 +344,7 @@ function Shell() {
               <RunDetail
                 key={path}
                 id={decodeURIComponent(path.slice('/runs/'.length))}
+                backTo={backgroundTaskListPath(backgroundTaskQueryFromSearch(search))}
                 onRetry={(sourceRun) => {
                   if (can('training.write')) setWizard({ sourceRun });
                 }}
@@ -349,14 +378,11 @@ function Shell() {
           </main>
           <footer className="page-footer">
             <span>TERMiTECH VLA · 让训练更清晰</span>
-            <span>
-              {runs.data?.length ? `${runs.data.length} 项训练记录` : '数据存于本机 · 管理集中统一'}
-            </span>
+            <span>数据存于本机 · 管理集中统一</span>
           </footer>
         </div>
       </div>
-      {wizard &&
-        can('training.write') &&
+      {showWizard &&
         (wizard.resume ? (
           <ResumeTrainingWizard sourceRun={wizard.sourceRun} close={() => setWizard(undefined)} />
         ) : (
@@ -388,8 +414,13 @@ function GlobalSearch() {
   const { nodes, assets, runs } = useData();
   const [query, setQuery] = useState('');
   const [focused, setFocused] = useState(false);
-  const lower = query.toLowerCase();
-  const results = query.trim()
+  const lower = query.trim().toLowerCase();
+  const searching = focused && Boolean(lower);
+  useDataRequests(searching ? searchRequests : undefined);
+  const pending = [nodes, assets, runs].some(
+    (resource) => resource.loading || (resource.data === undefined && !resource.error),
+  );
+  const results = searching
     ? [
         ...(runs.data || [])
           .filter((item) => item.name.toLowerCase().includes(lower))
@@ -424,16 +455,18 @@ function GlobalSearch() {
       ]
     : [];
   return (
-    <div className="global-search">
+    <div
+      className="global-search"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false);
+      }}
+    >
       <Search size={15} />
       <input
         aria-label="全局搜索"
         value={query}
         placeholder="搜索训练、机器或资产"
         onFocus={() => setFocused(true)}
-        onBlur={(event) => {
-          if (!event.currentTarget.parentElement?.contains(event.relatedTarget)) setFocused(false);
-        }}
         onChange={(event) => setQuery(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === 'Escape') {
@@ -442,7 +475,7 @@ function GlobalSearch() {
           }
         }}
       />
-      {focused && query && (
+      {searching && (
         <div className="search-results">
           {results.length ? (
             results.map((result) => (
@@ -460,7 +493,9 @@ function GlobalSearch() {
               </a>
             ))
           ) : (
-            <p>没有找到匹配的资源</p>
+            <p role={pending ? 'status' : undefined}>
+              {pending ? '正在搜索资源…' : '没有找到匹配的资源'}
+            </p>
           )}
         </div>
       )}
@@ -702,7 +737,7 @@ export function RequiredPasswordChange() {
 }
 
 function SettingsPage() {
-  const { overview } = useData();
+  const { error } = useAuth();
   return (
     <>
       <PageHeading
@@ -729,7 +764,7 @@ function SettingsPage() {
                 <strong>控制面 API</strong>
                 <code>{window.location.origin}/api/v1</code>
               </div>
-              <Badge state={overview.data && !overview.error ? 'ONLINE' : 'OFFLINE'} />
+              <Badge state={error ? 'OFFLINE' : 'ONLINE'} />
             </div>
           </div>
         </Panel>

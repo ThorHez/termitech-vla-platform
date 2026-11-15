@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+import re
 import sys
 
 import pytest
@@ -56,13 +58,22 @@ def test_process_rates_require_two_matching_samples_and_add_sockets(monkeypatch)
     monkeypatch.setattr(metrics.sys, 'platform', 'linux')
     monkeypatch.setattr(metrics, '_capture_sockets', lambda: next(snapshots))
     monkeypatch.setattr(metrics, 'monotonic', iter([10, 20]).__next__)
+    monkeypatch.setattr(metrics, '_today', lambda: '2026-11-15')
+    monkeypatch.setattr(metrics, '_process_identity', lambda pid, **kwargs: (500, 'ssh'))
     monitor = metrics.NetworkProcessMonitor()
 
-    assert monitor.sample() == {'status': 'warming_up', 'processes': [], 'partial': True}
-    assert monitor.sample() == {
+    assert monitor.sample() == {'status': 'warming_up', 'processes': [], 'partial': True,
+                                'today': {'date': '2026-11-15', 'processes': [], 'partial': True}}
+    result = monitor.sample()
+    today = result.pop('today')
+    assert result == {
         'status': 'ready', 'partial': True,
         'processes': [{'pid': 20, 'name': 'ssh', 'rx_bytes_per_second': 13, 'tx_bytes_per_second': 27}],
     }
+    assert today['date'] == '2026-11-15' and today['partial']
+    row, = today['processes']
+    assert re.fullmatch(r'[0-9a-f]{32}', row.pop('instance_id'))
+    assert row == {'pid': 20, 'name': 'ssh', 'rx_bytes': 130, 'tx_bytes': 270, 'active': True}
 
 
 def test_report_is_ranked_bounded_and_restarts_after_capture_failure(monkeypatch):
@@ -79,12 +90,150 @@ def test_report_is_ranked_bounded_and_restarts_after_capture_failure(monkeypatch
     monkeypatch.setattr(metrics.sys, 'platform', 'linux')
     monkeypatch.setattr(metrics, '_capture_sockets', capture)
     monkeypatch.setattr(metrics, 'monotonic', iter([10, 20, 40]).__next__)
+    monkeypatch.setattr(metrics, '_today', lambda: '2026-11-15')
     monitor = metrics.NetworkProcessMonitor()
 
     assert monitor.sample()['status'] == 'warming_up'
     assert [row['pid'] for row in monitor.sample()['processes']] == list(range(13, 3, -1))
-    assert monitor.sample() == {'status': 'unavailable', 'processes': []}
+    unavailable = monitor.sample()
+    assert unavailable['status'] == 'unavailable' and unavailable['processes'] == []
+    assert [row['pid'] for row in unavailable['today']['processes']] == list(range(13, 3, -1))
     assert monitor.sample()['status'] == 'warming_up'
+
+
+def test_today_aggregates_processes_outside_the_realtime_top_ten(monkeypatch):
+    sample = metrics.SocketSample
+    before = {pid: sample(pid, pid, 'worker', 500, 0) for pid in range(1, 14)}
+    middle = {pid: sample(pid, pid, 'worker', 500 + pid, 0) for pid in before}
+    after = {**middle, 1: sample(1, 1, 'worker', 521, 0)}
+    snapshots = iter([(before, False), (middle, False), (after, False)])
+    monkeypatch.setattr(metrics.sys, 'platform', 'linux')
+    monkeypatch.setattr(metrics, '_capture_sockets', lambda: next(snapshots))
+    monkeypatch.setattr(metrics, 'monotonic', iter([10, 20, 30]).__next__)
+    monkeypatch.setattr(metrics, '_today', lambda: '2026-11-15')
+    monkeypatch.setattr(metrics, '_process_identity', lambda pid, **kwargs: (pid, 'worker'))
+    monitor = metrics.NetworkProcessMonitor()
+    monitor.sample()
+    first = monitor.sample()
+    assert all(row['pid'] != 1 for row in first['processes'])
+    assert all(row['pid'] != 1 for row in first['today']['processes'])
+    total = monitor.sample()['today']['processes'][0]
+    assert total['pid'] == 1 and total['rx_bytes'] == 21
+
+
+def test_today_survives_agent_restart_and_keeps_exited_process_instances(tmp_path, monkeypatch):
+    sample = metrics.SocketSample
+    socket_key = (23, 55, '192.0.2.1:22', '198.51.100.1:3333')
+    snapshots = iter([
+        ({socket_key: sample(20, 500, 'sshd', 50, 200)}, False),
+        ({socket_key: sample(20, 500, 'sshd', 70, 500)}, False),
+        ({socket_key: sample(20, 600, 'python', 900, 4500)}, False),
+        ({socket_key: sample(20, 600, 'python', 1000, 4510)}, False),
+    ])
+    monkeypatch.setattr(metrics.sys, 'platform', 'linux')
+    monkeypatch.setattr(metrics, '_capture_sockets', lambda: next(snapshots))
+    monkeypatch.setattr(metrics, 'monotonic', iter([10, 20, 40, 50]).__next__)
+    monkeypatch.setattr(metrics, '_today', lambda: '2026-11-15')
+    started = 500
+    monkeypatch.setattr(metrics, '_boot_id', lambda: 'boot-three')
+    monkeypatch.setattr(metrics, '_process_identity', lambda pid, **kwargs: (started, 'sshd'))
+    first = metrics.NetworkProcessMonitor(tmp_path)
+    first.sample()
+    record, = first.sample()['today']['processes']
+    assert (record['active'], record['rx_bytes'], record['tx_bytes']) == (True, 20, 300)
+    text = (tmp_path / 'network-process-today.json').read_text()
+    assert '198.51.100.1' not in text and '"active"' not in text
+
+    started = 600
+    restarted = metrics.NetworkProcessMonitor(tmp_path)
+    restored = restarted.sample()
+    assert restored['status'] == 'warming_up' and restored['processes'] == []
+    assert restored['today']['processes'] == [{**record, 'active': False}]
+    rows = restarted.sample()['today']['processes']
+    assert len(rows) == 2
+    assert rows[0] == {**record, 'active': False}
+    assert rows[1]['instance_id'] != record['instance_id']
+    assert (rows[1]['pid'], rows[1]['active'], rows[1]['rx_bytes'], rows[1]['tx_bytes']) == (20, True, 100, 10)
+
+
+def test_today_resets_at_china_midnight_and_skips_the_crossing_delta(tmp_path, monkeypatch):
+    sample = metrics.SocketSample
+    snapshots = iter([({1: sample(20, 500, 'sshd', rx, 0)}, False) for rx in (500, 700, 950, 1000)])
+    dates = iter(['2026-11-15'] * 4 + ['2026-11-16'] * 4)
+    monkeypatch.setattr(metrics.sys, 'platform', 'linux')
+    monkeypatch.setattr(metrics, '_capture_sockets', lambda: next(snapshots))
+    monkeypatch.setattr(metrics, 'monotonic', iter([10, 20, 30, 40]).__next__)
+    monkeypatch.setattr(metrics, '_today', lambda: next(dates))
+    monkeypatch.setattr(metrics, '_process_identity', lambda pid, **kwargs: (500, 'sshd'))
+    monitor = metrics.NetworkProcessMonitor(tmp_path)
+    monitor.sample()
+    assert monitor.sample()['today']['processes'][0]['rx_bytes'] == 200
+    crossing = monitor.sample()
+    assert crossing['processes'][0]['rx_bytes_per_second'] == 25
+    assert crossing['today'] == {'date': '2026-11-16', 'processes': [], 'partial': True}
+    assert monitor.sample()['today']['processes'][0]['rx_bytes'] == 50
+    saved = json.loads((tmp_path / 'network-process-today.json').read_text())
+    assert saved['date'] == '2026-11-16' and saved['processes'][0]['rx_bytes'] == 50
+
+
+def test_capture_spanning_midnight_is_not_used_as_today_baseline(monkeypatch):
+    sample = metrics.SocketSample
+    snapshots = iter([({1: sample(20, 500, 'sshd', rx, 0)}, False) for rx in (500, 700, 950, 1000)])
+    dates = iter(['2026-11-15'] * 3 + ['2026-11-16'] * 5)
+    monkeypatch.setattr(metrics.sys, 'platform', 'linux')
+    monkeypatch.setattr(metrics, '_capture_sockets', lambda: next(snapshots))
+    monkeypatch.setattr(metrics, 'monotonic', iter([10, 20, 30, 40]).__next__)
+    monkeypatch.setattr(metrics, '_today', lambda: next(dates))
+    monkeypatch.setattr(metrics, '_process_identity', lambda pid, **kwargs: (500, 'sshd'))
+    monitor = metrics.NetworkProcessMonitor()
+    monitor.sample()
+    assert monitor.sample()['today']['processes'] == []
+    assert monitor.sample()['today']['processes'] == []
+    assert monitor.sample()['today']['processes'][0]['rx_bytes'] == 50
+
+
+def test_today_keeps_previous_boot_totals_separate(tmp_path, monkeypatch):
+    boot_ids = iter(['boot-one', 'boot-two'])
+    monkeypatch.setattr(metrics, '_boot_id', lambda: next(boot_ids))
+    monkeypatch.setattr(metrics, '_process_identity', lambda pid, **kwargs: (500, 'sshd'))
+    before_reboot = metrics._DailyProcessUsage(tmp_path)
+    before_reboot.begin_day('2026-11-15')
+    before_reboot.add({(20, 500): ('sshd', 100, 200)})
+    previous, = before_reboot.report()['processes']
+
+    after_reboot = metrics._DailyProcessUsage(tmp_path)
+    after_reboot.begin_day('2026-11-15')
+    after_reboot.add({(20, 500): ('sshd', 10, 20)})
+    retained, current = after_reboot.report()['processes']
+    assert retained == {**previous, 'active': False}
+    assert current['instance_id'] != previous['instance_id'] and current['active']
+
+
+def test_today_survives_storage_failure_and_limits_persisted_identities(tmp_path, monkeypatch):
+    sample = metrics.SocketSample
+    before = {pid: sample(pid, pid, 'worker', 0, 0) for pid in range(1, 5)}
+    after = {pid: sample(pid, pid, 'worker', pid * 100, 0) for pid in before}
+    snapshots = iter([(before, False), (after, False), (after, False)])
+    monkeypatch.setattr(metrics, 'MAX_DAY_PROCESSES', 2)
+    monkeypatch.setattr(metrics.sys, 'platform', 'linux')
+    monkeypatch.setattr(metrics, '_capture_sockets', lambda: next(snapshots))
+    monkeypatch.setattr(metrics, 'monotonic', iter([10, 20, 30]).__next__)
+    monkeypatch.setattr(metrics, '_today', lambda: '2026-11-15')
+
+    def denied(pid, **kwargs):
+        raise PermissionError
+
+    monkeypatch.setattr(metrics, '_process_identity', denied)
+    state_dir = tmp_path / 'temporarily-missing'
+    monitor = metrics.NetworkProcessMonitor(state_dir)
+    monitor.sample()
+    result = monitor.sample()
+    assert result['status'] == 'ready'
+    assert [(row['pid'], row['active']) for row in result['today']['processes']] == [(4, None), (3, None)]
+    state_dir.mkdir()
+    monitor.sample()
+    persisted = json.loads((state_dir / 'network-process-today.json').read_text())
+    assert [row['pid'] for row in persisted['processes']] == [4, 3]
 
 
 @pytest.mark.parametrize('code,error', [
@@ -114,7 +263,10 @@ def test_agent_heartbeat_includes_network_process_report(agent_fixture, monkeypa
 
     report = {'status': 'ready', 'processes': [
         {'pid': 100, 'name': 'sshd', 'rx_bytes_per_second': 400, 'tx_bytes_per_second': 500},
-    ]}
+    ], 'today': {'date': '2026-11-15', 'partial': True, 'processes': [
+        {'pid': 100, 'name': 'sshd', 'instance_id': 'a' * 32,
+         'rx_bytes': 800, 'tx_bytes': 1000, 'active': True},
+    ]}}
     monkeypatch.setattr(metrics.NetworkProcessMonitor, 'sample', lambda _: report)
     monkeypatch.setattr('vla_agent.main.gpu_inventory', lambda: ([], {}))
     agent = Agent(agent_fixture['config'], client=Client())

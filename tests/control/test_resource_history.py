@@ -389,3 +389,74 @@ def test_network_process_unready_status_and_older_agent_heartbeat(platform, monk
     assert heartbeat_at(platform, node, monkeypatch, END + timedelta(seconds=10),
                         metrics={"cpu_percent": 5}).status_code == 200
     assert "network_processes" not in node_detail(platform, node)["metrics"]
+
+
+def process_total(instance, pid=101, *, name="python3", rx=0, tx=250, active=True):
+    return {"instance_id": f"{instance:032x}", "pid": pid, "name": name, "rx_bytes": rx, "tx_bytes": tx,
+            "active": active}
+
+
+def test_process_daily_totals_are_ranked_scoped_and_not_added_twice(platform, monkeypatch):
+    node = platform.register()
+    clear_samples(platform)
+    previous_pid_owner = process_total(1, active=False)
+    current_pid_owner = process_total(2, rx=1000)
+    report = {
+        "status": "ready",
+        "processes": [],
+        "today": {
+            "date": "2026-10-27", "partial": False, "command": "extra-day-field",
+            "processes": [
+                previous_pid_owner,
+                {**current_pid_owner, "peer": "extra-row-field"},
+                process_total(2, pid=200),
+                process_total(3, tx=-1),
+                process_total(4, active=1),
+                {**process_total(5), "instance_id": "not-an-opaque-instance"},
+            ],
+        },
+    }
+    expected = {"date": "2026-10-27", "partial": True, "processes": [current_pid_owner, previous_pid_owner]}
+    for offset in (0, 10):
+        assert heartbeat_at(platform, node, monkeypatch, END + timedelta(seconds=offset),
+                            metrics={"network_processes": report}).status_code == 200
+        assert node_detail(platform, node)["metrics"]["network_processes"]["today"] == expected
+    assert "network_processes" not in platform.client.get("/api/v1/nodes", headers=ADMIN).json()[0]["metrics"]
+    assert "network_processes" not in samples(platform)[0].metrics
+    assert "network_processes" not in get_history(platform, node, monkeypatch, "1h").text
+    with platform.app.state.db.read() as session:
+        assert session.get(Node, node["node_id"]).metrics["network_processes"]["today"] == expected
+
+
+def test_process_daily_totals_retain_offline_usage_and_roll_over_in_beijing(platform, monkeypatch):
+    node = platform.register()
+    live = process_total(1, tx=10_000)
+    stopped = process_total(2, active=False)
+    today = {"date": "2026-10-27", "partial": False, "processes": [live, stopped]}
+    ready = {"status": "ready", "processes": [process_sample(101)], "today": today}
+    assert heartbeat_at(platform, node, monkeypatch, END,
+                        metrics={"network_processes": ready}).status_code == 200
+
+    partial = {**today, "partial": True, "processes": [{**live, "active": None}, stopped]}
+    monkeypatch.setattr(main_module, "now", lambda: timestamp(END + timedelta(seconds=31)))
+    stale = node_detail(platform, node)["metrics"]["network_processes"]
+    assert stale["status"] == "stale" and stale["processes"] == [] and stale["today"] == partial
+    with platform.app.state.db.write() as session:
+        session.get(Node, node["node_id"]).status = "OFFLINE"
+    assert node_detail(platform, node)["metrics"]["network_processes"]["today"] == partial
+
+    assert heartbeat_at(platform, node, monkeypatch, END + timedelta(seconds=40),
+                        metrics={"network_processes": {"status": "warming_up", "processes": []}}).status_code == 200
+    warming = node_detail(platform, node)["metrics"]["network_processes"]
+    assert warming["status"] == "warming_up" and warming["today"] == partial
+    assert heartbeat_at(platform, node, monkeypatch, END + timedelta(seconds=50),
+                        metrics={"cpu_percent": 5}).status_code == 200
+    unavailable = node_detail(platform, node)["metrics"]["network_processes"]
+    assert unavailable["status"] == "unavailable" and unavailable["today"] == partial
+
+    midnight = END.replace(hour=16)
+    monkeypatch.setattr(main_module, "now", lambda: timestamp(midnight))
+    assert "today" not in node_detail(platform, node)["metrics"]["network_processes"]
+    assert heartbeat_at(platform, node, monkeypatch, midnight,
+                        metrics={"network_processes": ready}).status_code == 200
+    assert "today" not in node_detail(platform, node)["metrics"]["network_processes"]

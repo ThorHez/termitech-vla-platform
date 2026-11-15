@@ -12,7 +12,7 @@ import {
 import { api, useApi } from './api';
 import { useAuth } from './auth';
 import { Badge, ErrorNotice, Loading, Modal } from './components';
-import { activeStates, useData } from './data';
+import { activeStates, useData, useDataRequests } from './data';
 import { DeploymentLogs } from './DeploymentLogs';
 import {
   agentReleaseLabel,
@@ -23,6 +23,8 @@ import {
   nodeOperationSucceeded as succeeded,
 } from './agentUpgradeState';
 import type { Node, NodeManagementInfo, RemoteDeployment } from './types';
+
+const nodeManagementResources = { runs: 15000 };
 
 export function nodeManagementAvailability(
   info: NodeManagementInfo | undefined,
@@ -93,13 +95,16 @@ function NodeManagementContent({
   close,
   changed,
   reconnect,
+  activeRunCount,
 }: {
   node: Node;
   close: () => void;
   changed?: () => void;
   reconnect: () => void;
+  activeRunCount?: number | null;
 }) {
   const { runs, refresh } = useData();
+  useDataRequests(activeRunCount === undefined ? nodeManagementResources : undefined);
   const management = useApi<NodeManagementInfo>(`/nodes/${node.id}/management`, 0);
   const [action, setAction] = useState<'disconnect' | 'uninstall' | 'upgrade'>();
   const [busy, setBusy] = useState(false);
@@ -110,14 +115,15 @@ function NodeManagementContent({
   const retryKey = useRef<{ id: string; key: string } | undefined>(undefined);
   const changedRef = useRef({ refresh, changed });
   changedRef.current = { refresh, changed };
-  const activeRuns = (runs.data || []).filter(
-    (run) => run.node_id === node.id && activeStates.has(run.state),
-  );
-  const trainingUnknown = runs.loading && !runs.data;
+  const activeRuns =
+    activeRunCount === undefined
+      ? runs.data?.filter((run) => run.node_id === node.id && activeStates.has(run.state)).length
+      : activeRunCount;
+  const trainingUnknown = activeRuns == null;
   const info = management.data;
   const { canDisconnect, canUninstall, canUpgrade } = nodeManagementAvailability(
     info,
-    activeRuns.length,
+    activeRuns ?? 0,
     trainingUnknown,
   );
   const upgradeReason = info?.upgrade_reason || info?.reason || '正在确认训练监控隔离状态。';
@@ -126,8 +132,8 @@ function NodeManagementContent({
   const latestUpgrade = latestNodeUpgrade(info?.latest_upgrade, node.id);
   const resumed = useRef(false);
   const active = job && !complete(job);
-  const reason = activeRuns.length
-    ? `此机器有 ${activeRuns.length} 个活动训练，暂不能断开连接或卸载；Agent 升级资格由训练监控隔离检查决定。`
+  const reason = activeRuns
+    ? `此机器有 ${activeRuns} 个活动训练，暂不能断开连接或卸载；Agent 升级资格由训练监控隔离检查决定。`
     : trainingUnknown
       ? '正在确认训练状态。'
       : '';

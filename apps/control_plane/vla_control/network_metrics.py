@@ -13,6 +13,7 @@ PROCESS_METRICS_KEY = "network_processes"
 MAX_NETWORK_PROCESSES = 10
 PROCESS_SAMPLE_MAX_AGE_SECONDS = 30
 PROCESS_NAME = re.compile(r"(?=[A-Za-z0-9_.+@-]*[A-Za-z])[A-Za-z0-9_.+@-]{1,64}")
+PROCESS_INSTANCE = re.compile(r"[0-9a-f]{32}")
 
 
 def rate(value):
@@ -103,16 +104,58 @@ def _process_report(raw):
     return {"status": status, "partial": partial, "processes": list(processes.values())}
 
 
+def _process_usage(raw, date):
+    today = raw.get("today") if isinstance(raw, dict) else None
+    if not isinstance(today, dict) or today.get("date") != date or not isinstance(today.get("processes"), list):
+        return None
+    rows = today["processes"]
+    partial = today.get("partial") is not False or len(rows) > MAX_NETWORK_PROCESSES
+    processes = {}
+    for item in rows[:MAX_NETWORK_PROCESSES]:
+        if not isinstance(item, dict):
+            partial = True
+            continue
+        pid, name, instance = item.get("pid"), item.get("name"), item.get("instance_id")
+        rx, tx, active = item.get("rx_bytes"), item.get("tx_bytes"), item.get("active")
+        if (type(pid) is not int or not 0 < pid < 2**31
+                or not isinstance(name, str) or len(name) > 64 or not PROCESS_NAME.fullmatch(name)
+                or not isinstance(instance, str) or not PROCESS_INSTANCE.fullmatch(instance)
+                or instance in processes or not (_counter(rx) and _counter(tx))
+                or (active is not None and type(active) is not bool)):
+            partial = True
+            continue
+        processes[instance] = {
+            "pid": pid, "name": name, "instance_id": instance, "rx_bytes": rx, "tx_bytes": tx,
+            "active": active,
+        }
+    if rows and not processes:
+        return None
+    ranked = sorted(processes.values(), key=lambda row: (-(row["rx_bytes"] + row["tx_bytes"]), row["instance_id"]))
+    return {"date": date, "partial": partial, "processes": ranked}
+
+
+def _partial_process_usage(today):
+    return {**today, "partial": True, "processes": [
+        {**row, "active": False if row["active"] is False else None} for row in today["processes"]
+    ]}
+
+
 def network_process_snapshot(metrics, status, last_seen, received_at, freshness_seconds):
-    report = _process_report(metrics.get(PROCESS_METRICS_KEY))
+    raw = metrics.get(PROCESS_METRICS_KEY)
+    report = _process_report(raw)
     if report is None:
         return None
+    now = datetime.fromisoformat(received_at)
+    today = _process_usage(raw, now.astimezone(DAY_TIMEZONE).date().isoformat())
     last_seen = _timestamp(last_seen)
-    if status in ("ONLINE", "RECOVERING") and last_seen:
-        age = datetime.fromisoformat(received_at) - datetime.fromisoformat(last_seen)
-        if timedelta(0) <= age <= timedelta(seconds=min(freshness_seconds, PROCESS_SAMPLE_MAX_AGE_SECONDS)):
-            return report
-    return {"status": "stale", "partial": report["partial"], "processes": []}
+    age = now - datetime.fromisoformat(last_seen) if last_seen else None
+    fresh = (status in ("ONLINE", "RECOVERING") and age is not None
+             and timedelta(0) <= age <= timedelta(seconds=min(freshness_seconds, PROCESS_SAMPLE_MAX_AGE_SECONDS)))
+    if not fresh:
+        report = {"status": "stale", "partial": report["partial"], "processes": []}
+    if today is not None:
+        report["today"] = today if report["status"] == "ready" else _partial_process_usage(today)
+    return report
 
 
 def _previous_usage(network, date):
@@ -137,13 +180,28 @@ def _previous_usage(network, date):
 
 def with_network_metrics(metrics, previous_metrics, reported_at, previous_at, max_gap_seconds):
     """Called under the node's heartbeat lock, before replacing its latest metrics."""
-    if PROCESS_METRICS_KEY in metrics:
-        processes = _process_report(metrics[PROCESS_METRICS_KEY])
+    previous_metrics = previous_metrics or {}
+    previous_processes = previous_metrics.get(PROCESS_METRICS_KEY)
+    if PROCESS_METRICS_KEY in metrics or previous_processes:
+        raw_processes = metrics.get(PROCESS_METRICS_KEY)
+        processes = _process_report(raw_processes)
+        process_date = datetime.fromisoformat(reported_at).astimezone(DAY_TIMEZONE).date().isoformat()
+        today = _process_usage(raw_processes, process_date) if processes is not None else None
+        if today is not None:
+            if processes["status"] != "ready":
+                today = _partial_process_usage(today)
+        else:
+            previous_today = _process_usage(previous_processes, process_date)
+            if previous_today is not None:
+                processes = processes or {"status": "unavailable", "partial": True, "processes": []}
+                today = _partial_process_usage(previous_today)
+        if today is not None:
+            processes["today"] = today
         metrics = {key: value for key, value in metrics.items() if key != PROCESS_METRICS_KEY}
         if processes is not None:
             metrics[PROCESS_METRICS_KEY] = processes
     raw = metrics.get("network")
-    previous_raw = (previous_metrics or {}).get("network")
+    previous_raw = previous_metrics.get("network")
     if raw is None and not previous_raw:
         return metrics
     current = _report(raw)

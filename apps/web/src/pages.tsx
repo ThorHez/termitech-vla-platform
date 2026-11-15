@@ -105,7 +105,17 @@ import {
   readDatasetProfile,
 } from './DatasetProfileForm';
 
-export function RunTable({ runs, compact = false }: { runs: RunSummary[]; compact?: boolean }) {
+export function RunTable({
+  runs,
+  compact = false,
+  node,
+  onDeleted,
+}: {
+  runs: RunSummary[];
+  compact?: boolean;
+  node?: Node;
+  onDeleted?: () => void;
+}) {
   const { nodes, templates, refresh } = useData();
   return (
     <div className="table-scroll">
@@ -148,7 +158,9 @@ export function RunTable({ runs, compact = false }: { runs: RunSummary[]; compac
               <td>
                 <a className="node-link" href={`#/nodes/${run.node_id}`}>
                   <Server size={13} />
-                  {nodes.data?.find((item) => item.id === run.node_id)?.name ||
+                  {(node?.id === run.node_id
+                    ? node.name
+                    : nodes.data?.find((item) => item.id === run.node_id)?.name) ||
                     run.node_id.slice(0, 10)}
                 </a>
               </td>
@@ -161,7 +173,7 @@ export function RunTable({ runs, compact = false }: { runs: RunSummary[]; compac
                 >
                   <ChevronRight size={16} />
                 </a>
-                <RunDeleteAction run={run} compact onDeleted={refresh} />
+                <RunDeleteAction run={run} compact onDeleted={onDeleted ?? refresh} />
               </td>
             </tr>
           ))}
@@ -173,7 +185,7 @@ export function RunTable({ runs, compact = false }: { runs: RunSummary[]; compac
 
 export function OverviewPage({ createRun }: { createRun: () => void }) {
   const { can } = useAuth();
-  const { enabled, overview, nodes, runs, assets, alerts } = useData();
+  const { enabled, overview, nodes, runs, alerts } = useData();
   const stats = overview.data;
   const recent = [...(runs.data || [])]
     .sort((a, b) => b.created_at.localeCompare(a.created_at))
@@ -342,7 +354,7 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
                 name: '登记本机资产',
                 desc: '建立数据、模型与机器的关联',
                 to: '/assets',
-                done: !!assets.data?.length,
+                done: Boolean(stats?.assets_total),
               },
               {
                 n: '03',
@@ -514,7 +526,7 @@ export function MachineNetworkTraffic({ node }: { node: Node }) {
 
 export function NodesPage() {
   const { can } = useAuth();
-  const { nodes, assets, profiles, enabled } = useData();
+  const { nodes, enabled } = useData();
   const [query, setQuery] = useState('');
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [managing, setManaging] = useState<Node>();
@@ -586,19 +598,11 @@ export function NodesPage() {
                 <MachineNetworkTraffic node={node} />
                 <div className="machine-stats">
                   <div>
-                    <strong>
-                      {assets.data?.filter(
-                        (asset) =>
-                          asset.node_id === node.id && (asset.state || asset.status) !== 'ARCHIVED',
-                      ).length ?? '—'}
-                    </strong>
+                    <strong>{node.asset_count ?? '—'}</strong>
                     <span>本地资产</span>
                   </div>
                   <div>
-                    <strong>
-                      {profiles.data?.filter((profile) => profile.node_id === node.id).length ??
-                        '—'}
-                    </strong>
+                    <strong>{node.profile_count ?? '—'}</strong>
                     <span>运行环境</span>
                   </div>
                   <div>
@@ -677,11 +681,22 @@ export function NodesPage() {
   );
 }
 
+type NodePageResponse =
+  | NodeDetail
+  | ({ node: Node } & Pick<NodeDetail, 'assets' | 'asset_norms' | 'profiles' | 'runs'>);
+
+const SERVER_169_NODE_ID = '0fcb9ef5-8fc7-4feb-9603-44fc05dae5cc';
+
 export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: string) => void }) {
   const { can } = useAuth();
-  const { nodes, assets, profiles, runs, alerts } = useData();
-  const details = useApi<NodeDetail | { node: Node; assets: Asset[] }>(
-    `/nodes/${encodeURIComponent(id)}?view=summary`,
+  const { alerts, pollingEnabled } = useData();
+  const nodeId = encodeURIComponent(id);
+  const isServer169 = id === SERVER_169_NODE_ID;
+  const detailRefreshMs = isServer169 ? 60_000 : 8_000;
+  const detailLimits = isServer169 ? 'asset_limit=10&run_limit=10' : 'run_limit=500';
+  const details = useApi<NodePageResponse>(
+    pollingEnabled ? `/nodes/${nodeId}?view=summary&${detailLimits}` : null,
+    detailRefreshMs,
   );
   const [showManagement, setShowManagement] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
@@ -690,14 +705,50 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
   const [showReservations, setShowReservations] = useState(false);
   const [reservationRevision, setReservationRevision] = useState(0);
   const raw = details.data;
-  const node =
-    (raw && 'node' in raw ? raw.node : (raw as NodeDetail | undefined)) ||
-    nodes.data?.find((item) => item.id === id);
-  const nodeAssets = datasetCatalogAssets(assets.data || []).assets.filter(
-    (asset) => asset.node_id === id,
+  const reportedNode = raw && 'node' in raw ? raw.node : raw;
+  const scoped = reportedNode?.id === id ? raw : undefined;
+  const node = scoped ? reportedNode : undefined;
+  const activeTraining = scoped && 'active_training' in scoped ? scoped.active_training : undefined;
+  const needsLegacyRuns = Boolean(scoped && !activeTraining);
+  const legacyRuns = useApi<RunSummary[]>(
+    pollingEnabled && needsLegacyRuns ? '/runs?view=summary' : null,
   );
-  const nodeProfiles = profiles.data?.filter((profile) => profile.node_id === id) || [];
-  const nodeRuns = runs.data?.filter((run) => run.node_id === id) || [];
+  const legacyProfiles = useApi<NonNullable<NodeDetail['profiles']>>(
+    pollingEnabled && scoped && !scoped.profiles ? `/profiles?node_id=${nodeId}` : null,
+    15000,
+  );
+  const allNodeAssets = useMemo(
+    () => (scoped?.assets || []).filter((asset) => asset.node_id === id),
+    [scoped?.assets, id],
+  );
+  const sortedNodeAssets = useMemo(
+    () =>
+      datasetCatalogAssets(allNodeAssets).assets.sort((a, b) =>
+        (b.created_at ?? '').localeCompare(a.created_at ?? ''),
+      ),
+    [allNodeAssets],
+  );
+  const nodeAssets = isServer169 ? sortedNodeAssets.slice(0, 10) : sortedNodeAssets;
+  const normAssets = scoped?.asset_norms
+    ? [...allNodeAssets, ...scoped.asset_norms]
+    : allNodeAssets;
+  const nodeProfiles = (scoped?.profiles ?? legacyProfiles.data ?? []).filter(
+    (profile) => profile.node_id === id && profile.active !== false,
+  );
+  const legacyNodeRuns = legacyRuns.data?.filter((run) => run.node_id === id);
+  const nodeRuns = (needsLegacyRuns ? legacyNodeRuns : undefined) ?? scoped?.runs ?? [];
+  const displayedRuns = isServer169 ? nodeRuns.slice(0, 10) : nodeRuns;
+  const reportedActiveRuns = (needsLegacyRuns ? legacyNodeRuns : scoped?.runs)?.filter((run) =>
+    activeStates.has(run.state),
+  );
+  const activeTrainingCount = activeTraining?.count ?? reportedActiveRuns?.length ?? null;
+  const activeProfileIds =
+    activeTraining?.profile_ids ?? reportedActiveRuns?.map((run) => run.profile_id);
+  const refreshDetails = () => {
+    details.refresh();
+    if (needsLegacyRuns) legacyRuns.refresh();
+    if (scoped && !scoped.profiles) legacyProfiles.refresh();
+  };
   const diskAlerts =
     alerts.data?.filter((alert) => alert.node_id === id && isDiskCapacityAlert(alert)) || [];
   return (
@@ -801,7 +852,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
             </div>
             <div>
               <span>活动训练</span>
-              <strong>{nodeRuns.filter((run) => activeStates.has(run.state)).length}</strong>
+              <strong>{activeTrainingCount ?? '—'}</strong>
             </div>
           </div>
           {diskAlerts.length > 0 && (
@@ -816,6 +867,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
             processReport={node.metrics?.network_processes}
             lastSeen={node.last_seen}
             processReportReceivedAt={details.updatedAt}
+            processReportMaxAgeMs={Math.max(30_000, detailRefreshMs + 10_000)}
           />
           <div className="detail-columns">
             <div>
@@ -841,8 +893,12 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               </NodeGpuResources>
               <Panel
                 title="本机资产"
-                subtitle="仅可供这台机器上的训练使用"
-                action={<ViewLink to={`/assets?node=${id}`}>管理资产</ViewLink>}
+                subtitle={isServer169 ? '最近 10 条资产记录' : '仅可供这台机器上的训练使用'}
+                action={
+                  <ViewLink to={`/assets?node=${nodeId}`}>
+                    {isServer169 ? '查看本机全部资产' : '管理资产'}
+                  </ViewLink>
+                }
               >
                 {nodeAssets.length ? (
                   <div className="association-list">
@@ -852,10 +908,18 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                           {asset.kind === 'DATASET' ? <Database size={16} /> : <Box size={16} />}
                         </div>
                         <div>
-                          <strong>{asset.name}</strong>
+                          {isServer169 ? (
+                            <a
+                              href={`#/assets?node=${nodeId}&asset=${encodeURIComponent(asset.id)}`}
+                            >
+                              <strong>{asset.name}</strong>
+                            </a>
+                          ) : (
+                            <strong>{asset.name}</strong>
+                          )}
                           <span className="mono">{asset.path}</span>
                           {asset.kind === 'DATASET' && (
-                            <DatasetNormSummary asset={asset} assets={assets.data || []} />
+                            <DatasetNormSummary asset={asset} assets={normAssets} />
                           )}
                         </div>
                         <span className="tag">{assetKinds[asset.kind]}</span>
@@ -875,16 +939,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               <Panel
                 title="运行环境"
                 subtitle="每套环境绑定独立代码目录与 Python，创建训练时选择"
-                action={
-                  <ProfileAddition
-                    node={node}
-                    changed={() => {
-                      profiles.refresh();
-                      nodes.refresh();
-                      details.refresh();
-                    }}
-                  />
-                }
+                action={<ProfileAddition node={node} changed={refreshDetails} />}
               >
                 {nodeProfiles.length ? (
                   <div className="profile-list">
@@ -927,14 +982,8 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                         <ProfileRebinding
                           node={node}
                           profile={profile}
-                          inUse={nodeRuns.some(
-                            (run) => run.profile_id === profile.id && activeStates.has(run.state),
-                          )}
-                          changed={() => {
-                            profiles.refresh();
-                            nodes.refresh();
-                            details.refresh();
-                          }}
+                          inUse={activeProfileIds?.includes(profile.id) ?? true}
+                          changed={refreshDetails}
                         />
                       </div>
                     ))}
@@ -952,11 +1001,8 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                 action={
                   <StorageConfiguration
                     node={node}
-                    inUse={nodeRuns.some((run) => activeStates.has(run.state))}
-                    changed={() => {
-                      nodes.refresh();
-                      details.refresh();
-                    }}
+                    inUse={activeTrainingCount === null || activeTrainingCount > 0}
+                    changed={details.refresh}
                   />
                 }
               >
@@ -1005,9 +1051,17 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               </Panel>
             </div>
           </div>
-          <Panel title="关联训练" subtitle="使用这台机器的训练历史">
-            {nodeRuns.length ? (
-              <RunTable runs={nodeRuns} />
+          <Panel
+            title="关联训练"
+            subtitle={isServer169 ? '最近 10 条本机训练' : '使用这台机器的训练历史'}
+            action={
+              isServer169 && (
+                <ViewLink to={`/runs?node=${nodeId}&type=training`}>查看本机全部训练</ViewLink>
+              )
+            }
+          >
+            {displayedRuns.length ? (
+              <RunTable runs={displayedRuns} node={node} onDeleted={refreshDetails} />
             ) : (
               <Empty
                 icon={Workflow}
@@ -1021,6 +1075,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
       {can('machines.manage') && showManagement && node && (
         <NodeManagement
           node={node}
+          activeRunCount={activeTrainingCount}
           close={() => setShowManagement(false)}
           changed={details.refresh}
           reconnect={() => {
@@ -1104,11 +1159,17 @@ export function AssetsPage({
   const [templateAsset, setTemplateAsset] = useState<Asset>();
   const [personalFormatsOpen, setPersonalFormatsOpen] = useState(false);
   const [detailId, setDetailId] = useState(initialAssetId);
-  const detailAsset = sourceAssets.find(
+  const listedDetailAsset = sourceAssets.find(
     (asset) =>
       asset.id === detailId &&
       (detailId !== initialAssetId || (asset.status || asset.state) !== 'ARCHIVED'),
   );
+  const assetDetail = useApi<Asset>(
+    listedDetailAsset ? `/assets/${encodeURIComponent(listedDetailAsset.id)}` : null,
+    0,
+  );
+  const detailAsset =
+    assetDetail.data?.id === listedDetailAsset?.id ? assetDetail.data : listedDetailAsset;
   const closeAssetDetail = () => {
     if (initialAssetId) {
       const filters = new URLSearchParams();
@@ -1167,7 +1228,10 @@ export function AssetsPage({
     if (selectionOwner && allowed(user, asset, can))
       setDatasetEdit({ id: asset.id, owner: selectionOwner, mode });
   };
-  const closeDatasetEdit = () => setDatasetEdit(undefined);
+  const closeDatasetEdit = () => {
+    if (detailAsset && datasetEdit?.id === detailAsset.id) assetDetail.refresh();
+    setDatasetEdit(undefined);
+  };
   const archiveAsset =
     archiving?.owner === selectionOwner
       ? assets.data?.find((asset) => asset.id === archiving.asset.id) || archiving.asset
@@ -1715,6 +1779,8 @@ export function AssetsPage({
         !templateAsset && (
           <AssetDetail
             asset={detailAsset}
+            detailError={assetDetail.loading ? undefined : assetDetail.error}
+            retryDetail={assetDetail.refresh}
             datasetChoices={
               detailAsset.kind === 'DATASET' && detailAsset.norm_asset_id
                 ? sourceAssets.filter(
@@ -2295,6 +2361,6 @@ export function TemplatesPage({
   );
 }
 
-export function RunsPage({ createRun }: { createRun: () => void }) {
-  return <BackgroundTasksPage createRun={createRun} />;
+export function RunsPage({ createRun, search }: { createRun: () => void; search?: string }) {
+  return <BackgroundTasksPage createRun={createRun} search={search} />;
 }

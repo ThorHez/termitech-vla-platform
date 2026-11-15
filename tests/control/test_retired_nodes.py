@@ -2,10 +2,30 @@ import pytest
 from sqlalchemy import update
 
 import vla_control.main as main_module
-from vla_control.common import offset_time
-from vla_control.models import Node
+from vla_control.common import now, offset_time
+from vla_control.models import Asset, Node, Profile
 
 from .conftest import ADMIN
+
+
+def test_machine_list_counts_unarchived_assets_and_active_profiles_per_node(platform):
+    first = platform.register(name="first")["node_id"]
+    second = platform.register(name="second")["node_id"]
+    with platform.app.state.db.write() as session:
+        session.add_all([
+            Asset(id=state.lower(), node_id=first, name=state, kind="MODEL", path=f"/machine/{state}",
+                  version="v1", state=state, created_at=now())
+            for state in ("REGISTERED", "UNAVAILABLE", "ARCHIVED")
+        ])
+        session.add(Profile(node_id=first, id="inactive", name="inactive", code_dir="/machine/code",
+                            python="/usr/bin/python3", adapter="smoke", active=False))
+        session.get(Profile, (second, "default")).active = False
+
+    response = platform.client.get("/api/v1/nodes", headers=ADMIN)
+    assert response.status_code == 200, response.text
+    assert {node["id"]: (node["asset_count"], node["profile_count"]) for node in response.json()} == {
+        first: (2, 1), second: (0, 0),
+    }
 
 
 @pytest.mark.parametrize("state", ["DISCONNECTED", "REMOVED"])

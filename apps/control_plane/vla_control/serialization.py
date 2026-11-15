@@ -2,7 +2,8 @@ import ipaddress
 import math
 from typing import Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import aliased
 
 from .models import Allocation, Asset, Attempt, Run
 from .network_metrics import PROCESS_METRICS_KEY, network_snapshot
@@ -12,7 +13,17 @@ from .remote_schemas import SSHAuthenticationInput
 from .gpu_reservations import reservation_dicts
 
 
+AssetListView = Literal["full", "summary"]
 RunListView = Literal["full", "summary"]
+
+ASSET_VALIDATION_SUMMARY_FIELDS = (
+    "id", "scope", "status", "profile_id", "requested_at", "checked_at", "completed_at",
+    "reason", "error", "source_fingerprint",
+)
+NODE_ASSET_PREVIEW_COLUMNS = (
+    Asset.id, Asset.name, Asset.kind, Asset.node_id, Asset.path,
+    Asset.version, Asset.state, Asset.created_at, Asset.norm_asset_id,
+)
 
 
 def _connection_address(session, node):
@@ -68,15 +79,44 @@ def profile_dict(profile):
             "docker_image": profile.docker_image, "metadata": profile.metadata_json, "active": profile.active}
 
 
-def asset_dict(asset):
+def asset_dict(asset, *, summary=False):
     from .dataset_validations import INTERNAL_KEY, validation_dict
+    hidden_metadata = {INTERNAL_KEY, "_image_registration"} if summary else {INTERNAL_KEY}
+    metadata = {key: value for key, value in (asset.metadata_json or {}).items() if key not in hidden_metadata}
+    validation = validation_dict(asset) if asset.kind == "DATASET" else None
+    if summary and validation is not None:
+        contract = validation.get("timestamp_contract")
+        validation = {key: validation[key] for key in ASSET_VALIDATION_SUMMARY_FIELDS if key in validation}
+        if isinstance(contract, dict):
+            validation["timestamp_contract"] = {key: contract[key] for key in ("status", "checked_rows") if key in contract}
     return {"id": asset.id, "node_id": asset.node_id, "name": asset.name, "kind": asset.kind,
             "path": asset.path, "version": asset.version, "state": asset.state,
-            "metadata": {key: value for key, value in (asset.metadata_json or {}).items() if key != INTERNAL_KEY},
-            **({"validation": validation_dict(asset)} if asset.kind == "DATASET" else {}), "created_at": asset.created_at,
+            "metadata": metadata,
+            **({"validation": validation} if asset.kind == "DATASET" else {}), "created_at": asset.created_at,
             "norm_asset_id": asset.norm_asset_id if asset.kind in {"DATASET", "MODEL"} else None,
             "origin_attempt_id": asset.origin_attempt_id,
             "registered_by_user_id": asset.registered_by_user_id}
+
+
+def recent_node_assets(session, node_id, limit):
+    """Return visible catalog rows and normalization references for a node preview."""
+    dataset = aliased(Asset)
+    bound_norm = select(dataset.id).where(
+        dataset.node_id == node_id, dataset.kind == "DATASET", dataset.state != "ARCHIVED",
+        dataset.norm_asset_id == Asset.id,
+    ).correlate(Asset).exists()
+    assets_query = select(*NODE_ASSET_PREVIEW_COLUMNS).where(
+        Asset.node_id == node_id, Asset.state != "ARCHIVED", or_(Asset.kind != "NORM", ~bound_norm),
+    ).order_by(Asset.created_at.desc(), Asset.id.desc()).limit(limit)
+    assets = [dict(row) for row in session.execute(assets_query).mappings()]
+    norm_ids = {asset["norm_asset_id"] for asset in assets if asset["kind"] == "DATASET" and asset["norm_asset_id"]}
+    norms = []
+    if norm_ids:
+        norm_query = select(*NODE_ASSET_PREVIEW_COLUMNS).where(
+            Asset.node_id == node_id, Asset.kind == "NORM", Asset.id.in_(norm_ids),
+        ).order_by(Asset.id)
+        norms = [dict(row) for row in session.execute(norm_query).mappings()]
+    return assets, norms
 
 
 def preview_dict(preview):
@@ -195,3 +235,20 @@ def run_dict(session, run):
                 payload["origin_run_id"] = origin_run_id
             result["input_assets"].append(payload)
     return result
+
+
+def run_status_dict(session, run):
+    latest = session.execute(select(
+        Attempt.id, Attempt.latest_metrics, Attempt.resources,
+    ).where(Attempt.run_id == run.id).order_by(Attempt.number.desc()).limit(1)).mappings().one_or_none()
+    attempt = None
+    if latest is not None:
+        metrics, resources = latest["latest_metrics"] or {}, latest["resources"] or {}
+        attempt = {
+            "id": latest["id"],
+            "latest_metrics": {**_numeric_fields(**metrics), "timestamp": metrics.get("timestamp")},
+            "resources": {key: resources[key] for key in ("rss_bytes", "cpu_seconds", "timestamp")
+                          if key in resources},
+        }
+    return {"id": run.id, "state": run.state, "updated_at": run.updated_at,
+            "queue_reason": run.queue_reason, "attempt": attempt}

@@ -3,6 +3,8 @@ import { backgroundTaskPagePath, fetchBackgroundTaskPage } from './backgroundTas
 import type { BackgroundTaskPage, BackgroundTaskQuery } from './backgroundTaskPagination';
 import type { Node } from './types';
 
+export const BACKGROUND_TASK_REFRESH_SECONDS = 10;
+
 export function useBackgroundTaskPage(
   request: BackgroundTaskQuery,
   enabled: boolean,
@@ -43,7 +45,7 @@ export function useBackgroundTaskPage(
       } finally {
         if (!cancelled) {
           setLoading(false);
-          timer = setTimeout(fetchPage, 3000);
+          timer = setTimeout(fetchPage, BACKGROUND_TASK_REFRESH_SECONDS * 1000);
         }
       }
     };

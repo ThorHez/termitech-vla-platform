@@ -168,7 +168,7 @@ class Agent:
         self.runtime_monitor = RuntimeMonitor(config["roots"])
         self.disk_capacity_monitor = DiskCapacityMonitor()
         self.network_monitor = NetworkMonitor()
-        self.network_process_monitor = NetworkProcessMonitor()
+        self.network_process_monitor = NetworkProcessMonitor(config["state_dir"])
         self.artifact_monitor = ArtifactMonitor(self.state, config["output_root"],
                                                 output_roots=config.get("_output_root_history", []))
         self._preflight_worker = None

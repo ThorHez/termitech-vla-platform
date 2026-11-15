@@ -1,24 +1,74 @@
-import { createContext, useContext, useMemo } from 'react';
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
-import { useApi } from './api';
+import { useApi, usePageVisible } from './api';
 import { deduplicateDiskAlerts } from './workspaceAlertData';
 import type { Alert, Asset, Gpu, Node, Overview, Profile, RunSummary, Template } from './types';
-import type { AssetTransfer } from './assetTransfer';
 import type { MemberSummary } from './resourcePermissions';
 
-function useResources(enabled: boolean) {
-  const members = useApi<MemberSummary[]>(enabled ? '/members' : null, 30000);
-  const overview = useApi<Overview>(enabled ? '/overview' : null);
-  const nodes = useApi<Node[]>(enabled ? '/nodes' : null);
-  const assets = useApi<Asset[]>(enabled ? '/assets' : null);
-  const profiles = useApi<Profile[]>(enabled ? '/profiles' : null, 15000);
-  const templates = useApi<Template[]>(enabled ? '/templates' : null, 30000);
-  const runs = useApi<RunSummary[]>(enabled ? '/runs?view=summary' : null);
-  const assetTransfers = useApi<AssetTransfer[]>(
-    enabled ? '/asset-transfers?limit=200' : null,
-    3000,
-  );
-  const alerts = useApi<Alert[]>(enabled ? '/alerts' : null, 10000);
+type DataResource =
+  | 'members'
+  | 'overview'
+  | 'nodes'
+  | 'assets'
+  | 'profiles'
+  | 'templates'
+  | 'runs'
+  | 'alerts';
+type DataRequests = Readonly<Partial<Record<DataResource, number>>>;
+
+const pageRequests: Record<string, DataRequests> = {
+  '/overview': { overview: 15000, nodes: 15000, runs: 15000, alerts: 10000 },
+  '/alerts': { alerts: 10000, nodes: 0 },
+  '/nodes': { nodes: 15000 },
+  '/assets': { assets: 30000, nodes: 15000, profiles: 0, runs: 0, members: 0 },
+  '/templates': { templates: 30000 },
+  '/runs': { nodes: 0, templates: 0, members: 0 },
+  '/deployments': { nodes: 0, members: 0 },
+};
+
+function requestsForRoute(route: string): DataRequests {
+  const [path, query] = route.split('?', 2);
+  if (path.startsWith('/nodes/')) return { templates: 0, alerts: 10000 };
+  if (path.startsWith('/runs/sync/')) return { nodes: 0, members: 0 };
+  if (path.startsWith('/runs/')) return { nodes: 0, templates: 0, members: 0 };
+  if (path.startsWith('/deployments/')) return { nodes: 0, profiles: 0, members: 0 };
+  if (path === '/scenes' && new URLSearchParams(query).get('scene')) return { assets: 0, runs: 0 };
+  return pageRequests[path] ?? {};
+}
+
+function useResource<T>(endpoint: string, interval?: number) {
+  const active = interval !== undefined;
+  const result = useApi<T>(active ? endpoint : null, interval ?? 0);
+  return {
+    ...result,
+    loading: active && (result.loading || (result.data === undefined && !result.error)),
+  };
+}
+
+function useResources(enabled: boolean, route: string) {
+  const visible = usePageVisible();
+  const pollingEnabled = enabled && visible;
+  const [extraRequests, setExtraRequests] = useState<DataRequests[]>([]);
+  const request = useCallback((scope: DataRequests) => {
+    const entry = { ...scope };
+    setExtraRequests((current) => [...current, entry]);
+    return () => setExtraRequests((current) => current.filter((value) => value !== entry));
+  }, []);
+  const scopes = [requestsForRoute(route), ...extraRequests];
+  const intervalFor = (resource: DataResource) => {
+    if (!pollingEnabled) return undefined;
+    const intervals = scopes.flatMap((scope) => scope[resource] ?? []);
+    const repeating = intervals.filter((value) => value > 0);
+    return repeating.length ? Math.min(...repeating) : intervals[0];
+  };
+  const members = useResource<MemberSummary[]>('/members', intervalFor('members'));
+  const overview = useResource<Overview>('/overview', intervalFor('overview'));
+  const nodes = useResource<Node[]>('/nodes', intervalFor('nodes'));
+  const assets = useResource<Asset[]>('/assets?view=summary', intervalFor('assets'));
+  const profiles = useResource<Profile[]>('/profiles', intervalFor('profiles'));
+  const templates = useResource<Template[]>('/templates', intervalFor('templates'));
+  const runs = useResource<RunSummary[]>('/runs?view=summary', intervalFor('runs'));
+  const alerts = useResource<Alert[]>('/alerts', intervalFor('alerts'));
   const currentAlerts = useMemo(
     () => (alerts.data ? deduplicateDiskAlerts(alerts.data) : undefined),
     [alerts.data],
@@ -31,11 +81,11 @@ function useResources(enabled: boolean) {
     profiles.refresh();
     templates.refresh();
     runs.refresh();
-    assetTransfers.refresh();
     alerts.refresh();
   };
   return {
     enabled,
+    pollingEnabled,
     members,
     overview,
     nodes,
@@ -43,14 +93,22 @@ function useResources(enabled: boolean) {
     profiles,
     templates,
     runs,
-    assetTransfers,
     alerts: { ...alerts, data: currentAlerts },
     refresh,
+    request,
   };
 }
 const DataContext = createContext<ReturnType<typeof useResources> | null>(null);
-export function DataProvider({ enabled, children }: { enabled: boolean; children: ReactNode }) {
-  const resources = useResources(enabled);
+export function DataProvider({
+  enabled,
+  route = '/overview',
+  children,
+}: {
+  enabled: boolean;
+  route?: string;
+  children: ReactNode;
+}) {
+  const resources = useResources(enabled, route);
   return <DataContext.Provider value={resources}>{children}</DataContext.Provider>;
 }
 export function useData() {
@@ -60,6 +118,10 @@ export function useData() {
 }
 export function useMembers() {
   return useContext(DataContext)?.members;
+}
+export function useDataRequests(requests?: DataRequests) {
+  const request = useContext(DataContext)?.request;
+  useEffect(() => (requests ? request?.(requests) : undefined), [request, requests]);
 }
 export const assetKinds: Record<string, string> = {
   DATASET: '数据集',

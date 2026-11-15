@@ -90,6 +90,9 @@ try {
     assert.match(html, />0 Mbps</);
     assert.match(html, />10 Mbps</);
     assert.match(html, /部分连接的归属无法确认/);
+    const previousPoll = new Date(Date.now() - 50_000);
+    assert.match(render({ receivedAt: previousPoll }), /暂无近期的进程流量数据/);
+    assert.match(render({ receivedAt: previousPoll, maxAgeMs: 70_000 }), />10 Mbps</);
     for (const props of [
       { nodeStatus: 'OFFLINE' },
       { receivedAt: new Date(0) },
@@ -99,8 +102,61 @@ try {
       assert.match(stale, /暂无近期的进程流量数据/);
       assert.doesNotMatch(stale, /sshd|Mbps/);
     }
-    assert.match(render({ report: undefined }), /尚未上报进程流量/);
+    assert.match(render({ report: undefined }), /尚未上报今日累计流量/);
     assert.match(render({ report: { status: 'warming_up', processes: [] } }), /等待下一次上报/);
+  });
+
+  await test('process traffic defaults to daily bytes and retains exited and offline rows', () => {
+    const today = {
+      date: '2026-11-15',
+      partial: true,
+      processes: [
+        {
+          instance_id: 'a'.repeat(32),
+          pid: 412,
+          name: 'caddy',
+          rx_bytes: 500000000,
+          tx_bytes: 1000000000,
+          active: false,
+        },
+        {
+          instance_id: 'b'.repeat(32),
+          pid: 412,
+          name: 'sshd',
+          rx_bytes: 0,
+          tx_bytes: 1250,
+          active: null,
+        },
+      ],
+    };
+    const report = {
+      status: 'ready',
+      processes: [
+        { pid: 423, name: 'live-only', rx_bytes_per_second: 0, tx_bytes_per_second: 1250000 },
+      ],
+      today,
+    };
+    for (const nodeStatus of ['ONLINE', 'OFFLINE']) {
+      const html = renderToStaticMarkup(
+        React.createElement(NetworkProcessTraffic, {
+          report,
+          nodeStatus,
+          lastSeen: new Date().toISOString(),
+        }),
+      );
+      assert.match(html, /aria-pressed="true"[^>]*>今日累计/);
+      assert.match(html, /北京时间 2026-11-15/);
+      assert.match(html, /累计入站/);
+      assert.match(html, /累计出站/);
+      assert.match(html, /<strong>caddy<\/strong>.*已退出/);
+      assert.match(html, />500 MB</);
+      assert.match(html, />1 GB</);
+      assert.match(html, /<strong>1.5 GB<\/strong>/);
+      assert.match(html, /<strong>sshd<\/strong>/);
+      assert.match(html, />1.25 KB</);
+      assert.match(html, /累计仅包含已观测流量/);
+      assert.doesNotMatch(html, /live-only|Mbps/);
+    }
   });
 
   await test('zero is an observed percentage; absent, malformed and out-of-range values stay unknown', () => {
@@ -403,8 +459,10 @@ try {
       React.createElement(ResourceHistory, { nodeId: 'one', status: 'OFFLINE' }),
     );
     assert.match(html, /资源占用历史/);
-    assert.equal((html.match(/aria-pressed=/g) || []).length, 5);
-    assert.match(html, /aria-pressed="true"[^>]*>近 24 小时/);
+    const timeRange = html.match(/aria-label="资源历史时间范围">(.*?)<\/div>/)?.[1];
+    assert.ok(timeRange);
+    assert.equal((timeRange.match(/aria-pressed=/g) || []).length, 5);
+    assert.match(timeRange, /aria-pressed="true"[^>]*>近 24 小时/);
     assert.match(html, /机器当前未在线，已有历史仍可查看/);
   });
 } finally {

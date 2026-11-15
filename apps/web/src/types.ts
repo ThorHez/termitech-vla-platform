@@ -41,6 +41,8 @@ export interface Node {
   } | null;
   status: string;
   last_seen?: string | null;
+  asset_count?: number;
+  profile_count?: number;
   roots?: string[];
   output_root?: string;
   cache_root?: string | null;
@@ -615,6 +617,7 @@ export interface Overview {
   runs_active: number;
   runs_failed: number;
   assets_total: number;
+  active_tasks?: { training: number; sync: number; total: number };
 }
 export interface Alert {
   id?: string;
@@ -695,6 +698,8 @@ export interface Logs {
 }
 export interface NodeDetail extends Node {
   assets?: Asset[];
+  asset_norms?: Asset[];
   profiles?: Profile[];
   runs?: RunSummary[];
+  active_training?: { count: number; profile_ids: string[] };
 }

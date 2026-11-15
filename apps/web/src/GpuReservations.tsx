@@ -103,7 +103,6 @@ export function GpuReservations({
   const [saved, setSaved] = useState<GpuReservation[]>();
   const pending = useRef(false);
   const writable = can('training.write') && Boolean(user);
-  const liveNode = nodes.data?.find((item) => item.id === node.id) || node;
   const rows = reservations.data || [];
   const mine = rows.filter((row) => row.user_id === user?.id).map((row) => row.gpu_uuid);
   const selectionLimit = reservationSelectionLimit(policy.data, mine.length, selected?.length || 0);
@@ -114,7 +113,7 @@ export function GpuReservations({
       );
     }
   }, [reservations.data, selected, user?.id]);
-  const inventory = liveNode.gpus || [];
+  const inventory = node.gpus || [];
   // Retain missing devices in the editor so their reservations can be released.
   const devices = [
     ...inventory.map((gpu, index) => ({
@@ -209,7 +208,7 @@ export function GpuReservations({
           {selectionLimit}
         </p>
       )}
-      {saved && <GpuReservationSaveReceipt node={liveNode} rows={saved} />}
+      {saved && <GpuReservationSaveReceipt node={node} rows={saved} />}
       <ErrorNotice
         error={error || reservations.error || policy.error}
         title={error ? '预留保存失败' : '预留信息读取失败'}
@@ -250,7 +249,7 @@ export function GpuReservations({
                 (!checked &&
                   (foreign ||
                     !device.present ||
-                    liveNode.status !== 'ONLINE' ||
+                    node.status !== 'ONLINE' ||
                     Boolean(
                       reservationSelectionLimit(
                         policy.data,

@@ -16,6 +16,12 @@ TaskType = Literal["ALL", "training", "data-sync"]
 TaskStatus = Literal["ALL", "ACTIVE", "SUCCEEDED", "FAILED", "CANCELLED"]
 ACTIVE_TRAINING = ("QUEUED", "STARTING", "RUNNING", "CANCELLING", "UNKNOWN")
 ACTIVE_SYNC = ("QUEUED", "PREPARING", "SCANNING", "TRANSFERRING", "VERIFYING", "CANCELLING")
+SYNC_SUMMARY_COLUMNS = (
+    AssetTransfer.id, AssetTransfer.name, AssetTransfer.owner_user_id,
+    AssetTransfer.source_node_id, AssetTransfer.target_node_id, AssetTransfer.state,
+    AssetTransfer.created_at, AssetTransfer.bytes_total, AssetTransfer.bytes_transferred,
+    AssetTransfer.speed_bytes_per_second, AssetTransfer.progress_pct,
+)
 
 
 def _search(fields, query):
@@ -27,14 +33,16 @@ def _search(fields, query):
     return content.ilike("%" + escaped + "%", escape="\\")
 
 
-def _task_queries(task_type="ALL", status="ALL", search=""):
+def _task_queries(task_type="ALL", status="ALL", search="", node_id=None):
     runs = select(Run.id.label("id"), literal("training").label("kind"),
                   Run.created_at.label("created_at")).where(Run.deleted_at.is_(None))
     copies = select(AssetTransfer.id.label("id"), literal("data-sync").label("kind"),
                     AssetTransfer.created_at.label("created_at")).where(AssetTransfer.deleted_at.is_(None))
-    if task_type == "training":
+    if node_id is not None:
+        runs = runs.where(Run.node_id == node_id)
+    if task_type == "training" or node_id is not None:
         copies = copies.where(false())
-    elif task_type == "data-sync":
+    if task_type == "data-sync":
         runs = runs.where(false())
     if status == "ACTIVE":
         runs = runs.where(Run.state.in_(ACTIVE_TRAINING))
@@ -60,10 +68,17 @@ def _task_queries(task_type="ALL", status="ALL", search=""):
     return runs, copies
 
 
-def task_page(session, *, page=1, page_size=20, task_type="ALL", status="ALL", query="", view="full"):
-    visible = union_all(*_task_queries()).subquery()
+def active_task_counts(session):
+    tasks = union_all(*_task_queries(status="ACTIVE")).subquery()
+    counts = dict(session.execute(select(tasks.c.kind, func.count()).group_by(tasks.c.kind)).all())
+    training, sync = counts.get("training", 0), counts.get("data-sync", 0)
+    return {"training": training, "sync": sync, "total": training + sync}
+
+
+def task_page(session, *, page=1, page_size=20, task_type="ALL", status="ALL", query="", view="full", node_id=None):
+    visible = union_all(*_task_queries(node_id=node_id)).subquery()
     total_all = session.scalar(select(func.count()).select_from(visible))
-    filtered = union_all(*_task_queries(task_type, status, query.strip())).subquery()
+    filtered = union_all(*_task_queries(task_type, status, query.strip(), node_id=node_id)).subquery()
     total = session.scalar(select(func.count()).select_from(filtered))
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = min(page, total_pages)
@@ -72,24 +87,28 @@ def task_page(session, *, page=1, page_size=20, task_type="ALL", status="ALL", q
         .offset((page - 1) * page_size).limit(page_size)))
     run_ids = [row.id for row in rows if row.kind == "training"]
     copy_ids = [row.id for row in rows if row.kind == "data-sync"]
+    copy_filters = (AssetTransfer.id.in_(copy_ids), AssetTransfer.deleted_at.is_(None))
     if view == "summary":
         runs = {row["id"]: row for row in run_summaries(session, run_ids=run_ids)} if run_ids else {}
+        copies = {row["id"]: dict(row) for row in session.execute(
+            select(*SYNC_SUMMARY_COLUMNS).where(*copy_filters)).mappings()} if copy_ids else {}
     else:
         runs = {row.id: run_dict(session, row) for row in session.scalars(select(Run).where(
             Run.id.in_(run_ids), Run.deleted_at.is_(None)))} if run_ids else {}
-    # The transfer serializer needs neither the file manifest nor SSH bindings.
-    copies = {row.id: row for row in session.scalars(select(AssetTransfer).options(
-        defer(AssetTransfer.manifest), defer(AssetTransfer.binding_snapshot)).where(
-            AssetTransfer.id.in_(copy_ids), AssetTransfer.deleted_at.is_(None)))} if copy_ids else {}
+        # The transfer serializer needs neither the file manifest nor SSH bindings.
+        copies = {row.id: asset_transfer_dict(row) for row in session.scalars(select(AssetTransfer).options(
+            defer(AssetTransfer.manifest), defer(AssetTransfer.binding_snapshot)).where(*copy_filters))} if copy_ids else {}
     items = []
     for row in rows:
         item = runs.get(row.id) if row.kind == "training" else copies.get(row.id)
         # A concurrent deletion can disappear between the ID and detail reads.
         if item is not None:
-            items.append({"key": f"{row.kind}:{row.id}", "kind": row.kind,
-                          "item": item if row.kind == "training" else asset_transfer_dict(item)})
-    return {"items": items, "total": total, "total_all": total_all, "page": page,
-            "page_size": page_size, "total_pages": total_pages}
+            items.append({"key": f"{row.kind}:{row.id}", "kind": row.kind, "item": item})
+    result = {"items": items, "total": total, "total_all": total_all, "page": page,
+              "page_size": page_size, "total_pages": total_pages}
+    if node_id is not None:
+        result["node_id"] = node_id
+    return result
 
 
 def register_routes(app, admin, db):
@@ -99,7 +118,8 @@ def register_routes(app, admin, db):
                          type: TaskType = Query(default="ALL"),
                          status: TaskStatus = Query(default="ALL"),
                          q: str | None = Query(default=None, max_length=200),
+                         node_id: str | None = Query(default=None, min_length=1, max_length=36),
                          view: RunListView = "full"):
         with db.read() as session:
             return task_page(session, page=page, page_size=page_size, task_type=type,
-                             status=status, query=q or "", view=view)
+                             status=status, query=q or "", view=view, node_id=node_id)

@@ -20,6 +20,18 @@ export interface NetworkProcessReport {
     rx_bytes_per_second: number;
     tx_bytes_per_second: number;
   }[];
+  today?: {
+    date: string;
+    partial: boolean;
+    processes: {
+      instance_id: string;
+      pid: number;
+      name: string;
+      rx_bytes: number;
+      tx_bytes: number;
+      active: boolean | null;
+    }[];
+  };
 }
 
 export interface ResourceHistoryPoint {
@@ -79,7 +91,7 @@ function validCounter(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-function decimalNetworkValue(value: number | null, unit: 'GB' | 'Mbps') {
+function decimalNetworkValue(value: number | null, unit: string) {
   if (value === null) return '—';
   if (value > 0 && value < 0.001) return `< 0.001 ${unit}`;
   return `${value.toLocaleString('zh-CN', { maximumFractionDigits: 3 })} ${unit}`;
@@ -101,6 +113,14 @@ export function formatNetworkRate(bytesPerSecond: number | null | undefined) {
 export function formatNetworkBytes(bytes: number | null | undefined) {
   const valid = validCounter(bytes);
   return decimalNetworkValue(valid === null ? null : valid / 1_000_000_000, 'GB');
+}
+
+export function formatTrafficBytes(bytes: number) {
+  const valid = validCounter(bytes);
+  if (valid === null) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB'];
+  const index = Math.min(units.length - 1, Math.floor(Math.log10(Math.max(1, valid)) / 3));
+  return decimalNetworkValue(valid / 1000 ** index, units[index]);
 }
 
 export function networkAxisMaximum(series: ChartValue[][]) {

@@ -129,7 +129,7 @@ def test_search_finds_machine_labels_hostnames_task_names_and_copy_paths(fixture
     for query in ("  source WORKBENCH  ", "source-linux-host", source["node_id"]):
         assert set(keys(get(platform, q=query))) == both
     for query in ("target thor", "target-jetson-host", "source-only-dataset", "destination-only", "exact-copy"):
-        assert keys(get(platform, q=query)) == ["data-sync:sync-0001"]
+        assert keys(get(platform, q=query, view="summary")) == ["data-sync:sync-0001"]
     for query in ("needle", "叠衣", "模型训练"):
         assert keys(get(platform, q=query)) == ["training:run-0000"]
     assert keys(get(platform, q="数据同步")) == ["data-sync:sync-0001"]
@@ -177,9 +177,35 @@ def test_out_of_range_pages_clamp_after_removing_the_last_page_record(fixture):
     assert empty["items"] == [] and empty["total"] == 0 and empty["page"] == empty["total_pages"] == 1
 
 
+def test_node_scope_matches_only_that_machines_visible_training_before_filtering(fixture):
+    platform, _, source, target, *_ = fixture
+    source_id, target_id = source["node_id"], target["node_id"]
+    save(fixture, training(fixture, 0, state="FAILED"), training(fixture, 1, state="RUNNING"),
+         training(fixture, 2, node_id=target_id, state="FAILED"),
+         training(fixture, 3, deleted_at=now()), sync(fixture, 4))
+    scoped = get(platform, node_id=source_id, page_size=1, view="summary")
+    assert scoped["node_id"] == source_id
+    assert scoped["total"] == scoped["total_all"] == scoped["total_pages"] == 2
+    assert keys(scoped) == ["training:run-0001"]
+    assert keys(get(platform, node_id=source_id, page_size=1, page=2)) == ["training:run-0000"]
+    failed = get(platform, node_id=source_id, type="training", status="FAILED", q="training task")
+    assert failed["total"] == 1 and failed["total_all"] == 2
+    assert keys(failed) == ["training:run-0000"]
+    assert keys(get(platform, node_id=target_id)) == ["training:run-0002"]
+    assert keys(get(platform, node_id=source_id, type="data-sync")) == []
+    empty = get(platform, node_id="missing-node")
+    assert empty["total"] == empty["total_all"] == 0
+
+
 def test_older_tasks_remain_accessible_beyond_each_legacy_list_limit(fixture):
     platform = fixture[0]
-    save(fixture, *(training(fixture, index) for index in range(501)), *(sync(fixture, index) for index in range(501)))
+    assert platform.client.get("/api/v1/overview", headers=ADMIN).json()["active_tasks"] == {
+        "training": 0, "sync": 0, "total": 0,
+    }
+    save(fixture, training(fixture, 0, state="UNKNOWN"), sync(fixture, 0, state="SCANNING"),
+         *(training(fixture, index) for index in range(1, 501)), *(sync(fixture, index) for index in range(1, 501)),
+         training(fixture, 501, state="RUNNING", deleted_at=now()),
+         sync(fixture, 501, state="TRANSFERRING", deleted_at=now()))
     page = get(platform, page_size=100, page=11)
     assert page["total"] == page["total_all"] == 1002 and page["total_pages"] == page["page"] == 11
     assert keys(page) == ["data-sync:sync-0000", "training:run-0000"]
@@ -187,14 +213,21 @@ def test_older_tasks_remain_accessible_beyond_each_legacy_list_limit(fixture):
     assert keys(get(platform, q="sync-0000")) == ["data-sync:sync-0000"]
     assert get(platform, type="training", page_size=100, page=6)["total"] == 501
     assert keys(get(platform, type="training", page_size=100, page=6)) == ["training:run-0000"]
+    node_scope = get(platform, node_id=fixture[2]["node_id"], page_size=100, page=6, view="summary")
+    assert node_scope["total"] == node_scope["total_all"] == 501
+    assert keys(node_scope) == ["training:run-0000"]
     assert keys(get(platform, type="data-sync", page_size=100, page=6)) == ["data-sync:sync-0000"]
+    assert platform.client.get("/api/v1/overview", headers=ADMIN).json()["active_tasks"] == {
+        "training": 1, "sync": 1, "total": 2,
+    }
 
 
 def test_items_keep_rich_progress_and_output_payloads_without_mutating_history(fixture):
     platform, _, source, _, source_asset, _ = fixture
     run = training(fixture, 0, inputs={"dataset": source_asset["id"]})
     copy = sync(fixture, 1, state="TRANSFERRING", bytes_total=1000, bytes_transferred=250,
-                progress_pct=25, files_total=10, files_transferred=-1, logs="copy progress\n")
+                speed_bytes_per_second=500, progress_pct=25, files_total=10, files_transferred=-1,
+                logs="copy progress\n" * 4000)
     save(fixture, run, copy)
     attempt_id = uid()
     with platform.app.state.db.write() as session:
@@ -215,6 +248,18 @@ def test_items_keep_rich_progress_and_output_payloads_without_mutating_history(f
     assert rich_run["outputs"][0]["kind"] == "MODEL" and rich_run["input_assets"][0]["id"] == source_asset["id"]
     assert rich_copy["bytes_transferred"] == 250 and rich_copy["files_transferred"] is None
     assert "binding_snapshot" not in rich_copy and "manifest" not in rich_copy
+    explicit_full = get(platform, view="full")
+    assert explicit_full == page
+    summary = get(platform, view="summary")
+    assert keys(summary) == keys(page)
+    assert summary["items"][0]["item"] == {
+        "id": copy.id, "name": copy.name, "owner_user_id": None,
+        "source_node_id": copy.source_node_id, "target_node_id": copy.target_node_id,
+        "state": "TRANSFERRING", "created_at": copy.created_at,
+        "bytes_total": 1000, "bytes_transferred": 250,
+        "speed_bytes_per_second": 500, "progress_pct": 25,
+    }
+    assert rich_copy["logs"] == copy.logs
     assert snapshots(platform) == before
 
 

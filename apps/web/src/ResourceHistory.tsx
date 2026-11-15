@@ -7,6 +7,7 @@ import {
   formatNetworkBytes,
   formatNetworkMbps,
   formatNetworkRate,
+  formatTrafficBytes,
   historicalGpus,
   historyWindows,
   nearestPointIndex,
@@ -471,6 +472,7 @@ type NetworkProcessTrafficProps = {
   lastSeen?: string | null;
   nodeStatus: string;
   receivedAt?: Date;
+  maxAgeMs?: number;
 };
 
 const processTrafficMessages = {
@@ -480,19 +482,51 @@ const processTrafficMessages = {
   stale: '暂无近期的进程流量数据。',
 };
 
+const processTrafficViews = [
+  { id: 'today', label: '今日累计' },
+  { id: 'realtime', label: '实时速率' },
+] as const;
+
 export function NetworkProcessTraffic({
   report,
   lastSeen,
   nodeStatus,
   receivedAt,
+  maxAgeMs = 30_000,
 }: NetworkProcessTrafficProps) {
+  const [selection, setSelection] = useState<(typeof processTrafficViews)[number]['id']>();
+  const today = report?.today;
+  const cumulative = (selection ?? (report && !today ? 'realtime' : 'today')) === 'today';
   const active = nodeStatus === 'ONLINE' || nodeStatus === 'RECOVERING';
   const status =
-    !active || (receivedAt && Date.now() - receivedAt.getTime() > 30_000)
+    !active || (receivedAt && Date.now() - receivedAt.getTime() > maxAgeMs)
       ? 'stale'
       : report?.status;
-  const rows = status === 'ready' ? (report?.processes ?? []) : [];
-  const emptyMessage = status ? processTrafficMessages[status] : '这台机器尚未上报进程流量。';
+  const rows = cumulative
+    ? (today?.processes ?? []).map((row) => ({
+        key: row.instance_id,
+        name: row.name,
+        pid: row.pid,
+        rx: formatTrafficBytes(row.rx_bytes),
+        tx: formatTrafficBytes(row.tx_bytes),
+        total: formatTrafficBytes(row.rx_bytes + row.tx_bytes),
+        exited: row.active === false,
+      }))
+    : (status === 'ready' ? (report?.processes ?? []) : []).map((row) => ({
+        key: row.pid,
+        name: row.name,
+        pid: row.pid,
+        rx: formatNetworkRate(row.rx_bytes_per_second),
+        tx: formatNetworkRate(row.tx_bytes_per_second),
+        total: null,
+        exited: false,
+      }));
+  const statusMessage = status ? processTrafficMessages[status] : '这台机器尚未上报进程流量。';
+  const emptyMessage = cumulative
+    ? today
+      ? '当天暂无可归属到进程的累计 TCP 流量。'
+      : '这台机器尚未上报今日累计流量。'
+    : statusMessage;
 
   return (
     <section
@@ -501,30 +535,54 @@ export function NetworkProcessTraffic({
     >
       <div className="resource-network-heading">
         <h3>进程网络流量（TCP）</h3>
-        {status === 'ready' && (
-          <span className="resource-process-timestamp">最近上报 {date(lastSeen ?? undefined)}</span>
-        )}
+        <div className="resource-history-windows" role="group" aria-label="进程流量视图">
+          {processTrafficViews.map(({ id, label }) => {
+            const selected = id === (cumulative ? 'today' : 'realtime');
+            return (
+              <button
+                type="button"
+                key={id}
+                aria-pressed={selected}
+                className={selected ? 'selected' : ''}
+                onClick={() => setSelection(id)}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
       </div>
+      {cumulative && today && <p className="resource-process-timestamp">北京时间 {today.date}</p>}
+      {!cumulative && status === 'ready' && (
+        <p className="resource-process-timestamp">最近上报 {date(lastSeen)}</p>
+      )}
       {rows.length ? (
         <div className="table-scroll">
-          <table aria-label="进程 TCP 收发速率排行榜">
+          <table aria-label={cumulative ? '进程 TCP 累计流量排行榜' : '进程 TCP 收发速率排行榜'}>
             <thead>
               <tr>
                 <th scope="col">进程</th>
                 <th scope="col">PID</th>
-                <th scope="col">入站</th>
-                <th scope="col">出站</th>
+                <th scope="col">{cumulative ? '累计入站' : '入站'}</th>
+                <th scope="col">{cumulative ? '累计出站' : '出站'}</th>
+                {cumulative && <th scope="col">合计</th>}
               </tr>
             </thead>
             <tbody>
               {rows.map((row) => (
-                <tr key={row.pid}>
+                <tr key={row.key}>
                   <td>
                     <strong>{row.name}</strong>
+                    {row.exited && <span className="resource-process-exited">已退出</span>}
                   </td>
                   <td className="mono">{row.pid}</td>
-                  <td>{formatNetworkRate(row.rx_bytes_per_second)}</td>
-                  <td>{formatNetworkRate(row.tx_bytes_per_second)}</td>
+                  <td>{row.rx}</td>
+                  <td>{row.tx}</td>
+                  {cumulative && (
+                    <td>
+                      <strong>{row.total}</strong>
+                    </td>
+                  )}
                 </tr>
               ))}
             </tbody>
@@ -534,8 +592,13 @@ export function NetworkProcessTraffic({
         <div className="resource-chart-unavailable">{emptyMessage}</div>
       )}
       <p className="resource-network-note">
-        按全机收发合计排序，仅估算两次采样均能归属的 TCP 连接。UDP 和短连接可通过网卡总量观察。
-        {status === 'ready' && report?.partial && '部分连接的归属无法确认。'}
+        {cumulative ? '按当天累计收发量排序。已退出的进程仍保留当天记录。' : '按当前收发速率排序。'}
+        统计整机可归属的 TCP 连接。UDP 和短连接可通过网卡总量观察。
+        {cumulative &&
+          today &&
+          (today.partial || status === 'stale') &&
+          '累计仅包含已观测流量，采集覆盖可能不完整。'}
+        {!cumulative && status === 'ready' && report?.partial && '部分连接的归属无法确认。'}
       </p>
     </section>
   );
@@ -675,12 +738,14 @@ export function ResourceHistory({
   processReport,
   lastSeen,
   processReportReceivedAt,
+  processReportMaxAgeMs,
 }: {
   nodeId: string;
   status: string;
   processReport?: NetworkProcessReport;
   lastSeen?: string | null;
   processReportReceivedAt?: Date;
+  processReportMaxAgeMs?: number;
 }) {
   const [window, setWindow] = useState<HistoryWindow>('24h');
   const [gpuSelection, setGpuSelection] = useState<{
@@ -725,6 +790,7 @@ export function ResourceHistory({
           lastSeen,
           nodeStatus: status,
           receivedAt: processReportReceivedAt,
+          maxAgeMs: processReportMaxAgeMs,
         }}
       />
     </Panel>

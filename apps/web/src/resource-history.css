@@ -209,14 +209,20 @@
   line-height: 1.6;
 }
 .resource-process-timestamp {
+  margin: 0 0 10px;
+  color: var(--text-secondary, #687888);
+  font-size: 11px;
+}
+.resource-process-exited {
+  margin-left: 8px;
   color: var(--text-secondary, #687888);
   font-size: 11px;
 }
 .resource-network-processes table {
   min-width: 320px;
 }
-.resource-network-processes th:nth-last-child(-n + 2),
-.resource-network-processes td:nth-last-child(-n + 2) {
+.resource-network-processes th:nth-child(n + 3),
+.resource-network-processes td:nth-child(n + 3) {
   text-align: right;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;

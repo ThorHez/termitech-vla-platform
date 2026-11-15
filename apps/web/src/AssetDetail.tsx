@@ -2,7 +2,7 @@ import { ArrowRightLeft, Link2, Pencil, Save, Server, Trash2 } from 'lucide-reac
 import { date } from './api';
 import { useAuth } from './auth';
 import { canArchiveAsset } from './assetArchive';
-import { Badge, Modal } from './components';
+import { Badge, ErrorNotice, Modal } from './components';
 import { assetKinds } from './data';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
 import { canBindDatasetNorm, canEditDatasetAsset } from './datasetAssetPermissions';
@@ -16,6 +16,8 @@ import './asset-detail.css';
 
 export function AssetDetail({
   asset,
+  detailError,
+  retryDetail,
   node,
   assets,
   close,
@@ -30,6 +32,8 @@ export function AssetDetail({
   selectDataset,
 }: {
   asset: Asset;
+  detailError?: Error;
+  retryDetail?: () => void;
   node?: Node;
   assets: Asset[];
   close: () => void;
@@ -87,6 +91,7 @@ export function AssetDetail({
         </>
       }
     >
+      <ErrorNotice error={detailError} retry={retryDetail} />
       <div className="asset-detail-heading">
         <h3>{asset.name}</h3>
         <Badge state={state} label={dataset && state === 'REGISTERED' ? '已登记' : undefined} />
