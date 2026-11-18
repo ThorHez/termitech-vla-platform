@@ -46,7 +46,7 @@ import {
   ViewLink,
 } from './components';
 import { activeStates, assetKinds, gpuAverage, gpuIdle, requiredInputs, useData } from './data';
-import type { Asset, Gpu, Node, NodeDetail, RunSummary } from './types';
+import type { Asset, Gpu, Node, NodeDetail, RunSummary, Template } from './types';
 import { NodeOnboarding, RuntimeCheckView, runtimeCheckFor } from './NodeOnboarding';
 import { NodeManagement } from './NodeManagement';
 import { NodeRename } from './NodeRename';
@@ -2287,6 +2287,104 @@ export function TemplatesPage({
 }) {
   const { can } = useAuth();
   const { templates, enabled } = useData();
+  const rsiTemplates =
+    templates.data?.filter(({ algorithm }) => ['RECAP', 'RLT'].includes(algorithm.toUpperCase())) ||
+    [];
+  const standaloneTemplates =
+    templates.data?.filter(
+      ({ algorithm }) => !['RECAP', 'RLT'].includes(algorithm.toUpperCase()),
+    ) || [];
+  const renderTemplate = (template: Template, nested = false) => {
+    const info = algorithmInfo[template.algorithm.toUpperCase()] || algorithmInfo.SFT;
+    const Icon = info.icon;
+    const Heading = nested ? 'h3' : 'h2';
+    const hasAcp = template.stages?.some(({ id }) => id === 'offline_rl');
+    const hasStandardRecap = hasAcp && template.stages?.some(({ id }) => id === 'value');
+    const hasKai0Recap = hasAcp && template.stages?.some(({ id }) => id === 'stage_progress');
+    const hasStageAnnotation = template.stages?.some(({ id }) => id === 'stage_annotation');
+    return (
+      <article
+        className={`template-card ${template.status !== 'AVAILABLE' ? 'planned' : ''}`}
+        key={template.id}
+      >
+        <div className="template-card-top">
+          <div className={`template-icon ${info.color}`}>
+            <Icon size={25} strokeWidth={1.7} />
+          </div>
+          <Badge
+            state={template.status}
+            label={template.status === 'PLANNED' ? '待接入' : undefined}
+          />
+        </div>
+        <span className="template-eyebrow">{info.text}</span>
+        <Heading>{template.name}</Heading>
+        <p>{template.id === 'recap' ? '用优势标注数据训练 ACP 策略。' : template.description}</p>
+        {template.id === 'recap'
+          ? (hasStandardRecap || hasKai0Recap) && (
+              <div className="template-stage-list" aria-label="ReCap 训练模式">
+                {hasStandardRecap && <span>ReCap 模式 · Value 训练 → 优势值标注 → ACP 训练</span>}
+                {hasKai0Recap && (
+                  <span>
+                    Stage Advantage ·{' '}
+                    {hasStageAnnotation ? '阶段进度训练 → 优势标注' : '阶段进度与优势标注'} → ACP
+                    训练
+                  </span>
+                )}
+              </div>
+            )
+          : !!template.stages?.length && (
+              <div className="template-stage-list">
+                {template.stages.map((stage, index) => (
+                  <span key={stage.id}>
+                    {index + 1}. {stage.name}
+                  </span>
+                ))}
+              </div>
+            )}
+        <div className="template-inputs">
+          {requiredInputs(template).map((input) => (
+            <span key={input}>
+              <Check size={13} />
+              {input === 'dataset'
+                ? '本机数据'
+                : input === 'model'
+                  ? '基础模型'
+                  : input === 'norm'
+                    ? '归一化参数'
+                    : input}
+            </span>
+          ))}
+        </div>
+        <footer>
+          <span className="tag mono">{template.id}</span>
+          {can('training.write') &&
+            template.id === 'openpi-sft' &&
+            template.status === 'AVAILABLE' &&
+            resumeTraining && (
+              <button type="button" className="button outline small" onClick={resumeTraining}>
+                从检查点续训
+              </button>
+            )}
+          {can('training.write') && (
+            <button
+              className={`button small ${template.status === 'AVAILABLE' ? 'outline' : 'ghost'}`}
+              disabled={template.status !== 'AVAILABLE'}
+              onClick={() => createRun(undefined, template.id)}
+            >
+              {template.status === 'AVAILABLE' ? (
+                <>
+                  使用模板
+                  <ArrowRight size={14} />
+                </>
+              ) : (
+                '待接入'
+              )}
+            </button>
+          )}
+        </footer>
+      </article>
+    );
+  };
   return (
     <>
       <PageHeading
@@ -2302,108 +2400,28 @@ export function TemplatesPage({
       {templates.loading && enabled && !templates.data ? (
         <Loading />
       ) : templates.data?.length ? (
-        <div className="template-grid">
-          {templates.data.map((template) => {
-            const info = algorithmInfo[template.algorithm.toUpperCase()] || algorithmInfo.SFT;
-            const Icon = info.icon;
-            const hasAcp = template.stages?.some(({ id }) => id === 'offline_rl');
-            const hasStandardRecap = hasAcp && template.stages?.some(({ id }) => id === 'value');
-            const hasKai0Recap =
-              hasAcp && template.stages?.some(({ id }) => id === 'stage_progress');
-            const hasStageAnnotation = template.stages?.some(({ id }) => id === 'stage_annotation');
-            return (
-              <article
-                className={`template-card ${template.status !== 'AVAILABLE' ? 'planned' : ''}`}
-                key={template.id}
-              >
-                <div className="template-card-top">
-                  <div className={`template-icon ${info.color}`}>
-                    <Icon size={25} strokeWidth={1.7} />
-                  </div>
-                  <Badge
-                    state={template.status}
-                    label={template.status === 'PLANNED' ? '待接入' : undefined}
-                  />
+        <div className="template-catalog">
+          {!!standaloneTemplates.length && (
+            <div className="template-grid">
+              {standaloneTemplates.map((template) => renderTemplate(template))}
+            </div>
+          )}
+          {!!rsiTemplates.length && (
+            <section className="template-family" aria-labelledby="rsi-template-heading">
+              <header className="template-family-header">
+                <div className="template-family-icon">
+                  <Workflow size={22} strokeWidth={1.7} />
                 </div>
-                <span className="template-eyebrow">{info.text}</span>
-                <h2>{template.name}</h2>
-                <p>
-                  {template.id === 'recap'
-                    ? '用优势标注数据训练 ACP 策略。'
-                    : template.description}
-                </p>
-                {template.id === 'recap'
-                  ? (hasStandardRecap || hasKai0Recap) && (
-                      <div className="template-stage-list" aria-label="ReCap 训练模式">
-                        {hasStandardRecap && (
-                          <span>ReCap 模式 · Value 训练 → 优势值标注 → ACP 训练</span>
-                        )}
-                        {hasKai0Recap && (
-                          <span>
-                            Stage Advantage ·{' '}
-                            {hasStageAnnotation ? '阶段进度训练 → 优势标注' : '阶段进度与优势标注'}{' '}
-                            → ACP 训练
-                          </span>
-                        )}
-                      </div>
-                    )
-                  : !!template.stages?.length && (
-                      <div className="template-stage-list">
-                        {template.stages.map((stage, index) => (
-                          <span key={stage.id}>
-                            {index + 1}. {stage.name}
-                          </span>
-                        ))}
-                      </div>
-                    )}
-                <div className="template-inputs">
-                  {requiredInputs(template).map((input) => (
-                    <span key={input}>
-                      <Check size={13} />
-                      {input === 'dataset'
-                        ? '本机数据'
-                        : input === 'model'
-                          ? '基础模型'
-                          : input === 'norm'
-                            ? '归一化参数'
-                            : input}
-                    </span>
-                  ))}
+                <div>
+                  <h2 id="rsi-template-heading">RSI</h2>
+                  <p>选择 ReCap 策略提升或 RLT 离线训练。</p>
                 </div>
-                <footer>
-                  <span className="tag mono">{template.id}</span>
-                  {can('training.write') &&
-                    template.id === 'openpi-sft' &&
-                    template.status === 'AVAILABLE' &&
-                    resumeTraining && (
-                      <button
-                        type="button"
-                        className="button outline small"
-                        onClick={resumeTraining}
-                      >
-                        从检查点续训
-                      </button>
-                    )}
-                  {can('training.write') && (
-                    <button
-                      className={`button small ${template.status === 'AVAILABLE' ? 'outline' : 'ghost'}`}
-                      disabled={template.status !== 'AVAILABLE'}
-                      onClick={() => createRun(undefined, template.id)}
-                    >
-                      {template.status === 'AVAILABLE' ? (
-                        <>
-                          使用模板
-                          <ArrowRight size={14} />
-                        </>
-                      ) : (
-                        '待接入'
-                      )}
-                    </button>
-                  )}
-                </footer>
-              </article>
-            );
-          })}
+              </header>
+              <div className="template-family-grid">
+                {rsiTemplates.map((template) => renderTemplate(template, true))}
+              </div>
+            </section>
+          )}
         </div>
       ) : (
         <div className="panel">

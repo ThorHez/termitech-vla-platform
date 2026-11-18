@@ -1581,6 +1581,49 @@ tbody tr:hover {
   color: var(--text-muted, #93a3af);
   font-size: 10px;
 }
+.template-catalog {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.template-family {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 22px;
+  background: var(--bg-subtle, #f3f8f7);
+}
+.template-family-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+.template-family-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 42px;
+  height: 42px;
+  border-radius: 11px;
+  background: var(--bg-surface, #fff);
+  color: var(--primary, #0e9c8d);
+}
+.template-family-header h2 {
+  margin: 0;
+  color: var(--text-primary, #3c5868);
+  font-size: 18px;
+}
+.template-family-header p {
+  margin: 6px 0 0;
+  color: var(--text-muted, #97a6b0);
+  font-size: 11px;
+  line-height: 1.8;
+}
+.template-family-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 22px;
+}
 .template-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1618,7 +1661,8 @@ tbody tr:hover {
   color: var(--text-muted, #9cabb5);
   margin-bottom: 9px;
 }
-.template-card h2 {
+.template-card h2,
+.template-card h3 {
   font-size: 16px;
   color: var(--text-primary, #3c5868);
 }
@@ -4403,6 +4447,10 @@ tbody tr:hover {
     max-width: 160px;
     text-align: right;
   }
+  .template-family {
+    padding: 16px;
+  }
+  .template-family-grid,
   .template-grid,
   .machine-grid {
     grid-template-columns: 1fr;
