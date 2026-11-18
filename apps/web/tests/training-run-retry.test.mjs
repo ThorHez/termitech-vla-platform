@@ -47,6 +47,20 @@ try {
     assert.deepEqual(source, before);
   });
 
+  await test('retry preserves the frozen Kai0 state token layout and normalization independently', () => {
+    const source = fixture();
+    source.auto_config.state_token_layout = 'kai0_pad32';
+    source.normalization_method = 'quantile';
+    for (const binding of source.dataset_bindings)
+      binding.processor.parameters.composition.model_transform = 'kai0_pad32';
+    const { request } = helper.retryTrainingSnapshot(source);
+    assert.equal(request.auto_config.state_token_layout, 'kai0_pad32');
+    assert.equal(request.normalization_method, 'quantile');
+    assert.deepEqual(request.dataset_bindings, source.dataset_bindings);
+    source.dataset_bindings[0].processor.name = 'OtherDataConfig';
+    assert.throws(() => helper.retryTrainingSnapshot(source), /状态 token 布局/);
+  });
+
   await test('repeated retraining keeps the base title and cleans only trailing retry markers', () => {
     for (const [name, expected] of [
       ['叠衣服双臂训练 训练（重新训练）（重新训练）（重新训练）', '叠衣服双臂训练 训练'],
@@ -172,6 +186,49 @@ try {
     assert.equal(helper.resumeTrainingRequest(source, firstCheckpoint, 2, '继续').parameters.steps, 2);
   });
 
+  await test('resume choices join compact run attempts to checkpoint assets without full run details', () => {
+    const run = {
+      id: 'run',
+      state: 'SUCCEEDED',
+      owner_user_id: 'operator',
+      node_id: 'node-a',
+      template_id: 'openpi-sft',
+      resume_candidate: true,
+      attempts: [
+        { id: 'ready', state: 'FAILED' },
+        { id: 'active', state: 'RUNNING' },
+        { id: 'changed', state: 'SUCCEEDED', code_changed_during_run: true },
+      ],
+    };
+    const checkpoint = {
+      id: 'checkpoint',
+      kind: 'MODEL',
+      state: 'READY',
+      node_id: 'node-a',
+      origin_attempt_id: 'ready',
+      metadata: { format: 'openpi-orbax', step: 50 },
+    };
+    const catalog = [
+      checkpoint,
+      { ...checkpoint, id: 'active-checkpoint', origin_attempt_id: 'active' },
+      { ...checkpoint, id: 'changed-checkpoint', origin_attempt_id: 'changed' },
+      { ...checkpoint, id: 'removed-checkpoint', state: 'UNAVAILABLE' },
+      { ...checkpoint, id: 'other-machine', node_id: 'node-b' },
+    ];
+    assert.deepEqual(helper.resumeCheckpointChoices([run], catalog, 'operator', false), [
+      { run, checkpoint, step: 50 },
+    ]);
+    assert.deepEqual(helper.resumeCheckpointChoices([run], catalog, 'other-user', false), []);
+    assert.deepEqual(
+      helper.resumeCheckpointChoices([{ ...run, resume_candidate: false }], catalog, 'operator', false),
+      [],
+    );
+    const legacy = { ...run, resume_candidate: undefined, outputs: [checkpoint] };
+    assert.deepEqual(helper.resumeCheckpointChoices([legacy], [], 'operator', false), [
+      { run: legacy, checkpoint, step: 50 },
+    ]);
+  });
+
   await test('draft comparison detects changed training settings but ignores wizard UI position and field tracking', () => {
     const first = helper.retryTrainingSnapshot(fixture()), second = structuredClone(first);
     second.step = 1; second.editedParameters = ['resource_recommendation.auto.num_workers'];
@@ -188,7 +245,8 @@ try {
     assert.match(app, /sourceRun=\{wizard\.sourceRun\}/);
     assert.match(wizard, /await draft\.replace\(snapshot\)/);
     assert.match(wizard, /consumedSourceRun\.current === source\.id/);
-    assert.match(wizard, /sameTrainingConfiguration\(previous, snapshot\)/);
+    assert.match(wizard, /recapDraftForPhase\(current, next\.recapPhase,/);
+    assert.match(wizard, /sameTrainingConfiguration\(previous, next\)/);
     assert.match(wizard, /载入并替换草稿/);
     assert.match(wizard, /confirmedConfigSha256: requiresConfigConfirmation \? confirmedConfigSha256 : undefined/);
     assert.match(wizard, /const requiresConfigConfirmation = hasLocalTraining \|\| isNorm/);

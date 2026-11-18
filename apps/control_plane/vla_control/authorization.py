@@ -49,15 +49,16 @@ _allow("platform.read", "GET",
        "/run-previews/{preview_id}", "/runs", "/runs/{run_id}",
        "/runs/{run_id}/events", "/runs/{run_id}/logs", "/runs/{run_id}/metrics", "/alerts")
 _allow("assets.register", "POST", "/assets", "/runs/{run_id}/recap-annotations")
+_allow("assets.register", "PATCH", "/assets/{asset_id}/model-format")
 _allow("assets.archive", "POST", "/assets/{asset_id}/archive")
 _allow("assets.purge", "GET", "/assets/deletions")
-_allow("assets.purge", "POST", "/assets/{asset_id}/purge-inspections", "/assets/{asset_id}/purge")
+_allow("assets.purge", "POST", "/assets/{asset_id}/purge-inspections", "/assets/{asset_id}/purge",
+       "/asset-deletions/{asset_id}/restore")
 _allow("assets.query", "POST", "/nodes/{node_id}/path-suggestions")
 _allow("datasets.write", "PATCH", "/assets/{asset_id}/dataset-profile")
 _allow("datasets.validate", "POST", "/assets/{asset_id}/validations")
 _allow("assets.write", "POST", "/assets/{asset_id}/validation/cancel")
-_allow("platform.read", "GET", "/assets/{asset_id}/validation")
-_allow("platform.read", "GET", "/assets/{asset_id}/statistics")
+_allow("platform.read", "GET", "/assets/{asset_id}", "/assets/{asset_id}/validation", "/assets/{asset_id}/statistics")
 _allow("dataset-templates.write", "GET", "/dataset-format-templates", "/dataset-format-templates/{template_id}")
 _allow("dataset-templates.write", "POST", "/dataset-format-templates")
 _allow("dataset-templates.write", "PUT", "/dataset-format-templates/{template_id}",

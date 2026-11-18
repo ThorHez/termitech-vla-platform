@@ -13,7 +13,7 @@ try {
   const helpers = await server.ssrLoadModule('/src/composedProcessing.ts');
   const { composedProcessingErrors: errors, normalizeComposedProcessing: normalize, compositionSchemaKey } = helpers;
   const { readDatasetProfile, datasetProfileErrors, applyComposedProcessing, DatasetProfileForm } = await server.ssrLoadModule('/src/DatasetProfileForm.tsx');
-  const { compositionBindingState, composedChoice, compositionToken, stageCompositionDraft } = await server.ssrLoadModule('/src/ComposedDatasetProcessing.tsx');
+  const { compositionBindingState, composedChoice, compositionToken, stageCompositionDraft, stageProgressBindingKey, updateStageProgressBinding, removeStageProgressBinding } = await server.ssrLoadModule('/src/ComposedDatasetProcessing.tsx');
   const { processorParameterErrors, filterDataProcessors } = await server.ssrLoadModule('/src/DataProcessorPicker.tsx');
   const { DatasetProcessing } = await server.ssrLoadModule('/src/DatasetProcessing.tsx');
   const { assetManagedOverridePaths, isAssetManagedField } = await server.ssrLoadModule('/src/recipeFieldPolicy.ts');
@@ -156,9 +156,11 @@ try {
     for (const key of ['/etc/passwd', '~/data', 'C:\\data', 'a//b', 'a/../b', '.', 'robot[0]', 'f()', 'a;rm', 'a$HOME', 'a\nkey']) assert.equal(compositionSchemaKey(key), false, key);
   });
   await test('trimmed action and prompt keys cannot occupy an auxiliary input', () => {
-    for (const key of ['action_key', 'prompt_key']) {
+    for (const [key, label] of [['action_key', '动作真实字段'], ['prompt_key', '任务文本真实字段']]) {
       const conflict = { ...spec, [key]: ' value_target ', aux_keys: ['value_target'] };
-      assert.ok(errors(conflict).some((error) => error.includes('辅助字段')));
+      assert.ok(errors(conflict).includes(
+        `「辅助监督字段」与「${label}」使用了同一列「value_target」。`,
+      ));
     }
   });
   await test('canonical text uses ECMAScript trim including BOM without swallowing edge controls', () => {
@@ -370,10 +372,26 @@ try {
     const supervised = { ...spec, aux_keys: ['value_target', 'is_positive'] };
     assert.deepEqual(stateFor({ stage: 'value', binding: configuredBinding(supervised) }).errors, []);
   });
-  await test('Kai0 requires physical stage progress while the derived ACP input uses is_positive', () => {
+  await test('supervision conflicts identify the source column and conflicting form field', () => {
+    const input = { ...spec, prompt_key: 'instruction.text', aux_keys: ['stage_progress_gt'] };
+    for (const [key, label] of [
+      [input.state_fields[0].key, '状态真实字段 1'],
+      [input.cameras[0].key, '组合视觉字段 1'],
+      [input.action_key, '动作真实字段'],
+      [input.prompt_key, '任务文本真实字段'],
+    ]) {
+      assert.ok(errors({ ...input, stage_progress_key: key }).includes(
+        `「阶段进度列」与「${label}」使用了同一列「${key}」。`,
+      ));
+    }
+    assert.ok(errors({ ...spec, action_key: 'value_target', aux_keys: ['value_target'] }).includes(
+      '「辅助监督字段」与「动作真实字段」使用了同一列「value_target」。',
+    ));
+  });
+  await test('Stage Advantage requires a progress source while ACP uses is_positive', async () => {
     const input = { ...spec, aux_keys: ['stage_progress_gt'] };
     const derived = { ...input, aux_keys: [...input.aux_keys, 'is_positive'] };
-    assert.ok(stateFor({ stage: 'stage_progress' }).errors.some((error) => error.includes('stage_progress_gt')));
+    assert.ok(stateFor({ stage: 'stage_progress' }).errors.some((error) => error.includes('阶段进度列')));
     assert.equal(stateFor({ stage: 'stage_progress', binding: configuredBinding(input) }).valid, true);
     assert.equal(stateFor({ stage: 'stage_progress', binding: configuredBinding({ ...input, model_transform: 'flat_state' }) }).valid, false);
     assert.equal(stateFor({ stage: 'offline_rl', binding: configuredBinding(input) }).valid, false);
@@ -382,6 +400,34 @@ try {
     assert.deepEqual(stageCompositionDraft(profile, 'stage_progress').aux_keys, ['stage_progress_gt']);
     assert.deepEqual(stageCompositionDraft(profile, 'offline_rl').aux_keys, ['is_positive']);
     assert.deepEqual(stageCompositionDraft({ ...profile, feature_keys: [] }, 'stage_progress').aux_keys, []);
+    const legacy = configuredBinding(input);
+    assert.equal(stageProgressBindingKey(legacy), 'stage_progress_gt');
+    const explicitCanonical = updateStageProgressBinding(legacy, asset(), 'stage_progress_gt');
+    assert.deepEqual(explicitCanonical.processor, legacy.processor);
+    const chosen = updateStageProgressBinding(legacy, asset(), ' progress.manual ');
+    assert.equal(stageProgressBindingKey(chosen), 'progress.manual');
+    assert.equal(stateFor({ stage: 'stage_progress', binding: chosen }).valid, true);
+    const cleared = updateStageProgressBinding(chosen, asset(), '');
+    assert.equal(stageProgressBindingKey(cleared), '');
+    assert.equal(cleared.processor.parameters.composition.stage_progress_key, '');
+    assert.equal(stateFor({ stage: 'stage_progress', binding: cleared }).valid, false);
+    assert.deepEqual(removeStageProgressBinding(chosen).processor, composedChoice({ ...input, aux_keys: [] }));
+    for (const key of ['progress/manual', 'task_index', 'absolute_value', input.action_key]) {
+      assert.equal(stateFor({ stage: 'stage_progress', binding: updateStageProgressBinding(legacy, asset(), key) }).valid, false);
+    }
+    const { encodeTrainingDraft, decodeTrainingDraft } = await server.ssrLoadModule('/src/trainingDraft.ts');
+    const { prepareTrainingTemplate } = await server.ssrLoadModule('/src/trainingTemplate.ts');
+    const { retryTrainingSnapshot } = await server.ssrLoadModule('/src/runRetry.ts');
+    const request = { name: 'Stage score', node_id: 'node', profile_id: 'profile', template_id: 'recap',
+      training_stage: 'stage_progress', inputs: { model: 'model' }, dataset_bindings: [chosen], parameters: {}, gpu_count: 1 };
+    const snapshot = { request, step: 0, advancedRecipe: false, editedParameters: [], editedStageParameters: [], entrypointEdited: false };
+    for (const restored of [
+      decodeTrainingDraft(encodeTrainingDraft(snapshot)),
+      decodeTrainingDraft(prepareTrainingTemplate(snapshot)),
+      retryTrainingSnapshot({ ...request, state: 'SUCCEEDED' }),
+    ]) {
+      assert.equal(stageProgressBindingKey(restored.request.dataset_bindings[0]), 'progress.manual');
+    }
   });
   await test('canonical comparison preserves row order but tolerates JSON property order', () => {
     const reordered = Object.fromEntries(Object.entries(spec).reverse());

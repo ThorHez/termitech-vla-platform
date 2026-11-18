@@ -55,7 +55,7 @@ try {
       { code_expectation: { automatic_preflight: { plan: { training_stage: 'stage_progress' } } } },
     ]) {
       assert.deepEqual(deployableOutputs({ ...run, ...stage }), []);
-      assert.match(sourceDeploymentBlocker({ ...run, ...stage }), /Kai0 阶段进度估计器/);
+      assert.match(sourceDeploymentBlocker({ ...run, ...stage }), /Stage Advantage 估计器/);
     }
     assert.deepEqual(deployableOutputs({ ...run, training_stage: 'offline_rl' }), [output]);
   });

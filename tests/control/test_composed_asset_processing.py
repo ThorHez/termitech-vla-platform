@@ -89,7 +89,8 @@ def pending(platform, *, source_only=False, customized=False, augmentation=None,
         "normalization": selected["normalization"],
         "image_keys": ["base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"], "depth_keys": [],
         "action_metadata_sha256": data["metadata_sha256"], "action_sequence_keys": [],
-        "action_loss_mask": [1.] * raw_action + [0.] * (32 - raw_action),
+        "action_loss_mask": ([1.] * 32 if state_token_layout == "kai0_pad32"
+                             else [1.] * raw_action + [0.] * (32 - raw_action)),
         "source": {"path": "src/openpi/training/composed_processing.py", "sha256": "c" * 64}}
     data["actions_shape"] = [16, raw_action]
     evidence["plan_digest"] = canonical_digest(evidence["plan"])
@@ -120,13 +121,24 @@ def test_composition_is_frozen_with_asset_even_after_edits_and_reaches_start(pla
     assert start["payload"]["dataset_bindings"][0]["processor"] == processor
 
 
-def test_kai0_token_layout_is_frozen_and_reaches_start(platform):
+@pytest.mark.parametrize("legacy_mask", [False, True])
+def test_kai0_token_layout_is_frozen_and_reaches_start(platform, legacy_mask):
     node, identifier, command, code, profile = pending(
         platform, automatic=True, state_dim=14, state_token_layout="kai0_pad32")
     payload = command["payload"]
     composition = payload["dataset_bindings"][0]["processor"]["parameters"]["composition"]
     assert profile["processing"]["model_transform"] == "standard"
     assert payload["auto_config"]["state_token_layout"] == composition["model_transform"] == "kai0_pad32"
+    if legacy_mask:
+        evidence = code["automatic_preflight"]
+        composed = evidence["plan"]["datasets"][0]["composition"]
+        width = composed["raw_action_dim"]
+        composed["action_loss_mask"] = [1.] * width + [0.] * (32 - width)
+        evidence["plan_digest"] = canonical_digest(evidence["plan"])
+        checked = acknowledge(platform, node, identifier, command, code)
+        assert checked["status"] == "FAILED", checked
+        assert checked["error"]["code"] == "AGENT_COMPOSITION_UNSUPPORTED"
+        return
     assert acknowledge(platform, node, identifier, command, code)["status"] == "READY"
     run = submit(platform, identifier)
     assert run.status_code == 201, run.text

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { appendTrainingMetricPage } from './trainingMetricFeed';
 import type { TrainingMetricFeed, TrainingMetricPage } from './trainingMetricFeed';
 import type { RunEvent } from './types';
@@ -165,7 +165,22 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 export const post = <T>(path: string, body: unknown = {}, headers?: Record<string, string>) =>
   api<T>(path, { method: 'POST', body: JSON.stringify(body), headers });
 
+function pageVisible() {
+  return typeof document === 'undefined' || document.visibilityState !== 'hidden';
+}
+
+function subscribePageVisibility(listener: () => void) {
+  document.addEventListener('visibilitychange', listener);
+  return () => document.removeEventListener('visibilitychange', listener);
+}
+
+export function usePageVisible() {
+  return useSyncExternalStore(subscribePageVisibility, pageVisible, () => true);
+}
+
 export function useApi<T>(path: string | null, interval = 8000) {
+  const visible = usePageVisible();
+  const canRead = interval <= 0 || visible;
   const [data, setData] = useState<T>();
   const [error, setError] = useState<Error>();
   const [loading, setLoading] = useState(true);
@@ -174,7 +189,7 @@ export function useApi<T>(path: string | null, interval = 8000) {
   const lastPath = useRef(path);
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
   useEffect(() => {
-    if (!path) {
+    if (!path || !canRead) {
       setLoading(false);
       return;
     }
@@ -187,6 +202,7 @@ export function useApi<T>(path: string | null, interval = 8000) {
     }
     setLoading(true);
     const fetchData = async () => {
+      if (cancelled || (interval > 0 && !pageVisible())) return;
       try {
         const result = await api<T>(path, {
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]),
@@ -211,7 +227,7 @@ export function useApi<T>(path: string | null, interval = 8000) {
       controller.abort();
       clearTimeout(timer);
     };
-  }, [path, interval, revision]);
+  }, [path, interval, revision, canRead]);
   return { data, error, loading, updatedAt, refresh };
 }
 
@@ -222,9 +238,10 @@ export function navigate(path: string) {
 // Retain a bounded local tail while advancing the server cursor. Re-fetching the
 // first page would freeze live logs as soon as an execution emits 1,000 events.
 export function useRunFeed<T extends { seq: number }>(
-  path: string,
+  path: string | null,
   kind: 'events' | 'logs',
   live = true,
+  enabled = true,
 ) {
   const [data, setData] = useState<T[]>([]);
   const [error, setError] = useState<Error>();
@@ -232,33 +249,39 @@ export function useRunFeed<T extends { seq: number }>(
   const [complete, setComplete] = useState(false);
   const [revision, setRevision] = useState(0);
   const liveRef = useRef(live);
+  const enabledRef = useRef(enabled);
   const previousLive = useRef(live);
   const wake = useRef<(() => void) | undefined>(undefined);
+  const syncPolling = useRef<(() => void) | undefined>(undefined);
   liveRef.current = live;
+  enabledRef.current = enabled;
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
   useEffect(() => {
+    if (!path) return;
+    previousLive.current = liveRef.current;
     let active = true;
     let cursor = 0;
     let rows: T[] = [];
-    let inFlight = false;
+    let request: AbortController | undefined;
+    let pending = true;
     let requested = false;
     let timer: ReturnType<typeof setTimeout>;
-    const controller = new AbortController();
     setData([]);
     setLoading(true);
     setComplete(false);
     const poll = async () => {
-      if (!active || inFlight) return;
-      inFlight = true;
+      if (!active || request || !enabledRef.current || !pageVisible()) return;
+      const controller = new AbortController();
+      request = controller;
       requested = false;
       let fullPage = false;
       let failed = false;
       try {
         const result = await api<T[] | { items: T[]; next_seq: number }>(
-          `${path}?after_seq=${cursor}&limit=1000`,
+          `${path}?after_seq=${cursor}&limit=1000${kind === 'events' ? '&view=timeline' : ''}`,
           { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]) },
         );
-        if (!active) return;
+        if (!active || controller.signal.aborted) return;
         const batch = kind === 'logs' ? (result as { items: T[] }).items : (result as T[]);
         fullPage = batch.length === 1000;
         if (batch.length) {
@@ -271,36 +294,51 @@ export function useRunFeed<T extends { seq: number }>(
           setComplete(!liveRef.current && !fullPage && !requested);
         }
       } catch (err) {
+        if (controller.signal.aborted) return;
         failed = true;
         if (active) {
           setError(err instanceof Error ? err : new Error(String(err)));
           setComplete(false);
         }
       } finally {
-        inFlight = false;
-        if (active) {
+        request = undefined;
+        pending = requested || fullPage || failed || liveRef.current;
+        if (active && !controller.signal.aborted) {
           setLoading(false);
-          if (requested || fullPage || failed || liveRef.current)
-            timer = setTimeout(poll, requested ? 0 : fullPage ? 50 : 3000);
         }
+        if (active && pending && enabledRef.current && pageVisible())
+          timer = setTimeout(poll, requested ? 0 : fullPage ? 50 : 8000);
       }
     };
     wake.current = () => {
       requested = true;
+      pending = true;
       setComplete(false);
-      if (!inFlight) {
-        clearTimeout(timer);
-        void poll();
+      clearTimeout(timer);
+      void poll();
+    };
+    const updatePolling = () => {
+      clearTimeout(timer);
+      if (enabledRef.current && pageVisible()) {
+        if (pending) void poll();
+      } else if (request) {
+        requested = true;
+        request.abort();
       }
     };
+    syncPolling.current = updatePolling;
+    const unsubscribe = subscribePageVisibility(updatePolling);
     void poll();
     return () => {
       active = false;
-      controller.abort();
+      unsubscribe();
+      request?.abort();
       clearTimeout(timer);
       wake.current = undefined;
+      syncPolling.current = undefined;
     };
   }, [path, kind, revision]);
+  useEffect(() => syncPolling.current?.(), [enabled]);
   useEffect(() => {
     if (previousLive.current === live) return;
     previousLive.current = live;
@@ -310,7 +348,12 @@ export function useRunFeed<T extends { seq: number }>(
   }, [live]);
   return { data, error, loading, complete, refresh };
 }
-export function useRunMetrics(runId: string, attemptId: string | undefined, live = true) {
+export function useRunMetrics(
+  runId: string,
+  attemptId: string | undefined,
+  live = true,
+  enabled = true,
+) {
   const path = attemptId
     ? `/runs/${encodeURIComponent(runId)}/metrics?attempt_id=${encodeURIComponent(attemptId)}`
     : null;
@@ -324,23 +367,28 @@ export function useRunMetrics(runId: string, attemptId: string | undefined, live
   }>({ path: null, data: [], loading: false, complete: false, totalCount: 0 });
   const [revision, setRevision] = useState(0);
   const liveRef = useRef(live);
+  const enabledRef = useRef(enabled);
   const previousLive = useRef(live);
   const wake = useRef<(() => void) | undefined>(undefined);
+  const syncPolling = useRef<(() => void) | undefined>(undefined);
   liveRef.current = live;
+  enabledRef.current = enabled;
   const refresh = useCallback(() => setRevision((value) => value + 1), []);
   useEffect(() => {
     if (!path || !attemptId) return;
+    previousLive.current = liveRef.current;
     let active = true;
     let feed: TrainingMetricFeed = { items: [], cursor: 0, totalCount: 0 };
     let recoveringHistory = false;
-    let inFlight = false;
+    let request: AbortController | undefined;
+    let pending = true;
     let requested = false;
     let timer: ReturnType<typeof setTimeout>;
-    const controller = new AbortController();
     setState({ path, data: [], loading: true, complete: false, totalCount: 0 });
     const poll = async () => {
-      if (!active || inFlight) return;
-      inFlight = true;
+      if (!active || request || !enabledRef.current || !pageVisible()) return;
+      const controller = new AbortController();
+      request = controller;
       requested = false;
       let more = false;
       let failed = false;
@@ -348,7 +396,7 @@ export function useRunMetrics(runId: string, attemptId: string | undefined, live
         const page = await api<TrainingMetricPage>(`${path}&after_seq=${feed.cursor}&limit=1000`, {
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(20000)]),
         });
-        if (!active) return;
+        if (!active || controller.signal.aborted) return;
         feed = appendTrainingMetricPage(feed, page, attemptId);
         more = page.has_more;
         if (!more && feed.items.length !== feed.totalCount) {
@@ -370,6 +418,7 @@ export function useRunMetrics(runId: string, attemptId: string | undefined, live
           });
         }
       } catch (error) {
+        if (controller.signal.aborted) return;
         failed = true;
         if (recoveringHistory) {
           feed = { items: [], cursor: 0, totalCount: feed.totalCount };
@@ -383,28 +432,42 @@ export function useRunMetrics(runId: string, attemptId: string | undefined, live
             error: error instanceof Error ? error : new Error(String(error)),
           }));
       } finally {
-        inFlight = false;
-        if (active && (requested || more || failed || liveRef.current)) {
-          timer = setTimeout(poll, requested ? 0 : more ? 50 : 3000);
+        request = undefined;
+        pending = requested || more || failed || liveRef.current;
+        if (active && pending && enabledRef.current && pageVisible()) {
+          timer = setTimeout(poll, requested ? 0 : more ? 50 : 8000);
         }
       }
     };
     wake.current = () => {
       requested = true;
+      pending = true;
       setState((current) => ({ ...current, complete: false }));
-      if (!inFlight) {
-        clearTimeout(timer);
-        void poll();
+      clearTimeout(timer);
+      void poll();
+    };
+    const updatePolling = () => {
+      clearTimeout(timer);
+      if (enabledRef.current && pageVisible()) {
+        if (pending) void poll();
+      } else if (request) {
+        requested = true;
+        request.abort();
       }
     };
+    syncPolling.current = updatePolling;
+    const unsubscribe = subscribePageVisibility(updatePolling);
     void poll();
     return () => {
       active = false;
-      controller.abort();
+      unsubscribe();
+      request?.abort();
       clearTimeout(timer);
       wake.current = undefined;
+      syncPolling.current = undefined;
     };
   }, [path, attemptId, revision]);
+  useEffect(() => syncPolling.current?.(), [enabled]);
   useEffect(() => {
     if (previousLive.current === live) return;
     previousLive.current = live;

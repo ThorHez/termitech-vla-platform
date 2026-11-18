@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Archive, LoaderCircle, RefreshCw, Server, Trash2 } from 'lucide-react';
+import { Archive, LoaderCircle, RefreshCw, RotateCcw, Server, Trash2 } from 'lucide-react';
 import { createOperationClient, date, useApi } from './api';
 import { useAuth } from './auth';
 import {
@@ -12,6 +12,7 @@ import {
 import type { ArchivedAsset, AssetFileDeletion, AssetPurgeInspection } from './assetPurge';
 import { Back, Badge, Empty, ErrorNotice, Field, Loading, Modal, PageHeading } from './components';
 import { assetKinds } from './data';
+import type { Asset } from './types';
 import './asset-deletions.css';
 
 const fileStates = {
@@ -44,19 +45,34 @@ export function AssetDeletionsPage() {
 
 function AssetDeletionsContent() {
   const ledger = useApi<ArchivedAsset[]>(assetDeletionsPath, 4000);
-  const [selection, setSelection] = useState<{ id: string; path: string }>();
+  const [selection, setSelection] = useState<
+    {
+      id: string;
+      path: string;
+    } & ({ action: 'purge' } | { action: 'restore'; archivedAt: string | null })
+  >();
   const [submitted, setSubmitted] = useState<{
     assetId: string;
     receipt: AssetFileDeletion;
     previous?: ArchivedAsset[];
   }>();
+  const [restored, setRestored] = useState<{ asset: Asset; previous?: ArchivedAsset[] }>();
   const latestRows = useRef(ledger.data);
   latestRows.current = ledger.data;
-  const selected = ledger.data?.find(
+  const rows =
+    restored && restored.previous === ledger.data
+      ? ledger.data?.filter((asset) => asset.id !== restored.asset.id)
+      : ledger.data;
+  const selected = rows?.find(
     (asset) => asset.id === selection?.id && asset.path === selection?.path,
   );
   const onSubmitted = (assetId: string, receipt: AssetFileDeletion) => {
     setSubmitted({ assetId, receipt, previous: latestRows.current });
+    setSelection(undefined);
+    ledger.refresh();
+  };
+  const onRestored = (asset: Asset) => {
+    setRestored({ asset, previous: latestRows.current });
     setSelection(undefined);
     ledger.refresh();
   };
@@ -66,7 +82,7 @@ function AssetDeletionsContent() {
       <Back to="/assets" label="返回数据与模型" />
       <PageHeading
         title="已删除资产"
-        description="查看已删除的资产登记、原文件位置和删除进度。永久删除文件后，历史登记和训练关联仍会保留。"
+        description="查看已删除的资产登记、原文件位置和删除进度。文件仍保留的资产可恢复登记。"
         actions={
           <button type="button" className="button outline" onClick={ledger.refresh}>
             <RefreshCw size={16} />
@@ -74,9 +90,20 @@ function AssetDeletionsContent() {
           </button>
         }
       />
+      {restored && (
+        <div className="info-strip" role="status">
+          <span>已恢复「{restored.asset.name}」的资产登记。</span>
+          <a
+            className="text-link"
+            href={`#/assets?${new URLSearchParams({ node: restored.asset.node_id, asset: restored.asset.id })}`}
+          >
+            查看资产
+          </a>
+        </div>
+      )}
       <ErrorNotice error={ledger.error} title="读取已删除资产失败" retry={ledger.refresh} />
       <div className="panel">
-        {ledger.data?.length ? (
+        {rows?.length ? (
           <div className="table-scroll">
             <table className="asset-deletions-table" aria-label="已删除资产">
               <thead>
@@ -89,7 +116,7 @@ function AssetDeletionsContent() {
                 </tr>
               </thead>
               <tbody>
-                {ledger.data.map((asset) => {
+                {rows.map((asset) => {
                   const accepted =
                     submitted?.assetId === asset.id && submitted.previous === ledger.data
                       ? submitted.receipt
@@ -138,19 +165,46 @@ function AssetDeletionsContent() {
                         {failure && <span className="subtext">{failure}</span>}
                       </td>
                       <td>
-                        {!accepted && canOpenAssetPurge(asset) ? (
-                          <button
-                            type="button"
-                            className="button outline small danger-text"
-                            aria-label={`${asset.file_deletion ? '重试删除文件' : '永久删除文件'} ${asset.name}`}
-                            disabled={Boolean(ledger.error)}
-                            onClick={() => setSelection({ id: asset.id, path: asset.path })}
-                          >
-                            <Trash2 size={14} aria-hidden="true" />
-                            {asset.file_deletion ? '重试删除' : '永久删除文件'}
-                          </button>
-                        ) : (
-                          <span className="subtext">{!accepted && asset.purge_block_reason}</span>
+                        <div className="asset-deletion-actions">
+                          {!accepted && asset.can_restore === true && (
+                            <button
+                              type="button"
+                              className="button outline small"
+                              aria-label={`恢复登记 ${asset.name}`}
+                              disabled={Boolean(ledger.error)}
+                              onClick={() =>
+                                setSelection({
+                                  id: asset.id,
+                                  path: asset.path,
+                                  action: 'restore',
+                                  archivedAt: asset.archived_at,
+                                })
+                              }
+                            >
+                              <RotateCcw size={14} aria-hidden="true" />
+                              恢复登记
+                            </button>
+                          )}
+                          {!accepted && canOpenAssetPurge(asset) && (
+                            <button
+                              type="button"
+                              className="button outline small danger-text"
+                              aria-label={`${asset.file_deletion ? '重试删除文件' : '永久删除文件'} ${asset.name}`}
+                              disabled={Boolean(ledger.error)}
+                              onClick={() =>
+                                setSelection({ id: asset.id, path: asset.path, action: 'purge' })
+                              }
+                            >
+                              <Trash2 size={14} aria-hidden="true" />
+                              {asset.file_deletion ? '重试删除' : '永久删除文件'}
+                            </button>
+                          )}
+                        </div>
+                        {!accepted && !asset.can_restore && asset.restore_block_reason && (
+                          <span className="subtext">{asset.restore_block_reason}</span>
+                        )}
+                        {!accepted && !canOpenAssetPurge(asset) && asset.purge_block_reason && (
+                          <span className="subtext">{asset.purge_block_reason}</span>
                         )}
                       </td>
                     </tr>
@@ -159,13 +213,13 @@ function AssetDeletionsContent() {
               </tbody>
             </table>
           </div>
-        ) : ledger.loading ? (
+        ) : ledger.loading && !rows ? (
           <Loading label="正在读取已删除资产…" />
-        ) : !ledger.error && ledger.data ? (
+        ) : !ledger.error && rows ? (
           <Empty icon={Archive} title="暂无已删除资产" description="删除登记的资产将在此显示。" />
         ) : null}
       </div>
-      {selected && (
+      {selected && selection?.action === 'purge' && (
         <AssetPurgeDialog
           key={`${selected.id}:${selected.path}`}
           asset={selected}
@@ -175,7 +229,115 @@ function AssetDeletionsContent() {
           onSubmitted={onSubmitted}
         />
       )}
+      {selected && selection?.action === 'restore' && (
+        <AssetRestoreDialog
+          key={`${selected.id}:${selected.path}`}
+          asset={selected}
+          expectedArchivedAt={selection.archivedAt}
+          available={!ledger.error}
+          refresh={ledger.refresh}
+          close={() => setSelection(undefined)}
+          onRestored={onRestored}
+        />
+      )}
     </>
+  );
+}
+
+function AssetRestoreDialog({
+  asset,
+  expectedArchivedAt,
+  available,
+  refresh,
+  close,
+  onRestored,
+}: {
+  asset: ArchivedAsset;
+  expectedArchivedAt: string | null;
+  available: boolean;
+  refresh: () => void;
+  close: () => void;
+  onRestored: (asset: Asset) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<Error>();
+  const active = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => active.current?.abort(), []);
+  const archiveChanged = asset.archived_at !== expectedArchivedAt;
+  const mayRestore = available && asset.can_restore === true && !archiveChanged;
+  const dismiss = () => {
+    if (!active.current) close();
+  };
+  const restore = async () => {
+    if (!mayRestore || active.current) return;
+    const request = new AbortController();
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20000)]);
+    active.current = request;
+    setBusy(true);
+    setError(undefined);
+    try {
+      const result = await createOperationClient().post<Asset>(
+        `/asset-deletions/${encodeURIComponent(asset.id)}/restore`,
+        { expected_archived_at: expectedArchivedAt },
+        { signal },
+      );
+      const state = result?.state || result?.status;
+      if (
+        result?.id !== asset.id ||
+        result.node_id !== asset.node_id ||
+        result.path !== asset.path ||
+        !state ||
+        state === 'ARCHIVED'
+      )
+        throw new Error('未能确认资产已恢复，请刷新列表后重试。');
+      onRestored(result);
+    } catch (cause) {
+      if (!request.signal.aborted) {
+        setError(cause as Error);
+        refresh();
+      }
+    } finally {
+      active.current = undefined;
+      if (!request.signal.aborted) setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      title="恢复资产登记"
+      close={dismiss}
+      footer={
+        <>
+          <button type="button" className="button outline" onClick={dismiss} disabled={busy}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="button primary"
+            onClick={() => void restore()}
+            disabled={!mayRestore || busy}
+          >
+            {busy && <LoaderCircle size={16} className="spin" aria-hidden="true" />}
+            确认恢复
+          </button>
+        </>
+      }
+    >
+      <p>恢复「{asset.name}」后，它将重新出现在资产目录中。</p>
+      {asset.file_deletion?.status === 'PENDING' && mayRestore && (
+        <p>尚未执行的文件删除任务也会取消。</p>
+      )}
+      <p className="asset-purge-path">
+        <code>{asset.path}</code>
+      </p>
+      {!mayRestore && !busy && (
+        <p role="status" className="field-hint">
+          {archiveChanged
+            ? '该资产的删除记录已更新，请关闭窗口后重新选择。'
+            : asset.restore_block_reason || '请刷新列表以核对可恢复状态。'}
+        </p>
+      )}
+      <ErrorNotice error={error} title="恢复资产登记失败" />
+    </Modal>
   );
 }
 

@@ -134,8 +134,8 @@ def link_recap_annotation(session, run_id, body: RecapAnnotationInput, request):
             raise APIError(409, "RECAP_ANNOTATION_CONFLICT", "该标注数据集已关联其他价值训练、检查点或源数据组")
         if source_index is None or recorded_index == source_index:
             return target
-    if metadata.get("registration_source") == "recap_stage_progress":
-        raise APIError(409, "RECAP_ANNOTATION_CONFLICT", "该数据集已有 Kai0 优势标注来源")
+    if metadata.get("registration_source") in ("recap_stage_progress", "recap_stage_annotation", "recap_value_annotation"):
+        raise APIError(409, "RECAP_ANNOTATION_CONFLICT", "该数据集已有优势标注来源")
     if source_index is not None:
         provenance["source_dataset_index"] = source_index
     target.metadata_json = {**metadata, RECAP_ANNOTATION_SOURCE: provenance}

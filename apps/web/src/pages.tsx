@@ -30,7 +30,8 @@ import {
 } from 'lucide-react';
 import { createOperationClient, date, displayNumber, navigate, useApi } from './api';
 import { useAuth } from './auth';
-import { AlertList, isDiskCapacityAlert } from './WorkspaceAlerts';
+import { AlertList, WorkspaceAlerts } from './WorkspaceAlerts';
+import { isDiskCapacityAlert } from './workspaceAlertData';
 import {
   Back,
   Badge,
@@ -45,12 +46,13 @@ import {
   ViewLink,
 } from './components';
 import { activeStates, assetKinds, gpuAverage, gpuIdle, requiredInputs, useData } from './data';
-import type { Asset, Gpu, Node, NodeDetail, Run } from './types';
+import type { Asset, Gpu, Node, NodeDetail, RunSummary } from './types';
 import { NodeOnboarding, RuntimeCheckView, runtimeCheckFor } from './NodeOnboarding';
 import { NodeManagement } from './NodeManagement';
 import { NodeRename } from './NodeRename';
 import { NodeTerminal } from './NodeTerminal';
 import { ResourceHistory } from './ResourceHistory';
+import { formatNetworkRate } from './resourceHistoryData';
 import { GpuReservations } from './GpuReservations';
 import { NodeGpuResources } from './NodeGpuResources';
 import { ProfileRebinding } from './ProfileRebinding';
@@ -73,6 +75,13 @@ import { AssetArchiveDialog } from './AssetArchiveDialog';
 import { assetDeletionsPath, canManageAssetDeletions } from './assetPurge';
 import { canArchiveAsset } from './assetArchive';
 import { canBindDatasetNorm, canEditDatasetAsset } from './datasetAssetPermissions';
+import {
+  ModelAssetFormatDialog,
+  ModelAssetFormatField,
+  canEditModelAssetFormat,
+  modelAssetFormatLabel,
+  type ModelFormatChoice,
+} from './ModelAssetFormatForm';
 import { catalogAssetGroups } from './modelAssetGroups';
 import { AssetGroupRows } from './AssetGroupRows';
 import { datasetCatalogAssets, groupDatasetNormAssets } from './datasetAssetGroups';
@@ -103,7 +112,17 @@ import {
   readDatasetProfile,
 } from './DatasetProfileForm';
 
-export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boolean }) {
+export function RunTable({
+  runs,
+  compact = false,
+  node,
+  onDeleted,
+}: {
+  runs: RunSummary[];
+  compact?: boolean;
+  node?: Node;
+  onDeleted?: () => void;
+}) {
   const { nodes, templates, refresh } = useData();
   return (
     <div className="table-scroll">
@@ -146,7 +165,9 @@ export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boo
               <td>
                 <a className="node-link" href={`#/nodes/${run.node_id}`}>
                   <Server size={13} />
-                  {nodes.data?.find((item) => item.id === run.node_id)?.name ||
+                  {(node?.id === run.node_id
+                    ? node.name
+                    : nodes.data?.find((item) => item.id === run.node_id)?.name) ||
                     run.node_id.slice(0, 10)}
                 </a>
               </td>
@@ -159,7 +180,7 @@ export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boo
                 >
                   <ChevronRight size={16} />
                 </a>
-                <RunDeleteAction run={run} compact onDeleted={refresh} />
+                <RunDeleteAction run={run} compact onDeleted={onDeleted ?? refresh} />
               </td>
             </tr>
           ))}
@@ -171,7 +192,7 @@ export function RunTable({ runs, compact = false }: { runs: Run[]; compact?: boo
 
 export function OverviewPage({ createRun }: { createRun: () => void }) {
   const { can } = useAuth();
-  const { enabled, overview, nodes, runs, assets, alerts } = useData();
+  const { enabled, overview, nodes, runs, alerts } = useData();
   const stats = overview.data;
   const recent = [...(runs.data || [])]
     .sort((a, b) => b.created_at.localeCompare(a.created_at))
@@ -340,7 +361,7 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
                 name: '登记本机资产',
                 desc: '建立数据、模型与机器的关联',
                 to: '/assets',
-                done: !!assets.data?.length,
+                done: Boolean(stats?.assets_total),
               },
               {
                 n: '03',
@@ -363,26 +384,13 @@ export function OverviewPage({ createRun }: { createRun: () => void }) {
             ))}
           </div>
         </Panel>
-        <Panel
-          id="workspace-alerts"
-          tabIndex={-1}
-          title="需要关注"
-          subtitle="来自机器和训练的实时异常"
-          action={<span className="count-pill">{alerts.data?.length ?? '—'}</span>}
-        >
-          <ErrorNotice error={alerts.error} retry={alerts.refresh} />
-          {alerts.data?.length ? (
-            <AlertList alerts={alerts.data} nodes={nodes.data} />
-          ) : (
-            <div className="healthy-state">
-              <div>
-                <ShieldCheck size={26} />
-              </div>
-              <strong>{enabled && alerts.data ? '当前没有待处理异常' : '等待资源状态上报'}</strong>
-              <p>{enabled && alerts.data ? '异常会在这里及时展示' : '连接管理服务后即可查看'}</p>
-            </div>
-          )}
-        </Panel>
+        <WorkspaceAlerts
+          alerts={alerts.data}
+          nodes={nodes.data}
+          enabled={enabled}
+          error={alerts.error}
+          refresh={alerts.refresh}
+        />
       </div>
     </>
   );
@@ -485,9 +493,47 @@ function GpuCard({ gpu, index }: { gpu: Gpu; index: number }) {
   );
 }
 
+export function MachineNetworkTraffic({ node }: { node: Node }) {
+  const network = node.metrics?.network;
+  const interfaces = Array.isArray(network?.interfaces)
+    ? network.interfaces.filter((item) => typeof item?.name === 'string')
+    : [];
+  const defaultInterface = interfaces.find((item) => item.name === network?.default_interface);
+  const selected = defaultInterface ?? (interfaces.length === 1 ? interfaces[0] : undefined);
+  const fresh =
+    (node.status === 'ONLINE' || node.status === 'RECOVERING') &&
+    Date.now() - Date.parse(node.last_seen ?? '') <= 30000;
+
+  return (
+    <div className="machine-network">
+      <div className="machine-network-header">
+        <Activity size={14} aria-hidden="true" />
+        <span>网络流量</span>
+        {selected && <code title={selected.name}>{selected.name}</code>}
+      </div>
+      {fresh && selected ? (
+        <dl className="machine-network-rates">
+          <div>
+            <dt>入站</dt>
+            <dd>{formatNetworkRate(selected.rx_bytes_per_second)}</dd>
+          </div>
+          <div>
+            <dt>出站</dt>
+            <dd>{formatNetworkRate(selected.tx_bytes_per_second)}</dd>
+          </div>
+        </dl>
+      ) : (
+        <span className="machine-network-empty">
+          {!fresh ? '暂无实时数据' : interfaces.length ? '在详情中选择网卡' : '等待网卡数据'}
+        </span>
+      )}
+    </div>
+  );
+}
+
 export function NodesPage() {
   const { can } = useAuth();
-  const { nodes, assets, profiles, enabled } = useData();
+  const { nodes, enabled } = useData();
   const [query, setQuery] = useState('');
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [managing, setManaging] = useState<Node>();
@@ -556,21 +602,14 @@ export function NodesPage() {
                   <span>{node.gpus?.[0]?.name || '尚无 GPU 信息'}</span>
                   <strong>× {node.gpus?.length || 0}</strong>
                 </div>
+                <MachineNetworkTraffic node={node} />
                 <div className="machine-stats">
                   <div>
-                    <strong>
-                      {assets.data?.filter(
-                        (asset) =>
-                          asset.node_id === node.id && (asset.state || asset.status) !== 'ARCHIVED',
-                      ).length ?? '—'}
-                    </strong>
+                    <strong>{node.asset_count ?? '—'}</strong>
                     <span>本地资产</span>
                   </div>
                   <div>
-                    <strong>
-                      {profiles.data?.filter((profile) => profile.node_id === node.id).length ??
-                        '—'}
-                    </strong>
+                    <strong>{node.profile_count ?? '—'}</strong>
                     <span>运行环境</span>
                   </div>
                   <div>
@@ -649,10 +688,23 @@ export function NodesPage() {
   );
 }
 
+type NodePageResponse =
+  | NodeDetail
+  | ({ node: Node } & Pick<NodeDetail, 'assets' | 'asset_norms' | 'profiles' | 'runs'>);
+
+const SERVER_169_NODE_ID = '0fcb9ef5-8fc7-4feb-9603-44fc05dae5cc';
+
 export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: string) => void }) {
   const { can } = useAuth();
-  const { nodes, assets, profiles, runs, alerts } = useData();
-  const details = useApi<NodeDetail | { node: Node; assets: Asset[] }>(`/nodes/${id}`);
+  const { alerts, pollingEnabled } = useData();
+  const nodeId = encodeURIComponent(id);
+  const isServer169 = id === SERVER_169_NODE_ID;
+  const detailRefreshMs = isServer169 ? 60_000 : 8_000;
+  const detailLimits = isServer169 ? 'asset_limit=10&run_limit=10' : 'run_limit=500';
+  const details = useApi<NodePageResponse>(
+    pollingEnabled ? `/nodes/${nodeId}?view=summary&${detailLimits}` : null,
+    detailRefreshMs,
+  );
   const [showManagement, setShowManagement] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showRename, setShowRename] = useState(false);
@@ -660,14 +712,50 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
   const [showReservations, setShowReservations] = useState(false);
   const [reservationRevision, setReservationRevision] = useState(0);
   const raw = details.data;
-  const node =
-    (raw && 'node' in raw ? raw.node : (raw as NodeDetail | undefined)) ||
-    nodes.data?.find((item) => item.id === id);
-  const nodeAssets = datasetCatalogAssets(assets.data || []).assets.filter(
-    (asset) => asset.node_id === id,
+  const reportedNode = raw && 'node' in raw ? raw.node : raw;
+  const scoped = reportedNode?.id === id ? raw : undefined;
+  const node = scoped ? reportedNode : undefined;
+  const activeTraining = scoped && 'active_training' in scoped ? scoped.active_training : undefined;
+  const needsLegacyRuns = Boolean(scoped && !activeTraining);
+  const legacyRuns = useApi<RunSummary[]>(
+    pollingEnabled && needsLegacyRuns ? '/runs?view=summary' : null,
   );
-  const nodeProfiles = profiles.data?.filter((profile) => profile.node_id === id) || [];
-  const nodeRuns = runs.data?.filter((run) => run.node_id === id) || [];
+  const legacyProfiles = useApi<NonNullable<NodeDetail['profiles']>>(
+    pollingEnabled && scoped && !scoped.profiles ? `/profiles?node_id=${nodeId}` : null,
+    15000,
+  );
+  const allNodeAssets = useMemo(
+    () => (scoped?.assets || []).filter((asset) => asset.node_id === id),
+    [scoped?.assets, id],
+  );
+  const sortedNodeAssets = useMemo(
+    () =>
+      datasetCatalogAssets(allNodeAssets).assets.sort((a, b) =>
+        (b.created_at ?? '').localeCompare(a.created_at ?? ''),
+      ),
+    [allNodeAssets],
+  );
+  const nodeAssets = isServer169 ? sortedNodeAssets.slice(0, 10) : sortedNodeAssets;
+  const normAssets = scoped?.asset_norms
+    ? [...allNodeAssets, ...scoped.asset_norms]
+    : allNodeAssets;
+  const nodeProfiles = (scoped?.profiles ?? legacyProfiles.data ?? []).filter(
+    (profile) => profile.node_id === id && profile.active !== false,
+  );
+  const legacyNodeRuns = legacyRuns.data?.filter((run) => run.node_id === id);
+  const nodeRuns = (needsLegacyRuns ? legacyNodeRuns : undefined) ?? scoped?.runs ?? [];
+  const displayedRuns = isServer169 ? nodeRuns.slice(0, 10) : nodeRuns;
+  const reportedActiveRuns = (needsLegacyRuns ? legacyNodeRuns : scoped?.runs)?.filter((run) =>
+    activeStates.has(run.state),
+  );
+  const activeTrainingCount = activeTraining?.count ?? reportedActiveRuns?.length ?? null;
+  const activeProfileIds =
+    activeTraining?.profile_ids ?? reportedActiveRuns?.map((run) => run.profile_id);
+  const refreshDetails = () => {
+    details.refresh();
+    if (needsLegacyRuns) legacyRuns.refresh();
+    if (scoped && !scoped.profiles) legacyProfiles.refresh();
+  };
   const diskAlerts =
     alerts.data?.filter((alert) => alert.node_id === id && isDiskCapacityAlert(alert)) || [];
   return (
@@ -771,7 +859,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
             </div>
             <div>
               <span>活动训练</span>
-              <strong>{nodeRuns.filter((run) => activeStates.has(run.state)).length}</strong>
+              <strong>{activeTrainingCount ?? '—'}</strong>
             </div>
           </div>
           {diskAlerts.length > 0 && (
@@ -779,7 +867,16 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               <AlertList alerts={diskAlerts} nodes={[node]} showNodeLink={false} />
             </Panel>
           )}
-          <ResourceHistory key={`history-${id}`} nodeId={id} status={node.status} />
+          <ResourceHistory
+            key={`history-${id}`}
+            nodeId={id}
+            status={node.status}
+            historyRefreshMs={isServer169 ? 60_000 : undefined}
+            processReport={node.metrics?.network_processes}
+            lastSeen={node.last_seen}
+            processReportReceivedAt={details.updatedAt}
+            processReportMaxAgeMs={Math.max(30_000, detailRefreshMs + 10_000)}
+          />
           <div className="detail-columns">
             <div>
               <NodeGpuResources
@@ -804,8 +901,12 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               </NodeGpuResources>
               <Panel
                 title="本机资产"
-                subtitle="仅可供这台机器上的训练使用"
-                action={<ViewLink to={`/assets?node=${id}`}>管理资产</ViewLink>}
+                subtitle={isServer169 ? '最近 10 条资产记录' : '仅可供这台机器上的训练使用'}
+                action={
+                  <ViewLink to={`/assets?node=${nodeId}`}>
+                    {isServer169 ? '查看本机全部资产' : '管理资产'}
+                  </ViewLink>
+                }
               >
                 {nodeAssets.length ? (
                   <div className="association-list">
@@ -815,10 +916,18 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                           {asset.kind === 'DATASET' ? <Database size={16} /> : <Box size={16} />}
                         </div>
                         <div>
-                          <strong>{asset.name}</strong>
+                          {isServer169 ? (
+                            <a
+                              href={`#/assets?node=${nodeId}&asset=${encodeURIComponent(asset.id)}`}
+                            >
+                              <strong>{asset.name}</strong>
+                            </a>
+                          ) : (
+                            <strong>{asset.name}</strong>
+                          )}
                           <span className="mono">{asset.path}</span>
                           {asset.kind === 'DATASET' && (
-                            <DatasetNormSummary asset={asset} assets={assets.data || []} />
+                            <DatasetNormSummary asset={asset} assets={normAssets} />
                           )}
                         </div>
                         <span className="tag">{assetKinds[asset.kind]}</span>
@@ -838,16 +947,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               <Panel
                 title="运行环境"
                 subtitle="每套环境绑定独立代码目录与 Python，创建训练时选择"
-                action={
-                  <ProfileAddition
-                    node={node}
-                    changed={() => {
-                      profiles.refresh();
-                      nodes.refresh();
-                      details.refresh();
-                    }}
-                  />
-                }
+                action={<ProfileAddition node={node} changed={refreshDetails} />}
               >
                 {nodeProfiles.length ? (
                   <div className="profile-list">
@@ -890,14 +990,8 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                         <ProfileRebinding
                           node={node}
                           profile={profile}
-                          inUse={nodeRuns.some(
-                            (run) => run.profile_id === profile.id && activeStates.has(run.state),
-                          )}
-                          changed={() => {
-                            profiles.refresh();
-                            nodes.refresh();
-                            details.refresh();
-                          }}
+                          inUse={activeProfileIds?.includes(profile.id) ?? true}
+                          changed={refreshDetails}
                         />
                       </div>
                     ))}
@@ -915,11 +1009,8 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
                 action={
                   <StorageConfiguration
                     node={node}
-                    inUse={nodeRuns.some((run) => activeStates.has(run.state))}
-                    changed={() => {
-                      nodes.refresh();
-                      details.refresh();
-                    }}
+                    inUse={activeTrainingCount === null || activeTrainingCount > 0}
+                    changed={details.refresh}
                   />
                 }
               >
@@ -968,9 +1059,17 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
               </Panel>
             </div>
           </div>
-          <Panel title="关联训练" subtitle="使用这台机器的训练历史">
-            {nodeRuns.length ? (
-              <RunTable runs={nodeRuns} />
+          <Panel
+            title="关联训练"
+            subtitle={isServer169 ? '最近 10 条本机训练' : '使用这台机器的训练历史'}
+            action={
+              isServer169 && (
+                <ViewLink to={`/runs?node=${nodeId}&type=training`}>查看本机全部训练</ViewLink>
+              )
+            }
+          >
+            {displayedRuns.length ? (
+              <RunTable runs={displayedRuns} node={node} onDeleted={refreshDetails} />
             ) : (
               <Empty
                 icon={Workflow}
@@ -984,6 +1083,7 @@ export function NodePage({ id, createRun }: { id: string; createRun: (nodeId?: s
       {can('machines.manage') && showManagement && node && (
         <NodeManagement
           node={node}
+          activeRunCount={activeTrainingCount}
           close={() => setShowManagement(false)}
           changed={details.refresh}
           reconnect={() => {
@@ -1064,14 +1164,21 @@ export function AssetsPage({
     owner: string;
     mode: 'profile' | 'norm';
   }>();
+  const [modelFormatEdit, setModelFormatEdit] = useState<{ id: string; owner: string }>();
   const [templateAsset, setTemplateAsset] = useState<Asset>();
   const [personalFormatsOpen, setPersonalFormatsOpen] = useState(false);
   const [detailId, setDetailId] = useState(initialAssetId);
-  const detailAsset = sourceAssets.find(
+  const listedDetailAsset = sourceAssets.find(
     (asset) =>
       asset.id === detailId &&
       (detailId !== initialAssetId || (asset.status || asset.state) !== 'ARCHIVED'),
   );
+  const assetDetail = useApi<Asset>(
+    listedDetailAsset ? `/assets/${encodeURIComponent(listedDetailAsset.id)}` : null,
+    0,
+  );
+  const detailAsset =
+    assetDetail.data?.id === listedDetailAsset?.id ? assetDetail.data : listedDetailAsset;
   const closeAssetDetail = () => {
     if (initialAssetId) {
       const filters = new URLSearchParams();
@@ -1113,6 +1220,13 @@ export function AssetsPage({
   const canRegisterDatasets = can('datasets.register');
   const canRegisterAssets = can('assets.register');
   const selectionOwner = user?.id || '';
+  const editingModelFormat =
+    detailAsset &&
+    modelFormatEdit?.id === detailAsset.id &&
+    modelFormatEdit.owner === selectionOwner &&
+    canEditModelAssetFormat(user, detailAsset, can)
+      ? detailAsset
+      : undefined;
   const editingAsset =
     datasetEdit?.owner === selectionOwner
       ? assets.data?.find((asset) => asset.id === datasetEdit.id)
@@ -1130,7 +1244,10 @@ export function AssetsPage({
     if (selectionOwner && allowed(user, asset, can))
       setDatasetEdit({ id: asset.id, owner: selectionOwner, mode });
   };
-  const closeDatasetEdit = () => setDatasetEdit(undefined);
+  const closeDatasetEdit = () => {
+    if (detailAsset && datasetEdit?.id === detailAsset.id) assetDetail.refresh();
+    setDatasetEdit(undefined);
+  };
   const archiveAsset =
     archiving?.owner === selectionOwner
       ? assets.data?.find((asset) => asset.id === archiving.asset.id) || archiving.asset
@@ -1176,6 +1293,9 @@ export function AssetsPage({
   useEffect(() => {
     if (datasetEdit && !editingProfile && !bindingDataset) setDatasetEdit(undefined);
   }, [datasetEdit, editingProfile, bindingDataset]);
+  useEffect(() => {
+    if (modelFormatEdit && !editingModelFormat) setModelFormatEdit(undefined);
+  }, [modelFormatEdit, editingModelFormat]);
   useEffect(() => {
     if (!canRegisterDatasets) setBatchRegister(false);
   }, [canRegisterDatasets]);
@@ -1310,6 +1430,9 @@ export function AssetsPage({
       </td>
       <td>
         <span>{assetKinds[asset.kind] || asset.kind}</span>
+        {asset.kind === 'MODEL' && (
+          <span className="subtext">{modelAssetFormatLabel(asset) ?? '模型格式未指定'}</span>
+        )}
         <span className="subtext mono">{asset.version}</span>
         <span className="subtext">
           {asset.registered_by_user_id
@@ -1674,10 +1797,13 @@ export function AssetsPage({
         !syncAsset &&
         !editingProfile &&
         !bindingDataset &&
+        !editingModelFormat &&
         !archiveAsset &&
         !templateAsset && (
           <AssetDetail
             asset={detailAsset}
+            detailError={assetDetail.loading ? undefined : assetDetail.error}
+            retryDetail={assetDetail.refresh}
             datasetChoices={
               detailAsset.kind === 'DATASET' && detailAsset.norm_asset_id
                 ? sourceAssets.filter(
@@ -1697,6 +1823,9 @@ export function AssetsPage({
             close={closeAssetDetail}
             bindNorm={() => openDatasetEdit(detailAsset, 'norm')}
             editProfile={() => openDatasetEdit(detailAsset, 'profile')}
+            editModelFormat={() =>
+              setModelFormatEdit({ id: detailAsset.id, owner: selectionOwner })
+            }
             sync={() => setSyncAsset(detailAsset)}
             saveTemplate={() => setTemplateAsset(detailAsset)}
             remove={() => openArchive(detailAsset)}
@@ -1737,6 +1866,18 @@ export function AssetsPage({
       {editingProfile && <DatasetProfileEditor asset={editingProfile} close={closeDatasetEdit} />}
       {bindingDataset && (
         <DatasetNormBindingDialog asset={bindingDataset} close={closeDatasetEdit} />
+      )}
+      {editingModelFormat && (
+        <ModelAssetFormatDialog
+          key={`${selectionOwner}:${editingModelFormat.id}`}
+          asset={editingModelFormat}
+          close={() => setModelFormatEdit(undefined)}
+          saved={() => {
+            assets.refresh();
+            assetDetail.refresh();
+            setModelFormatEdit(undefined);
+          }}
+        />
       )}
       {can('dataset-templates.write') && personalFormatsOpen && (
         <PersonalDatasetFormats close={() => setPersonalFormatsOpen(false)} />
@@ -1835,6 +1976,7 @@ function RegisterAssetContent({
   }, []);
   const [normAssetId, setNormAssetId] = useState(datasetDefaults?.normAssetId || '');
   const [normPath, setNormPath] = useState('');
+  const [modelFormat, setModelFormat] = useState<ModelFormatChoice>('');
   const [form, setForm] = useState({
     name: assetNameFromPath(datasetDefaults?.path || ''),
     kind: 'DATASET',
@@ -1879,6 +2021,7 @@ function RegisterAssetContent({
   };
   const node = nodes.data?.find((item) => item.id === form.node_id);
   const showDatasetConfig = form.kind === 'DATASET' && !deferProfile;
+  const modelFormatRequired = form.kind === 'MODEL' && !modelFormat;
   return (
     <Modal
       title="登记资产"
@@ -1907,7 +2050,7 @@ function RegisterAssetContent({
             className="button primary"
             form="register-asset"
             type="submit"
-            disabled={busy || profileErrors.length > 0 || Boolean(normError)}
+            disabled={busy || profileErrors.length > 0 || Boolean(normError) || modelFormatRequired}
           >
             {busy ? <LoaderCircle size={16} className="spin" /> : <Check size={16} />}
             登记资产
@@ -1925,7 +2068,8 @@ function RegisterAssetContent({
             !active() ||
             !Object.hasOwn(assetKinds, form.kind) ||
             profileErrors.length > 0 ||
-            normError
+            normError ||
+            modelFormatRequired
           )
             return;
           const abort = new AbortController();
@@ -1944,7 +2088,9 @@ function RegisterAssetContent({
                 metadata:
                   form.kind === 'DATASET' && !deferProfile
                     ? { dataset_profile: normalizedDatasetProfile(datasetProfile) }
-                    : {},
+                    : form.kind === 'MODEL' && modelFormat && modelFormat !== 'other'
+                      ? { format: modelFormat }
+                      : {},
                 ...(form.kind === 'DATASET'
                   ? {
                       dataset_inspection_id: inspectionDraft.inspectionIdFor(
@@ -2005,6 +2151,9 @@ function RegisterAssetContent({
               />
             </Field>
           </div>
+          {form.kind === 'MODEL' && (
+            <ModelAssetFormatField value={modelFormat} onChange={setModelFormat} disabled={busy} />
+          )}
           <Field label="所在机器" required>
             <select
               required
@@ -2157,7 +2306,11 @@ export function TemplatesPage({
           {templates.data.map((template) => {
             const info = algorithmInfo[template.algorithm.toUpperCase()] || algorithmInfo.SFT;
             const Icon = info.icon;
-            const kai0Stage = template.stages?.find((stage) => stage.id === 'stage_progress');
+            const hasAcp = template.stages?.some(({ id }) => id === 'offline_rl');
+            const hasStandardRecap = hasAcp && template.stages?.some(({ id }) => id === 'value');
+            const hasKai0Recap =
+              hasAcp && template.stages?.some(({ id }) => id === 'stage_progress');
+            const hasStageAnnotation = template.stages?.some(({ id }) => id === 'stage_annotation');
             return (
               <article
                 className={`template-card ${template.status !== 'AVAILABLE' ? 'planned' : ''}`}
@@ -2174,23 +2327,35 @@ export function TemplatesPage({
                 </div>
                 <span className="template-eyebrow">{info.text}</span>
                 <h2>{template.name}</h2>
-                <p>{template.description}</p>
-                {!!template.stages?.length && (
-                  <div className="template-stage-list">
-                    {template.id === 'recap' ? (
-                      <>
-                        <span>Value 训练 → 优势值标注 → ACP 训练</span>
-                        {kai0Stage && <span>备选 · {kai0Stage.name}</span>}
-                      </>
-                    ) : (
-                      template.stages.map((stage, index) => (
-                        <span key={stage.id}>
-                          {index + 1}. {stage.name}
-                        </span>
-                      ))
+                <p>
+                  {template.id === 'recap'
+                    ? '用优势标注数据训练 ACP 策略。'
+                    : template.description}
+                </p>
+                {template.id === 'recap'
+                  ? (hasStandardRecap || hasKai0Recap) && (
+                      <div className="template-stage-list" aria-label="ReCap 训练模式">
+                        {hasStandardRecap && (
+                          <span>ReCap 模式 · Value 训练 → 优势值标注 → ACP 训练</span>
+                        )}
+                        {hasKai0Recap && (
+                          <span>
+                            Stage Advantage ·{' '}
+                            {hasStageAnnotation ? '阶段进度训练 → 优势标注' : '阶段进度与优势标注'}{' '}
+                            → ACP 训练
+                          </span>
+                        )}
+                      </div>
+                    )
+                  : !!template.stages?.length && (
+                      <div className="template-stage-list">
+                        {template.stages.map((stage, index) => (
+                          <span key={stage.id}>
+                            {index + 1}. {stage.name}
+                          </span>
+                        ))}
+                      </div>
                     )}
-                  </div>
-                )}
                 <div className="template-inputs">
                   {requiredInputs(template).map((input) => (
                     <span key={input}>
@@ -2258,6 +2423,6 @@ export function TemplatesPage({
   );
 }
 
-export function RunsPage({ createRun }: { createRun: () => void }) {
-  return <BackgroundTasksPage createRun={createRun} />;
+export function RunsPage({ createRun, search }: { createRun: () => void; search?: string }) {
+  return <BackgroundTasksPage createRun={createRun} search={search} />;
 }

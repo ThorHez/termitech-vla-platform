@@ -5,11 +5,18 @@ import {
   Check,
   ChevronDown,
   Copy,
+  Layers3,
   Tags,
   Target,
 } from 'lucide-react';
-import { RECAP_PYTORCH_ENTRYPOINT, recapStageSupervision } from './recap';
+import {
+  isStageAdvantageStage,
+  RECAP_PYTORCH_ENTRYPOINT,
+  recapStageSupervision,
+  STAGE_ADVANTAGE_MODE,
+} from './recap';
 import type { TrainingStage, TrainingStageSpec } from './types';
+import type { RecapMode } from './recapPhaseDraft';
 import './recap-workflow.css';
 
 const annotationCommand = [
@@ -24,12 +31,14 @@ export function RecapWorkflow({
   stages,
   selected,
   disabled,
+  mode = isStageAdvantageStage(selected) ? 'stage_advantage' : 'recap',
   onSelect,
 }: {
   stages: TrainingStageSpec[];
   selected?: TrainingStage;
   disabled: boolean;
-  onSelect: (stage: TrainingStage) => void;
+  mode?: RecapMode;
+  onSelect: (stage: TrainingStage, mode: RecapMode) => void;
 }) {
   const headingId = useId();
   const annotationId = useId();
@@ -39,13 +48,29 @@ export function RecapWorkflow({
   const acpButton = useRef<HTMLButtonElement>(null);
   const valueStage = stages.find(({ id }) => id === 'value');
   const acpStage = stages.find(({ id }) => id === 'offline_rl');
-  const kai0Stage = stages.find(({ id }) => String(id) === 'stage_progress');
-  const valueUsesPytorch = valueStage?.default_entrypoint === RECAP_PYTORCH_ENTRYPOINT;
-  const acpUsesPytorch = acpStage?.default_entrypoint === RECAP_PYTORCH_ENTRYPOINT;
+  const kai0Stage = stages.find(({ id }) => id === 'stage_progress');
+  const stageAnnotation = stages.find(({ id }) => id === 'stage_annotation');
+  const valueAnnotation = stages.find(({ id }) => id === 'value_annotation');
+  const kai0Mode = !!kai0Stage && mode === 'stage_advantage';
+  const valueUsesPytorch =
+    valueStage?.backend === 'pytorch' ||
+    valueStage?.default_entrypoint === RECAP_PYTORCH_ENTRYPOINT;
 
   const choose = (stage: TrainingStage) => {
     setAnnotationOpen(false);
-    if (selected !== stage) onSelect(stage);
+    if (selected !== stage) onSelect(stage, mode);
+  };
+  const changeMode = (next: RecapMode) => {
+    if (next === mode) return;
+    setAnnotationOpen(false);
+    onSelect(
+      selected === 'offline_rl'
+        ? 'offline_rl'
+        : next === 'stage_advantage'
+          ? 'stage_progress'
+          : 'value',
+      next,
+    );
   };
   const copyCommand = async () => {
     try {
@@ -62,55 +87,163 @@ export function RecapWorkflow({
     <section className="recap-workflow" aria-labelledby={headingId}>
       <header className="recap-workflow-heading">
         <h3 id={headingId}>ReCap 工作流</h3>
-        <p>Value 和 ACP 分别提交训练作业。请选择本次作业。</p>
       </header>
-      <div className="recap-workflow-steps">
-        <button
-          type="button"
-          className="recap-workflow-card"
-          aria-pressed={selected === 'value'}
-          disabled={disabled || !valueStage}
-          onClick={() => choose('value')}
-        >
-          <span className="recap-workflow-icon">
+      {kai0Stage && (
+        <div className="recap-workflow-modes" role="group" aria-label="训练模式">
+          <button
+            type="button"
+            className="recap-workflow-mode"
+            aria-label="ReCap 模式"
+            aria-pressed={!kai0Mode}
+            disabled={disabled || !valueStage}
+            onClick={() => changeMode('recap')}
+          >
             <ChartNoAxesColumnIncreasing size={17} aria-hidden="true" />
-          </span>
-          <span className="recap-workflow-card-content">
-            <span className="recap-workflow-caption">
-              训练阶段 1{valueStage && (valueUsesPytorch ? ' · PyTorch' : ' · JAX')}
-            </span>
-            <strong>Value 训练</strong>
             <span>
-              使用 <code>{recapStageSupervision.value}</code>，产出 Value 检查点
+              <strong>ReCap 模式</strong>
+              <span>
+                回报价值 · <code>{recapStageSupervision.value}</code>
+              </span>
             </span>
-          </span>
-          {selected === 'value' && (
-            <Check size={16} className="recap-workflow-check" aria-hidden="true" />
-          )}
-        </button>
-        <ArrowRight size={16} className="recap-workflow-arrow" aria-hidden="true" />
-        <button
-          type="button"
-          className="recap-workflow-card"
-          aria-expanded={annotationOpen}
-          aria-controls={annotationId}
-          onClick={() => {
-            setAnnotationOpen(!annotationOpen);
-            setCopyStatus('');
-          }}
-        >
-          <span className="recap-workflow-icon">
-            <Tags size={17} aria-hidden="true" />
-          </span>
-          <span className="recap-workflow-card-content">
-            <span className="recap-workflow-caption">中间步骤 · 在训练机执行</span>
-            <strong>优势值标注</strong>
+            {!kai0Mode && <Check className="recap-mode-check" size={15} aria-hidden="true" />}
+          </button>
+          <button
+            type="button"
+            className="recap-workflow-mode"
+            aria-label={STAGE_ADVANTAGE_MODE}
+            aria-pressed={kai0Mode}
+            disabled={disabled}
+            onClick={() => changeMode('stage_advantage')}
+          >
+            <Layers3 size={17} aria-hidden="true" />
             <span>
-              使用 Value 检查点，生成含 <code>{recapStageSupervision.offline_rl}</code> 的数据
+              <strong>{STAGE_ADVANTAGE_MODE}</strong>
+              <span>使用指定数据列中的逐帧阶段进度</span>
             </span>
-          </span>
-          <ChevronDown size={16} className="recap-workflow-chevron" aria-hidden="true" />
-        </button>
+            {kai0Mode && <Check className="recap-mode-check" size={15} aria-hidden="true" />}
+          </button>
+        </div>
+      )}
+      <div className={`recap-workflow-steps${kai0Mode && !stageAnnotation ? ' kai0' : ''}`}>
+        {kai0Mode ? (
+          <>
+            <button
+              type="button"
+              className="recap-workflow-card"
+              aria-pressed={selected === 'stage_progress'}
+              disabled={disabled}
+              onClick={() => choose('stage_progress')}
+            >
+              <span className="recap-workflow-icon">
+                <Layers3 size={17} aria-hidden="true" />
+              </span>
+              <span className="recap-workflow-card-content">
+                <span className="recap-workflow-caption">训练阶段 1 · PyTorch</span>
+                <strong>{stageAnnotation ? '阶段进度训练' : '阶段进度训练与优势标注'}</strong>
+                {stageAnnotation ? (
+                  <span>用指定的阶段进度列训练估计器，产出模型检查点</span>
+                ) : (
+                  <span>
+                    用指定的阶段进度列产出含 <code>{recapStageSupervision.offline_rl}</code>{' '}
+                    的派生数据
+                  </span>
+                )}
+              </span>
+              {selected === 'stage_progress' && (
+                <Check size={16} className="recap-workflow-check" aria-hidden="true" />
+              )}
+            </button>
+            {stageAnnotation && (
+              <>
+                <ArrowRight size={16} className="recap-workflow-arrow" aria-hidden="true" />
+                <button
+                  type="button"
+                  className="recap-workflow-card"
+                  aria-pressed={selected === 'stage_annotation'}
+                  disabled={disabled}
+                  onClick={() => choose('stage_annotation')}
+                >
+                  <span className="recap-workflow-icon">
+                    <Tags size={17} aria-hidden="true" />
+                  </span>
+                  <span className="recap-workflow-card-content">
+                    <span className="recap-workflow-caption">标注阶段 2 · PyTorch</span>
+                    <strong>优势标注</strong>
+                    <span>
+                      选择阶段进度检查点和待标注数据集，生成含{' '}
+                      <code>{recapStageSupervision.offline_rl}</code> 的数据
+                    </span>
+                  </span>
+                  {selected === 'stage_annotation' && (
+                    <Check size={16} className="recap-workflow-check" aria-hidden="true" />
+                  )}
+                </button>
+              </>
+            )}
+          </>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="recap-workflow-card"
+              aria-pressed={selected === 'value'}
+              disabled={disabled || !valueStage}
+              onClick={() => choose('value')}
+            >
+              <span className="recap-workflow-icon">
+                <ChartNoAxesColumnIncreasing size={17} aria-hidden="true" />
+              </span>
+              <span className="recap-workflow-card-content">
+                <span className="recap-workflow-caption">
+                  训练阶段 1{valueStage && (valueUsesPytorch ? ' · PyTorch' : ' · JAX')}
+                </span>
+                <strong>Value 训练</strong>
+                <span>
+                  使用 <code>{recapStageSupervision.value}</code>，产出 Value 检查点
+                </span>
+              </span>
+              {selected === 'value' && (
+                <Check size={16} className="recap-workflow-check" aria-hidden="true" />
+              )}
+            </button>
+            <ArrowRight size={16} className="recap-workflow-arrow" aria-hidden="true" />
+            <button
+              type="button"
+              className="recap-workflow-card"
+              aria-pressed={valueAnnotation ? selected === 'value_annotation' : undefined}
+              aria-expanded={!valueAnnotation ? annotationOpen : undefined}
+              aria-controls={!valueAnnotation ? annotationId : undefined}
+              disabled={disabled}
+              onClick={() => {
+                if (valueAnnotation) choose('value_annotation');
+                else {
+                  setAnnotationOpen(!annotationOpen);
+                  setCopyStatus('');
+                }
+              }}
+            >
+              <span className="recap-workflow-icon">
+                <Tags size={17} aria-hidden="true" />
+              </span>
+              <span className="recap-workflow-card-content">
+                <span className="recap-workflow-caption">
+                  {valueAnnotation ? '标注阶段 2 · PyTorch' : '中间步骤 · 在训练机执行'}
+                </span>
+                <strong>优势值标注</strong>
+                <span>
+                  使用 Value 检查点，生成含 <code>{recapStageSupervision.offline_rl}</code> 的数据
+                </span>
+              </span>
+              {valueAnnotation ? (
+                selected === 'value_annotation' && (
+                  <Check size={16} className="recap-workflow-check" aria-hidden="true" />
+                )
+              ) : (
+                <ChevronDown size={16} className="recap-workflow-chevron" aria-hidden="true" />
+              )}
+            </button>
+          </>
+        )}
         <ArrowRight size={16} className="recap-workflow-arrow" aria-hidden="true" />
         <button
           type="button"
@@ -125,94 +258,82 @@ export function RecapWorkflow({
           </span>
           <span className="recap-workflow-card-content">
             <span className="recap-workflow-caption">
-              训练阶段 2{acpStage && (acpUsesPytorch ? ' · PyTorch' : ' · JAX')}
+              训练阶段 {(kai0Mode ? stageAnnotation : valueAnnotation) ? 3 : 2}
+              {acpStage && ' · JAX'}
             </span>
             <strong>ACP 训练</strong>
-            <span>使用标注数据和初始策略权重，产出 ACP 策略</span>
+            <span>
+              使用含 <code>{recapStageSupervision.offline_rl}</code> 的数据和 JAX / Orbax
+              初始策略权重
+            </span>
           </span>
           {selected === 'offline_rl' && (
             <Check size={16} className="recap-workflow-check" aria-hidden="true" />
           )}
         </button>
       </div>
-      <div className="recap-workflow-annotation" id={annotationId} hidden={!annotationOpen}>
-        {valueUsesPytorch ? (
-          <>
-            <div className="recap-workflow-annotation-heading">
-              <p>
-                在训练机的 OpenPI-UMI 目录运行。将路径替换为 Value 作业导出的{' '}
-                <code>training_config.py</code>、Value 检查点、含{' '}
-                <code>{recapStageSupervision.value}</code> 的待标注数据和新输出目录。
-              </p>
+      {!kai0Mode && !valueAnnotation && (
+        <div className="recap-workflow-annotation" id={annotationId} hidden={!annotationOpen}>
+          {valueUsesPytorch ? (
+            <>
+              <div className="recap-workflow-annotation-heading">
+                <p>
+                  在训练机的 OpenPI-UMI 目录运行。将路径替换为 Value 作业导出的{' '}
+                  <code>training_config.py</code>、Value 检查点、含{' '}
+                  <code>{recapStageSupervision.value}</code> 的待标注数据和新输出目录。
+                </p>
+                <button
+                  type="button"
+                  className="button outline small"
+                  onClick={() => void copyCommand()}
+                >
+                  <Copy size={14} aria-hidden="true" />
+                  复制命令
+                </button>
+              </div>
+              <textarea
+                ref={commandField}
+                aria-label="优势值标注命令"
+                value={annotationCommand}
+                rows={5}
+                readOnly
+                spellCheck={false}
+              />
+              <span className="recap-workflow-copy-status" role="status">
+                {copyStatus}
+              </span>
+            </>
+          ) : (
+            <p>
+              在训练机复制含 <code>{recapStageSupervision.value}</code> 的数据集。使用与 Value
+              检查点匹配的 OpenPI-UMI 配方，通过 <code>scripts/lerobot_value_infer.py</code>{' '}
+              给副本写入 <code>{recapStageSupervision.offline_rl}</code>。
+            </p>
+          )}
+          <div className="recap-workflow-annotation-footer">
+            <p>
+              {valueUsesPytorch && (
+                <>
+                  多数据集配方可用 <code>--dataset-index</code> 选择对应配置。
+                </>
+              )}
+              标注完成后，在「数据与模型」登记派生数据，再为 ACP 选择该数据。
+            </p>
+            {acpStage && (
               <button
                 type="button"
                 className="button outline small"
-                onClick={() => void copyCommand()}
+                disabled={disabled}
+                onClick={() => {
+                  choose('offline_rl');
+                  acpButton.current?.focus();
+                }}
               >
-                <Copy size={14} aria-hidden="true" />
-                复制命令
+                已有标注数据，配置 ACP
+                <ArrowRight size={14} aria-hidden="true" />
               </button>
-            </div>
-            <textarea
-              ref={commandField}
-              aria-label="优势值标注命令"
-              value={annotationCommand}
-              rows={5}
-              readOnly
-              spellCheck={false}
-            />
-            <span className="recap-workflow-copy-status" role="status">
-              {copyStatus}
-            </span>
-          </>
-        ) : (
-          <p>
-            在训练机复制含 <code>{recapStageSupervision.value}</code> 的数据集。使用与 Value
-            检查点匹配的 OpenPI-UMI 配方，通过 <code>scripts/lerobot_value_infer.py</code>{' '}
-            给副本写入 <code>{recapStageSupervision.offline_rl}</code>。
-          </p>
-        )}
-        <div className="recap-workflow-annotation-footer">
-          <p>
-            {valueUsesPytorch && (
-              <>
-                多数据集配方可用 <code>--dataset-index</code> 选择对应配置。
-              </>
             )}
-            标注完成后，在「数据与模型」登记派生数据，再为 ACP 选择该数据。
-          </p>
-          {acpStage && (
-            <button
-              type="button"
-              className="button outline small"
-              disabled={disabled}
-              onClick={() => {
-                choose('offline_rl');
-                acpButton.current?.focus();
-              }}
-            >
-              已有标注数据，配置 ACP
-              <ArrowRight size={14} aria-hidden="true" />
-            </button>
-          )}
-        </div>
-      </div>
-      {kai0Stage && (
-        <div className="recap-workflow-kai0">
-          <button
-            type="button"
-            className="button outline small"
-            aria-pressed={selected === kai0Stage.id}
-            disabled={disabled}
-            onClick={() => choose(kai0Stage.id)}
-          >
-            {selected === kai0Stage.id && <Check size={14} aria-hidden="true" />}
-            使用 Kai0 进度标注
-          </button>
-          <p>
-            备选路线。使用单个含 <code>{recapStageSupervision.stage_progress}</code>{' '}
-            的数据集，训练并标注后将派生数据用于 ACP。
-          </p>
+          </div>
         </div>
       )}
     </section>

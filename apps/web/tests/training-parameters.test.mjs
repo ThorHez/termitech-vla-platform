@@ -145,6 +145,49 @@ try {
     assert.equal(pytorchResources.num_workers, 8);
   });
 
+  await test('Stage Advantage only lists registered PyTorch weights compatible with its stage', () => {
+    const asset = resources.assets[0];
+    const modelError = (metadata) => recap.recapModelError({ ...asset, metadata }, 'stage_progress');
+    assert.equal(modelError({ format: 'openpi-pytorch' }), undefined);
+    assert.equal(modelError({ format: ' PyTorch ', model_role: 'stage_progress_estimator' }), undefined);
+    assert.match(modelError({ format: 'openpi-pytorch', model_role: 'value_estimator' }), /不匹配/);
+    assert.match(modelError({ format: 'openpi-jax' }), /model\.safetensors/);
+    assert.match(modelError({ format: 'custom' }), /补录/);
+    assert.match(modelError(undefined), /补录/);
+  });
+
+  await test('both ReCap workflows share JAX ACP entrypoints and accept only Orbax policy weights', () => {
+    const stage = { id: 'offline_rl', backend: 'jax' };
+    assert.equal(recap.recapStageEntrypoint(stage, 1), 'scripts/train.py');
+    assert.equal(recap.recapStageEntrypoint(stage, 2), 'scripts/train_multi_dataset.py');
+    const asset = resources.assets[0];
+    const modelError = (metadata, state) => recap.recapModelError({ ...asset, metadata, state }, stage.id);
+    assert.equal(modelError({ format: 'openpi-orbax', model_role: 'policy' }, 'REGISTERED'), undefined);
+    assert.equal(modelError({ format: ' Orbax ' }, 'READY'), undefined);
+    assert.match(modelError({ format: 'openpi-pytorch' }, 'READY'), /已改用 JAX/);
+    assert.match(modelError({ format: 'openpi-orbax', model_role: 'stage_progress_estimator' }, 'READY'), /不匹配/);
+    assert.match(modelError({ format: 'openpi-orbax' }, 'ARCHIVED'), /不可用/);
+    assert.match(modelError(undefined, 'READY'), /补录/);
+  });
+
+  await test('restoring a PyTorch ACP template prompts for Orbax and preserves the ACP settings', () => {
+    const source = snapshot();
+    source.request.template_id = 'recap';
+    source.request.training_stage = 'offline_rl';
+    source.request.stage_config = { acp_dropout: 0.2 };
+    source.request.entrypoint = 'scripts/acp/train_recap_pytorch.py';
+    const model = resources.assets[0];
+    const apply = (format) => templates.applyTrainingTemplate(record(codec.encodeTrainingDraft(source)), {
+      ...resources, assets: [{ ...model, state: 'REGISTERED', metadata: { format } }],
+    });
+    const torch = apply('openpi-pytorch');
+    assert.match(torch.issues.join(' '), /已改用 JAX/);
+    assert.deepEqual(torch.snapshot.request.inputs, {});
+    assert.equal(torch.snapshot.request.entrypoint, undefined);
+    assert.deepEqual(torch.snapshot.request.stage_config, { acp_dropout: 0.2 });
+    assert.equal(apply('openpi-orbax').snapshot.request.inputs.model, model.id);
+  });
+
   await test('legacy draft and template restoration keep missing overrides absent for native inheritance', () => {
     for (const advancedRecipe of [false, true]) {
       const source = { ...snapshot(), advancedRecipe };

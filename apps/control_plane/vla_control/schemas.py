@@ -126,6 +126,10 @@ class AssetDatasetProfileInput(InputModel):
     dataset_inspection_id: str | None = Field(default=None, min_length=1, max_length=36, strict=True)
 
 
+class AssetModelFormatInput(InputModel):
+    format: Literal["openpi-orbax", "openpi-pytorch"] | None
+
+
 class AssetNormBindingInput(InputModel):
     norm_asset_id: str | None = Field(default=None, min_length=1, max_length=36)
     norm_path: str | None = Field(default=None, min_length=1, max_length=4096, strict=True)
@@ -190,7 +194,7 @@ class PreviewInput(InputModel):
     profile_id: str
     template_id: str
     resume: bool = Field(default=False, strict=True)
-    training_stage: Literal["value", "offline_rl", "stage_progress"] | None = None
+    training_stage: Literal["value", "value_annotation", "offline_rl", "stage_progress", "stage_annotation"] | None = None
     stage_config: dict | None = None
     auto_config: dict | None = None
     normalization_method: Literal["minmax", "quantile", "zscore"] | None = None

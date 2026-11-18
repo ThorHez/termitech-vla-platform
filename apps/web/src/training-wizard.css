@@ -72,6 +72,10 @@
   gap: 0 16px;
 }
 
+.training-estimator-settings .form-grid.parameters {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 200px), 1fr));
+}
+
 .training-parameter-error {
   display: block;
   color: var(--text-danger, #b42318);
@@ -237,6 +241,10 @@
 
 .training-data-datasets > .dataset-bindings {
   margin: 0;
+}
+
+.training-state-configuration {
+  margin-bottom: 16px;
 }
 
 .training-data-datasets .dataset-binding-content > .form-grid {

@@ -5,8 +5,10 @@ import pytest
 from sqlalchemy import select
 
 from vla_control.auth_models import AuditEvent
+from vla_control.common import APIError
 from vla_control.main import create_app
 from vla_control.settings import Settings
+from vla_control.training_templates import _validate_shareable_content
 
 from .test_dataset_templates import PROFILE
 
@@ -23,6 +25,23 @@ TRAINING_CONTENT = {
     "entrypoint_edited": False,
     "special_values": [],
 }
+
+
+@pytest.mark.parametrize("phase,stage,valid", [
+    ("value_annotation", "value_annotation", True),
+    ("recap_acp", "offline_rl", True),
+    ("stage_advantage_acp", "offline_rl", True),
+    ("stage_annotation", "value_annotation", False),
+    ("unknown", "offline_rl", False),
+])
+def test_shareable_recap_template_preserves_the_active_phase(phase, stage, valid):
+    request = {**TRAINING_CONTENT["request"], "template_id": "recap", "training_stage": stage}
+    content = {**TRAINING_CONTENT, "request": request, "recap_phase": phase}
+    if valid:
+        _validate_shareable_content(content)
+    else:
+        with pytest.raises(APIError, match="共享前"):
+            _validate_shareable_content(content)
 
 
 def login(client, username):

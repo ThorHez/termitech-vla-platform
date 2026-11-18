@@ -3,8 +3,13 @@ import {
   stageCompositionDraft,
   trainingProfileSeed,
 } from './ComposedDatasetProcessing';
-import { composedProcessingErrors, type ComposedProcessingSpec } from './composedProcessing';
+import {
+  composedProcessingErrors,
+  withoutStageProgressSource,
+  type ComposedProcessingSpec,
+} from './composedProcessing';
 import { DEFAULT_AUTO_CONFIG } from './trainingConfiguration';
+import { isRecapAnnotationStage, isStageAdvantageStage } from './recap';
 import type { TrainingDraftSnapshot } from './trainingDraft';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
 import type { Asset, Run } from './types';
@@ -12,6 +17,13 @@ import type { Asset, Run } from './types';
 const usableAsset = (asset?: Asset) =>
   ['REGISTERED', 'READY'].includes(asset?.state ?? asset?.status ?? '') &&
   asset?.metadata?.availability !== 'removed';
+
+export function recapAcpDatasetLabelIssue(dataset: Asset, featureKeys?: readonly string[]) {
+  const source = featureKeys?.length ? featureKeys : undefined;
+  const keys = source ?? trainingProfileSeed(dataset).feature_keys;
+  if (!keys?.length || keys.includes('is_positive')) return undefined;
+  return `${source ? '数据集元信息' : '已登记字段'}缺少 is_positive，请选择已完成优势标注的数据集。`;
+}
 
 export function recapAcpSnapshot(
   run: Run,
@@ -25,9 +37,9 @@ export function recapAcpSnapshot(
   if (
     run.template_id !== 'recap' ||
     run.state !== 'SUCCEEDED' ||
-    (stage !== 'value' && stage !== 'stage_progress')
+    (stage !== 'value' && !isStageAdvantageStage(stage) && !isRecapAnnotationStage(stage))
   )
-    throw new Error('请从已完成的 Value 或 Kai0 作业选择 ACP 数据集。');
+    throw new Error('请从已完成的 Value 或 Stage Advantage 作业选择 ACP 数据集。');
   const dataset = assets.find((asset) => asset.id === selected.id);
   if (
     !dataset ||
@@ -42,6 +54,17 @@ export function recapAcpSnapshot(
   if (!rawLinkage || typeof rawLinkage !== 'object' || Array.isArray(rawLinkage))
     throw new Error('标注数据集缺少来源记录。');
   const linkage = rawLinkage as Record<string, unknown>;
+  if (isRecapAnnotationStage(stage)) {
+    const scorer = run.inputs?.model;
+    const scorerId = typeof scorer === 'string' ? scorer : scorer?.id;
+    if (
+      linkage.registration_source !==
+        (stage === 'value_annotation' ? 'recap_value_annotation' : 'recap_stage_annotation') ||
+      !scorerId ||
+      linkage.scorer_model_asset_id !== scorerId
+    )
+      throw new Error('标注数据集的检查点来源与当前作业不一致。');
+  }
   const attemptId = stage === 'value' ? linkage.attempt_id : dataset.origin_attempt_id;
   const attempt = run.attempts?.find((candidate) => candidate.id === attemptId);
   if (!attempt || (attempt.state ?? attempt.status) !== 'SUCCEEDED')
@@ -123,6 +146,7 @@ export function recapAcpSnapshot(
   const baseName = (run.name.trim() || 'ReCap').slice(0, 154).replace(/[\uD800-\uDBFF]$/u, '');
 
   return {
+    recapPhase: isStageAdvantageStage(stage) ? 'stage_advantage_acp' : 'recap_acp',
     step: 0,
     advancedRecipe: false,
     editedParameters: [],
@@ -140,7 +164,10 @@ export function recapAcpSnapshot(
           dataset_asset_id: dataset.id,
           norm_asset_id: norm.id,
           weight: 1,
-          processor: composedChoice({ ...composition, aux_keys: ['is_positive'] }),
+          processor: composedChoice({
+            ...withoutStageProgressSource(composition),
+            aux_keys: ['is_positive'],
+          }),
         },
       ],
       auto_config: { ...DEFAULT_AUTO_CONFIG },

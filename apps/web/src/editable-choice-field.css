@@ -1,12 +1,12 @@
-.robot-type-control {
+.editable-choice-control {
   position: relative;
 }
 
-.robot-type-control input {
+.editable-choice-control input[role='combobox'] {
   padding-right: 42px;
 }
 
-.robot-type-toggle {
+.editable-choice-toggle {
   position: absolute;
   top: 1px;
   right: 1px;
@@ -19,13 +19,13 @@
   background: transparent;
 }
 
-.robot-type-toggle::after {
+.editable-choice-toggle::after {
   content: '';
   width: 16px;
   height: 16px;
   background: var(--select-chevron) center / contain no-repeat;
 }
 
-.robot-type-toggle[aria-expanded='true']::after {
+.editable-choice-toggle[aria-expanded='true']::after {
   transform: rotate(180deg);
 }

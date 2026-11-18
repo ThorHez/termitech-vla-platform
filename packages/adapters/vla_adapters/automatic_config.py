@@ -10,14 +10,16 @@ if __package__:
     from .composition_spec import (
         COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, normalize_composition,
     )
-    from .recap import STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, uses_torch_recap, validate_stage_progress_selection
+    from .recap import (STAGE_ADVANTAGE_STAGES, STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, VALUE_ANNOTATION,
+                        recap_data_stage, uses_torch_recap, validate_stage_progress_selection)
 else:
     from dataset_bindings import validate_binding_assets
     from data_processors import instantiate_data_processor
     from composition_spec import (
         COMPOSABLE_PROCESSOR, FLAT_STATE_MODEL_TRANSFORM, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, normalize_composition,
     )
-    from recap import STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, uses_torch_recap, validate_stage_progress_selection
+    from recap import (STAGE_ADVANTAGE_STAGES, STAGE_PROGRESS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL, VALUE_ANNOTATION,
+                       recap_data_stage, uses_torch_recap, validate_stage_progress_selection)
 
 
 AUTO_CONFIG_DEFAULTS = {"model_type": "pi05", "finetune_mode": "full", "action_horizon": 50, "action_dim": 32}
@@ -47,7 +49,7 @@ def normalize_auto_config(value):
 
 def automatic_recipe_name(auto_config, training_stage=None):
     clean = normalize_auto_config(auto_config)
-    if clean is None or training_stage not in (None, "sft", "value", "offline_rl", STAGE_PROGRESS):
+    if clean is None or training_stage not in (None, "sft", "value", "offline_rl", VALUE_ANNOTATION, *STAGE_ADVANTAGE_STAGES):
         raise ValueError("AUTO_CONFIG_INVALID: 自动配置或训练阶段无效")
     return (f"auto_{clean['model_type']}_{clean['finetune_mode']}_h{clean['action_horizon']}"
             f"_d{clean['action_dim']}_{training_stage or 'sft'}")
@@ -108,18 +110,19 @@ def automatic_data_layout(auto_config, bindings, *, norm_stats=False):
 def build_automatic_model(auto_config, config_module, bindings, training_stage=None, *, norm_stats=False):
     """Share the exact SFT model and declared camera/state layout semantics."""
     clean = normalize_auto_config(auto_config)
-    if training_stage == STAGE_PROGRESS:
+    if training_stage in STAGE_ADVANTAGE_STAGES:
         validate_stage_progress_selection(training_stage, bindings, clean)
         try:
             model_module = importlib.import_module("openpi.models.pi0_stage_progress")
         except ModuleNotFoundError as exc:
             if exc.name != "openpi.models.pi0_stage_progress":
                 raise
-            raise ValueError("RECAP_STAGE_MODEL_UNAVAILABLE: 请更新 OpenPI-UMI 至支持 Kai0 阶段进度的版本") from exc
+            raise ValueError("RECAP_STAGE_MODEL_UNAVAILABLE: 请更新 OpenPI-UMI 至支持 Stage Advantage 的版本") from exc
         model_cls = getattr(model_module, STAGE_PROGRESS_MODEL, None)
     else:
-        model_module = getattr(config_module, "pi0_value" if training_stage == "value" else "pi0_config", None)
-        model_cls = getattr(model_module, "Pi0ValueConfig" if training_stage == "value" else "Pi0Config", None)
+        value_stage = recap_data_stage(training_stage) == "value"
+        model_module = getattr(config_module, "pi0_value" if value_stage else "pi0_config", None)
+        model_cls = getattr(model_module, "Pi0ValueConfig" if value_stage else "Pi0Config", None)
     if not isinstance(model_cls, type) or not dataclasses.is_dataclass(model_cls):
         raise ValueError("AUTO_CONFIG_UNSUPPORTED: 训练环境未导出所选 Pi0/Pi05 模型配置")
     kwargs = {"pi05": clean["model_type"] == "pi05", "action_dim": clean["action_dim"],
@@ -127,7 +130,7 @@ def build_automatic_model(auto_config, config_module, bindings, training_stage=N
     vision, state_padding = automatic_data_layout(clean, bindings, norm_stats=norm_stats)
     kwargs.update(vision)
     if clean["finetune_mode"] == "lora":
-        if training_stage == "value":
+        if recap_data_stage(training_stage) == "value":
             raise ValueError("AUTO_CONFIG_UNSUPPORTED: 自动价值训练暂不支持 LoRA，请使用全量微调或高级代码配方")
         kwargs.update(paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora")
     return model_cls(**kwargs), state_padding
@@ -188,7 +191,7 @@ def build_automatic_base(spec, config_module, weight_loaders):
         seed = instantiate_data_processor(processor, config_module, spec["code_dir"],
                                           dataset_path=spec["inputs"]["dataset_0"]["path"],
                                           norm_dir=norm.parent if norm.is_file() else norm,
-                                          training_stage=stage, stage_config=stage_config)
+                                          training_stage=recap_data_stage(stage), stage_config=stage_config)
         if len(bindings) > 1:
             multi = getattr(config_module, "MultiDataConfigFactory", None)
             if not isinstance(multi, type) or not dataclasses.is_dataclass(multi):

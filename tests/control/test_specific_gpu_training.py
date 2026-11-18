@@ -91,7 +91,7 @@ def test_preview_run_and_start_preserve_exact_selection_and_device_order(platfor
     assert starts(platform, node)[0]['payload']['gpu_uuids'] == ['GPU-3', 'GPU-1']
     detail = platform.get_run(run)
     assert detail['attempts'][0]['gpu_uuids'] == ['GPU-3', 'GPU-1']
-    assert next(item for item in platform.client.get('/api/v1/runs', headers=ADMIN).json()
+    assert next(item for item in platform.client.get('/api/v1/runs?view=full', headers=ADMIN).json()
                 if item['id'] == run['id'])['requested_gpu_uuids'] == ['GPU-3', 'GPU-1']
 
 

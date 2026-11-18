@@ -17,12 +17,14 @@ export function TrainingGpuSelector({
   request,
   node,
   minimum,
+  maximum,
   onChange,
   allowShared = true,
 }: {
   request: Pick<RunRequest, 'gpu_count' | 'requested_gpu_uuids' | 'training_gpu_policy'>;
   node?: Node;
   minimum: number;
+  maximum?: number;
   onChange: (
     selection: Pick<RunRequest, 'gpu_count' | 'requested_gpu_uuids' | 'training_gpu_policy'>,
   ) => void;
@@ -143,10 +145,10 @@ export function TrainingGpuSelector({
           type="number"
           required
           min={minimum}
-          max={Math.max(minimum, node?.gpus?.length || 0)}
+          max={maximum ?? Math.max(minimum, node?.gpus?.length || 0)}
           step={1}
           value={request.gpu_count}
-          readOnly={manual}
+          readOnly={manual || minimum === maximum}
           onChange={(event) =>
             onChange({ requested_gpu_uuids: undefined, gpu_count: Number(event.target.value) })
           }
@@ -166,7 +168,10 @@ export function TrainingGpuSelector({
                   type="checkbox"
                   aria-label={`选择 GPU ${index}`}
                   checked={selected.includes(gpu.uuid)}
-                  disabled={state === 'reserved' && !selected.includes(gpu.uuid)}
+                  disabled={
+                    !selected.includes(gpu.uuid) &&
+                    (state === 'reserved' || (maximum !== undefined && selected.length >= maximum))
+                  }
                   onChange={(event) => {
                     const next = event.target.checked
                       ? [...selected, gpu.uuid]

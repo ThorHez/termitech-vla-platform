@@ -1,19 +1,64 @@
 """Phase choices stay frozen from local preflight through optimizer launch."""
 
 import copy
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
-from vla_adapters.recap import RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, recap_torch_module_paths
+from vla_adapters.recap import (ACP_MULTI_ENTRYPOINT, RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, STAGE_ANNOTATION,
+                                STAGE_PROGRESS_DATASET, VALUE_ANNOTATION, VALUE_ANNOTATION_DATASET, recap_torch_module_paths)
 from vla_agent import preflight, runner, training_validation
 from vla_agent.safety import AgentError
 from vla_agent.snapshots import capture_code, compare_code
 from vla_agent.state import State
 
 from tests.agent.test_automatic_preflight import probe_fixture  # noqa: F401
+from tests.agent.test_artifacts import checkpoint as orbax_checkpoint
 from tests.agent.test_multi_dataset_agent import explicit_probe
+
+
+@pytest.mark.parametrize("stage", [STAGE_ANNOTATION, VALUE_ANNOTATION])
+def test_annotation_runner_only_accepts_data_linked_to_frozen_model_and_receipt(tmp_path, stage):
+    output = tmp_path.resolve()
+    value = stage == VALUE_ANNOTATION
+    dataset = output / (VALUE_ANNOTATION_DATASET if value else STAGE_PROGRESS_DATASET)
+    (dataset / "meta").mkdir(parents=True)
+    scorer_path = str(output.parent / "source-checkpoint/20")
+    settings = {"n_step": 10, "positive_ratio": 0.5}
+    receipt = {"schema_version": 1, "frame_count": 2, "positive_count": 1, **settings}
+    if value:
+        receipt.update(method="n_step_value", backend="pytorch", checkpoint=scorer_path, thresholds={"0": 0.3})
+    else:
+        settings["stage_count"] = 1
+        receipt.update(method="kai0_stage_progress", score="absolute_advantage", stage_count=1,
+                       stages=[{"stage": 0, "frame_count": 2, "positive_count": 1, "threshold": 0.3}])
+    receipt_path = dataset / "meta" / ("value_advantage.json" if value else "stage_advantage.json")
+    receipt_path.write_text(json.dumps(receipt))
+    source_manifest = "a" * 64
+    plan = {"datasets": [{"frames": 2}], "model": {"checkpoint_path": scorer_path, "scorer_checkpoint": {"step": 20}},
+            "recap_stage_contract": {"annotation": {"source_manifest_digest": source_manifest, **settings}}}
+    inputs = {key: {"id": key + "-asset"} for key in ("model", "dataset_0", "norm_0")}
+    payload = {"inputs": inputs, "training_stage": stage, "code_expectation": {"automatic_preflight": {"plan": plan}}}
+    metadata = {"format": "lerobot", "registration_source": "recap_value_annotation" if value else "recap_stage_annotation",
+                "source_dataset_asset_id": "dataset_0-asset",
+                "source_norm_asset_id": "norm_0-asset", "scorer_model_asset_id": "model-asset", "scorer_checkpoint_path": scorer_path,
+                "source_manifest_digest": source_manifest, "annotation": receipt,
+                "annotation_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest()}
+    artifact = {"kind": "DATASET", "name": "Annotated dataset", "path": str(dataset), "version": "20", "metadata": metadata}
+    manifest = output / "artifacts.json"
+    manifest.write_text(json.dumps([artifact]))
+    assert runner.verified_outputs(output, False, template_id="recap", stage_annotation=payload) == [artifact]
+    metadata["scorer_model_asset_id"] = "different-model"
+    manifest.write_text(json.dumps([artifact]))
+    with pytest.raises(AgentError, match="frozen scorer"):
+        runner.verified_outputs(output, False, template_id="recap", stage_annotation=payload)
+    metadata["scorer_model_asset_id"] = "model-asset"
+    manifest.write_text(json.dumps([artifact]))
+    receipt_path.write_text("{}")
+    with pytest.raises(AgentError, match="receipt"):
+        runner.verified_outputs(output, False, template_id="recap", stage_annotation=payload)
 
 
 @pytest.mark.parametrize("changed_stage,changed_config", [("offline_rl", {}), ("value", {"val_ratio": .2})])
@@ -86,6 +131,50 @@ def test_phase_probe_requires_real_model_loader_and_each_derived_dataset_evidenc
     write_response(probe_fixture, plan)
     evidence = training_validation.validate_training(probe_fixture["config"], launch, [])
     assert evidence["plan"]["training_stage"] == "offline_rl"
+
+
+@pytest.mark.parametrize("mutation", [None, "torch_backend", "estimator", "torch_entrypoint", "missing_manifest"])
+def test_jax_acp_probe_checks_native_policy_and_backend_evidence(probe_fixture, mutation):
+    launch, plan = staged_probe(probe_fixture)
+    spec = json.loads(launch["argv"][-1])
+    spec["recap_backend"] = "jax"
+    launch["argv"][-1] = json.dumps(spec)
+    contract = plan["recap_stage_contract"]
+    contract.update(backend="jax", loader_type="CheckpointWeightLoader")
+    path = plan["inputs"]["model"]
+    plan["entrypoint"] = spec["code_dir"] + "/" + ACP_MULTI_ENTRYPOINT
+    plan["model"].update(format="openpi-orbax", model_role="policy", path=path + "/params",
+                         metadata=[{"path": path + "/params/_METADATA", "sha256": "a" * 64}])
+    if mutation == "torch_backend":
+        contract["backend"] = "pytorch"
+    elif mutation == "estimator":
+        plan["model"]["model_role"] = "value_estimator"
+    elif mutation == "torch_entrypoint":
+        plan["entrypoint"] = spec["code_dir"] + "/" + RECAP_TORCH_ENTRY
+    elif mutation == "missing_manifest":
+        plan["model"]["metadata"] = []
+    write_response(probe_fixture, plan)
+    if mutation:
+        with pytest.raises(AgentError, match="ReCap"):
+            training_validation.validate_training(probe_fixture["config"], launch, [])
+    else:
+        evidence = training_validation.validate_training(probe_fixture["config"], launch, [])
+        assert evidence["plan"]["recap_stage_contract"]["backend"] == "jax"
+
+
+def test_jax_acp_runner_requires_final_committed_orbax_policy(tmp_path):
+    checkpoint = orbax_checkpoint(tmp_path, "19")
+    artifact = {"kind": "MODEL", "name": "policy", "path": str(checkpoint), "version": "19",
+                "metadata": {"format": "openpi-orbax", "backend": "jax", "model_role": "policy", "step": 19}}
+    manifest = tmp_path / "artifacts.json"
+    manifest.write_text(json.dumps([artifact]))
+    plan = {"recipe": "fixture_recipe", "parameters": {"steps": 20}}
+    assert runner.verified_outputs(tmp_path, False, template_id="recap", recap_acp=plan) == [artifact]
+    with pytest.raises(AgentError, match="final Orbax"):
+        runner.verified_outputs(tmp_path, False, template_id="recap", recap_acp={**plan, "parameters": {"steps": 21}})
+    (checkpoint / "_CHECKPOINT_METADATA").unlink()
+    with pytest.raises(AgentError, match="final Orbax"):
+        runner.verified_outputs(tmp_path, False, template_id="recap", recap_acp=plan)
 
 
 @pytest.mark.parametrize("mutation", ["old_wrapper", "different_stage", "different_config", "missing_check", "missing_contract", "wrong_dataset", "no_columns", "wrong_model", "wrong_supervision", "jax_evidence"])

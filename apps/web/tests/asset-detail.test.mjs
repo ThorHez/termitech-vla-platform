@@ -254,6 +254,37 @@ try {
     assert.equal(button(html, /数据特征/), undefined);
   });
 
+  await test('model details display the declared format and offer edits only for eligible registrations', () => {
+    const model = { ...norm, kind: 'MODEL', registered_by_user_id: 'operator' };
+    const props = { editModelFormat() {} };
+    const editAction = /^(?:补录|修改)模型格式$/;
+    const renderModel = (asset, role) => render(asset, node, role, [asset], props);
+    for (const [format, label] of [
+      ['orbax', 'JAX / Orbax'],
+      ['openpi-pytorch', 'PyTorch / Safetensors'],
+      [undefined, '未指定'],
+    ]) {
+      const asset = { ...model, metadata: format ? { format } : {} };
+      const html = renderModel(asset, 'operator');
+      assert.ok(html.includes(`<dt>模型格式</dt><dd>${label}</dd>`));
+      assert.equal(button(html, editAction)?.label, format ? '修改模型格式' : '补录模型格式');
+      assert.equal(button(renderModel(asset, 'viewer'), editAction), undefined);
+    }
+    const unowned = { ...model, registered_by_user_id: null };
+    assert.equal(button(renderModel(unowned, 'operator'), editAction), undefined);
+    assert.ok(button(renderModel(unowned, 'admin'), editAction));
+    for (const override of [
+      { origin_attempt_id: 'attempt' },
+      { metadata: { transfer_id: null } },
+      { metadata: { asset_sync: {} } },
+      { metadata: { format: 'openpi-transferred' } },
+      { status: 'ARCHIVED' },
+      { status: 'UNAVAILABLE' },
+    ]) {
+      assert.equal(button(renderModel({ ...model, ...override }, 'admin'), editAction), undefined);
+    }
+  });
+
   await test('missing machine and dataset metadata do not prevent inspecting an asset', () => {
     const html = render({ ...dataset, metadata: undefined, norm_asset_id: null }, null);
     assert.ok(html.includes(dataset.path));

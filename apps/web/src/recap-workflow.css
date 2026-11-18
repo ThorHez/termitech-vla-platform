@@ -7,7 +7,6 @@
 }
 
 .recap-workflow-heading,
-.recap-workflow-kai0,
 .recap-workflow-annotation-heading,
 .recap-workflow-annotation-footer {
   display: flex;
@@ -25,6 +24,60 @@
   font-size: 13px;
 }
 
+.recap-workflow-modes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.recap-workflow-mode {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 9px 11px;
+  border: 1px solid var(--border-default, #e1e9ed);
+  border-radius: 7px;
+  background: var(--bg-surface, #fff);
+  color: var(--text-primary, #304656);
+  text-align: left;
+}
+
+.recap-workflow-mode > svg {
+  flex-shrink: 0;
+  color: var(--text-accent, #087f76);
+}
+
+.recap-workflow-mode > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.recap-workflow-mode strong {
+  font-size: 13px;
+}
+
+.recap-workflow-mode > span > span {
+  color: var(--text-secondary, #556b79);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.recap-workflow-mode:hover:not(:disabled) {
+  border-color: var(--border-success, #a5d0ca);
+}
+
+.recap-workflow-mode[aria-pressed='true'] {
+  border-color: var(--text-accent, #087f76);
+  background: var(--bg-success, #eaf8f5);
+}
+
+.recap-mode-check {
+  margin-left: auto;
+}
+
 .recap-workflow p,
 .recap-workflow-copy-status {
   color: var(--text-secondary, #556b79);
@@ -37,6 +90,10 @@
   grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: stretch;
   gap: 8px;
+}
+
+.recap-workflow-steps.kai0 {
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
 }
 
 .recap-workflow-card {
@@ -55,8 +112,7 @@
 
 .recap-workflow-card:hover:not(:disabled),
 .recap-workflow-card[aria-expanded='true'],
-.recap-workflow-card[aria-pressed='true'],
-.recap-workflow-kai0 .button[aria-pressed='true'] {
+.recap-workflow-card[aria-pressed='true'] {
   border-color: var(--text-accent, #087f76);
   background: var(--bg-success, #eaf8f5);
 }
@@ -107,10 +163,6 @@
   transform: rotate(180deg);
 }
 
-.recap-workflow-kai0 {
-  margin-top: 10px;
-}
-
 .recap-workflow-annotation {
   margin-top: 10px;
   padding: 12px;
@@ -151,7 +203,8 @@
 }
 
 @media (max-width: 760px) {
-  .recap-workflow-steps {
+  .recap-workflow-steps,
+  .recap-workflow-steps.kai0 {
     grid-template-columns: minmax(0, 1fr);
     gap: 4px;
   }
@@ -159,5 +212,11 @@
   .recap-workflow-arrow {
     margin-left: 18px;
     transform: rotate(90deg);
+  }
+}
+
+@media (max-width: 480px) {
+  .recap-workflow-modes {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

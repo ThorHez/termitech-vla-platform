@@ -1,12 +1,12 @@
-import { useState } from 'react';
-import { AlertTriangle, HardDrive } from 'lucide-react';
-import { ViewLink } from './components';
+import { AlertTriangle, HardDrive, ShieldCheck } from 'lucide-react';
+import { Back, ErrorNotice, PageHeading, Panel, ViewLink } from './components';
+import { useData } from './data';
 import type { Alert, Node } from './types';
+import { isDiskCapacityAlert } from './workspaceAlertData';
 
-const regularPreviewCount = 4;
+const previewCount = 4;
 const percentFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
-
-export const isDiskCapacityAlert = (alert: Alert) => alert.code === 'DISK_CAPACITY_HIGH';
+export const alertsPath = '/alerts';
 
 export function focusWorkspaceAlerts() {
   const section = document.getElementById('workspace-alerts');
@@ -90,14 +90,9 @@ export function AlertList({
   nodes?: Pick<Node, 'id' | 'name'>[];
   showNodeLink?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
-  const disk = alerts.filter(isDiskCapacityAlert);
-  const regular = alerts.filter((alert) => !isDiskCapacityAlert(alert));
-  const visible = [...disk, ...(expanded ? regular : regular.slice(0, regularPreviewCount))];
-  const hidden = regular.length - regularPreviewCount;
   return (
     <div className="alert-list">
-      {visible.map((alert, index) => (
+      {alerts.map((alert, index) => (
         <AlertRow
           key={alert.id || index}
           alert={alert}
@@ -105,16 +100,74 @@ export function AlertList({
           showNodeLink={showNodeLink}
         />
       ))}
-      {hidden > 0 && (
-        <button
-          type="button"
-          className="button outline small"
-          aria-expanded={expanded}
-          onClick={() => setExpanded(!expanded)}
-        >
-          {expanded ? '收起其他异常' : `展开其余 ${hidden} 条异常`}
-        </button>
-      )}
     </div>
+  );
+}
+
+type AlertContentsProps = {
+  alerts?: Alert[];
+  nodes?: Pick<Node, 'id' | 'name'>[];
+  enabled: boolean;
+  error?: Error;
+  refresh: () => void;
+};
+
+function AlertContents({ alerts, nodes, enabled, error, refresh }: AlertContentsProps) {
+  return (
+    <>
+      <ErrorNotice error={error} retry={refresh} />
+      {alerts?.length ? (
+        <AlertList alerts={alerts} nodes={nodes} />
+      ) : (
+        <div className="healthy-state">
+          <div>
+            <ShieldCheck size={26} />
+          </div>
+          <strong>{enabled && alerts ? '当前没有待处理异常' : '等待资源状态上报'}</strong>
+        </div>
+      )}
+    </>
+  );
+}
+
+export function WorkspaceAlerts({ alerts, ...props }: AlertContentsProps) {
+  return (
+    <Panel
+      id="workspace-alerts"
+      tabIndex={-1}
+      title="需要关注"
+      subtitle="来自机器和训练的实时异常"
+      action={
+        <div className="workspace-alert-actions">
+          <span className="count-pill">{alerts?.length ?? '—'}</span>
+          <ViewLink to={alertsPath}>查看全部</ViewLink>
+        </div>
+      }
+    >
+      <AlertContents {...props} alerts={alerts?.slice(0, previewCount)} />
+    </Panel>
+  );
+}
+
+export function AlertsPage() {
+  const { alerts, nodes, enabled } = useData();
+  return (
+    <>
+      <Back to="/overview" label="返回训练工作台" />
+      <PageHeading
+        title="全部异常"
+        description="查看当前的机器、磁盘和训练异常。"
+        actions={alerts.data && <span className="count-pill">{alerts.data.length} 条异常</span>}
+      />
+      <div className="panel">
+        <AlertContents
+          alerts={alerts.data}
+          nodes={nodes.data}
+          enabled={enabled}
+          error={alerts.error}
+          refresh={alerts.refresh}
+        />
+      </div>
+    </>
   );
 }

@@ -18,7 +18,7 @@ try {
   const resources = () => ({
     nodes: [{ id: 'node-a', name: 'Machine A', hostname: 'machine-a', status: 'ONLINE' }],
     profiles: [{ id: 'native', node_id: 'node-a', name: 'Native', adapter: 'openpi-sft', execution_mode: 'native', code_dir: '/code/a', python: '/code/a/.venv/bin/python' }],
-    assets: [{ id: 'model-a', node_id: 'node-a', name: 'Initial policy', kind: 'MODEL', state: 'READY', path: '/models/a', version: '1' }],
+    assets: [{ id: 'model-a', node_id: 'node-a', name: 'Initial policy', kind: 'MODEL', state: 'READY', path: '/models/a', version: '1', metadata: { format: 'openpi-orbax' } }],
   });
   const snapshot = () => ({
     request: {

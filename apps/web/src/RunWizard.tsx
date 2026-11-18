@@ -21,7 +21,12 @@ import { inputRoles, requiredInputs, useData } from './data';
 import { RecipeLibrary } from './RecipeLibrary';
 import { NormStatsFields } from './NormStatsFields';
 import { NormDatasetEditor } from './NormDatasetEditor';
-import { fillRunRepresentationDefaults } from './ComposedDatasetProcessing';
+import {
+  fillRunRepresentationDefaults,
+  removeStageProgressBinding,
+  stageProgressBindingKey,
+} from './ComposedDatasetProcessing';
+import { validStageProgressSourceKey } from './composedProcessing';
 import {
   buildNormPreviewRequest,
   inferNormActionHorizon,
@@ -43,7 +48,8 @@ import { useTrainingDraft, type TrainingDraftSession } from './useTrainingDraft'
 import type { ImageLayoutEdits } from './imageLayout';
 import { TrainingTemplateLibrary } from './TrainingTemplateLibrary';
 import { retryTrainingSnapshot, sameTrainingConfiguration } from './runRetry';
-import { recapAcpSnapshot } from './recapAcp';
+import { recapAcpDatasetLabelIssue, recapAcpSnapshot } from './recapAcp';
+import { useDatasetSampleCounts } from './useDatasetSampleCounts';
 import { TrainingGpuSelector } from './TrainingGpuSelector';
 import { TrainingNormalizationField } from './TrainingNormalizationField';
 import { RecapWorkflow } from './RecapWorkflow';
@@ -68,6 +74,7 @@ import {
   isStateTokenLayout,
   kai0StateTokenLayoutError,
   normalizeAutoConfig,
+  showsStateTokenLayout,
   STATE_TOKEN_LAYOUT_LABELS,
   supportsStateTokenLayout,
   withoutKai0StateTransform,
@@ -111,14 +118,35 @@ import {
 import './training-wizard.css';
 import { PathAutocomplete, validTrainingEntrypoint } from './PathAutocomplete';
 import {
+  isRecapAnnotationStage,
+  isStageAdvantageStage,
   recapModelError,
   recapRecipeConfiguration,
-  RECAP_PYTORCH_ENTRYPOINT,
+  recapSettingsMigrationMessage,
+  recapStageEntrypoint,
+  stageAnnotationCheckpointLabel,
+  stageAnnotationSource,
   stageParameterHints,
   stageParameterLabels,
   trainingStageLabels,
   withoutLegacyRecapSettings,
 } from './recap';
+import { stageAdvantageHandoffSnapshot } from './stageAdvantageHandoff';
+import {
+  recapValueAnnotationSnapshot,
+  type RecapCheckpointHandoff,
+} from './recapValueAnnotationHandoff';
+import {
+  activeRecapPhase,
+  newRecapPhase,
+  recapDraftForPhase,
+  recapPhaseMode,
+  recapPhaseFor,
+  recapPhaseStage,
+  replaceRecapPhase,
+  switchRecapPhase,
+  type RecapPhase,
+} from './recapPhaseDraft';
 import type {
   Asset,
   ParameterSpec,
@@ -129,13 +157,14 @@ import type {
   Run,
   RunRequest,
   Template,
-  TrainingStage,
 } from './types';
 
 function preflightHint(error?: Error) {
   if (error instanceof ApiError) {
     if (error.code === 'PROFILE_NOT_VALIDATED')
       return '当前服务仍使用旧的配方验收限制，请更新中台和这台机器的 Agent 后重新预检。';
+    if (['RECAP_STAGE_RUNTIME_UNAVAILABLE', 'AGENT_RECAP_STAGE_INVALID'].includes(error.code))
+      return '请选择支持该 ReCap 步骤的 OpenPI 运行环境，再重新预检。';
     if (error.code === 'PREFLIGHT_EXPIRED') return '本次结果已过期，请重新预检。';
     if (['NODE_OFFLINE', 'NODE_UNAVAILABLE', 'NODE_NOT_ONLINE'].includes(error.code))
       return '请确认所选机器的 Agent 已在线，再重新预检。';
@@ -161,6 +190,7 @@ interface RunWizardProps {
   initialTemplate?: string;
   sourceRun?: Run;
   recapDataset?: Asset;
+  stageHandoff?: RecapCheckpointHandoff;
 }
 
 export default function RunWizard(props: RunWizardProps) {
@@ -184,6 +214,11 @@ export default function RunWizard(props: RunWizardProps) {
         props.initialTemplate,
         props.sourceRun?.id,
         props.recapDataset?.id,
+        props.stageHandoff?.checkpoint.id,
+        props.stageHandoff?.stage,
+        props.stageHandoff?.stage === 'value_annotation'
+          ? props.stageHandoff.sourceIndex
+          : undefined,
       ])}
       {...props}
       userId={user.id}
@@ -211,6 +246,7 @@ function TrainingDraftWorkspace(props: RunWizardProps & { userId: string }) {
       initialTemplate={selection.templateId}
       sourceRun={selection.sourceRun}
       recapDataset={selection.sourceRun ? props.recapDataset : undefined}
+      stageHandoff={selection.sourceRun ? props.stageHandoff : undefined}
       personalTemplate={selection.personalTemplate}
       selectTemplate={(templateId, personalTemplate) => {
         if (mounted.current) setSelection({ templateId, sourceRun: undefined, personalTemplate });
@@ -229,6 +265,29 @@ function TrainingDraftWizard(
 ) {
   const data = useData();
   const draft = useTrainingDraft(props.userId, props.initialTemplate);
+  const [phaseEditor, setPhaseEditor] = useState<{
+    generation: number;
+    revision: number;
+    snapshot: TrainingDraftSnapshot;
+  }>();
+  const phaseSelection = phaseEditor?.generation === draft.generation ? phaseEditor : undefined;
+  const assetCatalog = data.assets.data || [];
+  const recap = props.initialTemplate === 'recap';
+  const restored = phaseSelection?.snapshot ?? draft.initialSnapshot;
+  const currentPhase = recap
+    ? restored
+      ? activeRecapPhase(restored, assetCatalog)
+      : 'value'
+    : undefined;
+  const initialDraft = currentPhase
+    ? restored
+      ? {
+          ...restored,
+          recapPhase: currentPhase,
+          request: { ...restored.request, training_stage: recapPhaseStage(currentPhase) },
+        }
+      : newRecapPhase(currentPhase, props.initialNode)
+    : restored;
   const [templateNotice, setTemplateNotice] = useState<{ name: string; issues: string[] }>();
   const consumedSourceRun = useRef<string | undefined>(undefined);
   const sourceImportInFlight = useRef(false);
@@ -238,18 +297,19 @@ function TrainingDraftWizard(
     previous?: TrainingDraftSnapshot;
     error?: Error;
   }>();
-  const [sourceNotice, setSourceNotice] = useState<string>();
+  const [sourceNotice, setSourceNotice] = useState<{ name?: string; phase?: RecapPhase }>();
   const consumedPersonalTemplate = useRef(false);
   const [personalTemplateAction, setPersonalTemplateAction] = useState<{
     state: 'loading' | 'error';
     record: TrainingTemplateRecord;
     error?: Error;
   }>();
-  const savedRevisionId = draft.initialSnapshot?.request.recipe_revision_id;
+  const savedRevisionId = initialDraft?.request.recipe_revision_id;
   const resources = [data.nodes, data.profiles, data.assets, data.templates];
   const resourceError = resources.find((resource) => resource.error)?.error;
   const ready = resources.every((resource) => resource.data !== undefined);
   const recapDataset = props.recapDataset;
+  const stageHandoff = props.stageHandoff;
   const loadPersonalTemplate = useCallback(
     async (record: TrainingTemplateRecord) => {
       setPersonalTemplateAction({ state: 'loading', record });
@@ -260,7 +320,13 @@ function TrainingDraftWizard(
           nodes: data.nodes.data || [],
         });
         applied.snapshot.request.name = `${record.name} 训练`;
-        await draft.replace(applied.snapshot);
+        await draft.replace(
+          replaceRecapPhase(
+            draft.snapshotRef.current ?? draft.initialSnapshot,
+            applied.snapshot,
+            data.assets.data || [],
+          ),
+        );
         setTemplateNotice({ name: record.name, issues: applied.issues });
         setPersonalTemplateAction(undefined);
       } catch (cause) {
@@ -272,7 +338,7 @@ function TrainingDraftWizard(
         throw cause;
       }
     },
-    [draft.replace, data.assets.data, data.profiles.data, data.nodes.data],
+    [draft.replace, draft.initialSnapshot, data.assets.data, data.profiles.data, data.nodes.data],
   );
   useEffect(() => {
     if (!props.personalTemplate || !draft.loaded || !ready || consumedPersonalTemplate.current)
@@ -287,7 +353,7 @@ function TrainingDraftWizard(
       setSourceImport({ state: 'loading', snapshot });
       try {
         await draft.replace(snapshot);
-        setSourceNotice(props.sourceRun?.name);
+        setSourceNotice({ name: props.sourceRun?.name, phase: snapshot.recapPhase });
         setSourceImport(undefined);
       } catch (cause) {
         setSourceImport({
@@ -308,11 +374,19 @@ function TrainingDraftWizard(
     try {
       const snapshot = recapDataset
         ? recapAcpSnapshot(source, recapDataset, data.assets.data || [])
-        : retryTrainingSnapshot(source);
-      const previous = draft.snapshotRef.current || draft.initialSnapshot;
-      if (previous && !sameTrainingConfiguration(previous, snapshot))
-        setSourceImport({ state: 'confirm', snapshot, previous });
-      else void loadSource(snapshot);
+        : stageHandoff?.stage === 'value_annotation'
+          ? recapValueAnnotationSnapshot(source, stageHandoff, data.assets.data || [])
+          : stageHandoff
+            ? stageAdvantageHandoffSnapshot(source, stageHandoff, data.assets.data || [])
+            : retryTrainingSnapshot(source);
+      const current = draft.snapshotRef.current || draft.initialSnapshot;
+      const next = replaceRecapPhase(current, snapshot, data.assets.data || []);
+      const previous = next.recapPhase
+        ? recapDraftForPhase(current, next.recapPhase, data.assets.data || [])
+        : current;
+      if (previous && !sameTrainingConfiguration(previous, next))
+        setSourceImport({ state: 'confirm', snapshot: next, previous });
+      else void loadSource(next);
     } catch (cause) {
       setSourceImport({
         state: 'error',
@@ -322,6 +396,7 @@ function TrainingDraftWizard(
   }, [
     props.sourceRun,
     recapDataset,
+    stageHandoff,
     data.assets.data,
     draft.loaded,
     ready,
@@ -343,7 +418,13 @@ function TrainingDraftWizard(
     );
   if (props.sourceRun && (consumedSourceRun.current !== props.sourceRun.id || sourceImport)) {
     const importing = sourceImport?.state === 'loading' || !sourceImport;
-    const importTitle = recapDataset ? '载入 ACP 配置' : '载入原训练配置';
+    const importTitle = recapDataset
+      ? '载入 ACP 配置'
+      : isRecapAnnotationStage(stageHandoff?.stage)
+        ? '载入优势标注配置'
+        : stageHandoff
+          ? '载入继续训练配置'
+          : '载入原训练配置';
     return (
       <Modal
         title={sourceImport?.state === 'confirm' ? `确认${importTitle}` : importTitle}
@@ -417,7 +498,7 @@ function TrainingDraftWizard(
                     (asset) => asset.id === sourceImport.snapshot?.request.inputs.model,
                   )?.name ||
                     sourceImport.snapshot?.request.inputs.model ||
-                    (recapDataset ? '请在 ACP 配置中选择初始策略' : '无')}
+                    (recapDataset ? '请在 ACP 配置中选择 JAX / Orbax 初始策略' : '无')}
                 </dd>
               </div>
               <div>
@@ -432,8 +513,12 @@ function TrainingDraftWizard(
             </dl>
             <p className="field-hint">
               {recapDataset
-                ? '载入后请选择初始策略权重，重新预检、核对 config 并确认启动。'
-                : '载入后从原初始模型重新训练，需重新预检、核对 config 并确认启动。原训练记录保持不变。'}
+                ? '载入后请选择 JAX / Orbax 初始策略权重，重新预检、核对 config 并确认启动。'
+                : stageHandoff
+                  ? '已选择检查点、数据集和归一化参数。请预检并确认 config。'
+                  : sourceImport.snapshot?.request.training_stage === 'offline_rl'
+                    ? '载入后核对本机的 JAX / Orbax 初始策略权重，再预检、核对 config 并确认启动。'
+                    : '载入后从原初始模型重新训练，需重新预检、核对 config 并确认启动。原训练记录保持不变。'}
             </p>
           </>
         )}
@@ -480,13 +565,44 @@ function TrainingDraftWizard(
     );
   return (
     <RestoredRunWizard
-      key={`${draft.generation}:${savedRevisionId || ''}`}
+      key={`${draft.generation}:${phaseSelection?.revision ?? 0}:${savedRevisionId || ''}`}
       {...props}
       draftSession={draft}
-      initialDraft={draft.initialSnapshot}
+      initialDraft={initialDraft}
       userId={props.userId}
       templateNotice={templateNotice}
-      sourceRunNotice={sourceNotice}
+      sourceRunNotice={sourceNotice?.phase === currentPhase ? sourceNotice?.name : undefined}
+      onSelectRecapPhase={(phase) => {
+        const current = draft.snapshotRef.current;
+        if (!current || phase === currentPhase) return;
+        const next = switchRecapPhase(current, phase, assetCatalog, props.initialNode);
+        draft.snapshotRef.current = next;
+        draft.markEdited();
+        draft.changed();
+        setPhaseEditor({
+          generation: draft.generation,
+          revision: (phaseSelection?.revision ?? 0) + 1,
+          snapshot: next,
+        });
+      }}
+      onClearDraft={async () => {
+        if (!currentPhase) return draft.clear();
+        const next = replaceRecapPhase(
+          draft.snapshotRef.current,
+          newRecapPhase(currentPhase, props.initialNode),
+          assetCatalog,
+        );
+        await draft.replace(next);
+      }}
+      onFinishDraft={async () => {
+        const current = draft.snapshotRef.current;
+        if (!currentPhase || !Object.keys(current?.recapPhases ?? {}).length)
+          return draft.finished();
+        await draft.replace(
+          replaceRecapPhase(current, newRecapPhase(currentPhase, props.initialNode), assetCatalog),
+          { remount: false },
+        );
+      }}
       onSelectTemplate={async (templateId) => {
         if (!templateId || templateId === props.initialTemplate) return;
         await draft.flush();
@@ -545,8 +661,12 @@ function RunWizardContent({
   templateNotice,
   onApplyTemplate,
   onSelectTemplate,
+  onSelectRecapPhase,
+  onClearDraft,
+  onFinishDraft,
   sourceRunNotice,
   recapDataset,
+  stageHandoff,
 }: RunWizardProps & {
   initialDraft?: TrainingDraftSnapshot;
   initialSavedRevision?: RecipeRevision;
@@ -555,6 +675,9 @@ function RunWizardContent({
   templateNotice?: { name: string; issues: string[] };
   onApplyTemplate: (record: TrainingTemplateRecord) => Promise<void>;
   onSelectTemplate: (templateId: string) => Promise<void>;
+  onSelectRecapPhase: (phase: RecapPhase) => void;
+  onClearDraft: () => Promise<void>;
+  onFinishDraft: () => Promise<void>;
   sourceRunNotice?: string;
 }) {
   const { nodes, assets, profiles, templates, refresh } = useData();
@@ -570,7 +693,16 @@ function RunWizardContent({
     : false;
   const restoredRequest = initialDraft && withoutLegacyRecapSettings(initialDraft.request);
   const recapSettingsMigrated = restoredRequest !== initialDraft?.request;
-  const [step, setStep] = useState(initialDraft?.step || 0);
+  const restoredAcpModel =
+    restoredRequest?.template_id === 'recap' &&
+    restoredRequest.training_stage === 'offline_rl' &&
+    assets.data?.find((asset) => asset.id === restoredRequest.inputs.model);
+  const [step, setStep] = useState(
+    isRecapAnnotationStage(restoredRequest?.training_stage) ||
+      (restoredAcpModel && recapModelError(restoredAcpModel, 'offline_rl'))
+      ? 0
+      : initialDraft?.step || 0,
+  );
   const [advancedRecipe, setAdvancedRecipe] = useState(initialAdvancedRecipe);
   const [confirmedConfigSha256, setConfirmedConfigSha256] = useState<string>();
   const [request, setRequest] = useState<RunRequest>(() =>
@@ -753,8 +885,13 @@ function RunWizardContent({
   const requiresConfigConfirmation = hasLocalTraining || isNorm;
   const normRows = normDatasetsForRequest(request);
   const automaticMode = hasLocalTraining && !advancedRecipe;
-  const chooseStateTokenLayout = automaticMode && supportsStateTokenLayout(request);
-  const kai0TokenLayoutError = chooseStateTokenLayout
+  const showStateTokenLayout = automaticMode && showsStateTokenLayout(request);
+  const canSetStateTokenLayout = supportsStateTokenLayout(request);
+  const stateTokenLayout = request.auto_config?.state_token_layout ?? 'flat_state';
+  const stateTokenLayoutLabel = canSetStateTokenLayout
+    ? STATE_TOKEN_LAYOUT_LABELS[stateTokenLayout]
+    : '沿用当前处理器（默认）';
+  const kai0TokenLayoutError = showStateTokenLayout
     ? kai0StateTokenLayoutError(request)
     : undefined;
   const reviewedRequest = preview?.request || request;
@@ -770,10 +907,27 @@ function RunWizardContent({
   const trainingStage = isRecap
     ? template?.stages?.find((stage) => stage.id === request.training_stage)
     : undefined;
-  const stageProgress = trainingStage?.id === 'stage_progress';
+  const stageProgress = isStageAdvantageStage(trainingStage?.id);
+  const stageAnnotation = isRecapAnnotationStage(trainingStage?.id);
+  const valueAnnotation = trainingStage?.id === 'value_annotation';
+  const stageAcp = trainingStage?.id === 'offline_rl';
+  const estimatorTraining = trainingStage?.id === 'value' || trainingStage?.id === 'stage_progress';
+  const enteringPreflight = step === 1 || (stageAnnotation && step === 0);
+  const stageEntrypoint = recapStageEntrypoint(
+    trainingStage,
+    request.dataset_bindings?.length ?? 0,
+  );
   const stageProgressDatasetError =
-    stageProgress && (request.dataset_bindings?.length || 0) > 1
-      ? 'Kai0 阶段进度训练需要恰好一个数据集，请移除多余数据集。'
+    (stageProgress || stageAnnotation) && (request.dataset_bindings?.length || 0) > 1
+      ? '当前阶段只使用一个数据集，请移除多余数据集。'
+      : undefined;
+  const stageProgressSourceError =
+    stageProgress &&
+    request.dataset_bindings?.some(
+      (binding) =>
+        binding.dataset_asset_id && !validStageProgressSourceKey(stageProgressBindingKey(binding)),
+    )
+      ? '请在第 1 步为 Stage Advantage 数据集填写有效的阶段进度列名。'
       : undefined;
   const node = nodes.data?.find((item) => item.id === request.node_id);
   const resourceRecommendations = isNorm
@@ -809,7 +963,12 @@ function RunWizardContent({
       ) || [],
     [profiles.data, request.node_id, request.template_id, template?.runtime_adapter],
   );
-  const parameterSpecs = specs(template);
+  const templateParameterSpecs = specs(template);
+  const parameterSpecs = stageAnnotation
+    ? Object.fromEntries(
+        Object.entries(templateParameterSpecs).filter(([key]) => key === 'batch_size'),
+      )
+    : templateParameterSpecs;
   const parameterSpecsRef = useRef(parameterSpecs);
   parameterSpecsRef.current = parameterSpecs;
   const parameterGroups = trainingParameterGroups(parameterSpecs);
@@ -827,14 +986,18 @@ function RunWizardContent({
         message: `此配方不使用${parameterSpecs[key]?.label || key}，请清除此项后重新预检。`,
       })),
   ];
-  const parameterBlocker =
-    step === 1 ? parameterIssues.map((issue) => issue.message).join(' ') : '';
-  const gpuSelectionError = requestedGpuError(
-    request,
-    node,
-    template?.min_gpus ?? (template?.id === 'smoke' ? 0 : 1),
-    userId,
-  );
+  const parameterBlocker = enteringPreflight
+    ? parameterIssues.map((issue) => issue.message).join(' ')
+    : '';
+  const gpuSelectionError =
+    stageAnnotation && request.gpu_count !== 1
+      ? '优势标注使用 1 张 GPU，请选择一张卡。'
+      : requestedGpuError(
+          request,
+          node,
+          template?.min_gpus ?? (template?.id === 'smoke' ? 0 : 1),
+          userId,
+        );
   const stageParameterSpecs = specs(trainingStage);
   const inputRequirements = requiredInputs(trainingStage || template);
   const selectedProfile = compatibleProfiles.find((profile) => profile.id === request.profile_id);
@@ -844,7 +1007,9 @@ function RunWizardContent({
   }
   const snapshot: TrainingDraftSnapshot = {
     request,
-    step: step === 0 ? 0 : 1,
+    step: step === 0 || stageAnnotation ? 0 : 1,
+    ...(initialDraft?.recapPhase ? { recapPhase: initialDraft.recapPhase } : {}),
+    ...(initialDraft?.recapPhases ? { recapPhases: initialDraft.recapPhases } : {}),
     advancedRecipe,
     editedParameters: actionHorizonDraftParameters(editedParameters.current, actionHorizonMode),
     editedStageParameters: [...editedStageParameters.current],
@@ -897,7 +1062,10 @@ function RunWizardContent({
       )
     : [];
   const dataProcessingBlocker =
-    step === 1 && (hasLocalTraining || isNorm) && !processorsValid
+    enteringPreflight &&
+    (hasLocalTraining || isNorm) &&
+    !processorsValid &&
+    (!stageAnnotation || request.dataset_bindings?.some((binding) => binding.dataset_asset_id))
       ? isNorm
         ? '请返回数据配置，核对每个数据集的统计处理方式。'
         : missingProcessors.length
@@ -939,13 +1107,37 @@ function RunWizardContent({
       ) || [],
     [assets.data, request.node_id],
   );
+  const acpBindings = stageAcp && step < 2 ? request.dataset_bindings || [] : [];
+  const acpSampleCounts = useDatasetSampleCounts(acpBindings, localAssets, node, true);
+  const acpDatasetIssues = new Map<string, string>();
+  for (const binding of acpBindings) {
+    const dataset = localAssets.find(
+      (asset) => asset.id === binding.dataset_asset_id && asset.kind === 'DATASET',
+    );
+    if (!dataset) continue;
+    const issue = recapAcpDatasetLabelIssue(
+      dataset,
+      acpSampleCounts.counts[dataset.id]?.featureKeys,
+    );
+    if (issue) acpDatasetIssues.set(dataset.id, issue);
+  }
+  const acpDatasetBlocker = acpDatasetIssues.size
+    ? '所选数据集缺少 is_positive，请检查标红的数据组。'
+    : undefined;
+  const acpDatasetReading = acpBindings.some(
+    ({ dataset_asset_id }) => acpSampleCounts.counts[dataset_asset_id]?.status === 'loading',
+  );
   const selectedRecapModel = isRecap
     ? localAssets.find((asset) => asset.id === request.inputs.model && asset.kind === 'MODEL')
     : undefined;
   const selectedRecapModelError = selectedRecapModel
     ? recapModelError(selectedRecapModel, request.training_stage)
     : isRecap && request.inputs.model && assets.data
-      ? '原初始模型不在当前机器的可用资产中，请重新选择 PyTorch 权重。'
+      ? stageAnnotation
+        ? '已选检查点在当前机器上不可用，请重新选择。'
+        : stageAcp
+          ? '原初始模型在当前机器上不可用，请重新选择 JAX / Orbax 策略权重。'
+          : '原初始模型不在当前机器的可用资产中，请重新选择 PyTorch 权重。'
       : undefined;
   const actionHorizonInference = useMemo(
     () =>
@@ -966,9 +1158,12 @@ function RunWizardContent({
           : []),
       ]
     : [];
-  const actionHorizonBlocker = step === 1 ? actionHorizonErrors.join(' ') : '';
+  const actionHorizonBlocker = enteringPreflight ? actionHorizonErrors.join(' ') : '';
   const processingBlocker =
-    actionHorizonBlocker || (step === 1 && stageProgressDatasetError) || dataProcessingBlocker;
+    acpDatasetBlocker ||
+    actionHorizonBlocker ||
+    (enteringPreflight && (stageProgressDatasetError || stageProgressSourceError)) ||
+    dataProcessingBlocker;
   useEffect(() => {
     if (
       !automaticConfiguration ||
@@ -1102,7 +1297,8 @@ function RunWizardContent({
   useEffect(() => {
     // A generated preview is frozen. Resume resource following only after the
     // user returns to configuration, without changing its approval underneath.
-    if ((!hasLocalTraining && !isNorm) || step >= 2 || busy || draftActionBusy) return;
+    if (stageAnnotation || (!hasLocalTraining && !isNorm) || step >= 2 || busy || draftActionBusy)
+      return;
     const next = applyResourceRecommendations(
       request.parameters,
       editedParameters.current,
@@ -1127,6 +1323,7 @@ function RunWizardContent({
     hasLocalTraining,
     isNorm,
     isRecap,
+    stageAnnotation,
     advancedRecipe,
     step,
     busy,
@@ -1192,14 +1389,15 @@ function RunWizardContent({
   }, [request.node_id, request.template_id, request.profile_id, selectedProfile]);
   useEffect(() => {
     if (!trainingStage) return;
-    setRequest((value) =>
-      value.stage_config !== undefined
-        ? value
-        : {
-            ...value,
-            stage_config: trainingParameterDefaults(specs(trainingStage)),
-          },
-    );
+    const defaults = trainingParameterDefaults(specs(trainingStage));
+    setRequest((value) => {
+      if (
+        value.stage_config &&
+        Object.keys(defaults).every((key) => Object.hasOwn(value.stage_config!, key))
+      )
+        return value;
+      return { ...value, stage_config: { ...defaults, ...value.stage_config } };
+    });
   }, [trainingStage]);
   useEffect(() => {
     if (!hasLocalTraining || isRecap || automaticMode || entrypointEdited.current) return;
@@ -1416,41 +1614,6 @@ function RunWizardContent({
       }));
     }
   };
-  const selectStage = (stage: TrainingStage) => {
-    draftSession.markEdited();
-    setStep(0);
-    editedParameters.current = resourceRecommendationTracking(editedParameters.current);
-    editedStageParameters.current.clear();
-    entrypointEdited.current = false;
-    datasetDefaultsScope.current = '';
-    setRecipeDefaults({});
-    setRecipeDatasets([]);
-    setStageRecipeDefaults({});
-    setStageRecipeInfo(undefined);
-    setSelectedRecipeRevision(undefined);
-    setRecipeDirty(false);
-    setRecipeReading(false);
-    setPreviewId('');
-    setCreatedPreview(undefined);
-    setConfirmedConfigSha256(undefined);
-    setError(undefined);
-    setRequest((value) => ({
-      ...value,
-      training_stage: stage,
-      stage_config: undefined,
-      recipe: advancedRecipe ? '' : undefined,
-      recipe_revision_id: undefined,
-      entrypoint: undefined,
-      auto_config: value.auto_config
-        ? {
-            ...withoutStateTokenLayout(value.auto_config),
-            model_type: stage === 'stage_progress' ? 'pi05' : value.auto_config.model_type,
-            finetune_mode: 'full',
-          }
-        : undefined,
-      parameters: value.parameters,
-    }));
-  };
   const beginPreview = async () => {
     setBusy(true);
     setError(undefined);
@@ -1469,10 +1632,24 @@ function RunWizardContent({
               profile_id: request.profile_id,
               template_id: request.template_id,
               inputs: request.inputs,
-              dataset_bindings: hasLocalTraining ? request.dataset_bindings : undefined,
+              dataset_bindings: hasLocalTraining
+                ? stageProgress
+                  ? request.dataset_bindings
+                  : request.dataset_bindings?.map(removeStageProgressBinding)
+                : undefined,
               training_stage: isRecap ? request.training_stage : undefined,
-              stage_config: isRecap ? request.stage_config : undefined,
-              parameters: request.parameters,
+              stage_config: isRecap
+                ? Object.fromEntries(
+                    Object.entries(request.stage_config || {}).filter(([key]) =>
+                      Object.hasOwn(stageParameterSpecs, key),
+                    ),
+                  )
+                : undefined,
+              parameters: stageAnnotation
+                ? Object.fromEntries(
+                    Object.entries(request.parameters).filter(([key]) => key === 'batch_size'),
+                  )
+                : request.parameters,
               gpu_count: request.gpu_count,
               requested_gpu_uuids: request.requested_gpu_uuids,
               training_gpu_policy: hasLocalTraining ? request.training_gpu_policy : undefined,
@@ -1505,7 +1682,7 @@ function RunWizardContent({
         preflightId: preview.id,
         confirmedConfigSha256: requiresConfigConfirmation ? confirmedConfigSha256 : undefined,
         idempotencyKey: idempotencyKey.current,
-        finishDraft: draftSession.finished,
+        finishDraft: onFinishDraft,
         isActive: () => mounted.current,
         onSubmitted: (run) => {
           refresh();
@@ -1540,15 +1717,110 @@ function RunWizardContent({
     error: '尚未同步到服务端，当前修改会尽可能暂存在此浏览器',
     conflict: '草稿版本冲突，当前填写尚未覆盖服务端',
   }[draftSession.status];
+  const stageParameterFields = trainingStage && Object.keys(stageParameterSpecs).length > 0 && (
+    <>
+      {estimatorTraining ? (
+        <h4>验证设置</h4>
+      ) : (
+        <div className="form-section-title">
+          <Cpu size={16} />
+          <h3>{stageProgress ? trainingStageLabels[trainingStage.id] : trainingStage.name}参数</h3>
+          <span>仅用于当前阶段</span>
+        </div>
+      )}
+      {stageRecipeInfo?.mixedDropout && (
+        <div
+          className={`inline-note ${mixedDropoutUnresolved ? 'red training-validation-error' : 'amber'}`}
+          role={mixedDropoutUnresolved ? 'alert' : 'status'}
+        >
+          配方中各数据项的 ACP 条件丢弃概率不一致，请明确填写本次统一覆盖值。
+        </div>
+      )}
+      <div className="form-grid parameters">
+        {Object.entries(stageParameterSpecs).map(([key, spec]) => {
+          const hint =
+            key === 'val_ratio'
+              ? trainingStage.id === 'stage_progress'
+                ? '按完整轨迹划分训练集和验证集。填 0 关闭验证。'
+                : '按样本划分训练集和验证集。填 0 关闭验证。'
+              : spec.hint ||
+                (valueAnnotation && key === 'positive_ratio'
+                  ? '每个任务内按优势排序，取该比例作为正标签。'
+                  : stageParameterHints[key]) ||
+                '本次阶段参数，Agent 将在预检时核对。';
+          const recipeHint = Object.hasOwn(stageRecipeDefaults, key)
+            ? `配方值 ${stageRecipeDefaults[key]}${editedStageParameters.current.has(key) ? '，已由本次设置覆盖。' : '。'}`
+            : '';
+          return (
+            <Field
+              key={key}
+              label={spec.label || stageParameterLabels[key] || key}
+              required
+              hint={estimatorTraining && recipeHint ? `${hint} ${recipeHint}` : recipeHint || hint}
+            >
+              <input
+                type="number"
+                required
+                min={spec.min ?? spec.minimum}
+                max={spec.max ?? spec.maximum}
+                step={spec.type === 'integer' ? 1 : 'any'}
+                value={
+                  Number.isFinite(request.stage_config?.[key]) ? request.stage_config?.[key] : ''
+                }
+                onChange={(event) => {
+                  editedStageParameters.current.add(key);
+                  update('stage_config', {
+                    ...request.stage_config,
+                    [key]: event.target.value === '' ? NaN : Number(event.target.value),
+                  });
+                }}
+              />
+            </Field>
+          );
+        })}
+      </div>
+      {advancedRecipe && trainingStage.id === 'value' && (
+        <dl className="detail-list inset">
+          <div>
+            <dt>可训练参数范围</dt>
+            <dd>
+              由价值配方的冻结规则决定。Agent 在预检时检查。
+              {!stageRecipeInfo?.valueHead.length && (
+                <span className="field-hint">可在配方详情查看模型与冻结规则。</span>
+              )}
+            </dd>
+          </div>
+          {stageRecipeInfo?.valueHead.map((field) => (
+            <div key={field.path}>
+              <dt>
+                <code>{field.path}</code>
+              </dt>
+              <dd>
+                <code>{field.value}</code>
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </>
+  );
   return (
     <Modal
-      title={isNorm ? '计算 norm_stats' : isRecap ? '新建 ReCap 训练' : '新建训练'}
+      title={
+        isNorm
+          ? '计算 norm_stats'
+          : stageAnnotation
+            ? '新建 ReCap 优势标注'
+            : isRecap
+              ? '新建 ReCap 训练'
+              : '新建训练'
+      }
       className="training-run-modal"
       subtitle={
         isNorm
           ? '选择本机数据集和处理方式，核对统计配置后提交计算任务。'
           : isRecap
-            ? '按工作流选择训练作业，再配置数据、权重和训练参数。'
+            ? '选择工作流步骤，配置本次作业的数据、权重和参数。'
             : '选择数据和初始模型，确认训练方式与参数，预检后核对 config 再启动。'
       }
       close={() => {
@@ -1580,11 +1852,11 @@ function RunWizardContent({
                   document.getElementById(`training-parameter-${parameterIssues[0]?.key}`)?.focus()
                 }
               >
-                检查训练参数
+                {stageAnnotation ? '检查标注参数' : '检查训练参数'}
               </button>
             </div>
           )}
-          {step === 1 && gpuSelectionError && (
+          {enteringPreflight && gpuSelectionError && (
             <div className="wizard-processing-blocker" id="training-gpu-blocker" role="alert">
               <XCircle size={16} aria-hidden="true" />
               <span>{gpuSelectionError}</span>
@@ -1598,29 +1870,38 @@ function RunWizardContent({
             >
               <XCircle size={16} aria-hidden="true" />
               <span>{processingBlocker}</span>
-              <button
-                type="button"
-                className="button outline small"
-                disabled={busy}
-                onClick={() => {
-                  if (
-                    actionHorizonBlocker &&
-                    actionHorizonInference.recommendedHorizon !== undefined
-                  )
-                    document.getElementById('training-action-horizon')?.focus();
-                  else editDataProcessing();
-                }}
-              >
-                {actionHorizonBlocker && actionHorizonInference.recommendedHorizon !== undefined
-                  ? '检查预测长度'
-                  : '返回数据配置'}
-              </button>
+              {(!acpDatasetBlocker || step > 0) && (
+                <button
+                  type="button"
+                  className="button outline small"
+                  disabled={busy}
+                  onClick={() => {
+                    if (
+                      !acpDatasetBlocker &&
+                      actionHorizonBlocker &&
+                      actionHorizonInference.recommendedHorizon !== undefined
+                    )
+                      document.getElementById('training-action-horizon')?.focus();
+                    else editDataProcessing();
+                  }}
+                >
+                  {!acpDatasetBlocker &&
+                  actionHorizonBlocker &&
+                  actionHorizonInference.recommendedHorizon !== undefined
+                    ? '检查预测长度'
+                    : '返回数据配置'}
+                </button>
+              )}
             </div>
           )}
           <div className="wizard-footer-note">
             <ShieldCheck size={14} />
-            <span>
-              {step === 2 ? '代码版本由 Agent 读取并绑定本次训练' : '数据与模型保持在所选机器本地'}
+            <span role={acpDatasetReading ? 'status' : undefined}>
+              {acpDatasetReading
+                ? '正在核对 ACP 数据集字段'
+                : step === 2
+                  ? '代码版本由 Agent 读取并绑定本次训练'
+                  : '数据与模型保持在所选机器本地'}
             </span>
           </div>
           {step > 0 && (
@@ -1629,7 +1910,7 @@ function RunWizardContent({
               disabled={busy || draftActionBusy}
               onClick={() => {
                 draftSession.markEdited();
-                setStep(step - 1);
+                setStep(stageAnnotation ? 0 : step - 1);
                 setPreviewId('');
                 setCreatedPreview(undefined);
                 setError(undefined);
@@ -1645,7 +1926,7 @@ function RunWizardContent({
               className="button primary"
               type="submit"
               form="run-wizard-form"
-              formNoValidate={step === 0}
+              formNoValidate={!enteringPreflight}
               aria-describedby={
                 [
                   processingBlocker && 'training-processing-blocker',
@@ -1658,15 +1939,24 @@ function RunWizardContent({
               disabled={
                 busy ||
                 draftActionBusy ||
-                (step === 1 && recipeReading) ||
+                (enteringPreflight && recipeReading) ||
                 !!actionHorizonBlocker ||
                 !!stageProgressDatasetError ||
+                !!acpDatasetBlocker ||
+                acpDatasetReading ||
+                (enteringPreflight && !!stageProgressSourceError) ||
                 !!parameterBlocker ||
-                (step === 1 && !!gpuSelectionError) ||
-                (step === 1 && (hasLocalTraining || isNorm) && !processorsValid)
+                (enteringPreflight && !!gpuSelectionError) ||
+                (enteringPreflight && (hasLocalTraining || isNorm) && !processorsValid)
               }
             >
-              {step === 1 ? (recipeReading ? '读取配方配置…' : '生成 config 并预检') : '下一步'}
+              {enteringPreflight
+                ? recipeReading
+                  ? '读取配方配置…'
+                  : stageAnnotation
+                    ? '开始预检'
+                    : '生成 config 并预检'
+                : '下一步'}
               <ArrowRight size={15} />
             </button>
           ) : (
@@ -1676,7 +1966,7 @@ function RunWizardContent({
               onClick={() => void start()}
             >
               {busy ? <LoaderCircle size={16} className="spin" /> : <Play size={16} />}
-              {isNorm ? '确认开始计算' : '确认启动训练'}
+              {isNorm ? '确认开始计算' : stageAnnotation ? '确认启动标注' : '确认启动训练'}
             </button>
           )}
         </>
@@ -1687,7 +1977,8 @@ function RunWizardContent({
           stages={template.stages || []}
           selected={trainingStage?.id}
           disabled={busy || draftActionBusy || template.status !== 'AVAILABLE'}
-          onSelect={selectStage}
+          mode={initialDraft?.recapPhase ? recapPhaseMode(initialDraft.recapPhase) : undefined}
+          onSelect={(stage, mode) => onSelectRecapPhase(recapPhaseFor(stage, mode))}
         />
       )}
       {isRecap && <h3 className="recap-config-heading">当前作业配置</h3>}
@@ -1696,32 +1987,53 @@ function RunWizardContent({
         role="group"
         aria-label={isRecap ? '当前作业配置步骤' : '配置步骤'}
       >
-        {[
-          isNorm ? '本机数据集' : isRecap ? '数据与权重' : '数据和初始模型',
-          isNorm ? '统计配置与参数' : isRecap ? '训练参数' : '训练方式与参数',
-          '预检与 config 确认',
-        ].map((title, index) => (
-          <div
-            key={title}
-            className={`wizard-step ${index === step ? 'current' : index < step ? 'done' : ''}`}
-            aria-current={index === step ? 'step' : undefined}
-          >
-            <span>{index < step ? <Check size={15} /> : index + 1}</span>
-            <strong>{title}</strong>
-          </div>
-        ))}
+        {(stageAnnotation
+          ? ['标注数据配置', '预检确认']
+          : [
+              isNorm ? '本机数据集' : isRecap ? '数据与权重' : '数据和初始模型',
+              isNorm ? '统计配置与参数' : isRecap ? '训练参数' : '训练方式与参数',
+              isRecap ? '预检与配置确认' : '预检与 config 确认',
+            ]
+        ).map((title, index) => {
+          const displayedStep = stageAnnotation && step === 2 ? 1 : step;
+          return (
+            <div
+              key={title}
+              className={`wizard-step ${index === displayedStep ? 'current' : index < displayedStep ? 'done' : ''}`}
+              aria-current={index === displayedStep ? 'step' : undefined}
+            >
+              <span>{index < displayedStep ? <Check size={15} /> : index + 1}</span>
+              <strong>{title}</strong>
+            </div>
+          );
+        })}
       </div>
-      {isRecap && recapSettingsMigrated && (
-        <div className="inline-note" role="status">
-          此草稿已改用 PyTorch 入口，旧 FSDP 和 EMA 参数已移除。
-        </div>
-      )}
-      {sourceRunNotice && !recapDataset && (
+      {isRecap &&
+        recapSettingsMigrated &&
+        request.training_stage === restoredRequest?.training_stage && (
+          <div className="inline-note" role="status">
+            {recapSettingsMigrationMessage(request.training_stage)}
+          </div>
+        )}
+      {sourceRunNotice && !recapDataset && !stageHandoff && (
         <div className="inline-note" role="status">
           已载入“{sourceRunNotice}
-          ”的训练设置。默认使用原初始模型创建新训练，请核对资源、重新预检并确认 config。
+          ”的
+          {stageAnnotation
+            ? '标注设置。请核对资源、重新预检并确认 config。'
+            : stageAcp
+              ? 'ACP 设置。请核对初始 JAX / Orbax 策略权重和资源，再预检并确认 config。'
+              : '训练设置。默认使用原初始模型创建新训练，请核对资源、重新预检并确认 config。'}
         </div>
       )}
+      {stageHandoff &&
+        request.training_stage === stageHandoff.stage &&
+        request.inputs.model === stageHandoff.checkpoint.id && (
+          <div className="inline-note" role="status">
+            已载入检查点「{stageHandoff.checkpoint.name}」、原数据集和归一化参数。
+            {stageAnnotation ? '核对标注参数后预检。' : '从所选权重开始新的训练作业。'}
+          </div>
+        )}
       {sourceRunNotice &&
         recapDataset &&
         request.training_stage === 'offline_rl' &&
@@ -1729,7 +2041,8 @@ function RunWizardContent({
           (binding) => binding.dataset_asset_id === recapDataset.id,
         ) && (
           <div className="inline-note" role="status">
-            已载入标注数据集「{recapDataset.name}」及来源归一化参数。请选择初始策略权重，再预检。
+            已载入标注数据集「{recapDataset.name}」及来源归一化参数。请选择 JAX / Orbax
+            初始策略权重，再预检。
           </div>
         )}
       <section className="training-draft-status" aria-label="训练配置草稿">
@@ -1761,7 +2074,7 @@ function RunWizardContent({
             disabled={busy || draftActionBusy || draftSession.status === 'saving'}
             onClick={() => setConfirmClearDraft(true)}
           >
-            清空当前模板草稿
+            {isRecap ? '清空当前阶段草稿' : '清空当前模板草稿'}
           </button>
         </div>
         {draftSession.error && (
@@ -1791,12 +2104,16 @@ function RunWizardContent({
         )}
         {confirmClearDraft && (
           <div className="training-draft-choice" role="alert">
-            <span>清空会移除当前训练模板的草稿，并重新开始当前配置。</span>
+            <span>
+              {isRecap
+                ? '清空后重新填写当前阶段的配置。'
+                : '清空会移除当前训练模板的草稿，并重新开始当前配置。'}
+            </span>
             <button
               type="button"
               className="button outline small"
               disabled={draftActionBusy}
-              onClick={() => void draftAction(draftSession.clear)}
+              onClick={() => void draftAction(onClearDraft)}
             >
               确认清空并重新配置
             </button>
@@ -1869,7 +2186,7 @@ function RunWizardContent({
           onSubmit={(event) => {
             event.preventDefault();
             if (isRecap && !trainingStage) {
-              setError(new Error('请在 ReCap 工作流中选择本次要提交的训练作业。'));
+              setError(new Error('请在 ReCap 工作流中选择本次要提交的作业。'));
               return;
             }
             if (!request.name.trim() || request.name.trim().length > 160) {
@@ -1888,6 +2205,11 @@ function RunWizardContent({
               setError(new Error(stageProgressDatasetError));
               return;
             }
+            if (acpDatasetBlocker) {
+              setError(new Error(acpDatasetBlocker));
+              return;
+            }
+            if (acpDatasetReading) return;
             if (selectedRecapModelError) {
               setError(new Error(selectedRecapModelError));
               return;
@@ -1905,11 +2227,19 @@ function RunWizardContent({
                 ))
             ) {
               setError(
-                new Error('请选择初始模型，为每个数据集选择归一化参数，并填写大于 0 的混采权重。'),
+                new Error(
+                  stageAnnotation
+                    ? '请选择阶段进度模型检查点、待标注数据集和归一化参数。'
+                    : '请选择初始模型，为每个数据集选择归一化参数，并填写大于 0 的混采权重。',
+                ),
               );
               return;
             }
-            if (step === 1) {
+            if (stageProgressSourceError) {
+              setError(new Error(stageProgressSourceError));
+              return;
+            }
+            if (enteringPreflight) {
               if (gpuSelectionError) {
                 setError(new Error(gpuSelectionError));
                 return;
@@ -1948,7 +2278,13 @@ function RunWizardContent({
                 return;
               }
               if (isRecap && automaticMode && request.auto_config?.finetune_mode !== 'full') {
-                setError(new Error('PyTorch ReCap 自动配置需要选择全量微调。'));
+                setError(
+                  new Error(
+                    stageAcp
+                      ? 'JAX ACP 自动配置需要选择全量微调。'
+                      : 'PyTorch ReCap 自动配置需要选择全量微调。',
+                  ),
+                );
                 return;
               }
               if (
@@ -1984,11 +2320,11 @@ function RunWizardContent({
             }
             setError(undefined);
             draftSession.markEdited();
-            setStep(step + 1);
-            if (step === 1) void beginPreview();
+            setStep(enteringPreflight ? 2 : 1);
+            if (enteringPreflight) void beginPreview();
           }}
         >
-          {step === 0 ? (
+          {step === 0 && (
             <div
               className={`training-data-layout${hasLocalTraining || isNorm ? ' with-datasets' : ''}`}
             >
@@ -2097,6 +2433,29 @@ function RunWizardContent({
                           asset.kind === kind &&
                           (!recapModelInput || !recapModelError(asset, request.training_stage)),
                       );
+                      const checkpointGroups =
+                        recapModelInput && request.training_stage === 'stage_annotation'
+                          ? [
+                              {
+                                label: '阶段进度训练产物',
+                                assets: choices.filter((asset) => stageAnnotationSource(asset)),
+                              },
+                              {
+                                label: '已登记的 PyTorch 检查点',
+                                assets: choices.filter((asset) => !stageAnnotationSource(asset)),
+                              },
+                            ]
+                          : undefined;
+                      const modelOption = (asset: Asset) => (
+                        <option key={asset.id} value={asset.id}>
+                          {stageAnnotation && recapModelInput
+                            ? stageAnnotationCheckpointLabel(
+                                asset,
+                                request.training_stage ?? undefined,
+                              )
+                            : `${asset.name} · ${asset.version}`}
+                        </option>
+                      );
                       return (
                         <Field
                           key={role}
@@ -2104,20 +2463,42 @@ function RunWizardContent({
                             recapModelInput
                               ? request.training_stage === 'value'
                                 ? '初始 PyTorch 骨干 / 价值模型权重'
-                                : stageProgress
-                                  ? '初始 PyTorch π0.5 骨干 / 进度模型权重'
-                                  : trainingStage?.id === 'offline_rl'
-                                    ? '初始 PyTorch 策略权重'
-                                    : '初始 PyTorch 权重'
+                                : valueAnnotation
+                                  ? 'Value 模型检查点'
+                                  : stageAnnotation
+                                    ? '阶段进度模型检查点'
+                                    : stageProgress
+                                      ? '初始 PyTorch π0.5 骨干 / 进度模型权重'
+                                      : stageAcp
+                                        ? '初始 JAX / Orbax 策略权重'
+                                        : '初始 PyTorch 权重'
                               : inputRoles[role] || role
                           }
                           required
                           hint={
                             recapModelInput
                               ? selectedRecapModelError ||
-                                (choices.length
-                                  ? '请选择 model.safetensors 或包含该文件的检查点目录，Agent 会在预检时读取权重。'
-                                  : '请先在「数据与模型」中登记 model.safetensors 或包含该文件的检查点目录。')
+                                (stageAnnotation
+                                  ? !request.node_id
+                                    ? '先选择运行机器，再选择该机器上的检查点。'
+                                    : valueAnnotation
+                                      ? choices.length
+                                        ? '仅显示本机已成功完成的 Value 训练所产出的可用检查点。'
+                                        : '本机暂无可用检查点。请先完成第 1 步「Value 训练」。'
+                                      : choices.length
+                                        ? '可选本机的训练产物或已登记的 PyTorch 检查点。预检将核对阶段进度权重、model.safetensors 和 recap_checkpoint.json。'
+                                        : '本机暂无可用检查点。可在「数据与模型」登记 PyTorch 阶段进度检查点，或从阶段进度训练任务进入。'
+                                  : stageAcp
+                                    ? choices.length
+                                      ? '仅显示本机已登记为 JAX / Orbax 的策略权重。'
+                                      : '本机暂无可选的 JAX / Orbax 策略权重。请在「数据与模型」登记或补录模型格式。'
+                                    : stageProgress
+                                      ? choices.length
+                                        ? '仅显示本机已标记为 PyTorch 的权重，预检会检查 model.safetensors。'
+                                        : '当前机器没有可选的 PyTorch 权重。请在「数据与模型」登记权重或为已有模型补录格式。'
+                                      : choices.length
+                                        ? '请选择 model.safetensors 或包含该文件的检查点目录，Agent 会在预检时读取权重。'
+                                        : '请先在「数据与模型」中登记 model.safetensors 或包含该文件的检查点目录。')
                               : choices.length
                                 ? '只显示当前机器的资产，实际可用性将在预检时验证。'
                                 : '当前机器没有可选资产，请先在「数据与模型」中登记。'
@@ -2136,14 +2517,24 @@ function RunWizardContent({
                           >
                             <option value="">
                               {recapModelInput
-                                ? '选择 PyTorch 权重'
+                                ? valueAnnotation
+                                  ? '选择 Value 检查点'
+                                  : stageAnnotation
+                                    ? '选择阶段进度检查点'
+                                    : stageAcp
+                                      ? '选择 JAX / Orbax 策略权重'
+                                      : '选择 PyTorch 权重'
                                 : `选择${inputRoles[role] || role}`}
                             </option>
-                            {choices.map((asset) => (
-                              <option key={asset.id} value={asset.id}>
-                                {asset.name} · {asset.version}
-                              </option>
-                            ))}
+                            {checkpointGroups
+                              ? checkpointGroups
+                                  .filter(({ assets }) => assets.length > 0)
+                                  .map(({ label, assets }) => (
+                                    <optgroup key={label} label={label}>
+                                      {assets.map(modelOption)}
+                                    </optgroup>
+                                  ))
+                              : choices.map(modelOption)}
                           </select>
                         </Field>
                       );
@@ -2188,8 +2579,52 @@ function RunWizardContent({
                 </section>
               )}
               {hasLocalTraining && (
-                <section className="training-data-datasets" aria-label="训练数据与处理方式">
+                <section
+                  className="training-data-datasets"
+                  aria-label={stageAnnotation ? '标注数据与处理方式' : '训练数据与处理方式'}
+                >
+                  {showStateTokenLayout && request.auto_config && (
+                    <section
+                      id="training-state-configuration"
+                      className="training-parameter-section training-state-configuration"
+                      aria-labelledby="training-state-configuration-title"
+                      tabIndex={-1}
+                    >
+                      <h4 id="training-state-configuration-title">状态配置</h4>
+                      <Field
+                        label="状态 token 布局"
+                        hint={
+                          kai0TokenLayoutError ||
+                          '此设置用于本次训练的所有数据集。补齐到 32 维时，状态按 32 维编码，动作损失也按 32 维计算。'
+                        }
+                      >
+                        <select
+                          value={canSetStateTokenLayout ? stateTokenLayout : 'flat_state'}
+                          disabled={!canSetStateTokenLayout}
+                          onChange={(event) => {
+                            const layout = event.target.value;
+                            if (isStateTokenLayout(layout))
+                              update('auto_config', {
+                                ...request.auto_config!,
+                                state_token_layout: layout,
+                              });
+                          }}
+                        >
+                          <option value="flat_state">
+                            {canSetStateTokenLayout
+                              ? STATE_TOKEN_LAYOUT_LABELS.flat_state
+                              : stateTokenLayoutLabel}
+                          </option>
+                          <option value="kai0_pad32" disabled={!!kai0TokenLayoutError}>
+                            {STATE_TOKEN_LAYOUT_LABELS.kai0_pad32}
+                          </option>
+                        </select>
+                      </Field>
+                    </section>
+                  )}
                   <DatasetBindings
+                    sampleCounts={stageAcp ? acpSampleCounts : undefined}
+                    datasetLabelIssues={stageAcp ? acpDatasetIssues : undefined}
                     normalizationOverride={request.normalization_method}
                     imageLayoutEdits={imageLayoutEdits}
                     showProcessing
@@ -2221,36 +2656,43 @@ function RunWizardContent({
                 </section>
               )}
             </div>
-          ) : (
+          )}
+          {enteringPreflight && (
             <>
-              <div className="selection-summary">
-                <Server size={16} />
-                <strong>{node?.name}</strong>
-                <span>→</span>
-                <span>{selectedProfile?.name}</span>
-              </div>
-              <Field label="训练方式" required>
-                <select
-                  required
-                  value={request.template_id}
-                  onChange={(event) => void draftAction(() => onSelectTemplate(event.target.value))}
-                >
-                  <option value="">选择模板</option>
-                  {templates.data?.map((item) => (
-                    <option
-                      key={item.id}
-                      value={item.id}
-                      disabled={
-                        item.status !== 'AVAILABLE' ||
-                        (request.template_id !== 'smoke' && item.id === 'smoke')
-                      }
-                    >
-                      {item.name}
-                      {item.status !== 'AVAILABLE' ? ' · 待接入' : ''}
-                    </option>
-                  ))}
-                </select>
-              </Field>
+              {!stageAnnotation && (
+                <div className="selection-summary">
+                  <Server size={16} />
+                  <strong>{node?.name}</strong>
+                  <span>→</span>
+                  <span>{selectedProfile?.name}</span>
+                </div>
+              )}
+              {!isRecap && (
+                <Field label="训练方式" required>
+                  <select
+                    required
+                    value={request.template_id}
+                    onChange={(event) =>
+                      void draftAction(() => onSelectTemplate(event.target.value))
+                    }
+                  >
+                    <option value="">选择模板</option>
+                    {templates.data?.map((item) => (
+                      <option
+                        key={item.id}
+                        value={item.id}
+                        disabled={
+                          item.status !== 'AVAILABLE' ||
+                          (request.template_id !== 'smoke' && item.id === 'smoke')
+                        }
+                      >
+                        {item.name}
+                        {item.status !== 'AVAILABLE' ? ' · 待接入' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
               {isNorm && (
                 <>
                   <NormStatsFields
@@ -2282,18 +2724,30 @@ function RunWizardContent({
               )}
               {automaticMode && request.auto_config && (
                 <section aria-label="自动组装模型配置">
-                  <p className="field-hint">
-                    自动组装适用标准
-                    Pi0/Pi05。多数据混采需要可核验的状态布局，建议使用资产组件组合配置；MEM、Hybrid
-                    等特殊模型请使用高级代码配方。
-                  </p>
+                  {!stageAnnotation && (
+                    <p className="field-hint">
+                      自动组装适用标准
+                      Pi0/Pi05。多数据混采需要可核验的状态布局，建议使用资产组件组合配置；MEM、Hybrid
+                      等特殊模型请使用高级代码配方。
+                    </p>
+                  )}
                   <div className="form-section-title">
                     <Cpu size={16} />
-                    <h3>模型与微调方式</h3>
+                    <h3>{stageAnnotation ? '标注模型配置' : '模型与微调方式'}</h3>
                     <span>平台自动组装 config</span>
                   </div>
                   <div className="form-grid">
-                    <Field label="模型结构" required hint="需要与所选初始权重匹配。">
+                    <Field
+                      label="模型结构"
+                      required
+                      hint={
+                        valueAnnotation
+                          ? '需要与所选 Value 检查点匹配。'
+                          : stageAnnotation
+                            ? '需要与所选阶段进度检查点匹配。'
+                            : '需要与所选初始权重匹配。'
+                      }
+                    >
                       <select
                         value={request.auto_config.model_type}
                         onChange={(event) =>
@@ -2309,61 +2763,60 @@ function RunWizardContent({
                         </option>
                       </select>
                     </Field>
-                    <Field
-                      label="微调方式"
-                      required
-                      hint={
-                        request.training_stage === 'value'
-                          ? 'PyTorch 自动配置使用全量更新。只训练价值头可使用高级代码配方。'
-                          : stageProgress
-                            ? 'Kai0 阶段进度估计器使用 π0.5 全量微调。'
-                            : isRecap
-                              ? 'PyTorch ACP 自动配置使用全量微调。'
-                              : '全量微调或 LoRA；冻结规则写入生成的 config。'
-                      }
-                    >
-                      <select
-                        value={request.auto_config.finetune_mode}
-                        onChange={(event) =>
-                          update('auto_config', {
-                            ...request.auto_config!,
-                            finetune_mode: event.target.value as 'full' | 'lora',
-                          })
-                        }
-                      >
-                        <option value="full">
-                          {request.training_stage === 'value' ? '价值模型全量训练' : '全量微调'}
-                        </option>
-                        <option value="lora" disabled={isRecap}>
-                          LoRA 微调
-                        </option>
-                      </select>
-                    </Field>
-                    {chooseStateTokenLayout && (
+                    {!stageAnnotation && (
                       <Field
-                        label="状态 token 布局"
+                        label="微调方式"
+                        required
                         hint={
-                          kai0TokenLayoutError ||
-                          'Kai0 兼容在 14 个归一化状态值后补 18 个 -1，再编码为状态 token。'
+                          request.training_stage === 'value'
+                            ? 'PyTorch 自动配置使用全量更新。只训练价值头可使用高级代码配方。'
+                            : stageProgress
+                              ? 'Stage Advantage 估计器使用 π0.5 全量微调。'
+                              : isRecap
+                                ? 'JAX ACP 自动配置使用全量微调。'
+                                : '全量微调或 LoRA；冻结规则写入生成的 config。'
                         }
                       >
                         <select
-                          value={request.auto_config.state_token_layout ?? 'flat_state'}
-                          onChange={(event) => {
-                            const layout = event.target.value;
-                            if (isStateTokenLayout(layout))
-                              update('auto_config', {
-                                ...request.auto_config!,
-                                state_token_layout: layout,
-                              });
-                          }}
+                          value={request.auto_config.finetune_mode}
+                          onChange={(event) =>
+                            update('auto_config', {
+                              ...request.auto_config!,
+                              finetune_mode: event.target.value as 'full' | 'lora',
+                            })
+                          }
                         >
-                          <option value="flat_state">{STATE_TOKEN_LAYOUT_LABELS.flat_state}</option>
-                          <option value="kai0_pad32" disabled={!!kai0TokenLayoutError}>
-                            {STATE_TOKEN_LAYOUT_LABELS.kai0_pad32}
+                          <option value="full">
+                            {request.training_stage === 'value' ? '价值模型全量训练' : '全量微调'}
+                          </option>
+                          <option value="lora" disabled={isRecap}>
+                            LoRA 微调
                           </option>
                         </select>
                       </Field>
+                    )}
+                    {showStateTokenLayout && (
+                      <div className="field">
+                        <span className="field-label">状态 token 布局</span>
+                        <strong>{stateTokenLayoutLabel}</strong>
+                        {stateTokenLayout === 'kai0_pad32' && kai0TokenLayoutError && (
+                          <span className="training-parameter-error">{kai0TokenLayoutError}</span>
+                        )}
+                        <div>
+                          <button
+                            type="button"
+                            className="text-link"
+                            onClick={() => {
+                              editDataProcessing();
+                              requestAnimationFrame(() =>
+                                document.getElementById('training-state-configuration')?.focus(),
+                              );
+                            }}
+                          >
+                            去数据配置修改状态布局
+                          </button>
+                        </div>
+                      </div>
                     )}
                     <Field
                       label="动作预测长度"
@@ -2513,8 +2966,16 @@ function RunWizardContent({
                         profile={selectedProfile}
                       />
                       {isRecap ? (
-                        <Field label="PyTorch 训练入口">
-                          <code>{RECAP_PYTORCH_ENTRYPOINT}</code>
+                        <Field
+                          label={
+                            stageAnnotation
+                              ? 'PyTorch 标注入口'
+                              : stageAcp
+                                ? 'JAX 训练入口'
+                                : 'PyTorch 训练入口'
+                          }
+                        >
+                          <code>{stageEntrypoint}</code>
                         </Field>
                       ) : (
                         <PathAutocomplete
@@ -2535,7 +2996,7 @@ function RunWizardContent({
                   )}
                 </details>
               )}
-              {hasLocalTraining && (
+              {hasLocalTraining && !stageAnnotation && (
                 <details
                   className="training-advanced-settings"
                   open={isRecap || advancedRecipe || !processorsValid || undefined}
@@ -2544,6 +3005,8 @@ function RunWizardContent({
                     核对数据与处理配置（{request.dataset_bindings?.length || 0} 个数据集）
                   </summary>
                   <DatasetBindings
+                    sampleCounts={stageAcp ? acpSampleCounts : undefined}
+                    datasetLabelIssues={stageAcp ? acpDatasetIssues : undefined}
                     normalizationOverride={request.normalization_method}
                     imageLayoutEdits={imageLayoutEdits}
                     preserveProcessingOnDatasetChange={editedParameters.current.has(
@@ -2575,92 +3038,26 @@ function RunWizardContent({
                   />
                 </details>
               )}
-              {isRecap && trainingStage && (
-                <>
-                  <div className="form-section-title">
-                    <Cpu size={16} />
-                    <h3>{trainingStage.name}参数</h3>
-                    <span>仅用于当前阶段</span>
-                  </div>
-                  {stageRecipeInfo?.mixedDropout && (
-                    <div
-                      className={`inline-note ${mixedDropoutUnresolved ? 'red training-validation-error' : 'amber'}`}
-                      role={mixedDropoutUnresolved ? 'alert' : 'status'}
-                    >
-                      配方中各数据项的 ACP 条件丢弃概率不一致，请明确填写本次统一覆盖值。
-                    </div>
-                  )}
-                  <div className="form-grid parameters">
-                    {Object.entries(stageParameterSpecs).map(([key, spec]) => (
-                      <Field
-                        key={key}
-                        label={spec.label || stageParameterLabels[key] || key}
-                        required
-                        hint={
-                          Object.hasOwn(stageRecipeDefaults, key)
-                            ? `配方值：${stageRecipeDefaults[key]}${editedStageParameters.current.has(key) ? '；当前为本次覆盖' : ''}`
-                            : spec.hint ||
-                              stageParameterHints[key] ||
-                              '本次阶段参数，Agent 将在预检时核对。'
-                        }
-                      >
-                        <input
-                          type="number"
-                          required
-                          min={spec.min ?? spec.minimum}
-                          max={spec.max ?? spec.maximum}
-                          step={spec.type === 'integer' ? 1 : 'any'}
-                          value={
-                            Number.isFinite(request.stage_config?.[key])
-                              ? request.stage_config?.[key]
-                              : ''
-                          }
-                          onChange={(event) => {
-                            editedStageParameters.current.add(key);
-                            update('stage_config', {
-                              ...request.stage_config,
-                              [key]: event.target.value === '' ? NaN : Number(event.target.value),
-                            });
-                          }}
-                        />
-                      </Field>
-                    ))}
-                  </div>
-                  {advancedRecipe && request.training_stage === 'value' && (
-                    <dl className="detail-list inset">
-                      <div>
-                        <dt>训练参数范围</dt>
-                        <dd>
-                          由价值配方的冻结规则决定；Agent 在预检时检查。
-                          {!stageRecipeInfo?.valueHead.length && (
-                            <span className="field-hint">
-                              可在上一步的配方详情查看模型与冻结规则。
-                            </span>
-                          )}
-                        </dd>
-                      </div>
-                      {stageRecipeInfo?.valueHead.map((field) => (
-                        <div key={field.path}>
-                          <dt>
-                            <code>{field.path}</code>
-                          </dt>
-                          <dd>
-                            <code>{field.value}</code>
-                          </dd>
-                        </div>
-                      ))}
-                    </dl>
-                  )}
-                </>
-              )}
+              {!estimatorTraining && stageParameterFields}
               <div className="form-section-title">
                 <Cpu size={16} />
-                <h3>{isNorm ? '统计参数' : '训练参数'}</h3>
+                <h3>
+                  {isNorm
+                    ? '统计参数'
+                    : stageAnnotation
+                      ? '标注资源'
+                      : estimatorTraining
+                        ? '估计器优化与训练资源'
+                        : '训练参数'}
+                </h3>
                 <span>参数已填入初始值，可直接修改后生成 config</span>
               </div>
               <div className="training-parameter-sections">
                 {hasLocalTraining && (
-                  <section className="training-parameter-section" aria-label="训练归一化方式">
+                  <section
+                    className="training-parameter-section"
+                    aria-label={stageAnnotation ? '标注归一化方式' : '训练归一化方式'}
+                  >
                     <div className="form-grid">
                       <TrainingNormalizationField
                         value={request.normalization_method}
@@ -2673,32 +3070,46 @@ function RunWizardContent({
                   <section
                     className="training-parameter-section"
                     key={group.id}
-                    aria-label={group.title}
+                    aria-label={stageAnnotation ? '标注批次与 GPU' : group.title}
                   >
-                    <h4>{isNorm ? '数据加载' : group.title}</h4>
+                    {!stageAnnotation && (
+                      <h4>
+                        {isNorm
+                          ? '数据加载'
+                          : stageAcp && group.id === 'resources'
+                            ? 'JAX 训练与资源'
+                            : group.title}
+                      </h4>
+                    )}
                     <div className="form-grid parameters">
                       {group.entries.map(([key, spec]) => (
                         <Field
                           key={key}
-                          label={spec.label || key}
+                          label={
+                            stageAnnotation && key === 'batch_size'
+                              ? '标注批大小'
+                              : spec.label || key
+                          }
                           required={
                             !unusedParameters.includes(key) && !optionalTrainingParameter(spec)
                           }
                           hint={
-                            isNorm
-                              ? key === 'batch_size'
-                                ? '每批读取的样本数；任务始终完整遍历数据集。'
-                                : normResourceRecommendationHint(resourceRecommendations)
-                              : isTrainingResourceField(key)
-                                ? trainingResourceRecommendationHint(key, resourceRecommendations)
-                                : trainingParameterHint(
-                                    key,
-                                    spec,
-                                    advancedRecipe,
-                                    recipeDefaults,
-                                    editedParameters.current.has(key) &&
-                                      Object.hasOwn(request.parameters, key),
-                                  )
+                            stageAnnotation
+                              ? '每次推理读取的样本数。'
+                              : isNorm
+                                ? key === 'batch_size'
+                                  ? '每批读取的样本数；任务始终完整遍历数据集。'
+                                  : normResourceRecommendationHint(resourceRecommendations)
+                                : isTrainingResourceField(key)
+                                  ? trainingResourceRecommendationHint(key, resourceRecommendations)
+                                  : trainingParameterHint(
+                                      key,
+                                      spec,
+                                      advancedRecipe,
+                                      recipeDefaults,
+                                      editedParameters.current.has(key) &&
+                                        Object.hasOwn(request.parameters, key),
+                                    )
                           }
                         >
                           {unusedParameters.includes(key) ? (
@@ -2868,13 +3279,22 @@ function RunWizardContent({
                           request={request}
                           node={node}
                           minimum={minGpus}
-                          allowShared={hasLocalTraining}
+                          maximum={stageAnnotation ? 1 : undefined}
+                          allowShared={hasLocalTraining && !stageAnnotation}
                           onChange={updateGpuSelection}
                         />
                       )}
                     </div>
                   </section>
                 ))}
+                {estimatorTraining && stageParameterFields && (
+                  <section
+                    className="training-parameter-section training-estimator-settings"
+                    aria-label="验证设置"
+                  >
+                    {stageParameterFields}
+                  </section>
+                )}
               </div>
             </>
           )}
@@ -3062,10 +3482,10 @@ function RunWizardContent({
               <>
                 <div>
                   <dt>训练框架</dt>
-                  <dd>PyTorch</dd>
+                  <dd>{stageAcp ? 'JAX' : 'PyTorch'}</dd>
                 </div>
                 <div>
-                  <dt>训练阶段</dt>
+                  <dt>作业阶段</dt>
                   <dd>
                     {request.training_stage
                       ? trainingStageLabels[request.training_stage]
@@ -3108,10 +3528,14 @@ function RunWizardContent({
                 </dd>
               </div>
             )}
-            {supportsStateTokenLayout(reviewedRequest) && (
+            {showsStateTokenLayout(reviewedRequest) && (
               <div>
                 <dt>状态 token 布局</dt>
-                <dd>{STATE_TOKEN_LAYOUT_LABELS[reviewedStateTokenLayout]}</dd>
+                <dd>
+                  {supportsStateTokenLayout(reviewedRequest)
+                    ? STATE_TOKEN_LAYOUT_LABELS[reviewedStateTokenLayout]
+                    : '沿用当前处理器（默认）'}
+                </dd>
               </div>
             )}
             {frozenRecipe && (
@@ -3145,7 +3569,7 @@ function RunWizardContent({
                       {preview?.request?.entrypoint ||
                         preview?.code_snapshot?.requested_entrypoint ||
                         request.entrypoint ||
-                        (isRecap ? RECAP_PYTORCH_ENTRYPOINT : '由训练方式和数据集数量自动选择')}
+                        (isRecap ? stageEntrypoint : '由训练方式和数据集数量自动选择')}
                     </code>
                   </dd>
                 </div>

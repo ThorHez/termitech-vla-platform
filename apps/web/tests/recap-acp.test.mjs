@@ -15,7 +15,8 @@ const server = await createServer({
 });
 
 try {
-  const { recapAcpSnapshot } = await server.ssrLoadModule('/src/recapAcp.ts');
+  const { recapAcpDatasetLabelIssue, recapAcpSnapshot } = await server.ssrLoadModule('/src/recapAcp.ts');
+  const { emptyDatasetProfile } = await server.ssrLoadModule('/src/DatasetProfileForm.tsx');
   const { encodeTrainingDraft, decodeTrainingDraft } =
     await server.ssrLoadModule('/src/trainingDraft.ts');
   const fixture = () => {
@@ -74,6 +75,24 @@ try {
     return { run, dataset, norm };
   };
 
+  await test('ACP checks observed columns before registration and leaves unknown lists to preflight', () => {
+    const { dataset } = fixture();
+    assert.equal(recapAcpDatasetLabelIssue(dataset), undefined);
+    const profile = {
+      ...emptyDatasetProfile(),
+      robot_type: 'UMI',
+      task_description: 'fold',
+      cameras: [{ name: 'wrist', key: 'observation.wrist', kind: 'rgb' }],
+      feature_keys: ['actions'],
+    };
+    dataset.metadata.dataset_profile = profile;
+    assert.match(recapAcpDatasetLabelIssue(dataset), /已登记字段缺少 is_positive/);
+    assert.equal(recapAcpDatasetLabelIssue(dataset, ['actions', 'is_positive']), undefined);
+    profile.feature_keys.push('is_positive');
+    assert.match(recapAcpDatasetLabelIssue(dataset, ['actions']), /数据集元信息缺少 is_positive/);
+    assert.equal(recapAcpDatasetLabelIssue(dataset, []), undefined);
+  });
+
   await test('an attached Value annotation seeds ACP with fresh controls and no initial model', () => {
     const { run, dataset, norm } = fixture();
     const snapshot = recapAcpSnapshot(run, dataset, [dataset, norm]);
@@ -98,17 +117,64 @@ try {
     assert.deepEqual(decodeTrainingDraft(encodeTrainingDraft(snapshot)), snapshot);
   });
 
-  await test('Kai0 ACP handoff requires a registered output from the successful attempt', () => {
+  await test('Stage Advantage ACP handoff consumes only the canonical ACP label', () => {
     const { run, dataset, norm } = fixture();
     run.training_stage = 'stage_progress';
+    const composition = run.dataset_bindings[0].processor.parameters.composition;
+    composition.aux_keys = ['stage_progress_gt'];
+    composition.stage_progress_key = 'progress.hand_label';
     dataset.origin_attempt_id = 'attempt';
     dataset.metadata = { source_dataset_asset_id: 'source', source_norm_asset_id: norm.id };
     assert.throws(() => recapAcpSnapshot(run, dataset, [dataset, norm]), /来源与当前训练不一致/);
     run.outputs.push(dataset);
-    assert.equal(
-      recapAcpSnapshot(run, dataset, [dataset, norm]).request.training_stage,
-      'offline_rl',
-    );
+    const { request } = recapAcpSnapshot(run, dataset, [dataset, norm]);
+    assert.equal(request.training_stage, 'offline_rl');
+    const derived = request.dataset_bindings[0].processor.parameters.composition;
+    assert.deepEqual(derived.aux_keys, ['is_positive']);
+    assert.equal(derived.stage_progress_key, undefined);
+  });
+
+  await test('separate Stage Advantage annotation hands off only data scored by the recorded checkpoint', () => {
+    const { run, dataset, norm } = fixture();
+    run.training_stage = 'stage_annotation';
+    run.inputs.model = 'progress-checkpoint';
+    dataset.origin_attempt_id = 'attempt';
+    dataset.metadata = {
+      registration_source: 'recap_stage_annotation',
+      scorer_model_asset_id: 'progress-checkpoint',
+      source_dataset_asset_id: 'source',
+      source_norm_asset_id: norm.id,
+    };
+    run.outputs = [dataset];
+    const { request } = recapAcpSnapshot(run, dataset, [dataset, norm]);
+    assert.equal(request.training_stage, 'offline_rl');
+    assert.deepEqual(request.inputs, {});
+    assert.deepEqual(request.dataset_bindings[0].processor.parameters.composition.aux_keys, [
+      'is_positive',
+    ]);
+    dataset.metadata.scorer_model_asset_id = 'different-checkpoint';
+    assert.throws(() => recapAcpSnapshot(run, dataset, [dataset, norm]), /检查点来源/);
+  });
+
+  await test('managed Value annotation hands off to its own ACP phase using scorer lineage', () => {
+    const { run, dataset, norm } = fixture();
+    run.training_stage = 'value_annotation';
+    run.inputs.model = 'value-checkpoint';
+    dataset.origin_attempt_id = 'attempt';
+    dataset.metadata = {
+      registration_source: 'recap_value_annotation',
+      scorer_model_asset_id: 'value-checkpoint',
+      source_dataset_asset_id: 'source',
+      source_norm_asset_id: norm.id,
+    };
+    run.outputs = [dataset];
+    const snapshot = recapAcpSnapshot(run, dataset, [dataset, norm]);
+    assert.equal(snapshot.recapPhase, 'recap_acp');
+    assert.equal(snapshot.request.training_stage, 'offline_rl');
+    assert.equal(snapshot.request.dataset_bindings[0].dataset_asset_id, dataset.id);
+    assert.deepEqual(snapshot.request.inputs, {});
+    dataset.metadata.registration_source = 'recap_stage_annotation';
+    assert.throws(() => recapAcpSnapshot(run, dataset, [dataset, norm]), /检查点来源/);
   });
 
   await test('annotation lineage picks the exact source row when a dataset is bound twice', () => {

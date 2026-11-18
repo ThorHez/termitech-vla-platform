@@ -26,25 +26,28 @@ import {
 import type { BackgroundTask, BackgroundTaskType } from './backgroundTaskEntries';
 import {
   BACKGROUND_TASK_PAGE_SIZE,
+  backgroundTaskListPath,
   backgroundTaskPagePath,
   backgroundTaskPageRange,
+  backgroundTaskQueryFromSearch,
   backgroundTaskQueryReducer,
-  initialBackgroundTaskQuery,
 } from './backgroundTaskPagination';
 import type { BackgroundTaskPage, BackgroundTaskQuery } from './backgroundTaskPagination';
-import { useBackgroundTaskPage } from './useBackgroundTaskPage';
+import { BACKGROUND_TASK_REFRESH_SECONDS, useBackgroundTaskPage } from './useBackgroundTaskPage';
 import './background-tasks.css';
 
 export function BackgroundTaskTable({
   tasks,
   nodes = [],
   templates = [],
+  returnQuery = '',
   onRunDeleted,
   onTransferDeleted,
 }: {
   tasks: BackgroundTask[];
   nodes?: Node[];
   templates?: Template[];
+  returnQuery?: string;
   onRunDeleted?: () => void;
   onTransferDeleted?: () => void;
 }) {
@@ -67,8 +70,8 @@ export function BackgroundTaskTable({
           {tasks.map((task) => {
             const item = task.item;
             const progress = backgroundTaskProgress(task);
-            const path = backgroundTaskPath(task);
             const sync = task.kind === 'data-sync';
+            const path = backgroundTaskPath(task) + (sync ? '' : returnQuery);
             return (
               <tr key={task.key}>
                 <td>
@@ -198,10 +201,20 @@ export function BackgroundTaskErrors({
   );
 }
 
-export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
+export function BackgroundTasksPage({
+  createRun,
+  search = '',
+}: {
+  createRun: () => void;
+  search?: string;
+}) {
   const { can } = useAuth();
-  const { enabled } = useData();
-  const [request, dispatch] = useReducer(backgroundTaskQueryReducer, initialBackgroundTaskQuery);
+  const { enabled, nodes } = useData();
+  const [request, dispatch] = useReducer(
+    backgroundTaskQueryReducer,
+    search,
+    backgroundTaskQueryFromSearch,
+  );
   const [totalAll, setTotalAll] = useState<number>();
   const receivePage = useCallback((query: BackgroundTaskQuery, response: BackgroundTaskPage) => {
     setTotalAll(response.total_all);
@@ -222,6 +235,21 @@ export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
           )
         }
       />
+      {request.nodeId && (
+        <div className="info-strip">
+          <Server size={16} />
+          <span>
+            训练机器：
+            {nodes.data?.find((node) => node.id === request.nodeId)?.name || request.nodeId}
+          </span>
+          <a
+            className="text-link"
+            href={`#${backgroundTaskListPath({ ...request, nodeId: undefined, type: 'ALL', page: 1 })}`}
+          >
+            清除机器筛选
+          </a>
+        </div>
+      )}
       <div className="toolbar wrap background-task-toolbar">
         <div className="segmented">
           {(
@@ -248,6 +276,7 @@ export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
             任务类型
             <select
               aria-label="筛选任务类型"
+              disabled={Boolean(request.nodeId)}
               value={request.type}
               onChange={(event) =>
                 dispatch({ kind: 'type', value: event.target.value as BackgroundTaskType })
@@ -277,8 +306,8 @@ export function BackgroundTasksPage({ createRun }: { createRun: () => void }) {
         changePage={(page) => dispatch({ kind: 'page', page })}
       />
       <p className="background-task-history-note">
-        每页固定显示 {BACKGROUND_TASK_PAGE_SIZE} 条，按创建时间从新到旧排列；每 3
-        秒更新当前页，可翻页查看历史任务。
+        每页固定显示 {BACKGROUND_TASK_PAGE_SIZE} 条，按创建时间从新到旧排列。页面可见时每{' '}
+        {BACKGROUND_TASK_REFRESH_SECONDS} 秒更新当前页，可翻页查看历史任务。
       </p>
     </>
   );
@@ -293,12 +322,14 @@ function BackgroundTaskResults({
   receivePage: (query: BackgroundTaskQuery, response: BackgroundTaskPage) => void;
   changePage: (page: number) => void;
 }) {
-  const { nodes, templates, enabled, refresh } = useData();
-  const result = useBackgroundTaskPage(request, enabled, nodes.data || []);
+  const { nodes, templates, enabled, pollingEnabled, refresh } = useData();
+  const result = useBackgroundTaskPage(request, pollingEnabled, nodes.data || []);
   useEffect(() => {
     if (result.data) receivePage(request, result.data);
   }, [result.data, request, receivePage]);
-  const filtered = Boolean(request.query || request.type !== 'ALL' || request.status !== 'ALL');
+  const filtered = Boolean(
+    request.nodeId || request.query || request.type !== 'ALL' || request.status !== 'ALL',
+  );
   const deleted = () => {
     result.refresh();
     refresh();
@@ -308,8 +339,11 @@ function BackgroundTaskResults({
       <ErrorNotice error={result.error} retry={result.refresh} title="后台任务读取失败" />
       {result.data?.history_limited && (
         <p className="background-task-compatibility-note" role="status">
-          当前服务暂未支持全量历史分页，显示已加载的 {result.data.total_all} 条记录（训练最多 500
-          条，同步最多 200 条）。
+          当前服务暂未支持全量历史分页，显示已加载的 {result.data.total_all} 条记录
+          {request.nodeId
+            ? '（从最近 500 条训练记录筛选）'
+            : '（训练最多 500 条，同步最多 200 条）'}
+          。
         </p>
       )}
       <div className="panel">
@@ -320,6 +354,7 @@ function BackgroundTaskResults({
             tasks={result.data.items}
             nodes={nodes.data || []}
             templates={templates.data || []}
+            returnQuery={backgroundTaskListPath(request).slice('/runs'.length)}
             onRunDeleted={deleted}
             onTransferDeleted={deleted}
           />

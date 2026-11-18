@@ -1,6 +1,6 @@
 # 首个可运行版本：实现契约
 
-设计文档定义完整目标，本契约固定当前实现的接口。当前版本支持共享工作空间中按角色授权的资源、资产、预检、单阶段执行、取消、监控及代码追溯。ReCap 分阶段提交作业，Kai0 阶段进度作业同时生成后续 ACP 可用的派生数据。
+设计文档定义完整目标，本契约固定当前实现的接口。当前版本支持共享工作空间中按角色授权的资源、资产、预检、单阶段执行、取消、监控及代码追溯。Stage Advantage 的进度模型训练、优势标注和 ACP 分开提交。
 
 ## 代码布局
 
@@ -15,9 +15,10 @@
 - 管理员 GET/POST `/users`，PATCH `/users/{user_id}` 修改角色、显示名称及启用状态，POST `/users/{user_id}/reset-password` 重置；禁止禁用或降级末位启用管理员。修改角色、禁用和重置会撤销旧会话。
 - 管理员 GET `/audit?limit=100`（最多 500）读取最近审计；不保存请求正文、密码、查询串或凭据。
 
-- GET `/api/v1/overview`: `{nodes_online,nodes_total,gpus_total,gpus_available,runs_active,runs_failed,assets_total}`。
+- GET `/api/v1/overview`: `{nodes_online,nodes_total,gpus_total,gpus_available,runs_active,runs_failed,assets_total,active_tasks}`。`active_tasks` 含进行中的训练 `training`、资产同步 `sync` 和合计 `total`，供全局导航显示。
 - GET `/api/v1/nodes`: 节点数组；GET `/nodes/{id}` 返回节点及关联 assets/profiles/runs。
 - GET `/api/v1/assets?node_id=&kind=`；POST `/assets`: `{name,kind,node_id,path,version,metadata}`，kind DATASET/MODEL/NORM。初始 REGISTERED，Agent 预检后验证；逻辑归档 POST `/assets/{id}/archive`。
+- 资产列表使用 `view=summary` 可保留资产选择、数据特征和校验状态所需的字段。GET `/api/v1/assets/{id}` 返回该资产及其完整校验报告。资产列表省略 `view` 时返回完整记录。
 - POST `/api/v1/nodes/{id}/path-suggestions`：`{prefix:"",limit:30}`，limit 最多 50，返回 202 `{id,node_id,status:PENDING|READY|FAILED,prefix,parent,entries:[{name,path,kind:directory|file}],truncated,error}`；GET `/nodes/{id}/path-suggestions/{request_id}` 轮询相同结构。查询仅限在线、心跳新鲜且不在部署维护中的机器，使用节点 Agent 的受管根目录。空前缀和根前缀可列可访问 roots，目录路径带尾 `/`，目录内按 basename 前缀匹配；不读文件内容、不递归扫描。15 秒超时，10 秒内相同查询复用，节点 pending 上限 20；过期 PATH_SUGGEST 命令被清理为 REJECTED。旧 Agent 返回明确升级提示，管理员仍可手输路径登记。
 - GET `/api/v1/profiles?node_id=`：由 Agent 配置并登记，管理员不通过浏览器提交任意命令。
 - 配方详情与自定义库：POST/GET `/nodes/{id}/recipe-details` 异步读取有界静态配置；GET/POST `/recipes`、POST `/recipes/{id}/revisions`、GET `/recipe-revisions/{id}` 保存不可变修订与原始详情，完整字段及行为见[配方库契约](recipe-library.md)。来源不接受浏览器指定，支持受约束数值及已读取的数据、模型、优化器和学习率静态字段，不接收可执行表达式。
@@ -26,8 +27,11 @@
 - GET `/api/v1/templates`：模板数组，`id,name,algorithm,status,description,parameters,required_inputs`，ReCap 另含 `runtime_adapter,stages`（阶段参数、默认入口及数据要求）。status AVAILABLE 或 PLANNED；只有 AVAILABLE 可提交。
 - POST `/api/v1/run-previews`: `{name,node_id,profile_id,template_id,recipe?,training_stage?,stage_config?,inputs:{dataset:id,model:id,norm:id},dataset_bindings?,parameters:{steps,batch_size,learning_rate},gpu_count}`。配方为 ASCII 命名配置，匹配 `[A-Za-z0-9_-]{1,255}`；省略时仅可使用旧环境默认配方，smoke 固定为 `smoke`。服务端解析并冻结 `request.recipe`。返回 `{id,status:"PENDING"}`；GET `/run-previews/{id}` 返回 `{id,status,checks,code_snapshot,error,request}`。Agent 异步预检，成功 READY，失败 FAILED；有效期 15 分钟。
 - POST `/api/v1/runs`: `{preflight_id}` + `Idempotency-Key`；服务器冻结预检请求与代码基线。
-- GET `/api/v1/runs`；GET `/runs/{id}`：Run 含 `id,name,node_id,profile_id,template_id,recipe,state,created_at,inputs,parameters,gpu_count,code_expectation,attempts,outputs,queue_reason`。recipe 来自冻结的 `code_expectation.recipe`；历史无记录返回 null，不推测当前环境默认值，无需新增数据库列。
-- POST `/api/v1/runs/{id}/cancel`；GET `/runs/{id}/events?after_seq=0`: 事件数组；GET `/runs/{id}/logs?after_seq=0`: `{items:[{seq,text,timestamp}],next_seq}`。
+- GET `/api/v1/runs` 默认返回摘要，与显式请求 `view=summary` 相同。摘要包含任务标识、状态、时间、步数和用于关联资源的 ID。网页轮询、任务分页和机器详情的训练列表显式使用 `view=summary`。
+- GET `/api/v1/background-tasks?view=summary` 分页返回训练和同步列表所需字段。同步项包含来源、目标、状态和进度，历史日志由单条 `/api/v1/asset-transfers/{id}` 提供。
+- GET `/api/v1/runs/{id}` 返回单个任务的完整配置与产物。需要批量完整记录的客户端显式使用 GET `/api/v1/runs?view=full`。完整 Run 含 `id,name,node_id,profile_id,template_id,recipe,state,created_at,inputs,parameters,gpu_count,code_expectation,attempts,outputs,queue_reason`。recipe 来自冻结的 `code_expectation.recipe`；历史无记录返回 null，不推测当前环境默认值，无需新增数据库列。
+- GET `/api/v1/runs/{id}?view=status` 提供状态、更新时间、排队原因、最新一次执行的数值指标和资源摘要。详情页先读取完整记录，运行期间刷新摘要，执行状态或记录发生变化时再读取完整记录，终态停止轮询详情。
+- POST `/api/v1/runs/{id}/cancel`；GET `/runs/{id}/events?after_seq=0`: 事件数组，`view=timeline` 只返回时间线需要的事件类型和时间，日志、指标和资源通过各自接口读取；GET `/runs/{id}/logs?after_seq=0`: `{items:[{seq,text,timestamp}],next_seq}`。
 - GET `/api/v1/alerts`：当前异常数组。
 - POST `/api/v1/ssh-connections/test`：`{host,port:22,username,password,install_dir}`，管理员密码 SSH 检查。返回 `{connection_id,host,port,username,fingerprint,hostname,checks,can_install,existing_agent?,expires_at}`；existing_agent 只包含白名单本地配置和节点 ID，无节点 token。密码加密持久化，不在任何响应返回。
 - POST `/api/v1/remote-deployments`：`{connection_id,install_dir,agent:{name,control_plane_url?,roots,output_root,state_dir,profiles}}` + `Idempotency-Key`，202 返回异步部署记录。连接需测试且未过期，目录变化必须重新测试。
@@ -89,7 +93,7 @@ Run 状态 QUEUED → STARTING → RUNNING → SUCCEEDED/FAILED；取消 CANCELL
 
 `vla_protocol` 提供 `PROTOCOL_VERSION = 1` 和 `canonical_digest(value)`；无需依赖 ORM。Agent 与 API 可使用普通 dict 避免共享持久化模型。
 
-`vla_adapters` 提供 `get_templates() -> list[dict]`；`resolve_recipe(profile,requested=None,require_validated=True) -> str`；`build_launch(profile,template_id,inputs,parameters,output_dir,gpu_uuids,recipe=None,recipe_definition=None,entrypoint=None,dataset_bindings=None,training_stage=None,stage_config=None) -> dict`，返回 `{argv,cwd,env}`。控制面与 Agent 共用配方解析规则；`require_validated` 参数保留调用兼容，手工 `metadata.validated_recipes`、`validated_recipe_revisions` 和 `validated` 不再作为启动门槛。新接入环境可没有默认配方，SFT 预检必须明确配方，Agent 负责自动检查并返回绑定本次请求的证据，提交时再次校验。调用本包受控 wrapper，不接受 shell。`smoke` 为显式测试模板，记录为测试成果；真实 SFT 入口为 `openpi-sft`，调用已安装的 openpi 与训练脚本。ReCap 返回 AVAILABLE，提供 `value`、`stage_progress` 和 `offline_rl` 阶段配置，复用 openpi-sft 本机运行环境。MEM/RLT 仍返回 PLANNED。AVAILABLE 表示开放配置与预检入口，真实算法训练需要单独验收。
+`vla_adapters` 提供 `get_templates() -> list[dict]`；`resolve_recipe(profile,requested=None,require_validated=True) -> str`；`build_launch(profile,template_id,inputs,parameters,output_dir,gpu_uuids,recipe=None,recipe_definition=None,entrypoint=None,dataset_bindings=None,training_stage=None,stage_config=None) -> dict`，返回 `{argv,cwd,env}`。控制面与 Agent 共用配方解析规则；`require_validated` 参数保留调用兼容，手工 `metadata.validated_recipes`、`validated_recipe_revisions` 和 `validated` 不再作为启动门槛。新接入环境可没有默认配方，SFT 预检必须明确配方，Agent 负责自动检查并返回绑定本次请求的证据，提交时再次校验。调用本包受控 wrapper，不接受 shell。`smoke` 为显式测试模板，记录为测试成果；真实 SFT 入口为 `openpi-sft`，调用已安装的 openpi 与训练脚本。ReCap 返回 AVAILABLE，提供 `value`、`value_annotation`、`stage_progress`、`stage_annotation` 和 `offline_rl` 阶段配置，复用 openpi-sft 本机运行环境。MEM/RLT 仍返回 PLANNED。AVAILABLE 表示开放配置与预检入口，真实算法训练需要单独验收。
 
 SFT 与 ReCap `code_snapshot.automatic_preflight` 固定 `{schema_version:1,scope:"configuration_and_local_assets",plan,plan_digest}`。`plan` 包含实际入口、全部数据集和归一化参数、模型检查点、输入、参数与 GPU 数量；Agent 使用指定训练解释器解析配置，检查受管路径、数据协议、模型与输出空间，不初始化 GPU 或启动训练。逐项检查包含 `recipe_configuration/data_contract/norm_contract/model_checkpoint/training_entrypoint/output_storage/gpu_capacity`。提交验证完整证据与请求绑定，实际启动再次生成并比较计划；旧 Agent 或旧预检缺少证据时需要升级并重新预检。此证据不表示梯度更新、checkpoint 保存或训练效果已经验收。
 
@@ -121,18 +125,20 @@ SFT 与 ReCap `code_snapshot.automatic_preflight` 固定 `{schema_version:1,scop
 
 ## ReCap 分阶段训练契约
 
-`template_id:recap` 必须选择 `training_stage:value|stage_progress|offline_rl`。`stage_config` 仅包含所选阶段支持的字段，省略或传入 null 时沿用配方值。新建 ReCap 作业统一使用 PyTorch，复用 `runtime_adapter:openpi-sft` 登记的本机环境。`stage_progress` 作业包含估计器训练和离线标注，ACP 由用户选择派生数据后单独提交。
+`template_id:recap` 必须选择 `training_stage:value|value_annotation|stage_progress|stage_annotation|offline_rl`。`stage_config` 仅包含所选阶段支持的字段，省略或传入 null 时使用该阶段的默认值或配方值。五种作业使用 `runtime_adapter:openpi-sft` 登记的本机环境。两种模式的估计器训练和优势标注使用 PyTorch，ACP 使用 JAX。
 
 | 阶段 | 输入协议与模型 | 独立阶段参数 | 默认项目内入口 |
 | --- | --- | --- | --- |
 | `value` 价值函数训练 | 已含有限 `value_target` 的数据、初始权重及逐组归一化统计。配方模型为 `Pi0ValueConfig`，数据映射保留 `value_target` | `val_ratio` 数值 0–0.9，`eval_interval` 整数 1–1000000，`eval_batches` 整数 1–10000 | `scripts/acp/train_recap_pytorch.py` |
-| `stage_progress` Kai0 阶段进度与优势标注 | 单个 LeRobot 数据集，含 `[0,1]` 内的 `stage_progress_gt` 和真实帧、轨迹及任务索引。使用 `Pi0StageProgressConfig`、PyTorch π0.5 初始权重与对应的归一化统计 | `n_step` 优势窗口，默认 50 帧。`positive_ratio` 每阶段正例比例，默认 0.3。`stage_count` 阶段数，默认 2 | `scripts/acp/train_recap_pytorch.py` |
-| `offline_rl` 离线强化学习／ACP | 已完成离线优势标注的派生数据、初始策略权重及逐组归一化统计。ACP 配方读取 `is_positive` | `acp_dropout` 数值 0–1，覆盖每个数据工厂的优势条件丢弃概率 | `scripts/acp/train_recap_pytorch.py` |
+| `value_annotation` 优势值标注 | 已完成的同机 PyTorch Value 作业登记的检查点、单组含 `value_target` 的 LeRobot 数据及归一化统计。使用一张 GPU | `n_step` 默认 50 帧，`positive_ratio` 默认 0.3，按任务计算阈值 | `scripts/acp/lerobot_value_infer_pytorch.py` |
+| `stage_progress` 阶段进度训练 | 单个 LeRobot 数据集，配置取值在 `[0,1]` 内的实际进度字段，并保留真实帧、轨迹及任务索引。使用 `Pi0StageProgressConfig`、PyTorch π0.5 初始权重或已训练的进度模型，以及对应的归一化统计 | 可配置公共训练参数 | `scripts/acp/train_recap_pytorch.py` |
+| `stage_annotation` 阶段优势标注 | 单个 LeRobot 数据集、进度字段、对应的归一化统计和同机成功的 `stage_progress` 作业登记的 PyTorch 检查点。使用一张 GPU | `n_step` 优势窗口，默认 50 帧。`positive_ratio` 每阶段正例比例，默认 0.3。`stage_count` 阶段数，默认 2 | `scripts/acp/lerobot_stage_progress_infer_pytorch.py` |
+| `offline_rl` 离线强化学习／ACP | 已完成离线优势标注的派生数据、JAX / Orbax 初始动作策略权重及逐组归一化统计。ACP 配方读取 `is_positive` | `acp_dropout` 数值 0–1，覆盖每个数据工厂的优势条件丢弃概率 | `scripts/train.py` 或 `scripts/train_multi_dataset.py` |
 
-三个阶段均要求显式 `dataset_bindings` 与 `inputs:{model:id}`，逐行绑定同机 DATASET/NORM 资产及处理方式。公共训练步数、batch、学习率和 GPU 数量按模板规则校验，阶段参数拒绝未知字段、布尔伪数值、非有限数值及越界值。
+五种作业均要求显式 `dataset_bindings` 与 `inputs:{model:id}`，逐行绑定同机 DATASET/NORM 资产及处理方式。公共训练步数、batch、学习率和 GPU 数量按模板规则校验，阶段参数拒绝未知字段、布尔伪数值、非有限数值及越界值。标注使用 batch 配置执行推理。
 
-初始权重使用登记范围内的 `model.safetensors` 文件或其所在目录。训练入口和相关 PyTorch 源码摘要在预检与启动时核对。多卡训练使用单机 DDP，按 GPU 数切分全局 batch。新作业的数字步 checkpoint 包含 `model.safetensors`、`recap_checkpoint.json` 和归一化资产。历史 JAX 作业保留原执行记录与部署行为。
+PyTorch 阶段初始权重使用登记范围内的 `model.safetensors` 文件或其所在目录。多卡训练使用单机 DDP，按 GPU 数切分全局 batch。PyTorch 进度模型和 Value 检查点包含 `model.safetensors`、`recap_checkpoint.json` 和归一化资产。JAX ACP 初始化使用 Orbax 参数，生成包含 `params/` 的 Orbax 策略检查点。训练入口和相关源码摘要在预检与启动时核对。历史作业保留原执行记录与部署行为。
 
-Agent 在 CPU 自动预检中核对模型类型、PyTorch 权重文件和实际 parquet 的映射列及监督字段。每组最多抽取 16 个均匀分布文件的前 64 行监督列。`recap_stage_contract` 记录阶段、后端、模型类型、权重加载方式及数据证据。阶段、参数和源码摘要随预检计划冻结，启动时复核。
+Agent 在 CPU 自动预检中核对模型类型、该阶段要求的权重格式和实际 parquet 的映射列及监督字段。每组最多抽取 16 个均匀分布文件的前 64 行监督列。`recap_stage_contract` 记录阶段、后端、模型类型、权重加载方式及数据证据。阶段、参数和源码摘要随预检计划冻结，启动时复核。
 
-回报价值路线的 `value_target` 准备和 `lerobot_value_infer_pytorch.py` 标注在训练作业外执行。Kai0 路线在最终估计器 checkpoint 保存后生成 `stage_advantage_dataset`，以首帧为锚计算 `absolute_advantage`，按阶段分位数写入 `is_positive`。派生目录保留原任务字段和视频，`meta/stage_advantage.json` 记录窗口、阈值与实际标签数量。成功作业登记估计器 checkpoint 和带来源血缘的派生数据资产。ACP 读取两条路线产出的 `is_positive`。估计器 checkpoint 用于评分，动作策略部署使用 ACP 的 checkpoint。
+回报价值路线从已有 `value_target` 的数据开始，Value 标注作业生成 `value_advantage_dataset`，记录 `meta/value_advantage.json`。Stage Advantage 的进度训练登记估计器检查点，用户可使用仍可用的检查点开启新的进度训练或提交阶段优势标注。阶段优势标注以首帧为锚计算 `absolute_advantage`，按阶段分位数写入 `is_positive`，登记 `stage_advantage_dataset` 并记录 `meta/stage_advantage.json`。派生目录保留原任务字段和视频，登记记录所选模型、源数据和归一化资产。ACP 读取两条路线产出的 `is_positive`。估计器 checkpoint 用于评分，动作策略部署使用 ACP 的 checkpoint。

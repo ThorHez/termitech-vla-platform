@@ -11,8 +11,10 @@ import math
 import re
 
 if __package__:
+    from .composition_spec import composition_aux_sources
     from .dataset_validation_cache import lookup_cached
 else:
+    from composition_spec import composition_aux_sources
     from dataset_validation_cache import lookup_cached
 
 
@@ -77,7 +79,7 @@ def _source_samples(source, data):
         if not isinstance(composition, dict):
             raise ValueError("invalid submission composition")
         required = {row["key"] for row in composition["state_fields"] + composition["cameras"]}
-        required.update([composition["action_key"], *composition["aux_keys"]])
+        required.update([composition["action_key"], *composition_aux_sources(composition).values()])
     for index, row in zip(indices, rows):
         if (not isinstance(row, dict) or type(row.get("index")) is not int or row["index"] != index
                 or not isinstance(row.get("fields"), dict) or not row["fields"]

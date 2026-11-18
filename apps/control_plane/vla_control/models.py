@@ -200,6 +200,7 @@ class AssetDeletion(Base):
     asset_id: Mapped[str] = mapped_column(ForeignKey("assets.id", ondelete="RESTRICT"), primary_key=True)
     archived_at: Mapped[str | None] = mapped_column(String(40))
     archived_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    previous_state: Mapped[str | None] = mapped_column(String(32))
     inspection_command_id: Mapped[str | None] = mapped_column(ForeignKey("commands.id", ondelete="RESTRICT"))
     purge_command_id: Mapped[str | None] = mapped_column(ForeignKey("commands.id", ondelete="RESTRICT"))
 

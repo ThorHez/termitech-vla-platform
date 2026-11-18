@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   AlertCircle,
@@ -11,6 +11,7 @@ import {
   ExternalLink,
   GitCommitHorizontal,
   LoaderCircle,
+  RefreshCw,
   Rocket,
   RotateCcw,
   Server,
@@ -31,13 +32,13 @@ import {
   PageHeading,
   Panel,
 } from './components';
-import { activeStates, assetKinds, inputRoles, useData } from './data';
+import { activeStates, assetKinds, inputRoles, useData, useDataRequests } from './data';
 import { DatasetBindingSummary } from './DatasetBindings';
 import { NormDatasetEditor } from './NormDatasetEditor';
 import { GeneratedConfigReview } from './GeneratedConfigReview';
 import { datasetInputLabel } from './datasetBindingHelpers';
 import { stageParameterLabels, trainingStageLabels } from './recap';
-import type { Asset, Logs, Run, RunEvent } from './types';
+import type { Asset, Attempt, Logs, Run, RunEvent } from './types';
 import { deployableOutputs, sourceDeploymentBlocker } from './policyDeployment';
 import { TrainingMetrics } from './TrainingMetrics';
 import { resumeCheckpoints, retryableRun } from './runRetry';
@@ -47,6 +48,7 @@ import { trainingGpuPolicySummary } from './trainingGpuPolicy';
 import { RunDeleteAction } from './RunDeleteAction';
 import { RunGpuReservationNotice } from './GpuReservations';
 import { RecapRunHandoff } from './RecapRunHandoff';
+import type { RecapCheckpointHandoff } from './recapValueAnnotationHandoff';
 import { TrainingEnvironmentDetails } from './TrainingEnvironment';
 
 const queueReasonLabels: Record<string, string> = {
@@ -83,32 +85,83 @@ function outputStep(output: Asset) {
   return typeof step === 'number' && Number.isFinite(step) ? step : -1;
 }
 
+type RunStatus = Pick<Run, 'id' | 'state' | 'updated_at' | 'queue_reason'> & {
+  attempt: Pick<Attempt, 'id' | 'latest_metrics' | 'resources'> | null;
+};
+
+const RUN_ASSET_REQUESTS = { assets: 0 } as const;
+const RECAP_RUN_REQUESTS = { assets: 0, runs: 0 } as const;
+
 export default function RunDetail({
   id,
+  backTo = '/runs',
   onRetry,
   onResume,
   onRecapAcp,
+  onStageHandoff,
 }: {
   id: string;
+  backTo?: string;
   onRetry?: (run: Run) => void;
   onResume?: (run: Run) => void;
   onRecapAcp?: (run: Run, dataset: Asset) => void;
+  onStageHandoff?: (run: Run, handoff: RecapCheckpointHandoff) => void;
 }) {
   const { can, user } = useAuth();
   const { nodes, templates, assets, refresh } = useData();
-  const detail = useApi<Run>(`/runs/${id}`, 3000);
+  const runPath = `/runs/${encodeURIComponent(id)}`;
+  const detail = useApi<Run>(runPath, 0);
   const run = detail.data?.id === id ? detail.data : undefined;
   const resumeSource = run?.resume_source ?? run?.code_expectation?.resume_source;
   const canManage = can('training.write') && canManageResource(user, run?.owner_user_id);
-  const live = !run || !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(run.state);
-  const events = useRunFeed<RunEvent>(`/runs/${id}/events`, 'events', live);
-  const logs = useRunFeed<Logs['items'][number]>(`/runs/${id}/logs`, 'logs', live);
+  const live = !!run && !['SUCCEEDED', 'FAILED', 'CANCELLED'].includes(run.state);
+  const status = useApi<RunStatus>(live ? `${runPath}?view=status` : null, 10000);
+  const current = live && status.data?.id === id ? status.data : undefined;
+  const statusError = live ? status.error : undefined;
+  const attempt = run?.attempts?.at(-1);
+  const trainingStage =
+    run?.training_stage ||
+    attempt?.code_snapshot?.training_stage ||
+    run?.code_expectation?.training_stage;
+  const stageAnnotation =
+    trainingStage === 'stage_annotation' || trainingStage === 'value_annotation';
+  const currentAttempt = current?.attempt?.id === attempt?.id ? current?.attempt : undefined;
+  const refreshDetail = detail.refresh;
+  const hasChanged =
+    !!current &&
+    (current.state !== run?.state ||
+      current.updated_at !== run.updated_at ||
+      current.attempt?.id !== attempt?.id);
+  const changedVersion = hasChanged
+    ? [current.state, current.updated_at, current.attempt?.id].join(':')
+    : null;
+  useEffect(() => {
+    if (changedVersion) refreshDetail();
+  }, [changedVersion, refreshDetail]);
   const [tab, setTab] = useState('overview');
+  useDataRequests(
+    run?.template_id === 'recap'
+      ? RECAP_RUN_REQUESTS
+      : run && tab === 'assets'
+        ? RUN_ASSET_REQUESTS
+        : undefined,
+  );
+  const events = useRunFeed<RunEvent>(
+    run ? `${runPath}/events` : null,
+    'events',
+    live,
+    tab === 'overview',
+  );
+  const logs = useRunFeed<Logs['items'][number]>(
+    run ? `${runPath}/logs` : null,
+    'logs',
+    live,
+    tab === 'overview' || tab === 'logs',
+  );
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
-  const attempt = run?.attempts?.[run.attempts.length - 1];
-  const metrics = useRunMetrics(id, attempt?.id, live);
+  const metrics = useRunMetrics(id, attempt?.id, live, tab === 'overview' && !stageAnnotation);
   const outputs = useMemo(
     () =>
       [...(run?.outputs || [])].sort((left, right) => {
@@ -129,15 +182,11 @@ export default function RunDetail({
   );
   const node = nodes.data?.find((item) => item.id === run?.node_id);
   const template = templates.data?.find((item) => item.id === run?.template_id);
-  const trainingStage =
-    run?.training_stage ||
-    attempt?.code_snapshot?.training_stage ||
-    run?.code_expectation?.training_stage;
   const stageConfig =
     run?.stage_config ||
     attempt?.code_snapshot?.stage_config ||
     run?.code_expectation?.stage_config;
-  const resource = attempt?.resources;
+  const resource = currentAttempt?.resources ?? attempt?.resources;
   const recipe = run?.recipe || attempt?.code_snapshot?.recipe || run?.code_expectation?.recipe;
   const autoConfig =
     run?.auto_config || attempt?.code_snapshot?.auto_config || run?.code_expectation?.auto_config;
@@ -150,9 +199,9 @@ export default function RunDetail({
   const actualEntrypoint =
     attempt?.code_snapshot?.automatic_preflight?.plan.entrypoint ||
     run?.code_expectation?.automatic_preflight?.plan.entrypoint;
-  const pytorchRecap =
-    (attempt?.code_snapshot?.automatic_preflight?.plan.recap_stage_contract?.backend ||
-      run?.code_expectation?.automatic_preflight?.plan.recap_stage_contract?.backend) === 'pytorch';
+  const recapBackend =
+    attempt?.code_snapshot?.automatic_preflight?.plan.recap_stage_contract?.backend ||
+    run?.code_expectation?.automatic_preflight?.plan.recap_stage_contract?.backend;
   const recipeDefinition =
     run?.recipe_definition ||
     attempt?.code_snapshot?.recipe_definition ||
@@ -171,7 +220,7 @@ export default function RunDetail({
   };
   return (
     <>
-      <Back to="/runs" label="返回训练任务" />
+      <Back to={backTo} label="返回训练任务" />
       <PageHeading
         eyebrow="RUN DETAIL"
         title={run?.name || '训练详情'}
@@ -180,10 +229,23 @@ export default function RunDetail({
           run && (
             <>
               <Badge state={run.state} />
+              <button
+                type="button"
+                className="button outline"
+                onClick={refreshDetail}
+                disabled={detail.loading}
+              >
+                <RefreshCw size={14} />
+                刷新
+              </button>
               {can('training.write') && onRetry && retryableRun(run) && (
                 <button type="button" className="button primary" onClick={() => onRetry(run)}>
                   <RotateCcw size={14} />
-                  {run.state === 'FAILED' ? '重新配置并启动' : '重新训练'}
+                  {run.state === 'FAILED'
+                    ? '重新配置并启动'
+                    : stageAnnotation
+                      ? '重新标注'
+                      : '重新训练'}
                 </button>
               )}
               {onResume &&
@@ -227,15 +289,23 @@ export default function RunDetail({
         }
       />
       {run && <ResourceOwner ownerUserId={run.owner_user_id} />}
-      <ErrorNotice error={detail.error || error} retry={detail.refresh} />
+      <ErrorNotice
+        error={detail.error || statusError || error}
+        retry={!detail.error && statusError ? status.refresh : detail.refresh}
+      />
       {detail.loading && !run ? (
         <Loading />
       ) : (
         run && (
           <>
-            <RunQueueReason reason={run.queue_reason} />
+            <RunQueueReason reason={current ? current.queue_reason : run.queue_reason} />
             {run.template_id === 'recap' && (
-              <RecapRunHandoff key={run.id} run={run} onAcp={onRecapAcp} />
+              <RecapRunHandoff
+                key={run.id}
+                run={run}
+                onAcp={onRecapAcp}
+                onStageHandoff={onStageHandoff}
+              />
             )}
             {run.state === 'UNKNOWN' && (
               <div className="inline-note amber">
@@ -314,7 +384,11 @@ export default function RunDetail({
             </div>
             <div className="tabs">
               {[
-                { id: 'overview', title: '训练概览', icon: Activity },
+                {
+                  id: 'overview',
+                  title: stageAnnotation ? '标注概览' : '训练概览',
+                  icon: Activity,
+                },
                 { id: 'logs', title: '运行日志', icon: Terminal },
                 { id: 'code', title: '代码与配置', icon: Code2 },
                 { id: 'assets', title: '输入与产出', icon: Database },
@@ -332,26 +406,28 @@ export default function RunDetail({
             {tab === 'overview' && (
               <div className="detail-columns">
                 <div>
-                  <Panel title="训练指标" subtitle="来自训练进程的实际上报">
-                    <TrainingMetrics
-                      key={`${id}-${attempt?.id || 'pending'}`}
-                      events={metricEvents}
-                      latestMetrics={attempt?.latest_metrics}
-                      totalSteps={run.parameters?.steps}
-                      loading={metrics.loading}
-                      error={metrics.error}
-                      retry={metrics.refresh}
-                      historyComplete={metrics.complete}
-                    />
-                  </Panel>
+                  {!stageAnnotation && (
+                    <Panel title="训练指标" subtitle="来自训练进程的实际上报">
+                      <TrainingMetrics
+                        key={`${id}-${attempt?.id || 'pending'}`}
+                        events={metricEvents}
+                        latestMetrics={currentAttempt?.latest_metrics ?? attempt?.latest_metrics}
+                        totalSteps={run.parameters?.steps}
+                        loading={metrics.loading}
+                        error={metrics.error}
+                        retry={metrics.refresh}
+                        historyComplete={metrics.complete}
+                      />
+                    </Panel>
+                  )}
                   <Panel
                     title="最近日志"
                     subtitle={
                       live
                         ? undefined
                         : logs.complete
-                          ? '训练已结束，日志已同步'
-                          : '训练已结束，正在补齐历史日志…'
+                          ? '作业已结束，日志已同步'
+                          : '作业已结束，正在补齐历史日志…'
                     }
                     action={
                       <button className="text-link" onClick={() => setTab('logs')}>
@@ -374,10 +450,10 @@ export default function RunDetail({
                           <dd>{trainingStageLabels[trainingStage] || trainingStage}</dd>
                         </div>
                       )}
-                      {pytorchRecap && (
+                      {(recapBackend === 'pytorch' || recapBackend === 'jax') && (
                         <div>
                           <dt>训练框架</dt>
-                          <dd>PyTorch</dd>
+                          <dd>{recapBackend === 'jax' ? 'JAX' : 'PyTorch'}</dd>
                         </div>
                       )}
                       <div>
@@ -567,11 +643,11 @@ export default function RunDetail({
                     <CodeVersion snapshot={run.code_expectation} title="提交时绑定的代码版本" />
                   </Panel>
                 </div>
-                <Panel title="冻结训练配置">
+                <Panel title={stageAnnotation ? '冻结标注配置' : '冻结训练配置'}>
                   <dl className="detail-list padded">
                     {requestedEntrypoint && (
                       <div>
-                        <dt>所选训练入口</dt>
+                        <dt>{stageAnnotation ? '所选标注入口' : '所选训练入口'}</dt>
                         <dd>
                           <code>{requestedEntrypoint}</code>
                         </dd>
@@ -579,7 +655,7 @@ export default function RunDetail({
                     )}
                     {actualEntrypoint && (
                       <div>
-                        <dt>实际训练入口</dt>
+                        <dt>{stageAnnotation ? '实际标注入口' : '实际训练入口'}</dt>
                         <dd>
                           <code>{actualEntrypoint}</code>
                         </dd>
@@ -635,32 +711,34 @@ export default function RunDetail({
                         ))}
                       </>
                     )}
-                    {Object.entries(run.parameters || {}).map(([key, value]) => (
-                      <div key={key}>
-                        <dt>
-                          {(
-                            {
-                              steps: '训练步数',
-                              batch_size: '批次大小',
-                              save_interval: '检查点保存间隔',
-                              keep_period: '检查点永久保留周期',
-                              num_workers: '数据加载进程数',
-                              warmup_steps: '学习率预热步数',
-                              decay_steps: '学习率衰减总步数',
-                              decay_lr: '最终学习率',
-                              clip_gradient_norm: '梯度裁剪阈值',
-                              ema_decay: 'EMA 衰减系数',
-                              fsdp_devices: 'FSDP 分片设备数',
-                              log_interval: '日志记录间隔',
-                              learning_rate: '学习率',
-                            } as Record<string, string>
-                          )[key] || key}
-                        </dt>
-                        <dd>
-                          <code>{typeof value === 'string' ? value : JSON.stringify(value)}</code>
-                        </dd>
-                      </div>
-                    ))}
+                    {Object.entries(run.parameters || {})
+                      .filter(([key]) => !stageAnnotation || key === 'batch_size')
+                      .map(([key, value]) => (
+                        <div key={key}>
+                          <dt>
+                            {(
+                              {
+                                steps: '训练步数',
+                                batch_size: '批次大小',
+                                save_interval: '检查点保存间隔',
+                                keep_period: '检查点永久保留周期',
+                                num_workers: '数据加载进程数',
+                                warmup_steps: '学习率预热步数',
+                                decay_steps: '学习率衰减总步数',
+                                decay_lr: '最终学习率',
+                                clip_gradient_norm: '梯度裁剪阈值',
+                                ema_decay: 'EMA 衰减系数',
+                                fsdp_devices: 'FSDP 分片设备数',
+                                log_interval: '日志记录间隔',
+                                learning_rate: '学习率',
+                              } as Record<string, string>
+                            )[key] || key}
+                          </dt>
+                          <dd>
+                            <code>{typeof value === 'string' ? value : JSON.stringify(value)}</code>
+                          </dd>
+                        </div>
+                      ))}
                     {trainingStage && (
                       <div>
                         <dt>训练阶段</dt>
@@ -796,11 +874,13 @@ export default function RunDetail({
                     )}
                   </Panel>
                   <Panel
-                    title="训练产出"
+                    title={stageAnnotation ? '标注产出' : '训练产出'}
                     subtitle={
-                      activeStates.has(run.state)
-                        ? '自动更新已保存的检查点，产出保存在执行机器上'
-                        : '产出保存在执行机器上并登记来源关系'
+                      stageAnnotation && activeStates.has(run.state)
+                        ? '标注完成后会登记派生数据集'
+                        : activeStates.has(run.state)
+                          ? '自动更新已保存的检查点，产出保存在执行机器上'
+                          : '产出保存在执行机器上并登记来源关系'
                     }
                   >
                     {outputs.length ? (
@@ -852,13 +932,23 @@ export default function RunDetail({
                     ) : (
                       <Empty
                         icon={Box}
-                        title={activeStates.has(run.state) ? '等待首个检查点' : '尚无训练产出'}
-                        description={
-                          run.state === 'RUNNING'
-                            ? '训练正在进行，首个检查点保存完成后会自动出现在这里。'
+                        title={
+                          stageAnnotation
+                            ? '尚无标注产出'
                             : activeStates.has(run.state)
-                              ? '训练保存并上报首个检查点后，会自动出现在这里。'
-                              : '此任务尚未上报可用的训练产出。'
+                              ? '等待首个检查点'
+                              : '尚无训练产出'
+                        }
+                        description={
+                          stageAnnotation
+                            ? activeStates.has(run.state)
+                              ? '等待作业发布带优势标签的数据集。'
+                              : '此作业没有可用的派生数据集。'
+                            : run.state === 'RUNNING'
+                              ? '训练正在进行，首个检查点保存完成后会自动出现在这里。'
+                              : activeStates.has(run.state)
+                                ? '训练保存并上报首个检查点后，会自动出现在这里。'
+                                : '此任务尚未上报可用的训练产出。'
                         }
                       />
                     )}

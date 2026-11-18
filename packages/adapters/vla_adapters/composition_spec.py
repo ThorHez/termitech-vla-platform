@@ -8,6 +8,7 @@ from copy import deepcopy
 import hashlib
 import json
 import math
+import re
 
 if __package__:
     from .image_policy import AUGMENTATIONS
@@ -18,12 +19,15 @@ else:
 COMPOSABLE_PROCESSOR = "ComposableDataConfig"
 FLAT_STATE_MODEL_TRANSFORM = "flat_state"
 KAI0_PAD32_MODEL_TRANSFORM = "kai0_pad32"
+STAGE_PROGRESS_COLUMN = "stage_progress_gt"
+_STAGE_PROGRESS_RESERVED = {"index", "episode_index", "frame_index", "task_index", "timestamp", "task",
+                            "value_target", "is_positive", "absolute_value", "absolute_advantage", "relative_advantage"}
 FIELDS = {"schema_version", "robot_model", "arm_mode", "state_representation", "state_fields", "state_history",
           "action_representation", "action_key", "action_layout", "action_mode", "rotation_representation",
           "position_unit", "joint_unit", "coordinate_frame", "gripper_range", "cameras", "prompt_key",
-          "normalization", "model_transform", "aux_keys"}
+          "normalization", "model_transform", "aux_keys", "stage_progress_key"}
 OPTIONAL_FIELDS = {"position_unit", "joint_unit", "coordinate_frame", "gripper_range",
-                   "action_mode", "rotation_representation", "prompt_key"}
+                   "action_mode", "rotation_representation", "prompt_key", "stage_progress_key"}
 SLOTS = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 STATE_KINDS = {"position", "rotation", "joint", "gripper", "other"}
 # Match ECMAScript String.trim exactly across the API, UI and training code.
@@ -71,6 +75,25 @@ def _key(value, label):
             or any(char in "()[]{}'\"`; $".replace(" ", "") for char in result)):
         _fail(label + "必须是数据字段名，不能是路径或表达式")
     return result
+
+
+def stage_progress_source_key(value):
+    key = _key(value, "阶段进度字段")
+    if "/" in key or key in _STAGE_PROGRESS_RESERVED:
+        _fail("阶段进度字段需要独立的物理 parquet 列名")
+    return key
+
+
+def stage_progress_source_feature(feature):
+    if not isinstance(feature, dict):
+        return False
+    shape, dtype = feature.get("shape"), feature.get("dtype")
+    return (isinstance(shape, list) and (not shape or len(shape) == 1 and type(shape[0]) is int and shape[0] == 1)
+            and isinstance(dtype, str) and re.fullmatch(r"(?:u?int(?:8|16|32|64)|float(?:16|32|64)|double)", dtype) is not None)
+
+
+def composition_aux_sources(spec):
+    return {key: spec.get("stage_progress_key", key) if key == STAGE_PROGRESS_COLUMN else key for key in spec["aux_keys"]}
 
 
 def _number(value, label):
@@ -244,9 +267,18 @@ def normalize_composition(value, *, norm_stats=False):
             or any(item not in {"value_target", "is_positive", "stage_progress_gt"} for item in aux if isinstance(item, str))
             or any(not isinstance(item, str) for item in aux)):
         _fail("辅助字段仅支持 value_target、is_positive 和 stage_progress_gt，且不能重复")
-    if any(key in {*keys, result["action_key"], result["prompt_key"]} for key in aux):
-        _fail("辅助字段不能与其它输入字段重名")
     result["aux_keys"] = list(aux)
+    if "stage_progress_key" in value:
+        key = stage_progress_source_key(value["stage_progress_key"])
+        if STAGE_PROGRESS_COLUMN not in aux:
+            _fail("设置阶段进度字段时需要保留 stage_progress_gt 辅助字段")
+        if key != STAGE_PROGRESS_COLUMN:
+            result["stage_progress_key"] = key
+    occupied = {*keys, result["action_key"], result["prompt_key"]}
+    if occupied.intersection(aux) or occupied.intersection(composition_aux_sources(result).values()):
+        _fail("辅助字段不能与其它输入字段重名")
+    if norm_stats:
+        result.pop("stage_progress_key", None)
     return result
 
 
@@ -425,7 +457,12 @@ def verify_composition_metadata(value, info, *, derived_features=(), action_hori
                 _fail("RGB 元信息须明确三通道和 CHW/HWC 布局：" + camera["key"])
         elif len(actual) not in (2, 3) or (len(actual) == 3 and channels != 1):
             _fail("深度元信息须明确单通道布局：" + camera["key"])
-    for key in ([] if norm_stats else ([spec["prompt_key"]] if spec["prompt_key"] else []) + spec["aux_keys"]):
+    aux = composition_aux_sources(spec)
+    for key in ([] if norm_stats else ([spec["prompt_key"]] if spec["prompt_key"] else []) + list(aux.values())):
         if key not in features and key not in derived_features:
             _fail("数据集缺少任务或阶段辅助字段：" + key)
+    if not norm_stats and STAGE_PROGRESS_COLUMN in aux:
+        progress = aux[STAGE_PROGRESS_COLUMN]
+        if not stage_progress_source_feature(features.get(progress)):
+            _fail("阶段进度字段需要数值标量元信息：" + progress)
     return spec

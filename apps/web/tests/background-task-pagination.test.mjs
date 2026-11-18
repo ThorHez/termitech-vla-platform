@@ -15,8 +15,10 @@ const server = await createServer({
 try {
   const {
     BACKGROUND_TASK_PAGE_SIZE,
+    backgroundTaskListPath,
     backgroundTaskPagePath,
     backgroundTaskPageRange,
+    backgroundTaskQueryFromSearch,
     backgroundTaskQueryReducer,
     initialBackgroundTaskQuery,
   } = await server.ssrLoadModule('/src/backgroundTaskPagination.ts');
@@ -33,6 +35,27 @@ try {
     page_size: 20,
     total_pages: 4,
     ...changes,
+  });
+
+  await test('machine selection is exact and the list path preserves return filters', () => {
+    const request = backgroundTaskQueryFromSearch(
+      'node=machine%2B01&type=data-sync&status=ACTIVE&page=4&q=A%26B',
+    );
+    assert.deepEqual(request, {
+      nodeId: 'machine+01',
+      type: 'training',
+      status: 'ACTIVE',
+      page: 4,
+      query: 'A&B',
+    });
+    assert.equal(
+      backgroundTaskListPath(request),
+      '/runs?node=machine%2B01&type=training&status=ACTIVE&q=A%26B&page=4',
+    );
+    const path = new URL(backgroundTaskPagePath(request), 'https://example.test');
+    assert.equal(path.searchParams.get('node_id'), 'machine+01');
+    assert.equal(path.searchParams.get('type'), 'training');
+    assert.equal(path.searchParams.get('q'), 'A&B');
   });
   const renderPagination = (value, loading = false) =>
     renderToStaticMarkup(
@@ -167,7 +190,7 @@ try {
     assert.match(html, /新建训练/);
     assert.match(html, /aria-label="搜索任务"[^>]*maxLength="200"/i);
     assert.match(html, /每页固定显示 20 条/);
-    assert.match(html, /每 3 秒更新当前页/);
+    assert.match(html, /每 10 秒更新当前页/);
     assert.match(html, /aria-label="任务分页"/);
     assert.doesNotMatch(html, /最近 200 条/);
   });

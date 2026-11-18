@@ -15,11 +15,12 @@ from pathlib import Path
 
 import psutil
 from vla_adapters import build_launch
-from vla_adapters.recap import STAGE_PROGRESS, stage_progress_outputs_match
-from vla_adapters.recap_checkpoint import recap_torch_artifact_valid
+from vla_adapters.recap import (ACP_STAGE, ANNOTATION_STAGES, STAGE_PROGRESS, VALUE_ANNOTATION,
+                               stage_annotation_outputs_match, stage_progress_outputs_match, value_annotation_outputs_match)
+from vla_adapters.recap_checkpoint import acp_artifact_valid, recap_torch_artifact_valid
 from vla_protocol.config_preview import validate_generated_config
 
-from .artifacts import ArtifactMonitor, completed_torch_recap_checkpoint
+from .artifacts import ArtifactMonitor, completed_openpi_checkpoint, completed_torch_recap_checkpoint
 from .config import load_config
 from .metrics import check_gpus, check_training_gpus, process_metrics
 from .output_isolation import validate_output_isolation
@@ -33,7 +34,8 @@ from .training_gpu import shared_training_environment, training_gpu_evidence, va
 
 def verified_outputs(output_dir: Path, smoke: bool, *, template_id: str | None = None,
                      norm_datasets: list[dict] | None = None, stage_progress: dict | None = None,
-                     recap_pytorch: dict | None = None) -> list[dict]:
+                     recap_pytorch: dict | None = None, stage_annotation: dict | None = None,
+                     recap_acp: dict | None = None) -> list[dict]:
     manifest = output_dir / "artifacts.json"
     if not manifest.exists():
         if not smoke:
@@ -58,30 +60,39 @@ def verified_outputs(output_dir: Path, smoke: bool, *, template_id: str | None =
             if smoke:
                 metadata["simulation"] = True
             result.append({**output, "path": str(path), "metadata": metadata})
-        required_kind = "NORM" if template_id == "openpi-norm" else "MODEL"
+        required_kind = "DATASET" if stage_annotation is not None else "NORM" if template_id == "openpi-norm" else "MODEL"
         if not smoke and not any(artifact["kind"] == required_kind for artifact in result):
             raise ValueError(f"Task exited without a {required_kind} artifact")
-        if recap_pytorch is not None:
+        if recap_pytorch is not None and stage_annotation is None:
             plan = recap_pytorch["code_expectation"]["automatic_preflight"]["plan"]
             stage = recap_pytorch["training_stage"]
             models = [row for row in result if row["kind"] == "MODEL"]
-            if (len(models) != 1 or not recap_torch_artifact_valid(models[0], str(output_dir), plan["recipe"], stage,
+            if (len(result) != (2 if stage_progress is not None else 1) or len(models) != 1
+                    or not recap_torch_artifact_valid(models[0], str(output_dir), plan["recipe"], stage,
                                                                     final_step=plan["parameters"]["steps"] - 1)):
                 raise ValueError("PyTorch ReCap needs its verified final model artifact")
             committed = completed_torch_recap_checkpoint(Path(models[0]["path"]))
             if committed is None or committed["model_role"] != models[0]["metadata"]["model_role"]:
                 raise ValueError("PyTorch ReCap checkpoint is incomplete or belongs to a different stage")
-        if stage_progress is not None:
-            input_ids = {role: asset["id"] for role, asset in stage_progress["inputs"].items()}
-            plan = stage_progress["code_expectation"]["automatic_preflight"]["plan"]
-            if not stage_progress_outputs_match(result, str(output_dir), input_ids, plan):
-                raise ValueError("Kai0 stage progress requires a matching model and derived dataset")
+        if recap_acp is not None and (len(result) != 1 or not acp_artifact_valid(
+                result[0], str(output_dir), recap_acp["recipe"], final_step=recap_acp["parameters"]["steps"] - 1)
+                or completed_openpi_checkpoint(Path(result[0]["path"])) is None):
+            raise ValueError("JAX ACP needs its committed final Orbax policy checkpoint")
+        annotation_payload = stage_annotation if stage_annotation is not None else stage_progress
+        if annotation_payload is not None:
+            input_ids = {role: asset["id"] for role, asset in annotation_payload["inputs"].items()}
+            plan = annotation_payload["code_expectation"]["automatic_preflight"]["plan"]
+            value = annotation_payload.get("training_stage") == VALUE_ANNOTATION
+            matches = (value_annotation_outputs_match if value else stage_annotation_outputs_match
+                       if stage_annotation is not None else stage_progress_outputs_match)
+            if not matches(result, str(output_dir), input_ids, plan):
+                raise ValueError("ReCap annotation output does not match the frozen scorer and dataset")
             dataset = next(row for row in result if row["kind"] == "DATASET")
-            path = Path(dataset["path"]) / "meta" / "stage_advantage.json"
+            path = Path(dataset["path"]) / "meta" / ("value_advantage.json" if value else "stage_advantage.json")
             receipt = allowed_path(str(path), [dataset["path"]])
             if (path != receipt or not receipt.is_file() or receipt.stat().st_size > 128 * 1024
                     or hashlib.sha256(receipt.read_bytes()).hexdigest() != dataset["metadata"].get("annotation_sha256")):
-                raise ValueError("Kai0 derived dataset annotation receipt does not match the manifest")
+                raise ValueError("ReCap annotation receipt does not match the manifest")
         if template_id == "openpi-norm":
             from vla_adapters.norm_entry import verify_statistics
             from vla_adapters.norm_datasets import normalize_norm_datasets
@@ -177,9 +188,10 @@ def execute(config: dict, attempt_id: str) -> int:
         output = allowed_path(attempt["output_dir"], [config["output_root"]], must_exist=False)
         profile, inputs = validate_local_inputs(config, payload)
         policy = validate_training_gpu_policy(payload, profile, require_frozen=True)
+        frozen_plan = payload.get("code_expectation", {}).get("automatic_preflight", {}).get("plan", {})
+        frozen_backend = (frozen_plan.get("recap_stage_contract") or {}).get("backend")
         if profile.get("adapter") != "smoke":
             expectation = payload.get("code_expectation", {})
-            frozen_plan = expectation.get("automatic_preflight", {}).get("plan", {})
             if frozen_plan.get("resume_source") != payload.get("resume_source"):
                 raise AgentError("RESUME_SOURCE_MISMATCH", "启动命令与预检冻结的续训来源不一致，请重新预检")
             generated = frozen_plan.get("generated_config")
@@ -211,7 +223,7 @@ def execute(config: dict, attempt_id: str) -> int:
         if policy is not None:
             check_training_gpus(payload["gpu_uuids"], policy)
         launch = build_launch(profile, payload["template_id"], inputs, payload.get("parameters", {}), str(output),
-                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}), **({"resume_source": payload["resume_source"]} if payload.get("resume_source") is not None else {}))
+                              payload.get("gpu_uuids", []), recipe=payload.get("recipe"), recipe_definition=payload.get("recipe_definition"), entrypoint=payload.get("entrypoint"), dataset_bindings=payload.get("dataset_bindings"), training_stage=payload.get("training_stage"), stage_config=payload.get("stage_config"), **({"auto_config": payload["auto_config"]} if payload.get("auto_config") is not None else {}), **({"normalization_method": payload["normalization_method"]} if payload.get("normalization_method") is not None else {}), **({"norm_datasets": payload["norm_datasets"]} if payload.get("norm_datasets") is not None else {}), **({"training_gpu_policy": policy} if policy is not None else {}), **({"resume_source": payload["resume_source"]} if payload.get("resume_source") is not None else {}), **({"frozen_recap_backend": frozen_backend} if frozen_backend is not None else {}))
         allowed_path(launch["cwd"], config["roots"])
         if profile.get("adapter") != "smoke":
             if not isinstance(payload["code_expectation"].get("automatic_preflight"), dict):
@@ -244,7 +256,7 @@ def execute(config: dict, attempt_id: str) -> int:
         environment = shared_training_environment(environment, policy, devices)
         if payload["template_id"] == "recap":
             environment.pop("VLA_RECAP_TORCH_MEMORY_FRACTION", None)
-            if policy is not None:
+            if policy is not None and frozen_backend == "pytorch":
                 environment["VLA_RECAP_TORCH_MEMORY_FRACTION"] = environment["XLA_CLIENT_MEM_FRACTION"]
         child = subprocess.Popen(launch["argv"], cwd=launch["cwd"], env=environment,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -355,11 +367,15 @@ def execute(config: dict, attempt_id: str) -> int:
             state.emit(attempt_id, "CANCELLED", common)
         elif child.returncode == 0:
             plan = payload.get("code_expectation", {}).get("automatic_preflight", {}).get("plan", {})
-            torch_recap = (plan.get("recap_stage_contract") or {}).get("backend") == "pytorch"
+            contract = plan.get("recap_stage_contract") or {}
+            torch_recap = contract.get("backend") == "pytorch"
+            stage = payload.get("training_stage")
             outputs = verified_outputs(output, profile.get("adapter") == "smoke", template_id=payload["template_id"],
                                        norm_datasets=payload.get("norm_datasets"),
-                                       stage_progress=payload if payload.get("training_stage") == STAGE_PROGRESS else None,
-                                       recap_pytorch=payload if torch_recap else None)
+                                       stage_progress=payload if stage == STAGE_PROGRESS and "annotation" in contract else None,
+                                       stage_annotation=payload if stage in ANNOTATION_STAGES else None,
+                                       recap_pytorch=payload if torch_recap else None,
+                                       recap_acp=plan if stage == ACP_STAGE and contract.get("backend") == "jax" else None)
             state.emit(attempt_id, "SUCCEEDED", {**common, "outputs": outputs})
         else:
             state.emit(attempt_id, "FAILED", {**common, "error": {"code": "PROCESS_EXITED", "message": f"Training process exited with code {child.returncode}"}})

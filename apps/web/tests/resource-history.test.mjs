@@ -28,13 +28,19 @@ try {
     validPercent,
     seriesValues,
     chartSegments,
+    formatNetworkRate,
+    networkMbps,
     seriesSummary,
     historicalGpus,
     nearestPointIndex,
   } = await server.ssrLoadModule('/src/resourceHistoryData.ts');
-  const { ResourceTrendChart, ResourceHistory, GpuHistoryCharts } = await server.ssrLoadModule(
-    '/src/ResourceHistory.tsx',
-  );
+  const {
+    ResourceTrendChart,
+    ResourceHistory,
+    GpuHistoryCharts,
+    NetworkHistoryCharts,
+    NetworkProcessTraffic,
+  } = await server.ssrLoadModule('/src/ResourceHistory.tsx');
   const gpu = (uuid, usage, memory = null) => ({
     uuid,
     name: 'same GPU model',
@@ -60,6 +66,98 @@ try {
       uuid: match[1].match(/<code>([^<]+)<\/code>/)?.[1],
       checked: /<input\b[^>]*\bchecked=""/.test(match[1]),
     }));
+
+  await test('process traffic shows measured TCP rates and hides offline or stale rows', () => {
+    const report = {
+      status: 'ready',
+      partial: true,
+      processes: [{ pid: 412, name: 'sshd', rx_bytes_per_second: 0, tx_bytes_per_second: 1250000 }],
+    };
+    const recent = new Date().toISOString();
+    const render = (props) =>
+      renderToStaticMarkup(
+        React.createElement(NetworkProcessTraffic, {
+          report,
+          lastSeen: recent,
+          nodeStatus: 'ONLINE',
+          ...props,
+        }),
+      );
+    const html = render();
+    assert.match(html, /进程网络流量（TCP）/);
+    assert.match(html, /<strong>sshd<\/strong>/);
+    assert.match(html, />412</);
+    assert.match(html, />0 Mbps</);
+    assert.match(html, />10 Mbps</);
+    assert.match(html, /部分连接的归属无法确认/);
+    const previousPoll = new Date(Date.now() - 50_000);
+    assert.match(render({ receivedAt: previousPoll }), /暂无近期的进程流量数据/);
+    assert.match(render({ receivedAt: previousPoll, maxAgeMs: 70_000 }), />10 Mbps</);
+    for (const props of [
+      { nodeStatus: 'OFFLINE' },
+      { receivedAt: new Date(0) },
+      { report: { ...report, status: 'stale' } },
+    ]) {
+      const stale = render(props);
+      assert.match(stale, /暂无近期的进程流量数据/);
+      assert.doesNotMatch(stale, /sshd|Mbps/);
+    }
+    assert.match(render({ report: undefined }), /尚未上报今日累计流量/);
+    assert.match(render({ report: { status: 'warming_up', processes: [] } }), /等待下一次上报/);
+  });
+
+  await test('process traffic defaults to daily bytes and retains exited and offline rows', () => {
+    const today = {
+      date: '2026-11-15',
+      partial: true,
+      processes: [
+        {
+          instance_id: 'a'.repeat(32),
+          pid: 412,
+          name: 'caddy',
+          rx_bytes: 500000000,
+          tx_bytes: 1000000000,
+          active: false,
+        },
+        {
+          instance_id: 'b'.repeat(32),
+          pid: 412,
+          name: 'sshd',
+          rx_bytes: 0,
+          tx_bytes: 1250,
+          active: null,
+        },
+      ],
+    };
+    const report = {
+      status: 'ready',
+      processes: [
+        { pid: 423, name: 'live-only', rx_bytes_per_second: 0, tx_bytes_per_second: 1250000 },
+      ],
+      today,
+    };
+    for (const nodeStatus of ['ONLINE', 'OFFLINE']) {
+      const html = renderToStaticMarkup(
+        React.createElement(NetworkProcessTraffic, {
+          report,
+          nodeStatus,
+          lastSeen: new Date().toISOString(),
+        }),
+      );
+      assert.match(html, /aria-pressed="true"[^>]*>今日累计/);
+      assert.match(html, /北京时间 2026-11-15/);
+      assert.match(html, /累计入站/);
+      assert.match(html, /累计出站/);
+      assert.match(html, /<strong>caddy<\/strong>.*已退出/);
+      assert.match(html, />500 MB</);
+      assert.match(html, />1 GB</);
+      assert.match(html, /<strong>1.5 GB<\/strong>/);
+      assert.match(html, /<strong>sshd<\/strong>/);
+      assert.match(html, />1.25 KB</);
+      assert.match(html, /累计仅包含已观测流量/);
+      assert.doesNotMatch(html, /live-only|Mbps/);
+    }
+  });
 
   await test('zero is an observed percentage; absent, malformed and out-of-range values stay unknown', () => {
     assert.equal(validPercent(0), 0);
@@ -283,13 +381,88 @@ try {
     assert.doesNotMatch(noHistory, /<svg\b|<input\b/);
   });
 
+  await test('network rates preserve valid zeros and handle Mbps values over 100', () => {
+    assert.equal(formatNetworkRate(0), '0 Mbps');
+    assert.equal(formatNetworkRate(1), '< 0.001 Mbps');
+    assert.equal(formatNetworkRate(125_000_000), '1,000 Mbps');
+    assert.equal(formatNetworkRate(Infinity), '—');
+    assert.equal(formatNetworkRate(null), '—');
+    assert.equal(networkMbps(125_000_000), 1000);
+  });
+
+  await test('network history selects the default route and displays only one interface', () => {
+    const nic = (name, rx, tx) => ({
+      name,
+      rx_bytes_per_second: rx,
+      tx_bytes_per_second: tx,
+    });
+    const history = {
+      ...gpuHistory([
+        point(0, null, {
+          network_interfaces: [nic('eth1', 800, 300), nic('eth0', 125_000_000, 0)],
+        }),
+        point(30, null, { network_interfaces: [nic('eth1', 900, 60)] }),
+        point(60, null, { network_interfaces: [nic('eth0', 250_000_000, 20_000_000)] }),
+      ]),
+      network: {
+        default_interface: 'eth0',
+        day_date: '2026-10-27',
+        day_timezone: 'Asia/Shanghai',
+        interfaces: [
+          { name: 'eth1', day_rx_bytes: null, day_tx_bytes: null, day_partial: false },
+          { name: 'eth0', day_rx_bytes: 2_500_000_000, day_tx_bytes: 0, day_partial: true },
+        ],
+      },
+    };
+    const renderNetwork = (interfaceName) =>
+      renderToStaticMarkup(
+        React.createElement(NetworkHistoryCharts, {
+          history,
+          interfaceName,
+          selectInterface: () => {},
+        }),
+      );
+    const defaultHtml = renderNetwork(null);
+    assert.match(defaultHtml, /value="eth0" selected="">eth0（默认出口）/);
+    assert.match(defaultHtml, /2\.5 GB/);
+    assert.match(defaultHtml, /0 GB/);
+    assert.match(defaultHtml, /2026-10-27 北京时间/);
+    assert.match(defaultHtml, /今日采样覆盖不完整/);
+    assert.match(defaultHtml, /纵轴单位为 Mbps/);
+    assert.match(defaultHtml, />2,000<\/text>/);
+    assert.equal((defaultHtml.match(/<circle\b/g) || []).length, 4);
+    assert.doesNotMatch(defaultHtml, /<path\b/);
+    const explicitHtml = renderNetwork('eth1');
+    assert.match(explicitHtml, /value="eth1" selected="">eth1/);
+    assert.doesNotMatch(explicitHtml, /2\.5 GB|今日采样覆盖不完整/);
+    assert.equal((explicitHtml.match(/<path\b/g) || []).length, 2);
+    const missingHtml = renderNetwork('renamed-nic');
+    assert.match(missingHtml, /value="renamed-nic" selected="">renamed-nic/);
+    assert.match(missingHtml, /该时段未采集到可用指标/);
+    assert.doesNotMatch(missingHtml, /<svg\b/);
+  });
+
+  await test('history from an older controller shows no network data', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(NetworkHistoryCharts, {
+        history: gpuHistory([point(0, null)]),
+        interfaceName: null,
+        selectInterface: () => {},
+      }),
+    );
+    assert.match(html, /暂无网卡流量数据/);
+    assert.doesNotMatch(html, /<svg\b|0 GB|0 Mbps/);
+  });
+
   await test('history panel offers bounded ranges to read-only machine viewers', () => {
     const html = renderToStaticMarkup(
       React.createElement(ResourceHistory, { nodeId: 'one', status: 'OFFLINE' }),
     );
     assert.match(html, /资源占用历史/);
-    assert.equal((html.match(/aria-pressed=/g) || []).length, 5);
-    assert.match(html, /aria-pressed="true"[^>]*>近 24 小时/);
+    const timeRange = html.match(/aria-label="资源历史时间范围">(.*?)<\/div>/)?.[1];
+    assert.ok(timeRange);
+    assert.equal((timeRange.match(/aria-pressed=/g) || []).length, 5);
+    assert.match(timeRange, /aria-pressed="true"[^>]*>近 24 小时/);
     assert.match(html, /机器当前未在线，已有历史仍可查看/);
   });
 } finally {

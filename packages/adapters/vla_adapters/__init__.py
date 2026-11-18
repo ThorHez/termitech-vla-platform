@@ -8,7 +8,8 @@ from pathlib import Path
 from .entrypoints import validate_entrypoint
 from .dataset_bindings import validate_binding_assets
 from .norm_datasets import normalize_norm_datasets, validate_norm_assets, validate_norm_configuration
-from .recap import (STAGE_PROGRESS, recap_stages, runtime_adapter_for, validate_recap_torch_selection,
+from .recap import (ACP_STAGE, ANNOTATION_STAGES, STAGE_ADVANTAGE_STAGES, recap_backend, recap_stages,
+                    runtime_adapter_for, validate_recap_selection,
                     validate_stage_progress_selection, validate_training_stage)
 from .automatic_config import automatic_recipe_name, normalize_auto_config, validate_state_token_layout
 from .runtime_options import RUNTIME_PARAMETER_RULES, normalize_normalization_method, validate_runtime_parameter_relations
@@ -41,8 +42,8 @@ def get_templates() -> list[dict]:
         {"id": "mem", "name": "MEM 记忆训练", "algorithm": "MEM", "status": "PLANNED",
          "description": "待接入 mem_exp 两阶段训练与记忆产物选择。", "parameters": {}, "required_inputs": []},
         {"id": "recap", "name": "ReCap 策略提升", "algorithm": "RECAP", "status": "AVAILABLE",
-         "description": "使用 PyTorch 训练回报价值模型、用 Kai0 阶段进度生成优势数据，或用已标注数据训练 ACP 策略。",
-         "runtime_adapter": "openpi-sft", "backend": "pytorch", "stages": recap_stages(),
+         "description": "使用 PyTorch 训练估计器或生成优势数据，再用已标注数据在 JAX 中训练 ACP 策略。",
+         "runtime_adapter": "openpi-sft", "stages": recap_stages(),
          "parameters": recap_parameters, "required_inputs": ["dataset", "model", "norm"], "min_gpus": 1},
         {"id": "rlt", "name": "RLT 离线训练", "algorithm": "RLT", "status": "PLANNED",
          "description": "待确认代码入口与 replay 数据协议。", "parameters": {}, "required_inputs": []},
@@ -114,7 +115,7 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
                  training_stage: str | None = None, stage_config: dict | None = None,
                  auto_config: dict | None = None, normalization_method: str | None = None,
                  norm_datasets: list[dict] | None = None, training_gpu_policy: dict | None = None,
-                 resume_source: dict | None = None) -> dict:
+                 resume_source: dict | None = None, frozen_recap_backend: str | None = None) -> dict:
     """Build argv; Agent preflight and launch recheck validate the selected recipe."""
     from .recipe_definitions import recipe_parameters, resolve_definition
     from vla_protocol.training_gpu_policy import normalize_training_gpu_policy
@@ -133,8 +134,15 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
         if template_id not in {"openpi-sft", "recap", "openpi-norm"} or recipe_definition is not None:
             raise ValueError("AUTO_CONFIG_CONFLICT: 当前模板或自定义配方不能使用自动配置")
     entrypoint = validate_entrypoint(entrypoint)
+    backend = None
     if template_id == "recap":
-        validate_recap_torch_selection(auto_config, entrypoint)
+        backend = recap_backend(training_stage)
+        if training_stage == ACP_STAGE and frozen_recap_backend == "pytorch":
+            backend = "pytorch"
+        row_count = len(dataset_bindings) if isinstance(dataset_bindings, list) else 0
+        validate_recap_selection(auto_config, entrypoint, training_stage, backend, row_count)
+        if training_stage in ANNOTATION_STAGES and len(gpu_uuids) != 1:
+            raise ValueError("RECAP_STAGE_GPU_COUNT: ReCap 优势标注需要 1 张 GPU")
     resume_source = normalize_resume_source(resume_source, inputs, template_id=template_id, entrypoint=entrypoint)
     dataset_bindings = validate_binding_assets(dataset_bindings, inputs)
     validate_state_token_layout(auto_config, dataset_bindings, template_id=template_id, training_stage=training_stage)
@@ -201,8 +209,8 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
             spec["training_gpu_policy"] = training_gpu_policy
         if template_id == "recap":
             spec.update({"template_id": "recap", "training_stage": training_stage, "stage_config": stage_config,
-                         "recap_backend": "pytorch"})
-            if training_stage == STAGE_PROGRESS:
+                         "recap_backend": backend})
+            if training_stage in STAGE_ADVANTAGE_STAGES | ANNOTATION_STAGES:
                 spec["profile_id"] = profile.get("id")
         if dataset_bindings is not None:
             spec["dataset_bindings"] = dataset_bindings
@@ -220,5 +228,5 @@ def build_launch(profile: dict, template_id: str, inputs: dict, parameters: dict
     return {"argv": argv, "cwd": str(code_dir), "env": {
         "CUDA_VISIBLE_DEVICES": ",".join(gpu_uuids), "PYTHONUNBUFFERED": "1",
         "WANDB_MODE": "disabled", "HF_HUB_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1",
-        **({"JAX_PLATFORMS": "cpu"} if template_id == "recap" else {}),
+        **({"JAX_PLATFORMS": "cpu" if backend == "pytorch" else "cuda"} if backend is not None else {}),
     }}

@@ -3,6 +3,7 @@ import { validRequestedGpuList } from './trainingGpuSelection';
 import { isTrainingNormalizationMethod } from './trainingNormalization';
 import { isStateTokenLayout } from './trainingConfiguration';
 import { validTrainingGpuPolicy } from './trainingGpuPolicy';
+import { isRecapPhase, recapPhaseStage, type RecapPhase } from './recapPhaseDraft';
 
 export const MAX_TRAINING_DRAFT_BYTES = 512 * 1024;
 export const MAX_TRAINING_DRAFT_DEPTH = 48;
@@ -18,7 +19,7 @@ export interface RecipeEditorDraft {
   description?: string;
 }
 
-export interface TrainingDraftSnapshot {
+export interface TrainingPhaseSnapshot {
   request: RunRequest;
   step: 0 | 1;
   advancedRecipe: boolean;
@@ -34,6 +35,11 @@ export interface TrainingDraftSnapshot {
     valueHead: { path: string; value: string }[];
   };
   recipeEditorDraft?: RecipeEditorDraft;
+}
+
+export interface TrainingDraftSnapshot extends TrainingPhaseSnapshot {
+  recapPhase?: RecapPhase;
+  recapPhases?: Partial<Record<RecapPhase, TrainingPhaseSnapshot>>;
 }
 
 type Path = (string | number)[];
@@ -82,6 +88,8 @@ const envelopeKeys = new Set([
   'stage_recipe_defaults',
   'stage_recipe_info',
   'recipe_editor_draft',
+  'recap_phase',
+  'recap_phases',
   'special_values',
 ]);
 // Match the server's normalized credential/approval names before anything can
@@ -231,7 +239,14 @@ function validRequest(value: unknown): value is RunRequest {
     if (value[key] !== undefined && !text(value[key])) return false;
   if (
     value.training_stage !== undefined &&
-    !['sft', 'value', 'stage_progress', 'offline_rl'].includes(String(value.training_stage))
+    ![
+      'sft',
+      'value',
+      'value_annotation',
+      'stage_progress',
+      'stage_annotation',
+      'offline_rl',
+    ].includes(String(value.training_stage))
   )
     return false;
   if (value.stage_config !== undefined && !numbers(value.stage_config)) return false;
@@ -422,6 +437,33 @@ export function encodeTrainingDraft(snapshot: TrainingDraftSnapshot): JsonObject
     recipe_editor_draft: snapshot.recipeEditorDraft,
   }))
     if (value !== undefined) raw[key] = value;
+  if (snapshot.recapPhase !== undefined) {
+    if (
+      !isRecapPhase(snapshot.recapPhase) ||
+      snapshot.request.template_id !== 'recap' ||
+      snapshot.request.training_stage !== recapPhaseStage(snapshot.recapPhase)
+    )
+      fail();
+    raw.recap_phase = snapshot.recapPhase;
+  }
+  if (snapshot.recapPhases !== undefined) {
+    if (!snapshot.recapPhase || !plainObject(snapshot.recapPhases)) fail();
+    const phases: JsonObject = {};
+    for (const [phase, source] of Object.entries(snapshot.recapPhases)) {
+      if (
+        !isRecapPhase(phase) ||
+        phase === snapshot.recapPhase ||
+        !source ||
+        Object.hasOwn(source, 'recapPhase') ||
+        Object.hasOwn(source, 'recapPhases') ||
+        source.request.template_id !== 'recap' ||
+        source.request.training_stage !== recapPhaseStage(phase)
+      )
+        fail();
+      phases[phase] = encodeTrainingDraft(source);
+    }
+    raw.recap_phases = phases;
+  }
   if (!validRequest(request) || !validContext(raw)) fail();
   const specials: SpecialEntry[] = [];
   const wire = cloneData(raw, specials) as JsonObject;
@@ -488,6 +530,35 @@ export function decodeTrainingDraft(content: unknown): TrainingDraftSnapshot | u
                 : -0;
     }
     if (!validRequest(wire.request) || !validContext(wire)) return undefined;
+    const phase = wire.recap_phase;
+    if (
+      phase !== undefined &&
+      (!isRecapPhase(phase) ||
+        wire.request.template_id !== 'recap' ||
+        wire.request.training_stage !== recapPhaseStage(phase))
+    )
+      return undefined;
+    const phases: TrainingDraftSnapshot['recapPhases'] = {};
+    if (wire.recap_phases !== undefined) {
+      if (!isRecapPhase(phase) || !plainObject(wire.recap_phases)) return undefined;
+      for (const [key, archived] of Object.entries(wire.recap_phases)) {
+        if (
+          !isRecapPhase(key) ||
+          key === phase ||
+          !plainObject(archived) ||
+          own(archived, 'recap_phases') ||
+          own(archived, 'recap_phase')
+        )
+          return undefined;
+        const snapshot = decodeTrainingDraft(archived);
+        if (
+          snapshot?.request.template_id !== 'recap' ||
+          snapshot.request.training_stage !== recapPhaseStage(key)
+        )
+          return undefined;
+        phases[key] = snapshot;
+      }
+    }
     return {
       request: wire.request,
       step: wire.step === 0 ? 0 : 1,
@@ -495,6 +566,8 @@ export function decodeTrainingDraft(content: unknown): TrainingDraftSnapshot | u
       editedParameters: wire.edited_parameters as string[],
       editedStageParameters: wire.edited_stage_parameters as string[],
       entrypointEdited: wire.entrypoint_edited as boolean,
+      ...(isRecapPhase(phase) ? { recapPhase: phase } : {}),
+      ...(wire.recap_phases !== undefined ? { recapPhases: phases } : {}),
       ...(wire.recipe_datasets !== undefined
         ? { recipeDatasets: wire.recipe_datasets as RecipeDatasetSlot[] }
         : {}),

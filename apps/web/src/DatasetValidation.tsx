@@ -26,6 +26,24 @@ export function DatasetValidationBadge({
   );
 }
 
+function validationSummaryKey(report?: DatasetSourceValidation | null) {
+  return JSON.stringify([
+    report?.id,
+    report?.scope,
+    report?.status,
+    report?.profile_id,
+    report?.requested_at,
+    report?.checked_at,
+    report?.completed_at,
+    report?.reason,
+    report?.error?.code,
+    report?.error?.message,
+    report?.source_fingerprint,
+    report?.timestamp_contract?.status,
+    report?.timestamp_contract?.checked_rows,
+  ]);
+}
+
 export function DatasetValidation({
   asset,
   node,
@@ -64,7 +82,7 @@ export function DatasetValidation({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error>();
   const pending = useRef(false);
-  const published = useRef(JSON.stringify(asset.validation || null));
+  const published = useRef(validationSummaryKey(asset.validation));
   const writable =
     can('datasets.validate') &&
     !['ARCHIVED', 'UNAVAILABLE'].includes(asset.status || asset.state || '');
@@ -72,7 +90,7 @@ export function DatasetValidation({
   useEffect(() => setPolling(report?.status === 'PENDING'), [report?.status]);
   useEffect(() => {
     if (detail.data === undefined) return;
-    const value = JSON.stringify(detail.data);
+    const value = validationSummaryKey(detail.data);
     if (value !== published.current) {
       published.current = value;
       changed?.();

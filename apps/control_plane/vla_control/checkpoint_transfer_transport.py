@@ -1,9 +1,4 @@
-"""Checkpoint rsync over two authenticated SSH channels, without a weight cache.
-
-The receiver is a real rsync client. Its private Unix-socket remote-shell relay
-exposes only rsync protocol bytes on the SSH channel. Two ``--server`` peers do
-not implement rsync's client handshake, so they cannot safely be bridged alone.
-"""
+"""Checkpoint verification and publication around a direct machine-to-machine copy."""
 from __future__ import annotations
 
 import base64
@@ -11,7 +6,6 @@ import hashlib
 import json
 import re
 import shlex
-import socket
 import time
 
 
@@ -28,7 +22,6 @@ def manifest_digest(manifest):
 
 
 _CHECKPOINT_EXCLUDED_ROOT_DIRECTORIES = ("train_state",)
-_RSYNC_EXCLUDE_ARGUMENTS = tuple("--exclude=/" + name + "/" for name in _CHECKPOINT_EXCLUDED_ROOT_DIRECTORIES)
 
 
 _REMOTE_SCRIPT = r'''
@@ -123,7 +116,7 @@ try:
         root = safe(p['path'],p['roots'])
         if not root.is_dir() or not ((root/'params').is_dir() or (root/'model.safetensors').is_file()) or not (root/'assets').is_dir():
             fail('TRANSFER_CHECKPOINT_INVALID','Checkpoint requires model weights and assets directory')
-        result = {'path':str(root),'manifest':manifest(root)}
+        result = {'kind':'directory','path':str(root),'manifest':manifest(root)}
         if not any(item['path'].endswith('norm_stats.json') and item['path'].startswith('assets/') for item in result['manifest']['files']):
             fail('TRANSFER_NORM_MISSING','Checkpoint assets contain no normalization statistics')
         if shutil.which('rsync') is None:
@@ -175,16 +168,18 @@ try:
         expected = {item['path']:item for item in p['manifest']['files']}
         if any(item['path'] not in expected for item in existing['files']):
             fail('TRANSFER_PARTIAL_CONFLICT','Partial directory contains unrelated files')
-        correct = sum(item['size'] for item in existing['files'] if expected[item['path']]==item)
-        # Existing correct files need no rewrite. A corrupted existing file can
-        # still require its full replacement before rsync atomically renames it.
+        matching = [item for item in existing['files'] if expected[item['path']]==item]
+        correct = sum(item['size'] for item in matching)
+        source_paths = {item['path'] for item in p['source_manifest']['files']}
+        source_bytes_existing = sum(item['size'] for item in matching if item['path'] in source_paths)
+        # Reserve space for any file whose contents are not already verified.
         required = max(0,p['manifest']['bytes_total']-correct)
         margin = max(1024*1024,int(required*.02))
         if shutil.disk_usage(parent).free < required+margin:
             fail('TRANSFER_SPACE_INSUFFICIENT','Target has insufficient free storage for the checkpoint')
         if shutil.which('rsync') is None:
             fail('TRANSFER_RSYNC_MISSING','rsync is not installed on the target machine')
-        result = {'staging_path':str(staging),'target_path':str(final),'bytes_existing':correct}
+        result = {'staging_path':str(staging),'target_path':str(final),'source_bytes_existing':source_bytes_existing}
     elif mode == 'extras':
         staging = safe(p['path'],p['roots'])
         for name, encoded in p['files'].items():
@@ -232,96 +227,6 @@ except Exception as error:
         code, message = 'TRANSFER_REMOTE_FAILED', 'Checkpoint filesystem operation failed'
     print(json.dumps({'error':{'code':code,'message':message[:2000]}}))
 '''.replace('__CHECKPOINT_EXCLUDED_ROOT_DIRECTORIES__', repr(_CHECKPOINT_EXCLUDED_ROOT_DIRECTORIES))
-
-
-_RELAY_SCRIPT = r'''
-import os, socket, sys, threading
-os.set_blocking(0,True)
-os.set_blocking(1,True)
-connection = socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-connection.connect(sys.argv[1])
-def upload():
-    try:
-        while True:
-            chunk=os.read(0,65536)
-            if not chunk:break
-            connection.sendall(chunk)
-    finally:
-        try:connection.shutdown(socket.SHUT_WR)
-        except OSError:pass
-threading.Thread(target=upload,daemon=True).start()
-while True:
-    chunk=connection.recv(65536)
-    if not chunk:break
-    while chunk:
-        count=os.write(1,chunk);chunk=chunk[count:]
-connection.close()
-'''
-
-
-_RECEIVER_SCRIPT = r'''
-import base64, json, os, pathlib, shlex, signal, socket, subprocess, sys, tempfile, threading
-p=json.loads(base64.b64decode(sys.argv[1]))
-relay=base64.b64decode(p['relay']).decode()
-with tempfile.TemporaryDirectory(prefix='termitech-rsync-') as temporary:
-    os.chmod(temporary,0o700)
-    address=str(pathlib.Path(temporary)/'channel')
-    listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
-    listener.bind(address);listener.listen(1);listener.settimeout(25)
-    rsh=shlex.join([sys.executable,'-c',relay,address])
-    # In-place writes are limited to the receipt-owned, unpublished staging
-    # tree. An SSH interruption therefore leaves source-named partial files,
-    # rather than abandoned random rsync temp files which cannot be resumed.
-    connection=None
-    child=None
-    def stop_child():
-        if child is not None and child.poll() is None:
-            try:os.killpg(child.pid,signal.SIGTERM)
-            except ProcessLookupError:pass
-    def interrupted(_signal,_frame):
-        stop_child()
-        raise SystemExit(130)
-    signal.signal(signal.SIGTERM,interrupted)
-    signal.signal(signal.SIGHUP,interrupted)
-    signal.signal(signal.SIGINT,interrupted)
-    try:
-        child=subprocess.Popen(['rsync','-rct','--partial','--inplace','--progress']+p.get('excludes',__CHECKPOINT_RSYNC_EXCLUDES__)+['-e',rsh,'--','checkpoint-source:/checkpoint/',p['path']+'/'],
-            stdin=subprocess.DEVNULL,stdout=sys.stderr,stderr=sys.stderr,close_fds=True,start_new_session=True)
-        connection,_=listener.accept()
-        def upload():
-            try:
-                while True:
-                    chunk=os.read(0,65536)
-                    if not chunk:break
-                    connection.sendall(chunk)
-            except OSError:pass
-            finally:
-                try:connection.shutdown(socket.SHUT_WR)
-                except OSError:pass
-        thread=threading.Thread(target=upload,daemon=True);thread.start()
-        while True:
-            chunk=connection.recv(65536)
-            if not chunk:break
-            while chunk:
-                count=os.write(1,chunk);chunk=chunk[count:]
-        status=child.wait(timeout=15)
-        sys.exit(status)
-    finally:
-        stop_child()
-        if child is not None:
-            try:child.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                try:os.killpg(child.pid,signal.SIGKILL)
-                except ProcessLookupError:pass
-                child.wait(timeout=5)
-        if connection:connection.close()
-        listener.close()
-'''.replace('__CHECKPOINT_RSYNC_EXCLUDES__', repr(list(_RSYNC_EXCLUDE_ARGUMENTS)))
-
-
-def _python_command(script, payload):
-    encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode()).decode()
-    return shlex.join(["python3", "-u", "-c", script, encoded])
 
 
 def _open_channel(remote, command):
@@ -381,99 +286,9 @@ def _remote_json(remote, payload, cancelled, timeout=3600, *, script=None, max_b
         channel.close()
 
 
-def _bridge(source, target, cancelled, progress, bytes_total, files_total, initial_bytes=0, idle_timeout=300):
-    source_eof=target_eof=False
-    started=last_activity=time.monotonic()
-    moved=0
-    last_emit=0
-    tail=bytearray()
-    # SSH sendall may write a prefix before timing out without reporting its
-    # length. Keep one bounded block per direction and advance only by send's
-    # confirmed count, while continuing to drain the reverse rsync protocol.
-    pending={source:bytearray(),target:bytearray()}
-    try:
-        source.settimeout(0)
-        target.settimeout(0)
-        while True:
-            if cancelled():
-                raise TransferError("TRANSFER_CANCELLED", "Checkpoint transfer was cancelled; partial files are retained")
-            now=time.monotonic()
-            if now-last_activity>idle_timeout:
-                raise TransferError("TRANSFER_IDLE_TIMEOUT", "No rsync progress was received; retry resumes the partial checkpoint")
-            activity=False
-            for incoming,outgoing in ((source,target),(target,source)):
-                buffer=pending[incoming]
-                for _ in range(8):
-                    if not buffer and incoming.recv_ready():
-                        try:chunk=incoming.recv(65536)
-                        except socket.timeout:break
-                        except (OSError,EOFError):
-                            raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已断开；已传文件保留，可手动重试继续同步") from None
-                        if not chunk:break
-                        buffer.extend(chunk)
-                        activity=True
-                    if not buffer or not outgoing.send_ready():break
-                    try:count=outgoing.send(bytes(buffer))
-                    except socket.timeout:
-                        # A full SSH send window is temporary backpressure,
-                        # not a failed transfer. No bytes were accepted by send.
-                        break
-                    except (OSError,EOFError):
-                        if not outgoing.exit_status_ready():
-                            raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已断开；已传文件保留，可手动重试继续同步") from None
-                        buffer.clear()
-                        break
-                    if not count:
-                        if not outgoing.exit_status_ready():
-                            raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已关闭；已传文件保留，可手动重试继续同步")
-                        buffer.clear()
-                        break
-                    del buffer[:count]
-                    if incoming is source:moved+=count
-                    activity=True
-                # Bound stderr work too, so cancellation and the other peer
-                # cannot be starved by a continuously producing progress log.
-                for _ in range(8):
-                    if not incoming.recv_stderr_ready():break
-                    try:chunk=incoming.recv_stderr(32768)
-                    except socket.timeout:break
-                    except (OSError,EOFError):
-                        raise TransferError("TRANSFER_CONNECTION_CLOSED", "SSH 数据通道已断开；已传文件保留，可手动重试继续同步") from None
-                    if not chunk:break
-                    if incoming is target:
-                        tail.extend(chunk)
-                        if len(tail)>8192:del tail[:-8192]
-                    activity=True
-            if activity:last_activity=time.monotonic()
-            if not source_eof and source.exit_status_ready() and not source.recv_ready() and not pending[source]:
-                source_eof=True
-                try:target.shutdown_write()
-                except OSError:pass
-            if not target_eof and target.exit_status_ready() and not target.recv_ready() and not pending[target]:
-                target_eof=True
-                try:source.shutdown_write()
-                except OSError:pass
-            if now-last_emit>=.4:
-                # Wire bytes are bounded by checkpoint bytes for display. rsync
-                # metadata/delta traffic is never claimed as verified content.
-                done=min(bytes_total,initial_bytes+moved)
-                progress({"stage":"TRANSFERRING","bytes_done":done,"bytes_total":bytes_total,
-                    "files_done":None,"files_total":files_total,"speed_bps":round(moved/max(.001,now-started)),
-                    "percent":round(done*100/max(1,bytes_total),1)})
-                last_emit=now
-            if source_eof and target_eof:
-                codes=(source.recv_exit_status(),target.recv_exit_status())
-                if any(codes):
-                    raise TransferError("TRANSFER_RSYNC_FAILED", "rsync did not complete; partial files are retained for retry")
-                return
-            if not activity:time.sleep(.005)
-    finally:
-        source.close();target.close()
-
-
 def transfer_checkpoint(source_remote, target_remote, source_path, target_parent, transfer_id,
                         source_roots, target_roots, progress=None, cancelled=None, extra_files=None):
-    """Copy a checkpoint into a unique target directory, then verify and publish.
+    """Pull a checkpoint directly to a unique target directory, then verify and publish.
 
     ``remote`` objects must be connected SSHRemote instances. Callback receives
     plain dictionaries; no credential or raw remote stderr is forwarded to it.
@@ -515,14 +330,20 @@ def transfer_checkpoint(source_remote, target_remote, source_path, target_parent
         progress({"stage":"SUCCEEDED","bytes_done":result["bytes_total"],"bytes_total":result["bytes_total"],
             "files_done":result["files_total"],"files_total":result["files_total"],"speed_bps":0,"percent":100})
         return result
-    sender=_open_channel(source_remote,shlex.join(["rsync","--server","--sender","-rct","--partial",*_RSYNC_EXCLUDE_ARGUMENTS,".",source["path"]+"/"]))
-    try:
-        receiver=_open_channel(target_remote,_python_command(_RECEIVER_SCRIPT,{"path":prepared["staging_path"],
-            "relay":base64.b64encode(_RELAY_SCRIPT.encode()).decode()}))
-    except BaseException:
-        sender.close();raise
-    _bridge(sender,receiver,cancelled,progress,expected["bytes_total"],expected["files_total"],prepared["bytes_existing"])
-    progress({"stage":"VERIFYING","bytes_total":expected["bytes_total"],"files_total":expected["files_total"],
+
+    def report_copy_progress(event):
+        if "bytes_total" in event:
+            # The deployment includes sidecars that rsync does not copy.
+            event = dict(event, bytes_total=expected["bytes_total"], files_total=expected["files_total"],
+                         percent=min(99, 100 * event["bytes_done"] / max(1, expected["bytes_total"])))
+        progress(event)
+
+    from .direct_asset_transfer import direct_copy
+    direct_copy(source_remote, target_remote, source, prepared["staging_path"], transfer_id,
+                progress=report_copy_progress, cancelled=cancelled, initial_bytes=prepared["source_bytes_existing"],
+                exclude_train_state=True)
+    progress({"stage":"VERIFYING","bytes_done":original["bytes_total"],
+              "bytes_total":expected["bytes_total"],"files_total":expected["files_total"],
               "message":"Comparing source stability and target SHA-256 manifest"})
     after=_remote_json(source_remote,{"mode":"source","path":source_path,"roots":source_roots},cancelled)["manifest"]
     if after!=original:

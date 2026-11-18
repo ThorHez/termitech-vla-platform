@@ -15,6 +15,7 @@ else:
 
 
 RECAP_TORCH_FORMAT = "openpi-pytorch"
+ACP_ORBAX_FORMAT = "openpi-orbax"
 RECAP_TORCH_WEIGHTS = "model.safetensors"
 RECAP_TORCH_COMMIT = "recap_checkpoint.json"
 _MAX_HEADER_BYTES = 16 * 1024 * 1024
@@ -72,7 +73,7 @@ def recap_commit_matches(receipt, step, stage=None):
             and (stage is None or receipt["stage"] == stage))
 
 
-def recap_model_evidence_valid(model, asset_path):
+def recap_model_evidence_valid(model, asset_path, *, scoring=False, scoring_stage=None):
     if (not isinstance(model, dict) or not isinstance(asset_path, str) or not asset_path.startswith("/")
             or model.get("format") != RECAP_TORCH_FORMAT or model.get("checkpoint_path") != asset_path
             or type(model.get("parameter_bytes")) is not int or model["parameter_bytes"] <= 0):
@@ -81,10 +82,20 @@ def recap_model_evidence_valid(model, asset_path):
     weights = model.get("path")
     expected = str(asset) if asset.name == RECAP_TORCH_WEIGHTS else str(asset / RECAP_TORCH_WEIGHTS)
     metadata = model.get("metadata")
-    return (weights == expected and isinstance(metadata, list) and 1 <= len(metadata) <= 2
+    valid_weights = (weights == expected and isinstance(metadata, list) and 1 <= len(metadata) <= 2
             and isinstance(metadata[0], dict) and metadata[0].get("path") == weights
             and metadata[0].get("scope") == "safetensors_header"
             and isinstance(metadata[0].get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", metadata[0]["sha256"]) is not None)
+    if scoring and scoring_stage is None:
+        scoring_stage = "stage_progress"
+    if not valid_weights or scoring_stage is None:
+        return valid_weights
+    scorer = model.get("scorer_checkpoint")
+    marker = metadata[1] if len(metadata) == 2 else None
+    return (isinstance(scorer, dict) and set(scorer) == {"stage", "step"}
+            and scorer["stage"] == scoring_stage and type(scorer["step"]) is int and 0 <= scorer["step"] < 2**53
+            and isinstance(marker, dict) and marker.get("path") == str(PurePosixPath(weights).parent / RECAP_TORCH_COMMIT)
+            and isinstance(marker.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", marker["sha256"]) is not None)
 
 
 def recap_torch_artifact_valid(output, output_dir, recipe, stage, *, final_step=None):
@@ -97,4 +108,31 @@ def recap_torch_artifact_valid(output, output_dir, recipe, stage, *, final_step=
             and output.get("path") == str(PurePosixPath(output_dir) / "checkpoints" / recipe / "platform" / version)
             and isinstance(metadata, dict) and metadata.get("format") == RECAP_TORCH_FORMAT
             and metadata.get("backend") == "pytorch" and metadata.get("model_role") == role
+            and type(metadata.get("step")) is int and str(metadata["step"]) == version)
+
+
+def acp_model_evidence_valid(model, asset_path):
+    if (not isinstance(model, dict) or not isinstance(asset_path, str) or not asset_path.startswith("/")
+            or model.get("format") != ACP_ORBAX_FORMAT or model.get("model_role") != "policy"
+            or model.get("checkpoint_path") != asset_path
+            or type(model.get("parameter_bytes")) is not int or model["parameter_bytes"] <= 0):
+        return False
+    params = model.get("path")
+    metadata = model.get("metadata")
+    return (params in (asset_path, str(PurePosixPath(asset_path) / "params"))
+            and isinstance(metadata, list) and any(
+                isinstance(row, dict) and row.get("path") == str(PurePosixPath(params) / "_METADATA")
+                and isinstance(row.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", row["sha256"]) is not None
+                for row in metadata))
+
+
+def acp_artifact_valid(output, output_dir, recipe, *, final_step=None):
+    if not isinstance(output, dict) or output.get("kind") != "MODEL" or not isinstance(output_dir, str) or not isinstance(recipe, str):
+        return False
+    metadata, version = output.get("metadata"), output.get("version")
+    return (isinstance(version, str) and version.isascii() and version.isdigit() and len(version) <= 16
+            and (final_step is None or version == str(final_step))
+            and output.get("path") == str(PurePosixPath(output_dir) / "checkpoints" / recipe / "platform" / version)
+            and isinstance(metadata, dict) and metadata.get("format") == ACP_ORBAX_FORMAT
+            and metadata.get("model_role", "policy") == "policy" and metadata.get("backend", "jax") == "jax"
             and type(metadata.get("step")) is int and str(metadata["step"]) == version)

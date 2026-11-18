@@ -33,7 +33,7 @@ const available = Boolean(chromium && executablePath && existsSync(executablePat
 const timestamp = (seconds) => `2026-11-14T01:02:${seconds}.000000+00:00`;
 
 await test(
-  'asset deletion requires an exact path and current inspection and renders Agent status',
+  'restored assets appear on catalogue entry and physical deletion verifies the exact file receipt',
   { skip: !available },
   async (t) => {
     const cacheDir = await mkdtemp(path.join(tmpdir(), 'vla-asset-deletions-ui-'));
@@ -65,11 +65,36 @@ await test(
       archived_by: null,
     };
     const scope = `/api/v1/assets/${asset.id}`;
+    const restorable = {
+      ...asset,
+      id: 'fixture-restore',
+      name: 'Restorable dataset',
+      path: '/fixture/restorable/dataset',
+      can_restore: true,
+      can_purge: false,
+    };
+    const deleted = {
+      ...restorable,
+      id: 'fixture-deleted',
+      name: 'Permanently deleted dataset',
+      path: '/fixture/deleted/dataset',
+      can_restore: false,
+      restore_block_reason: '文件已永久删除，无法恢复登记。',
+    };
     const commands = [];
+    const report = {
+      scope: 'dataset_source',
+      status: 'SUCCEEDED',
+      checks: [{ name: 'raw_samples', ok: true, message: 'Fixture samples verified' }],
+    };
     const page = await browser.newPage();
     let role = 'admin';
     let reauthenticated = false;
     let ledgerReads = 0;
+    let assetReads = 0;
+    let assetDetailReads = 0;
+    let restoredAsset;
+    let restoreCalls = 0;
     const session = () => ({
       user: {
         id: role,
@@ -119,7 +144,38 @@ await test(
       }
       if (endpoint === '/api/v1/assets/deletions') {
         ledgerReads++;
-        return respond([asset]);
+        return respond([asset, deleted, ...(restoredAsset ? [] : [restorable])]);
+      }
+      if (endpoint === '/api/v1/assets' && request.method() === 'GET') {
+        assetReads++;
+        assert.equal(url.searchParams.get('view'), 'summary');
+        return respond(restoredAsset ? [restoredAsset] : []);
+      }
+      if (endpoint === `/api/v1/assets/${restorable.id}` && request.method() === 'GET') {
+        assetDetailReads++;
+        return respond({ ...restoredAsset, validation: report });
+      }
+      if (endpoint === `/api/v1/assets/${restorable.id}/validation`) return respond(report);
+      if (endpoint === `/api/v1/asset-deletions/${restorable.id}/restore`) {
+        assert.equal(request.method(), 'POST');
+        assert.deepEqual(request.postDataJSON(), { expected_archived_at: restorable.archived_at });
+        assert.equal(request.headers()['x-csrf-token'], 'fixture');
+        assert.equal(request.headers()['x-operation-user'], 'admin');
+        assert.equal(reauthenticated, false, 'catalogue restore requires no password confirmation');
+        restoreCalls++;
+        if (restoreCalls === 1)
+          return respond(
+            { error: { code: 'ASSET_RESTORE_PATH_IN_USE', message: '同一路径已有登记。' } },
+            409,
+          );
+        restoredAsset = {
+          ...restorable,
+          state: 'REGISTERED',
+          status: 'REGISTERED',
+          version: '1',
+          validation: { scope: report.scope, status: report.status },
+        };
+        return respond(restoredAsset);
       }
       if (endpoint === `${scope}/purge-inspections`) {
         assert.equal(request.method(), 'POST');
@@ -146,7 +202,48 @@ await test(
     await page.goto(`${origin}/#/assets`);
     await page.getByRole('link', { name: '已删除资产' }).click();
     await page.getByText(asset.path, { exact: true }).waitFor();
-    await page.getByText('时间未记录', { exact: true }).waitFor();
+    await page.getByText('时间未记录', { exact: true }).first().waitFor();
+    const blockedRow = page.getByRole('row', { name: /Permanently deleted dataset/ });
+    await blockedRow.getByText(deleted.restore_block_reason).waitFor();
+    assert.equal(await blockedRow.getByRole('button', { name: /恢复登记/ }).count(), 0);
+    const catalogReadsBeforeRestore = assetReads;
+    const restoreButton = page.getByRole('button', { name: `恢复登记 ${restorable.name}` });
+    await restoreButton.click();
+    const restoreDialog = page.getByRole('dialog', { name: '恢复资产登记' });
+    await restoreDialog.getByRole('button', { name: '取消' }).click();
+    assert.equal(restoreCalls, 0);
+    await restoreButton.click();
+    restorable.archived_at = timestamp('05');
+    await restoreDialog
+      .getByRole('status')
+      .getByText('该资产的删除记录已更新，请关闭窗口后重新选择。')
+      .waitFor();
+    assert.equal(await restoreDialog.getByRole('button', { name: '确认恢复' }).isDisabled(), true);
+    await restoreDialog.getByRole('button', { name: '取消' }).click();
+    assert.equal(restoreCalls, 0);
+    await restoreButton.click();
+    await restoreDialog.getByRole('button', { name: '确认恢复' }).click();
+    await restoreDialog.getByText('同一路径已有登记。').waitFor();
+    await restoreDialog.getByRole('button', { name: '确认恢复' }).click();
+    await page.getByText('已恢复「Restorable dataset」的资产登记。').waitFor();
+    assert.equal(await restoreButton.count(), 0);
+    assert.equal(assetReads, catalogReadsBeforeRestore, 'restore only refreshes the deletion ledger');
+    assert.equal(assetDetailReads, 0, 'the catalogue does not load asset details in the background');
+    const detailRequested = page.waitForResponse(
+      (response) => response.url() === `${origin}/api/v1/assets/${restorable.id}`,
+    );
+    await page.getByRole('link', { name: '查看资产', exact: true }).click();
+    await page.waitForURL(`**/#/assets?node=${restorable.node_id}&asset=${restorable.id}`);
+    const assetDialog = page.getByRole('dialog', { name: '资产详情' });
+    await assetDialog.getByText(restorable.name, { exact: true }).waitFor();
+    await detailRequested;
+    assert.ok(assetReads > catalogReadsBeforeRestore, 'entering the catalogue reads restored assets');
+    await assetDialog.getByText('最近检查结果（1 项）').click();
+    await assetDialog.getByText('Fixture samples verified').waitFor();
+    assert.ok(assetDetailReads > 0, 'opening the dialog requests full asset details');
+    await assetDialog.getByRole('button', { name: '关闭弹窗' }).click();
+    await page.getByRole('link', { name: '已删除资产' }).click();
+    await page.getByText(asset.path, { exact: true }).waitFor();
     await page.getByRole('button', { name: `永久删除文件 ${asset.name}` }).click();
     const dialog = page.getByRole('dialog', { name: '永久删除文件' });
     const field = dialog.getByRole('textbox', { name: '输入完整原文件路径' });

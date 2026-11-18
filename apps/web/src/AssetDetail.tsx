@@ -2,7 +2,7 @@ import { ArrowRightLeft, Link2, Pencil, Save, Server, Trash2 } from 'lucide-reac
 import { date } from './api';
 import { useAuth } from './auth';
 import { canArchiveAsset } from './assetArchive';
-import { Badge, Modal } from './components';
+import { Badge, ErrorNotice, Modal } from './components';
 import { assetKinds } from './data';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
 import { canBindDatasetNorm, canEditDatasetAsset } from './datasetAssetPermissions';
@@ -11,15 +11,19 @@ import { datasetFormatProfile } from './datasetFormatTemplateData';
 import { boundDatasetNorm, datasetNormSelectionError } from './datasetNormAssets';
 import { DatasetValidation } from './DatasetValidation';
 import { DatasetStatistics } from './DatasetStatistics';
+import { canEditModelAssetFormat, modelAssetFormatLabel } from './ModelAssetFormatForm';
 import type { Asset, Node, Profile } from './types';
 import './asset-detail.css';
 
 export function AssetDetail({
   asset,
+  detailError,
+  retryDetail,
   node,
   assets,
   close,
   editProfile,
+  editModelFormat,
   bindNorm,
   sync,
   remove,
@@ -30,10 +34,13 @@ export function AssetDetail({
   selectDataset,
 }: {
   asset: Asset;
+  detailError?: Error;
+  retryDetail?: () => void;
   node?: Node;
   assets: Asset[];
   close: () => void;
   editProfile: () => void;
+  editModelFormat?: () => void;
   bindNorm: () => void;
   sync: () => void;
   remove: () => void;
@@ -53,6 +60,8 @@ export function AssetDetail({
   const canSaveTemplate = can('dataset-templates.write') && !archived;
   const dataset = asset.kind === 'DATASET';
   const model = asset.kind === 'MODEL';
+  const modelFormat = model ? modelAssetFormatLabel(asset) : undefined;
+  const modelFormatEditable = editModelFormat && canEditModelAssetFormat(user, asset, can);
   const profile = dataset ? readDatasetProfile(asset.metadata?.dataset_profile) : undefined;
   const templateProfile = dataset
     ? datasetFormatProfile(asset.metadata?.dataset_profile)
@@ -87,6 +96,7 @@ export function AssetDetail({
         </>
       }
     >
+      <ErrorNotice error={detailError} retry={retryDetail} />
       <div className="asset-detail-heading">
         <h3>{asset.name}</h3>
         <Badge state={state} label={dataset && state === 'REGISTERED' ? '已登记' : undefined} />
@@ -107,7 +117,7 @@ export function AssetDetail({
           </select>
         </label>
       )}
-      {(editable || transferable || canSaveTemplate) && (
+      {(editable || modelFormatEditable || transferable || canSaveTemplate) && (
         <section className="asset-detail-section asset-detail-action-section">
           <h4>资产操作</h4>
           <div className="asset-detail-actions">
@@ -121,6 +131,12 @@ export function AssetDetail({
               <button type="button" className="button outline" onClick={editProfile}>
                 <Pencil size={15} />
                 {profile ? '编辑数据特征' : '补录数据特征'}
+              </button>
+            )}
+            {modelFormatEditable && (
+              <button type="button" className="button outline" onClick={editModelFormat}>
+                <Pencil size={15} />
+                {modelFormat ? '修改模型格式' : '补录模型格式'}
               </button>
             )}
             {canSaveTemplate && templateProfile && saveTemplate && (
@@ -154,6 +170,12 @@ export function AssetDetail({
           <dt>资产版本</dt>
           <dd>{asset.version}</dd>
         </div>
+        {model && (
+          <div>
+            <dt>模型格式</dt>
+            <dd>{modelFormat ?? '未指定'}</dd>
+          </div>
+        )}
         <div>
           <dt>所在机器</dt>
           <dd>

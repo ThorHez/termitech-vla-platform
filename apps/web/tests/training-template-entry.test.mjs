@@ -151,6 +151,19 @@ try {
     assert.deepEqual(decodeTrainingDraft(encodeTrainingDraft(sft)), sft);
   });
 
+  await test('switching away from SFT clears the Kai0 token layout and its frozen transform', () => {
+    const saved = source();
+    saved.request.auto_config.state_token_layout = 'kai0_pad32';
+    saved.request.dataset_bindings[0].processor.parameters.composition.model_transform = 'kai0_pad32';
+    const norm = trainingTemplateEntry(saved, templates.norm, resources).request;
+    const recap = trainingTemplateEntry(saved, templates.recap, resources).request;
+    assert.equal(norm.auto_config.state_token_layout, undefined);
+    assert.equal(recap.auto_config.state_token_layout, undefined);
+    assert.equal(norm.norm_datasets[0].processor.parameters.composition.model_transform, 'standard');
+    assert.equal(recap.dataset_bindings[0].processor.parameters.composition.model_transform, 'standard');
+    assert.equal(saved.request.auto_config.state_token_layout, 'kai0_pad32');
+  });
+
   await test('legacy named-recipe and unresolvable dataset IDs stay selected while new processing is seeded from metadata', () => {
     const saved = source();
     saved.request.dataset_bindings = [{ dataset_asset_id: 'cloth', norm_asset_id: 'old', weight: 1, recipe_index: 0 },

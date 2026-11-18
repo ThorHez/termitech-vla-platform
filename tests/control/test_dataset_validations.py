@@ -88,6 +88,22 @@ def test_registration_queues_one_dataset_scoped_command_and_safe_ack_updates_onl
     assert success["source_fingerprint"] == "f" * 64 and success["raw_samples"]["checked_samples"] == 3
     listing = platform.client.get("/api/v1/assets", headers=ADMIN).json()
     assert listing[0]["validation"] == success and listing[0]["metadata"] == asset["metadata"]
+    response = platform.client.get("/api/v1/assets", headers=ADMIN, params={
+        "view": "summary", "kind": "DATASET", "node_id": node["node_id"],
+    })
+    assert response.status_code == 200, response.text
+    summary, = response.json()
+    assert summary["id"] == asset["id"]
+    assert summary["metadata"]["dataset_profile"] == asset["metadata"]["dataset_profile"]
+    assert "_image_registration" not in summary["metadata"]
+    for field in ("status", "profile_id", "scope", "source_fingerprint", "completed_at"):
+        assert summary["validation"][field] == success[field]
+    assert summary["validation"]["timestamp_contract"] == {
+        key: success["timestamp_contract"][key] for key in ("status", "checked_rows")
+    }
+    assert not {"checks", "raw_samples", "runtime"} & summary["validation"].keys()
+    detail = platform.client.get(f"/api/v1/assets/{asset['id']}", headers=ADMIN)
+    assert detail.status_code == 200 and detail.json() == listing[0]
     with platform.app.state.db.read() as session:
         assert session.get(Asset, asset["id"]).state == "REGISTERED"
         assert list(session.scalars(select(Run))) == list(session.scalars(select(Attempt))) == list(session.scalars(select(Allocation))) == []

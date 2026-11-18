@@ -10,8 +10,12 @@ import pytest
 
 from vla_adapters import recap_runtime, training_plan
 from vla_adapters.openpi_entry import resolve_config
-from vla_adapters.recap import RECAP_TORCH_ENTRY, STAGE_PROGRESS, STAGE_PROGRESS_ID_COLUMNS, recap_torch_module_paths
+from vla_adapters.recap import (ACP_ENTRYPOINT, ACP_MULTI_ENTRYPOINT, RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, STAGE_ANNOTATION, STAGE_ANNOTATION_ENTRY,
+                                STAGE_PROGRESS, STAGE_PROGRESS_DATASET, VALUE_ANNOTATION, VALUE_ANNOTATION_ENTRY,
+                                STAGE_PROGRESS_ID_COLUMNS, STAGE_PROGRESS_MODEL, recap_contract_valid,
+                                recap_torch_module_paths)
 from vla_adapters.training_plan import fingerprint, inspect_training_config, training_entrypoint
+from vla_adapters.recap_checkpoint import acp_model_evidence_valid
 from test_training_plan import Assets, Config, Data, training
 
 
@@ -127,7 +131,8 @@ def test_preflight_combines_source_and_recap_supervision_cache_misses(recap, mon
     ]
 
 
-def test_new_value_plan_resolves_native_torch_weights_and_freezes_the_backend(recap, monkeypatch):
+@pytest.mark.parametrize("stage", ["value", VALUE_ANNOTATION])
+def test_value_plan_resolves_native_torch_weights_and_freezes_the_backend(recap, monkeypatch, stage):
     from test_recap_torch_checkpoint import _weights
 
     @dataclasses.dataclass
@@ -141,21 +146,46 @@ def test_new_value_plan_resolves_native_torch_weights_and_freezes_the_backend(re
     base.model.action_dim, base.model.pi05 = 2, True
     spec["recap_backend"] = "pytorch"
     path = Path(spec["inputs"]["model"]["path"]) / "model.safetensors"
-    _weights(path, {"action_in_proj.weight": [3, 2], "action_out_proj.weight": [2, 3]})
-    for source in (RECAP_TORCH_ENTRY, *("src/openpi/" + name for name in recap_torch_module_paths("value"))):
+    weights = {"action_in_proj.weight": [3, 2], "action_out_proj.weight": [2, 3]}
+    entry = RECAP_TORCH_ENTRY
+    if stage == VALUE_ANNOTATION:
+        entry = VALUE_ANNOTATION_ENTRY
+        spec.update(training_stage=stage, stage_config={"n_step": 30}, dataset_bindings=spec["dataset_bindings"][:1],
+                    inputs={key: spec["inputs"][key] for key in ("model", "dataset_0", "norm_0")})
+        base.model.num_value_bins = 4
+        weights.update({"final_norm.weight": [5], "final_norm.bias": [5], "value_fc1.weight": [5, 5],
+                        "value_fc1.bias": [5], "value_fc2.weight": [4, 5], "value_fc2.bias": [4]})
+        (path.parent / "recap_checkpoint.json").write_text(json.dumps({"schema_version": 1, "backend": "pytorch",
+            "stage": "value", "step": 17}))
+        supervision = recap_runtime.require_cached_supervision
+
+        def value_columns(dataset, resolved):
+            report = supervision(dataset, resolved)
+            report["checked_files"][0]["columns"].extend(["index", "task_index"])
+            return report
+
+        monkeypatch.setattr(recap_runtime, "require_cached_supervision", value_columns)
+    _weights(path, weights)
+    for source in (entry, *("src/openpi/" + name for name in recap_torch_module_paths(stage))):
         file = Path(spec["code_dir"]) / source
         file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text("def main(config, *, worker_setup=None): pass\ndef init_wandb(*a, **kw): pass\n")
+        file.write_text("def main(config, **kwargs): pass\ndef init_wandb(*a, **kw): pass\n")
     monkeypatch.setattr(recap_runtime, "_value_runtime_cache", lambda *_: pytest.fail("PyTorch requested a JAX cache probe"))
     monkeypatch.setattr(recap_runtime, "recap_torch_runtime_versions",
                         lambda: {"torch": "2.7.1", "safetensors": "0.5.3", "transformers": "4.53.2"})
     loaders.NoOpWeightLoader = object
     config = resolve_config(base, spec, module, loaders)
     plan = inspect_training_config(config, spec, checks=[])
-    assert config.recap_training_stage == "value" and config.pytorch_weight_path == str(path.parent)
+    assert config.recap_training_stage == stage and config.pytorch_weight_path == str(path.parent)
     assert config.ema_decay is None and config.fsdp_devices == 1
-    assert plan["model"]["format"] == "openpi-pytorch" and plan["entrypoint"].endswith("/" + RECAP_TORCH_ENTRY)
-    assert plan["recap_stage_contract"]["backend"] == "pytorch"
+    assert plan["model"]["format"] == "openpi-pytorch" and plan["entrypoint"].endswith("/" + entry)
+    contract = plan["recap_stage_contract"]
+    assert contract["backend"] == "pytorch"
+    if stage == VALUE_ANNOTATION:
+        assert plan["model"]["scorer_checkpoint"] == {"stage": "value", "step": 17}
+        assert contract["annotation"]["n_step"] == 30 and contract["annotation"]["positive_ratio"] == .3
+        assert recap_contract_valid(stage, spec["stage_config"], contract, plan["datasets"], expected_backend="pytorch")
+        assert len(config.data.datasets) == 1
     assert "'recap_backend': 'pytorch'" in plan["generated_config"]["source"]
 
 
@@ -179,6 +209,31 @@ def test_offline_stage_overrides_all_data_factories_without_value_checkpoint_dep
     assert plan["training_stage"] == "offline_rl"
     assert all("is_positive" in row["required_columns"] for row in plan["recap_stage_contract"]["datasets"])
     assert set(spec["inputs"]) == {"model", *(f"dataset_{i}" for i in range(3)), *(f"norm_{i}" for i in range(3))}
+
+
+@pytest.mark.parametrize("head", [None, "stage_progress_fc1", "value_fc2"])
+def test_jax_acp_requires_native_orbax_policy_inputs_and_matches_the_multi_entrypoint(recap, head):
+    base, spec, module, loaders = as_acp(recap)
+    spec["recap_backend"] = "jax"
+    checkpoint = Path(spec["inputs"]["model"]["path"])
+    paths = [("params", "action_in_proj", "kernel"), ("params", "action_out_proj", "kernel")]
+    if head:
+        paths.append(("params", head, "kernel"))
+    tree = {str(path): {"key_metadata": [{"key": part, "key_type": 2} for part in path]} for path in paths}
+    (checkpoint / "params/_METADATA").write_text(json.dumps({"tree_metadata": tree}))
+    config = resolve_config(base, spec, module, loaders)
+    if head:
+        with pytest.raises(ValueError, match="ACP 需要 Orbax 动作策略权重"):
+            inspect_training_config(config, spec, checks=[])
+        return
+    plan = inspect_training_config(config, spec, checks=[])
+    assert plan["entrypoint"].endswith("/" + ACP_MULTI_ENTRYPOINT)
+    assert plan["recap_stage_contract"]["backend"] == "jax"
+    assert acp_model_evidence_valid(plan["model"], str(checkpoint))
+    assert recap_contract_valid("offline_rl", spec["stage_config"], plan["recap_stage_contract"], plan["datasets"],
+                                expected_backend="jax")
+    with pytest.raises(ValueError, match="RECAP_STAGE_ENTRYPOINT_MISMATCH"):
+        training_entrypoint(config, {**spec, "entrypoint": ACP_ENTRYPOINT})
 
 
 def test_omitted_stage_values_inherit_recipe_and_requested_override_is_frozen(recap):
@@ -376,6 +431,108 @@ def test_stage_progress_source_validation_checks_physical_ids_and_caches_range(s
     monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda *a, **kw: pytest.fail("No late supervision scanning"))
     receipt = recap_runtime.require_cached_supervision(data, spec)
     assert receipt["supervision_summary"] == {"stage_progress_gt": {"min": 0., "max": 1., "count": 2}}
+
+
+def test_stage_progress_alias_reuses_only_selected_scalar_evidence(supervision_source, monkeypatch):
+    data, spec, info = supervision_source
+    spec["training_stage"] = STAGE_PROGRESS
+    info["features"].update({key: {"shape": [1], "dtype": "float32"} for key in (
+        "labels.progress", "unbounded", "bad_shape", "not_written")})
+    names = ["value_target", "is_positive", "labels.progress", "unbounded", "bad_shape", *STAGE_PROGRESS_ID_COLUMNS]
+    values = {"value_target": [-.5, 0.], "is_positive": [0, 1], "labels.progress": [[.1], [.9]],
+              "unbounded": [0., 2.], "bad_shape": [[[.1]], [[.9]]]}
+    install_fake_parquet(monkeypatch, names=names, values=values)
+    data["composition"] = {"spec": {"stage_progress_key": "labels.progress"}}
+    with pytest.raises(ValueError, match="DATASET_BASE_VALIDATION_REQUIRED"):
+        recap_runtime.require_cached_supervision(data, spec)
+    recap_runtime.prepare_source_supervision(data, spec, info)
+    monkeypatch.setattr(recap_runtime, "_parquet_evidence", lambda *a, **kw: pytest.fail("No late supervision scanning"))
+    receipt = recap_runtime.require_cached_supervision(data, spec)
+    assert receipt["supervision_summary"] == {"labels.progress": {"min": .1, "max": .9, "count": 2}}
+    for key in ("unbounded", "bad_shape"):
+        data["composition"]["spec"]["stage_progress_key"] = key
+        with pytest.raises(ValueError, match=f"RECAP_LABEL_INVALID.*{key}"):
+            recap_runtime.require_cached_supervision(data, spec)
+    data["composition"]["spec"]["stage_progress_key"] = "not_written"
+    with pytest.raises(ValueError, match="RECAP_DATA_SCHEMA_INVALID.*not_written"):
+        recap_runtime.require_cached_supervision(data, spec)
+
+
+@pytest.mark.parametrize("stage", [STAGE_PROGRESS, STAGE_ANNOTATION])
+def test_stage_progress_contract_binds_runtime_and_evidence_to_requested_physical_column(stage):
+    selected = "labels.progress"
+    spec = {"aux_keys": ["stage_progress_gt"], "stage_progress_key": selected}
+    bindings = [{"processor": {"name": "ComposableDataConfig", "parameters": {"composition": copy.deepcopy(spec)}}}]
+    datasets = [{"path": "/data/foo", "composition": {"stage_progress_key": selected, "spec": spec}}]
+    row = {"path": "/data/foo", "required_columns": [selected, *STAGE_PROGRESS_ID_COLUMNS],
+           "supervision_columns": [selected], "stage_progress_key": selected,
+           "supervision_summary": {selected: {"min": 0., "max": 1., "count": 2}}}
+    contract = {"stage": stage, "model_type": STAGE_PROGRESS_MODEL, "backend": "pytorch",
+                "loader_type": RECAP_TORCH_LOADER, "datasets": [row],
+                "runtime_versions": dict.fromkeys(("torch", "safetensors", "transformers"), "test"),
+                "source_sha256": {"src/openpi/" + name: "a" * 64 for name in recap_torch_module_paths(stage)}}
+    annotation = {"output": STAGE_PROGRESS_DATASET, "source_manifest_digest": "b" * 64,
+                  "n_step": 50, "stage_count": 2, "positive_ratio": .3}
+    if stage == STAGE_PROGRESS:
+        contract["operation"] = "train"
+    else:
+        contract["annotation"] = annotation
+
+    def valid():
+        return recap_contract_valid(stage, {}, contract, datasets, require_pytorch=True, bindings=bindings)
+
+    assert valid()
+    if stage == STAGE_PROGRESS:
+        validation = {"val_ratio": .2, "eval_interval": 100, "eval_batches": 4}
+        request = {"val_ratio": .2}
+        assert not recap_contract_valid(stage, request, contract, datasets, bindings=bindings)
+        contract["validation"] = validation
+        assert recap_contract_valid(stage, request, contract, datasets, bindings=bindings)
+        assert not recap_contract_valid(stage, {"val_ratio": .1}, contract, datasets, bindings=bindings)
+    row["required_columns"][0] = "stage_progress_gt"
+    assert not valid()
+    row["required_columns"][0] = selected
+    datasets[0]["composition"]["stage_progress_key"] = "another"
+    assert not valid()
+    datasets[0]["composition"]["stage_progress_key"] = selected
+    row["supervision_summary"][selected]["max"] = 2.
+    assert not valid()
+    row["supervision_summary"][selected]["max"] = 1.
+    assert valid()
+    spec["stage_progress_key"] = "another"
+    assert not valid()
+
+
+def test_stage_progress_validation_requires_runtime_capability(tmp_path):
+    path = "src/openpi/training/recap_pytorch.py"
+    module = tmp_path / path
+    module.parent.mkdir(parents=True)
+    module.write_text("# older OpenPI runtime\n")
+    spec = {"code_dir": str(tmp_path)}
+    with pytest.raises(ValueError, match="RECAP_STAGE_RUNTIME_UNAVAILABLE"):
+        recap_runtime._require_stage_progress_validation(spec, {path: hashlib.sha256(module.read_bytes()).hexdigest()})
+    module.write_text("PLATFORM_STAGE_PROGRESS_VALIDATION_VERSION = 1\n")
+    recap_runtime._require_stage_progress_validation(spec, {path: hashlib.sha256(module.read_bytes()).hexdigest()})
+
+
+def test_train_only_stage_requires_compatible_runtime_and_annotation_uses_separate_entrypoint(tmp_path):
+    spec = {"code_dir": str(tmp_path), "allowed_roots": [str(tmp_path)], "template_id": "recap",
+            "recap_backend": "pytorch", "training_stage": STAGE_PROGRESS}
+    trainer = tmp_path / RECAP_TORCH_ENTRY
+    trainer.parent.mkdir(parents=True)
+    source = "def init_wandb(): pass\ndef main(config): pass\n"
+    trainer.write_text(source)
+    config = SimpleNamespace(data=SimpleNamespace())
+    with pytest.raises(ValueError, match="RECAP_STAGE_RUNTIME_UNAVAILABLE"):
+        training_entrypoint(config, spec)
+    trainer.write_text("PLATFORM_STAGE_PROGRESS_TRAIN_ONLY_VERSION = 1\n" + source)
+    assert training_entrypoint(config, spec) == trainer
+    scorer = tmp_path / STAGE_ANNOTATION_ENTRY
+    scorer.write_text("def init_wandb(): pass\ndef main(config, *, output_dir=None): pass\n")
+    spec["training_stage"] = STAGE_ANNOTATION
+    assert training_entrypoint(config, spec) == scorer
+    with pytest.raises(ValueError, match="RECAP_STAGE_ENTRYPOINT_MISMATCH"):
+        training_entrypoint(config, {**spec, "entrypoint": RECAP_TORCH_ENTRY})
 
 
 def test_value_submission_reuses_receipt_and_checks_current_range_without_parquet_reads(supervision_source, monkeypatch):

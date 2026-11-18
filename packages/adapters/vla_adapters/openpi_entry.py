@@ -30,15 +30,17 @@ if __package__:
     from .generated_config import configuration_snapshot
     from .image_runtime import install_image_processing, prepare_recap_worker
     from .recipe_definitions import apply_overrides, validate_definition
-    from .recap import (STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_OUTPUT_COLUMNS,
-                        recap_model_role, stage_progress_dataset_profile, uses_torch_recap, valid_stage_progress_receipt)
-    from .recap_checkpoint import (RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, RECAP_TORCH_WEIGHTS,
+    from .recap import (ANNOTATION_STAGES, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_OUTPUT_COLUMNS,
+                        VALUE_ANNOTATION, VALUE_ANNOTATION_COLUMNS, VALUE_ANNOTATION_DATASET, VALUE_ANNOTATION_DEFAULTS,
+                        recap_data_stage, recap_model_role, stage_progress_dataset_profile, uses_jax_acp,
+                        uses_torch_recap, valid_stage_progress_receipt, valid_value_annotation_receipt, value_annotation_dataset_profile)
+    from .recap_checkpoint import (ACP_ORBAX_FORMAT, RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, RECAP_TORCH_WEIGHTS,
                                    recap_commit_matches, recap_weight_file, safetensors_header)
     from .recap_runtime import apply_stage, stage_request
     from .resume import normalize_resume_source
     from .runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                   validate_runtime_parameter_relations)
-    from .training_plan import file_manifest, fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
+    from .training_plan import file_manifest, fingerprint, inspect_training_config, local_path, model_contract, read_json, require_lerobot_source, training_entrypoint
 else:
     from automatic_config import build_automatic_base, normalize_auto_config
     from cache_contract import configure_cache
@@ -49,15 +51,17 @@ else:
     from generated_config import configuration_snapshot
     from image_runtime import install_image_processing, prepare_recap_worker
     from recipe_definitions import apply_overrides, validate_definition
-    from recap import (STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_OUTPUT_COLUMNS,
-                       recap_model_role, stage_progress_dataset_profile, uses_torch_recap, valid_stage_progress_receipt)
-    from recap_checkpoint import (RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, RECAP_TORCH_WEIGHTS,
+    from recap import (ANNOTATION_STAGES, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_OUTPUT_COLUMNS,
+                       VALUE_ANNOTATION, VALUE_ANNOTATION_COLUMNS, VALUE_ANNOTATION_DATASET, VALUE_ANNOTATION_DEFAULTS,
+                       recap_data_stage, recap_model_role, stage_progress_dataset_profile, uses_jax_acp,
+                       uses_torch_recap, valid_stage_progress_receipt, valid_value_annotation_receipt, value_annotation_dataset_profile)
+    from recap_checkpoint import (ACP_ORBAX_FORMAT, RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, RECAP_TORCH_WEIGHTS,
                                   recap_commit_matches, recap_weight_file, safetensors_header)
     from recap_runtime import apply_stage, stage_request
     from resume import normalize_resume_source
     from runtime_options import (OPTIMIZER_PARAMETERS, SCHEDULE_PARAMETERS, normalize_normalization_method, runtime_parameter_overrides,
                                  validate_runtime_parameter_relations)
-    from training_plan import file_manifest, fingerprint, inspect_training_config, local_path, read_json, require_lerobot_source, training_entrypoint
+    from training_plan import file_manifest, fingerprint, inspect_training_config, local_path, model_contract, read_json, require_lerobot_source, training_entrypoint
 
 
 def resolve_config(base, spec, config_module, weight_loaders):
@@ -134,7 +138,7 @@ def resolve_config(base, spec, config_module, weight_loaders):
                 processor = {**processor, "parameters": {"acp_dropout": stage_config["acp_dropout"], **processor["parameters"]}}
             factory = instantiate_data_processor(processor, config_module, spec["code_dir"],
                                                 dataset_path=dataset, norm_dir=norm_dir,
-                                                training_stage=stage, stage_config=stage_config)
+                                                training_stage=recap_data_stage(stage), stage_config=stage_config)
         elif hasattr(base.data, "datasets"):
             if row["recipe_index"] >= len(base.data.datasets):
                 raise ValueError("DATASET_BINDINGS_INVALID: 所选数据处理配置超出了配方的数据源数量")
@@ -355,21 +359,33 @@ def checkpoint_norm_descriptor(checkpoint, spec):
     return result
 
 
-def stage_progress_artifact(output, checkpoint, spec, plan):
-    dataset = output / STAGE_PROGRESS_DATASET
-    receipt, receipt_digest = read_json(dataset / "meta" / "stage_advantage.json", spec, limit=128 * 1024)
+def annotation_artifact(output, spec, plan):
+    value = spec["training_stage"] == VALUE_ANNOTATION
+    if value:
+        dataset = output / VALUE_ANNOTATION_DATASET
+        receipt_name, registration_source = "value_advantage.json", "recap_value_annotation"
+        columns, build_profile, label = VALUE_ANNOTATION_COLUMNS, value_annotation_dataset_profile, "价值优势标注"
+    else:
+        dataset = output / STAGE_PROGRESS_DATASET
+        receipt_name, registration_source = "stage_advantage.json", "recap_stage_annotation"
+        columns, build_profile, label = STAGE_PROGRESS_OUTPUT_COLUMNS, stage_progress_dataset_profile, "Stage Advantage 标注"
+    receipt, receipt_digest = read_json(dataset / "meta" / receipt_name, spec, limit=128 * 1024)
     info, _ = read_json(dataset / "meta" / "info.json", spec)
     annotation = plan["recap_stage_contract"]["annotation"]
+    model = plan["model"]
+    frame_count = plan["datasets"][0]["frames"]
+    valid_receipt = (valid_value_annotation_receipt(receipt, annotation, frame_count, model["checkpoint_path"]) if value
+                     else valid_stage_progress_receipt(receipt, annotation, frame_count))
     if (dataset.resolve() != dataset or dataset.is_symlink()
-            or not valid_stage_progress_receipt(receipt, annotation, plan["datasets"][0]["frames"])
+            or not valid_receipt
             or info.get("total_frames") != receipt["frame_count"] or not isinstance(info.get("features"), dict)
-            or not set(STAGE_PROGRESS_OUTPUT_COLUMNS) <= set(info["features"])):
-        raise ValueError("RECAP_STAGE_OUTPUT_INVALID: Kai0 派生数据集缺少与本次训练匹配的优势标注")
+            or not set(columns) <= set(info["features"])):
+        raise ValueError(f"RECAP_STAGE_OUTPUT_INVALID: {label}的派生数据集缺少与本次请求匹配的优势标注")
     source = spec["inputs"]["dataset_0"]
     _, _, source_digest = file_manifest(source["path"], spec, max_entries=60000, timeout=15)
     if source_digest != annotation["source_manifest_digest"]:
-        raise ValueError("RECAP_STAGE_SOURCE_CHANGED: Kai0 输入数据在训练或标注期间发生变化")
-    profile = stage_progress_dataset_profile(source.get("dataset_profile"))
+        raise ValueError(f"RECAP_STAGE_SOURCE_CHANGED: {label}的输入数据在标注期间发生变化")
+    profile = build_profile(source.get("dataset_profile"))
     validation_spec = {key: spec[key] for key in ("code_dir", "allowed_roots", "validation_cache_dir", "profile_id")}
     validation_spec.update(path=str(dataset), registered_profile=profile,
                            inputs={"dataset": {"path": str(dataset), "dataset_profile": profile}})
@@ -391,11 +407,22 @@ def stage_progress_artifact(output, checkpoint, spec, plan):
         raise ValueError("RECAP_STAGE_OUTPUT_INVALID: " + reason)
     # Supervision evidence is already held in the machine's source cache.
     validation.pop("recap_supervision", None)
-    return {"kind": "DATASET", "name": "Kai0 优势标注 / " + checkpoint.name, "path": str(dataset), "version": checkpoint.name,
-            "metadata": {"format": "lerobot", "registration_source": "recap_stage_progress",
+    version = str(model["scorer_checkpoint"]["step"])
+    name = label + " / " + (source.get("name") or Path(source["path"]).name)
+    return {"kind": "DATASET", "name": name[:200],
+            "path": str(dataset), "version": version,
+            "metadata": {"format": "lerobot", "registration_source": registration_source,
                          "source_dataset_asset_id": source["id"], "source_norm_asset_id": spec["inputs"]["norm_0"]["id"],
-                         "scorer_checkpoint_path": str(checkpoint), "source_manifest_digest": source_digest, "annotation": receipt,
+                         "scorer_model_asset_id": spec["inputs"]["model"]["id"], "scorer_checkpoint_path": model["checkpoint_path"],
+                         "source_manifest_digest": source_digest, "annotation": receipt,
                          "annotation_sha256": receipt_digest, "source_validation": validation}}
+
+
+def write_artifacts(output, artifacts):
+    manifest = output / "artifacts.json"
+    temporary = output / ".artifacts.json.tmp"
+    temporary.write_text(json.dumps(artifacts, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(manifest)
 
 
 def _run_spec(spec, *, validate_only=False, fps_runtime=None):
@@ -465,6 +492,7 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
         print("VLA_EVENT:" + json.dumps({"type": "METRIC", "data": {
             **metrics, "step": step, "total_steps": config.num_train_steps}}), flush=True)
 
+    stage = spec.get("training_stage")
     with training_module(entry, spec["code_dir"], plan["entrypoint_sha256"]) as module:
         try:
             inspect.signature(module.main).bind(config)
@@ -479,11 +507,17 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
             return result
 
         module.init_wandb = local_init
-        if uses_torch_recap(spec):
+        if stage in ANNOTATION_STAGES:
+            settings = ({key: plan["recap_stage_contract"]["annotation"][key] for key in VALUE_ANNOTATION_DEFAULTS}
+                        if stage == VALUE_ANNOTATION else {})
+            module.main(config, output_dir=output, **settings)
+        elif uses_torch_recap(spec):
             module.main(config, worker_setup=functools.partial(prepare_recap_worker, spec=spec))
         else:
             module.main(config)
-    stage = spec.get("training_stage")
+    if stage in ANNOTATION_STAGES:
+        write_artifacts(output, [annotation_artifact(output, spec, plan)])
+        return
     if uses_torch_recap(spec):
         step = config.num_train_steps - 1
         last = Path(config.checkpoint_dir) / str(step)
@@ -494,6 +528,16 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
             raise RuntimeError("OUTPUT_MISSING: PyTorch ReCap 最终检查点的训练阶段或步数不匹配")
         safetensors_header(last / RECAP_TORCH_WEIGHTS)
         format_metadata = {"format": RECAP_TORCH_FORMAT, "backend": "pytorch", "model_role": recap_model_role(stage)}
+    elif uses_jax_acp(spec):
+        last = Path(config.checkpoint_dir) / str(config.num_train_steps - 1)
+        if local_path(last, spec) != last or last.is_symlink():
+            raise RuntimeError("OUTPUT_MISSING: JAX ACP 缺少已提交的最终 Orbax 检查点")
+        receipt, _ = read_json(last / "_CHECKPOINT_METADATA", spec, limit=1024 * 1024)
+        committed = receipt.get("commit_timestamp_nsecs")
+        if type(committed) is not int or committed <= 0:
+            raise RuntimeError("OUTPUT_MISSING: JAX ACP 最终 Orbax 检查点尚未提交")
+        model_contract({**spec, "inputs": {"model": {"path": str(last)}}})
+        format_metadata = {"format": ACP_ORBAX_FORMAT, "backend": "jax", "model_role": "policy"}
     else:
         checkpoints = sorted((p for p in Path(config.checkpoint_dir).iterdir()
                               if p.is_dir() and p.name.isdigit() and (p / "params").is_dir()),
@@ -511,19 +555,12 @@ def _run_spec(spec, *, validate_only=False, fps_runtime=None):
         raise RuntimeError("OUTPUT_MISSING: 自动共享训练的 checkpoint 缺少实际使用的共享 norm_stats，不能登记未绑定模型")
     if norm is not None:
         artifact["metadata"]["norm_stats"] = norm
-    artifacts = [artifact]
-    if stage == STAGE_PROGRESS:
-        artifact["metadata"]["model_role"] = "stage_progress_estimator"
-        artifacts.append(stage_progress_artifact(output, last, spec, plan))
-    manifest = output / "artifacts.json"
-    temporary = output / ".artifacts.json.tmp"
-    temporary.write_text(json.dumps(artifacts, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(manifest)
+    write_artifacts(output, [artifact])
 
 
 def _require_current_recap_runtime(spec):
-    if spec.get("template_id") == "recap" and not uses_torch_recap(spec):
-        raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: 新 ReCap 作业需要 PyTorch 预检，请更新 Agent 后重新预检")
+    if spec.get("template_id") == "recap" and not (uses_torch_recap(spec) or uses_jax_acp(spec)):
+        raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: ReCap 阶段需要与平台匹配的训练后端，请更新 Agent 后重新预检")
 
 
 def main():

@@ -18,7 +18,7 @@ import { ApiError, date, navigate, post, useApi } from './api';
 import { useAuth } from './auth';
 import { canManageResource, ResourceOwner } from './resourcePermissions';
 import { Badge, Empty, ErrorNotice, Field, Loading, Modal, PageHeading, Panel } from './components';
-import { useData } from './data';
+import { useData, useDataRequests } from './data';
 import { PathAutocomplete } from './PathAutocomplete';
 import { RecipeAutocomplete } from './RecipeAutocomplete';
 import { recipeSuggestionScope } from './recipeSuggestions';
@@ -72,6 +72,9 @@ import {
 import './policy-deployments.css';
 import { DeploymentRecordDeleteAction } from './DeploymentRecordDeleteAction';
 
+const DEPLOYMENT_PATH_REQUESTS = { profiles: 0 } as const;
+const DEPLOYMENT_RUN_REQUESTS = { profiles: 0, runs: 0 } as const;
+
 export default function PolicyDeployments({
   initialRun,
   path = '/deployments',
@@ -83,7 +86,11 @@ export default function PolicyDeployments({
 }) {
   const { can, user } = useAuth();
   const { nodes } = useData();
-  const list = useApi<DeploymentRecordSummary[]>('/deployment-records', 8000);
+  const route = parseDeploymentWorkspaceRoute(path);
+  const list = useApi<DeploymentRecordSummary[]>(
+    route.kind === 'list' ? '/deployment-records' : null,
+    8000,
+  );
   const [createdDeployment, setCreatedDeployment] = useState<PolicyDeployment>();
   const [form, setForm] = useState<{
     run?: string;
@@ -92,7 +99,6 @@ export default function PolicyDeployments({
   }>();
   const openedRun = useRef('');
   const writable = can('training.write');
-  const route = parseDeploymentWorkspaceRoute(path);
   useEffect(() => {
     if (initialRun && openedRun.current !== initialRun && writable) {
       openedRun.current = initialRun;
@@ -1146,6 +1152,7 @@ function DeploymentForm({
   const [source, setSource] = useState(
     initialRun || initialRecord?.source_run_id || !initialRecord ? 'run' : 'path',
   );
+  useDataRequests(source === 'run' ? DEPLOYMENT_RUN_REQUESTS : DEPLOYMENT_PATH_REQUESTS);
   const [runId, setRunId] = useState(initialRun || initialRecord?.source_run_id || '');
   const [recordId, setRecordId] = useState(initialRecord?.id || initialTransfer?.record_id || '');
   const runDetail = useApi<Run>(
@@ -1594,8 +1601,8 @@ function DeploymentForm({
               </div>
               <ErrorNotice error={syncError} title="无法开始同步" />
               <p>
-                复用机器资源中的 SSH
-                连接。同步完成后再点击“部署并启动服务”；关闭窗口后仍可在部署页查看进度。
+                目标机使用 rsync 直连源机，需能访问源机的 SSH
+                端口。同步完成后再点击“部署并启动服务”；关闭窗口后仍可在部署页查看进度。
               </p>
               <ErrorNotice
                 error={transferId && !transferQuery.loading ? transferQuery.error : undefined}

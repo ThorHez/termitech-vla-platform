@@ -4,6 +4,7 @@ Value training consumes targets, stage-progress training publishes a derivative,
 and ACP consumes previously annotated labels.
 """
 
+import ast
 import dataclasses
 import hashlib
 import importlib
@@ -15,24 +16,32 @@ import time
 from pathlib import Path
 
 if __package__:
-    from .composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
+    from .composition_spec import (COMPOSABLE_PROCESSOR, STAGE_PROGRESS_COLUMN, composition_aux_sources,
+                                   normalize_composition, stage_progress_source_feature, stage_progress_source_key)
     from .cache_contract import _managed_path
     from .dataset_validation_cache import get_or_validate, lookup_cached
     from .submission_validation import base_validation_asset_key, record_base_validation_failure
-    from .recap import (RECAP_SUPERVISION, RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_ENTRY,
+    from .recap import (ACP_ENTRYPOINT, ACP_MULTI_ENTRYPOINT, ACP_WEIGHT_LOADERS, ESTIMATOR_VALIDATION_PARAMETERS,
+                        RECAP_SUPERVISION, RECAP_TORCH_LOADER, STAGE_ADVANTAGE_STAGES, STAGE_ANNOTATION,
+                        STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_ENTRY, VALUE_ANNOTATION,
+                        VALUE_ANNOTATION_DATASET, VALUE_ANNOTATION_DEFAULTS,
                         STAGE_PROGRESS_ID_COLUMNS, STAGE_PROGRESS_KEYS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL,
                         STAGE_PROGRESS_MODULES, STAGE_PROGRESS_SUPPORT_ENTRY,
-                        recap_model_matches, recap_torch_module_paths, uses_torch_recap,
+                        recap_model_matches, recap_torch_entrypoint, recap_torch_module_paths, uses_jax_acp, uses_torch_recap,
                         validate_recap_torch_selection, validate_stage_progress_selection, validate_training_stage)
 else:
-    from composition_spec import COMPOSABLE_PROCESSOR, normalize_composition
+    from composition_spec import (COMPOSABLE_PROCESSOR, STAGE_PROGRESS_COLUMN, composition_aux_sources,
+                                  normalize_composition, stage_progress_source_feature, stage_progress_source_key)
     from cache_contract import _managed_path
     from dataset_validation_cache import get_or_validate, lookup_cached
     from submission_validation import base_validation_asset_key, record_base_validation_failure
-    from recap import (RECAP_SUPERVISION, RECAP_TORCH_ENTRY, RECAP_TORCH_LOADER, STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_ENTRY,
+    from recap import (ACP_ENTRYPOINT, ACP_MULTI_ENTRYPOINT, ACP_WEIGHT_LOADERS, ESTIMATOR_VALIDATION_PARAMETERS,
+                       RECAP_SUPERVISION, RECAP_TORCH_LOADER, STAGE_ADVANTAGE_STAGES, STAGE_ANNOTATION,
+                       STAGE_PROGRESS, STAGE_PROGRESS_DATASET, STAGE_PROGRESS_ENTRY, VALUE_ANNOTATION,
+                       VALUE_ANNOTATION_DATASET, VALUE_ANNOTATION_DEFAULTS,
                        STAGE_PROGRESS_ID_COLUMNS, STAGE_PROGRESS_KEYS, STAGE_PROGRESS_LOADER, STAGE_PROGRESS_MODEL,
                        STAGE_PROGRESS_MODULES, STAGE_PROGRESS_SUPPORT_ENTRY,
-                       recap_model_matches, recap_torch_module_paths, uses_torch_recap,
+                       recap_model_matches, recap_torch_entrypoint, recap_torch_module_paths, uses_jax_acp, uses_torch_recap,
                        validate_recap_torch_selection, validate_stage_progress_selection, validate_training_stage)
 
 
@@ -46,8 +55,17 @@ def _factory_mapping(factory):
         return getattr(factory, "mapping", None)
     spec = normalize_composition(factory.composition)
     keys = [field["key"] for field in spec["state_fields"] + spec["cameras"]]
-    keys += [spec["action_key"], spec["prompt_key"], *spec["aux_keys"]]
-    return {key: key for key in keys}
+    keys += [key for key in (spec["action_key"], spec["prompt_key"]) if key]
+    return {**{key: key for key in keys}, **composition_aux_sources(spec)}
+
+
+def _apply_estimator_validation(config, stage, overrides):
+    keys = ESTIMATOR_VALIDATION_PARAMETERS
+    if any(not hasattr(config, key) for key in keys):
+        raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 估计器配方缺少验证参数")
+    config = dataclasses.replace(config, **overrides)
+    validate_training_stage("recap", stage, {key: getattr(config, key) for key in keys})
+    return config
 
 
 def apply_stage(config, spec):
@@ -59,39 +77,43 @@ def apply_stage(config, spec):
     model_type = type(config.model).__name__
     torch_recap = uses_torch_recap(spec)
     if torch_recap:
-        validate_recap_torch_selection(spec.get("auto_config"), spec.get("entrypoint"))
+        validate_recap_torch_selection(spec.get("auto_config"), spec.get("entrypoint"), stage)
         if any("lora" in str(getattr(config.model, key, "")) for key in ("paligemma_variant", "action_expert_variant")):
             raise ValueError("RECAP_TORCH_LORA_UNSUPPORTED: PyTorch ReCap 支持全量微调，请选择兼容的模型配方")
         if stage == "offline_rl" and model_type not in {"Pi0Config", "Pi0GripperConfig"}:
             raise ValueError("RECAP_STAGE_MODEL_UNSUPPORTED: PyTorch ACP 支持 Pi0Config 和 Pi0GripperConfig")
         if getattr(config, "recap_training_stage", None) != stage or not getattr(config, "pytorch_weight_path", None):
             raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: 当前 OpenPI-UMI 未绑定 PyTorch ReCap 阶段和权重")
-    if stage == STAGE_PROGRESS:
+    if stage in STAGE_ADVANTAGE_STAGES:
         validate_stage_progress_selection(stage, spec.get("dataset_bindings"), spec.get("auto_config"))
         if children is not None or model_type != STAGE_PROGRESS_MODEL or not getattr(config.model, "pi05", False):
-            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: Kai0 阶段进度需要单数据集的 Pi0StageProgressConfig 配方")
+            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: Stage Advantage 需要单数据集的 Pi0StageProgressConfig 配方")
         if (type(config.data).__name__ != COMPOSABLE_PROCESSOR
                 or RECAP_SUPERVISION[stage] not in _factory_mapping(config.data)):
-            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: Kai0 阶段进度需要保留 stage_progress_gt 的组合字段处理器")
+            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: Stage Advantage 需要保留 stage_progress_gt 的组合字段处理器")
         if not torch_recap and type(config.weight_loader).__name__ != STAGE_PROGRESS_LOADER:
-            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: Kai0 阶段进度需要支持初始化进度头的权重加载器")
+            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: Stage Advantage 需要支持初始化进度头的权重加载器")
+        if stage == STAGE_PROGRESS and torch_recap:
+            return _apply_estimator_validation(config, stage, overrides)
+        if stage == STAGE_PROGRESS and overrides:
+            raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: 阶段进度验证需要 PyTorch 训练入口")
         model = dataclasses.replace(config.model, **overrides)
-        validate_training_stage("recap", stage, {key: getattr(model, key) for key in STAGE_PROGRESS_KEYS})
+        validate_training_stage("recap", STAGE_ANNOTATION, {key: getattr(model, key) for key in STAGE_PROGRESS_KEYS})
         return dataclasses.replace(config, model=model)
-    if stage == "value":
+    if stage in {"value", VALUE_ANNOTATION}:
         if model_type != "Pi0ValueConfig":
             raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数阶段必须使用 Pi0ValueConfig 配方")
         if any(not isinstance(_factory_mapping(factory), dict) or
                "value_target" not in _factory_mapping(factory) for factory in factories):
             raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方必须保留 value_target")
-        if any(not hasattr(config, key) for key in overrides):
-            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方缺少所选验证参数")
-        config = dataclasses.replace(config, **overrides)
-        keys = ("val_ratio", "eval_interval", "eval_batches")
-        if any(not hasattr(config, key) for key in keys):
-            raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 价值函数配方缺少验证参数")
-        validate_training_stage("recap", "value", {key: getattr(config, key) for key in keys})
-        return config
+        if stage == VALUE_ANNOTATION:
+            if len(factories) != 1:
+                raise ValueError("RECAP_STAGE_DATASET_COUNT: 价值优势标注需要单数据集配置")
+            return config
+        return _apply_estimator_validation(config, stage, overrides)
+    if uses_jax_acp(spec) and (model_type not in {"Pi0Config", "Pi0GripperConfig"}
+            or type(config.weight_loader).__name__ not in ACP_WEIGHT_LOADERS):
+        raise ValueError("RECAP_STAGE_MODEL_UNSUPPORTED: JAX ACP 需要 Pi0 或 Pi0.5 策略和 Orbax 权重加载器")
     if not recap_model_matches(stage, model_type) or any(
             not hasattr(factory, "acp_dropout") or
             not isinstance(_factory_mapping(factory), dict) or
@@ -107,7 +129,7 @@ def apply_stage(config, spec):
 def default_entrypoint(config, spec):
     stage, _ = stage_request(spec)
     if uses_torch_recap(spec):
-        return RECAP_TORCH_ENTRY
+        return recap_torch_entrypoint(stage)
     multi = hasattr(config.data, "datasets")
     if stage == "value":
         name = "train_value_multi_dataset.py" if multi else "train_value.py"
@@ -118,7 +140,7 @@ def default_entrypoint(config, spec):
         return legacy
     if stage == STAGE_PROGRESS:
         return STAGE_PROGRESS_ENTRY
-    return "scripts/train_multi_dataset.py" if multi else "scripts/train.py"
+    return ACP_MULTI_ENTRYPOINT if multi else ACP_ENTRYPOINT
 
 
 def validate_stage_entrypoint(config, spec, entry):
@@ -127,7 +149,11 @@ def validate_stage_entrypoint(config, spec, entry):
         return
     relative = entry.relative_to(Path(spec["code_dir"]).resolve()).as_posix()
     if uses_torch_recap(spec):
-        validate_recap_torch_selection(spec.get("auto_config"), relative)
+        validate_recap_torch_selection(spec.get("auto_config"), relative, stage)
+        return
+    if uses_jax_acp(spec):
+        if relative != default_entrypoint(config, spec):
+            raise ValueError("RECAP_STAGE_ENTRYPOINT_MISMATCH: ACP 需要和实际单数据集或混采配方匹配的 JAX 训练入口")
         return
     policy = {"scripts/train.py", "scripts/train_multi_dataset.py", "scripts/train_multi_dataset_hybrid.py"}
     single_value = {"scripts/train_value.py", "scripts/acp/train_value.py"}
@@ -168,7 +194,7 @@ def _scalar(value):
     return value
 
 
-def _parquet_evidence(path, required, supervised, *, stage, value_min, value_max):
+def _parquet_evidence(path, required, supervised, *, stage, value_min, value_max, optional_progress=()):
     try:
         import pyarrow.parquet as parquet
     except ImportError as exc:
@@ -182,6 +208,8 @@ def _parquet_evidence(path, required, supervised, *, stage, value_min, value_max
                       for i in range(min(16, len(files)))}) if len(files) > 1 else [0]
     rows = []
     summary = {key: {"min": None, "max": None, "count": 0} for key in supervised}
+    progress_summary = {key: {"min": None, "max": None, "count": 0} for key in optional_progress}
+    invalid_progress = {}
     deadline = time.monotonic() + 15
     for index in indices:
         if time.monotonic() > deadline:
@@ -194,20 +222,36 @@ def _parquet_evidence(path, required, supervised, *, stage, value_min, value_max
             missing = sorted((set(required) | set(supervised)) - set(columns))
             if missing:
                 raise ValueError(f"RECAP_DATA_SCHEMA_INVALID: {file} 缺少阶段数据列：{', '.join(missing)}")
-            batch = next(iter(source.iter_batches(batch_size=64, columns=supervised)), None)
+            for key in progress_summary.keys() - set(columns):
+                invalid_progress[key] = "missing"
+            progress_columns = [key for key in progress_summary if key not in invalid_progress]
+            batch = next(iter(source.iter_batches(batch_size=64, columns=[*supervised, *progress_columns])), None)
             if batch is None or batch.num_rows <= 0:
                 raise ValueError(f"RECAP_DATA_SCHEMA_INVALID: {file} 没有可检查的训练样本")
             values = batch.to_pydict()
-            for key in supervised:
+            for key in [*supervised, *progress_columns]:
+                optional = key in progress_summary
+                measured = progress_summary[key] if optional else summary[key]
                 for raw in values[key]:
-                    number = _scalar(raw)
+                    try:
+                        if optional and isinstance(raw, (tuple, list)) and (
+                                len(raw) != 1 or isinstance(raw[0], (tuple, list))):
+                            raise ValueError("invalid numeric scalar")
+                        number = _scalar(raw)
+                    except ValueError:
+                        if not optional:
+                            raise
+                        invalid_progress[key] = "invalid"
+                        break
                     if key == "is_positive" and number not in (0, 1):
                         raise ValueError(f"RECAP_LABEL_INVALID: {file} 的 is_positive 必须为 0 或 1；请先完成离线优势标注")
-                    if key == "stage_progress_gt" and not 0 <= number <= 1:
-                        raise ValueError(f"RECAP_LABEL_INVALID: {file} 的 stage_progress_gt 必须位于 [0, 1]")
+                    if (optional or key == STAGE_PROGRESS_COLUMN) and not 0 <= number <= 1:
+                        if optional:
+                            invalid_progress[key] = "invalid"
+                            break
+                        raise ValueError(f"RECAP_LABEL_INVALID: {file} 的 {key} 必须位于 [0, 1]")
                     if key == "value_target" and value_min is not None and value_max is not None and not value_min <= number <= value_max:
                         raise ValueError(f"RECAP_LABEL_INVALID: {file} 的 value_target 超出 [{value_min}, {value_max}]")
-                    measured = summary[key]
                     measured["min"] = number if measured["min"] is None else min(measured["min"], number)
                     measured["max"] = number if measured["max"] is None else max(measured["max"], number)
                     measured["count"] += 1
@@ -222,26 +266,30 @@ def _parquet_evidence(path, required, supervised, *, stage, value_min, value_max
                 close()
     if "is_positive" in summary:
         summary["is_positive"]["binary"] = True
-    return {"parquet_files": len(files), "checked_files": rows,
-            "supervision_summary": summary,
-            "scope": "bounded parquet schema and first 64 supervision rows from up to 16 evenly spaced files"}
+    result = {"parquet_files": len(files), "checked_files": rows, "supervision_summary": summary,
+              "scope": "bounded parquet schema and first 64 supervision rows from up to 16 evenly spaced files"}
+    if optional_progress:
+        result["supervision_summary"] = {key: value for key, value in progress_summary.items() if key not in invalid_progress}
+        result["invalid_progress"] = invalid_progress
+    return result
 
 
 _SUPERVISION_CONTEXT = {"scope": "recap_supervision"}
 _STAGE_PROGRESS_CONTEXT = {"scope": "recap_stage_progress_supervision"}
+_STAGE_PROGRESS_CANDIDATES_CONTEXT = {"scope": "recap_stage_progress_candidates"}
 
 
 def prepare_source_supervision(data, spec, info):
     """Measure optional ReCap labels only during the dataset's basic validation."""
     features = info.get("features", {})
     supervised = [key for key in ("value_target", "is_positive") if key in features]
-    progress = RECAP_SUPERVISION[STAGE_PROGRESS]
+    progress = STAGE_PROGRESS_COLUMN
 
-    def measure(required, columns, context):
+    def measure(required, columns, context, *, optional_progress=()):
         def validate():
             return {"schema_version": 1, "status": "verified", "path": data["path"],
                     **_parquet_evidence(data["path"], required, columns, stage="source",
-                                        value_min=None, value_max=None)}
+                                        value_min=None, value_max=None, optional_progress=optional_progress)}
         return get_or_validate("source", data, spec, validate, context=context)
 
     result = measure(supervised, supervised, _SUPERVISION_CONTEXT) if supervised else None
@@ -249,6 +297,17 @@ def prepare_source_supervision(data, spec, info):
         stage_result = measure([progress, *STAGE_PROGRESS_ID_COLUMNS], [progress], _STAGE_PROGRESS_CONTEXT)
         result = ({**result, "supervision_summary": {**result["supervision_summary"], **stage_result["supervision_summary"]}}
                   if result else stage_result)
+    candidates = []
+    for key, feature in features.items():
+        if key == progress or not stage_progress_source_feature(feature):
+            continue
+        try:
+            if stage_progress_source_key(key) == key:
+                candidates.append(key)
+        except ValueError:
+            continue
+    if candidates:
+        measure([], [], _STAGE_PROGRESS_CANDIDATES_CONTEXT, optional_progress=sorted(candidates))
     return result
 
 
@@ -259,18 +318,34 @@ def _base_validation_required(dataset):
 
 def require_cached_supervision(dataset, spec):
     """Read an existing source-bound label receipt; never scan or load on a miss."""
-    progress = spec.get("training_stage") == STAGE_PROGRESS
-    context = _STAGE_PROGRESS_CONTEXT if progress else _SUPERVISION_CONTEXT
+    progress = spec.get("training_stage") in STAGE_ADVANTAGE_STAGES
+    if progress:
+        composition = dataset.get("composition", {}).get("spec", {})
+        progress_key = composition.get("stage_progress_key", STAGE_PROGRESS_COLUMN)
+        context = _STAGE_PROGRESS_CONTEXT if progress_key == STAGE_PROGRESS_COLUMN else _STAGE_PROGRESS_CANDIDATES_CONTEXT
+    else:
+        progress_key = None
+        context = _SUPERVISION_CONTEXT
     evidence = lookup_cached("source", dataset, spec, context=context)
     if (not isinstance(evidence, dict) or evidence.get("schema_version") != 1
             or evidence.get("status") != "verified" or evidence.get("path") != dataset.get("path")):
         _base_validation_required(dataset)
     checked = evidence.get("checked_files")
     summary = evidence.get("supervision_summary")
+    if progress_key is not None and progress_key != STAGE_PROGRESS_COLUMN:
+        invalid = evidence.get("invalid_progress")
+        if isinstance(invalid, dict) and invalid.get(progress_key) == "missing":
+            raise ValueError(f"RECAP_DATA_SCHEMA_INVALID: 实际 parquet 缺少阶段进度列 {progress_key}")
+        if isinstance(invalid, dict) and invalid.get(progress_key) == "invalid":
+            raise ValueError(f"RECAP_LABEL_INVALID: {progress_key} 必须是位于 [0, 1] 的有限数值标量")
+        if not isinstance(summary, dict) or progress_key not in summary:
+            _base_validation_required(dataset)
+        summary = {progress_key: summary[progress_key]}
+        evidence = {**evidence, "supervision_summary": summary}
     if (type(evidence.get("parquet_files")) is not int or not isinstance(checked, list)
             or not 1 <= len(checked) <= min(16, evidence["parquet_files"])
             or not isinstance(summary, dict) or not summary
-            or set(summary) - ({"stage_progress_gt"} if progress else {"value_target", "is_positive"})):
+            or set(summary) - ({progress_key} if progress else {"value_target", "is_positive"})):
         _base_validation_required(dataset)
     count = 0
     for row in checked:
@@ -292,7 +367,7 @@ def require_cached_supervision(dataset, spec):
                        for bound in ("min", "max")) or measured["min"] > measured["max"]
                 or (key == "is_positive" and (measured.get("binary") is not True
                                               or measured["min"] not in (0, 1) or measured["max"] not in (0, 1)))
-                or (key == "stage_progress_gt" and not 0 <= measured["min"] <= measured["max"] <= 1)):
+                or (progress and not 0 <= measured["min"] <= measured["max"] <= 1)):
             _base_validation_required(dataset)
     return evidence
 
@@ -339,12 +414,14 @@ def inspect_stage(config, spec, factories, datasets, base_validation_failures=No
     # Recheck the actual resolved objects even when a caller did not use the
     # normal resolver, and record only effective, stable values.
     apply_stage(config, spec)
-    if stage == "value" and any(getattr(config, key) != value for key, value in requested.items()):
-        raise ValueError("RECAP_STAGE_CONFIGURATION_MISMATCH: 实际价值验证参数与本次请求不一致")
+    torch_recap = uses_torch_recap(spec)
+    estimator_training = stage == "value" or (stage == STAGE_PROGRESS and torch_recap)
+    if estimator_training and any(getattr(config, key) != value for key, value in requested.items()):
+        raise ValueError("RECAP_STAGE_CONFIGURATION_MISMATCH: 实际估计器验证参数与本次请求不一致")
     if stage == "offline_rl" and "acp_dropout" in requested and any(
             factory.acp_dropout != requested["acp_dropout"] for factory in factories):
         raise ValueError("RECAP_STAGE_CONFIGURATION_MISMATCH: 实际 ACP 条件 dropout 与本次请求不一致")
-    if stage == STAGE_PROGRESS and any(getattr(config.model, key) != value for key, value in requested.items()):
+    if stage == STAGE_ANNOTATION and any(getattr(config.model, key) != value for key, value in requested.items()):
         raise ValueError("RECAP_STAGE_CONFIGURATION_MISMATCH: 实际阶段进度参数与本次请求不一致")
     minimum = getattr(config.model, "value_min", -1.0)
     maximum = getattr(config.model, "value_max", 0.0)
@@ -361,12 +438,18 @@ def inspect_stage(config, spec, factories, datasets, base_validation_failures=No
         mapping = _factory_mapping(factory)
         required = _mapping_columns(mapping)
         required_supervision = RECAP_SUPERVISION[stage]
-        if mapping.get(required_supervision) != required_supervision:
-            raise ValueError("RECAP_DATA_SCHEMA_UNSUPPORTED: 阶段监督字段必须保留标准列名")
-        if stage == STAGE_PROGRESS:
+        if stage in STAGE_ADVANTAGE_STAGES:
+            stage_progress_key = (dataset.get("composition", {}).get("spec", {})
+                                  .get("stage_progress_key", STAGE_PROGRESS_COLUMN))
+            if mapping.get(required_supervision) != stage_progress_key:
+                raise ValueError("RECAP_DATA_SCHEMA_UNSUPPORTED: 阶段进度物理列与冻结的数据处理配置不一致")
             required = sorted(set(required) | set(STAGE_PROGRESS_ID_COLUMNS))
-            supervised = [required_supervision]
+            supervised = [stage_progress_key]
         else:
+            if mapping.get(required_supervision) != required_supervision:
+                raise ValueError("RECAP_DATA_SCHEMA_UNSUPPORTED: 阶段监督字段必须保留标准列名")
+            if stage == VALUE_ANNOTATION:
+                required = sorted(set(required) | set(STAGE_PROGRESS_ID_COLUMNS))
             supervised = [key for key in ("value_target", "is_positive") if key in required]
         try:
             cached = require_cached_supervision(dataset, spec)
@@ -392,6 +475,8 @@ def inspect_stage(config, spec, factories, datasets, base_validation_failures=No
                "scope": "reused bounded supervision evidence from dataset basic validation; no Parquet rows read at submission"}
         if stage == "offline_rl":
             row["acp_dropout"] = factory.acp_dropout
+        if stage in STAGE_ADVANTAGE_STAGES and stage_progress_key != STAGE_PROGRESS_COLUMN:
+            row["stage_progress_key"] = stage_progress_key
         rows.append(row)
     if base_validation_failures:
         return None
@@ -399,19 +484,49 @@ def inspect_stage(config, spec, factories, datasets, base_validation_failures=No
               "loader_type": type(config.weight_loader).__name__, "datasets": rows}
     if stage == "value":
         result["value_range"] = [minimum, maximum]
-        result["validation"] = {key: getattr(config, key) for key in ("val_ratio", "eval_interval", "eval_batches")}
-    if uses_torch_recap(spec):
+    if estimator_training:
+        result["validation"] = {key: getattr(config, key) for key in ESTIMATOR_VALIDATION_PARAMETERS}
+    if torch_recap:
         result.update(backend="pytorch", loader_type=RECAP_TORCH_LOADER,
                       source_sha256=recap_torch_source_hashes(spec, stage),
                       runtime_versions=recap_torch_runtime_versions())
+    elif uses_jax_acp(spec):
+        result["backend"] = "jax"
     elif stage in {"value", STAGE_PROGRESS}:
         result["runtime_cache"] = _value_runtime_cache(spec)
-    if stage == STAGE_PROGRESS:
+    if stage == STAGE_PROGRESS and torch_recap:
+        result["operation"] = "train"
+        if config.val_ratio > 0:
+            _require_stage_progress_validation(spec, result["source_sha256"])
+            if datasets[0]["episodes"] < 2:
+                raise ValueError("RECAP_STAGE_VALIDATION_DATA: 阶段进度验证需要至少两条轨迹")
+    if stage == VALUE_ANNOTATION:
+        result["annotation"] = {"output": VALUE_ANNOTATION_DATASET, **VALUE_ANNOTATION_DEFAULTS, **requested}
+    if stage == STAGE_ANNOTATION or (stage == STAGE_PROGRESS and not uses_torch_recap(spec)):
         result["annotation"] = {"output": STAGE_PROGRESS_DATASET,
                                 **{key: getattr(config.model, key) for key in STAGE_PROGRESS_KEYS}}
         if not uses_torch_recap(spec):
             result["source_sha256"] = stage_progress_source_hashes(spec)
     return result
+
+
+def _require_stage_progress_validation(spec, sources):
+    name = next(path for path in sources if path.endswith("openpi/training/recap_pytorch.py"))
+    source = Path(spec["code_dir"]) / name
+    try:
+        contents = source.read_bytes()
+        tree = ast.parse(contents)
+        supported = hashlib.sha256(contents).hexdigest() == sources[name] and any(
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "PLATFORM_STAGE_PROGRESS_VALIDATION_VERSION"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Constant) and type(node.value.value) is int and node.value.value == 1
+            for node in tree.body
+        )
+    except (OSError, SyntaxError, ValueError):
+        supported = False
+    if not supported:
+        raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: 所选 OpenPI 环境不支持阶段进度验证，请选择已升级的运行环境")
 
 
 def stage_progress_source_hashes(spec):

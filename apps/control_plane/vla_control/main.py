@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import secrets
 import threading
+from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, Query, Request, WebSocketException
 from fastapi.encoders import jsonable_encoder
@@ -27,6 +28,8 @@ from .authorization import permission_for, request_route_path
 from .common import ACTIVE, APIError, TERMINAL, digest, now, offset_time, require_path, token_hash, uid, valid_snapshot
 from .db import Database
 from .disk_alerts import disk_capacity_alerts
+from .model_formats import update_model_format
+from .stage_annotation_sources import stage_annotation_sources
 from .models import Allocation, Asset, Attempt, Command, Event, GPUReservation, Idempotency, Node, Preview, Profile, Run, RunInput
 from .onboarding import generate_agent_config, resolve_agent_config_defaults
 from .path_suggestions import acknowledge as acknowledge_path_query, create_query, expire_pending as expire_path_queries, matching_profile as matching_path_profile, query_dict as path_query_dict
@@ -55,8 +58,10 @@ from .policy_deployment_models import PolicyDeployment, RESOURCE_STATES as POLIC
 from .remote_deployment import DeploymentManager, register_remote_routes
 from .remote_models import RemoteDeployment
 from .scheduler import enqueue, gpu_available, resolve_inputs, tick
-from .serialization import asset_dict, node_dict, preview_dict, profile_dict, run_dict
+from .serialization import (AssetListView, RunListView, asset_dict, node_dict, preview_dict, profile_dict,
+                            recent_node_assets, run_dict, run_summaries)
 from .service import apply_ack, automatic_preflight_error, config_confirmation_error, get_required, ingest_events, sync_profiles, validate_request
+from .serialization import run_status_dict
 from .settings import Settings
 from .operation_audit import OperationAuditMiddleware, prime_context
 from .transport_security import TransportSecurityMiddleware, uvicorn_options
@@ -65,8 +70,10 @@ from .training_templates import register_routes as register_training_template_ro
 from .dataset_templates import register_routes as register_dataset_template_routes
 from .dataset_batches import DatasetBatchManager, register_routes as register_dataset_batch_routes
 from .asset_transfer_batches import register_routes as register_asset_transfer_batch_routes
+from .background_tasks import ACTIVE_TRAINING, active_task_counts
 from .background_tasks import register_routes as register_background_task_routes
 from .resource_history import capture_sample, register_routes as register_resource_history_routes
+from .network_metrics import PROCESS_METRICS_KEY, network_process_snapshot, with_network_metrics
 from .run_records import delete_run_record, require_replayable_run, require_visible_run
 from .training_metrics import register_routes as register_training_metric_routes
 from .training_resume import freeze_resume_source
@@ -221,7 +228,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_dataset_batch_routes(app, admin, dataset_batch_manager)
     register_asset_transfer_batch_routes(app, admin, asset_transfer_manager, auth)
     register_gpu_reservation_routes(app, admin, db, auth, settings)
-    register_resource_history_routes(app, admin, db)
+    register_resource_history_routes(app, admin, db, settings.heartbeat_timeout_seconds)
     register_training_metric_routes(app, admin, db)
     register_background_task_routes(app, admin, db)
     register_dataset_validation_routes(app, admin, db, settings)
@@ -312,7 +319,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                           for n in nodes for gpu in n.gpus),
                     "runs_active": session.scalar(select(func.count()).select_from(Run).where(Run.deleted_at.is_(None), Run.state.not_in(TERMINAL))),
                     "runs_failed": session.scalar(select(func.count()).select_from(Run).where(Run.deleted_at.is_(None), Run.state == "FAILED")),
-                    "assets_total": session.scalar(select(func.count()).select_from(Asset).where(Asset.state != "ARCHIVED"))}
+                    "assets_total": session.scalar(select(func.count()).select_from(Asset).where(Asset.state != "ARCHIVED")),
+                    "active_tasks": active_task_counts(session)}
 
     @app.get("/api/v1/nodes", dependencies=admin)
     def nodes(include_inactive: bool = False):
@@ -320,15 +328,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             query = select(Node).order_by(Node.created_at)
             if not include_inactive:
                 query = query.where(Node.status.not_in(RETIRED_NODE_STATES))
-            return [node_dict(session, node) for node in session.scalars(query)]
+            records = list(session.scalars(query))
+            if not records:
+                return []
+            ids = [node.id for node in records]
+            asset_counts = dict(session.execute(select(Asset.node_id, func.count()).where(
+                Asset.node_id.in_(ids), Asset.state != "ARCHIVED",
+            ).group_by(Asset.node_id)).all())
+            profile_counts = dict(session.execute(select(Profile.node_id, func.count()).where(
+                Profile.node_id.in_(ids), Profile.active.is_(True),
+            ).group_by(Profile.node_id)).all())
+            return [dict(node_dict(session, node), asset_count=asset_counts.get(node.id, 0),
+                         profile_count=profile_counts.get(node.id, 0)) for node in records]
 
     @app.get("/api/v1/nodes/{node_id}", dependencies=admin)
-    def node_detail(node_id: str):
+    def node_detail(node_id: str, view: RunListView = "full",
+                    run_limit: int = Query(default=100, ge=1, le=500),
+                    asset_limit: int | None = Query(default=None, ge=1, le=100)):
         with db.read() as session:
-            result = node_dict(session, get_required(session, Node, node_id, "Node"))
-            result["assets"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.node_id == node_id))]
+            node = get_required(session, Node, node_id, "Node")
+            result = node_dict(session, node)
+            processes = network_process_snapshot(node.metrics, node.status, node.last_seen, now(),
+                                                 settings.heartbeat_timeout_seconds)
+            if processes is not None:
+                result["metrics"][PROCESS_METRICS_KEY] = processes
+            if asset_limit is None:
+                result["assets"] = [asset_dict(a) for a in session.scalars(select(Asset).where(Asset.node_id == node_id))]
+            else:
+                result["assets"], result["asset_norms"] = recent_node_assets(session, node_id, asset_limit)
             result["profiles"] = [profile_dict(p) for p in session.scalars(select(Profile).where(Profile.node_id == node_id))]
-            result["runs"] = [run_dict(session, r) for r in session.scalars(select(Run).where(Run.node_id == node_id, Run.deleted_at.is_(None)).order_by(Run.created_at.desc()).limit(100))]
+            if view == "summary":
+                result["runs"] = run_summaries(session, node_id=node_id, limit=run_limit)
+                active_by_profile = session.execute(
+                    select(Run.profile_id, func.count()).where(
+                        Run.node_id == node_id, Run.deleted_at.is_(None), Run.state.in_(ACTIVE_TRAINING),
+                    ).group_by(Run.profile_id).order_by(Run.profile_id)
+                ).all()
+                result["active_training"] = {
+                    "count": sum(count for _, count in active_by_profile),
+                    "profile_ids": [profile_id for profile_id, _ in active_by_profile],
+                }
+            else:
+                runs_query = select(Run).where(Run.node_id == node_id, Run.deleted_at.is_(None)).order_by(
+                    Run.created_at.desc(), Run.id.desc(),
+                ).limit(run_limit)
+                result["runs"] = [run_dict(session, r) for r in session.scalars(runs_query)]
             return result
 
     @app.patch("/api/v1/nodes/{node_id}", dependencies=admin)
@@ -420,14 +464,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return recipe_query_dict(command, profile, node.roots, code_only=True)
 
     @app.get("/api/v1/assets", dependencies=admin)
-    def assets(node_id: str | None = None, kind: str | None = None):
+    def assets(node_id: str | None = None, kind: str | None = None, view: AssetListView = "full"):
         with db.read() as session:
             query = select(Asset).order_by(Asset.created_at.desc())
             if node_id:
                 query = query.where(Asset.node_id == node_id)
             if kind:
                 query = query.where(Asset.kind == kind)
-            return [asset_dict(a) for a in session.scalars(query)]
+            assets = list(session.scalars(query))
+            scorer_sources = stage_annotation_sources(session, assets)
+            value_sources = stage_annotation_sources(session, assets, scorer_stage="value")
+            return [asset_dict(asset, summary=view == "summary", stage_annotation_source=scorer_sources.get(asset.id),
+                               value_annotation_source=value_sources.get(asset.id))
+                    for asset in assets]
+
+    @app.get("/api/v1/assets/{asset_id}", dependencies=admin)
+    def asset_detail(asset_id: str):
+        with db.read() as session:
+            asset = get_required(session, Asset, asset_id, "Asset")
+            source = stage_annotation_sources(session, [asset]).get(asset.id)
+            value = stage_annotation_sources(session, [asset], scorer_stage="value").get(asset.id)
+            return asset_dict(asset, stage_annotation_source=source, value_annotation_source=value)
 
     @app.post("/api/v1/assets", dependencies=admin, status_code=201)
     def create_asset(body: schemas.AssetInput, request: Request):
@@ -471,6 +528,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                              actor_request=request, source_registration=True)
             return asset_dict(asset)
 
+    @app.patch("/api/v1/assets/{asset_id}/model-format", dependencies=admin)
+    def patch_model_format(asset_id: str, body: schemas.AssetModelFormatInput, request: Request):
+        with db.write() as session:
+            return asset_dict(update_model_format(session, request, asset_id, body.format))
+
     @app.put("/api/v1/assets/{asset_id}/norm-binding", dependencies=admin)
     def put_dataset_norm_binding(asset_id: str, body: schemas.AssetNormBindingInput, request: Request):
         with db.write() as session:
@@ -503,8 +565,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     Asset.kind == "MODEL", Asset.norm_asset_id == asset.id, Asset.state != "ARCHIVED").limit(1)):
                 raise APIError(409, "MODEL_NORM_IN_USE", "此 norm_stats 与模型训练结果绑定，请先归档关联模型")
             invalidate_validation(session, asset, preserve_delivered=True)
-            asset.state = "ARCHIVED"
             asset_deletions.record_archive(session, asset, request)
+            asset.state = "ARCHIVED"
             return asset_dict(asset)
 
     @app.patch("/api/v1/assets/{asset_id}/dataset-profile", dependencies=admin)
@@ -710,14 +772,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return run_dict(session, run)
 
     @app.get("/api/v1/runs", dependencies=admin)
-    def runs():
+    def runs(view: RunListView = "summary"):
         with db.read() as session:
+            if view == "summary":
+                return run_summaries(session)
             return [run_dict(session, run) for run in session.scalars(select(Run).where(Run.deleted_at.is_(None)).order_by(Run.created_at.desc()).limit(500))]
 
     @app.get("/api/v1/runs/{run_id}", dependencies=admin)
-    def run_detail(run_id: str):
+    def run_detail(run_id: str, view: Literal["full", "status"] = "full"):
         with db.read() as session:
-            return run_dict(session, require_visible_run(session, run_id))
+            run = require_visible_run(session, run_id)
+            if view == "status":
+                return run_status_dict(session, run)
+            return run_dict(session, run)
 
     @app.post("/api/v1/runs/{run_id}/recap-annotations", dependencies=admin)
     def recap_annotation_link(run_id: str, body: RecapAnnotationInput, request: Request):
@@ -778,10 +845,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return run_dict(session, run)
 
     @app.get("/api/v1/runs/{run_id}/events", dependencies=admin)
-    def run_events(run_id: str, after_seq: int = Query(default=0, ge=0), limit: int = Query(default=1000, ge=1, le=1000)):
+    def run_events(run_id: str, after_seq: int = Query(default=0, ge=0), limit: int = Query(default=1000, ge=1, le=1000),
+                   view: Literal["full", "timeline"] = "full"):
         with db.read() as session:
             require_visible_run(session, run_id)
-            events = session.scalars(select(Event).join(Attempt, Event.attempt_id == Attempt.id).where(Attempt.run_id == run_id, Event.seq > after_seq).order_by(Event.seq).limit(limit))
+            query = select(Event).join(Attempt, Event.attempt_id == Attempt.id).where(Attempt.run_id == run_id, Event.seq > after_seq)
+            if view == "timeline":
+                # The timeline displays only the event type and time. Logs and
+                # metrics have dedicated cursor feeds with their own consumers.
+                query = query.with_only_columns(Event.attempt_id, Event.seq, Event.type, Event.timestamp)
+                rows = session.execute(query.where(Event.type.not_in(("LOG", "METRIC", "RESOURCE")))
+                                       .order_by(Event.seq).limit(limit)).mappings()
+                return [{**row, "data": {}} for row in rows]
+            events = session.scalars(query.order_by(Event.seq).limit(limit))
             return [{"attempt_id": e.attempt_id, "seq": e.seq, "type": e.type, "timestamp": e.timestamp, "data": e.data} for e in events]
 
     @app.get("/api/v1/runs/{run_id}/logs", dependencies=admin)
@@ -796,13 +872,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with db.read() as session:
             result = []
             moment = datetime.now(timezone.utc)
-            disk_alerts = []
-            for node in session.scalars(select(Node).where(Node.status.in_(["ONLINE", "OFFLINE", "RECOVERING"]))):
+            nodes = list(session.scalars(select(Node).where(Node.status.in_(["ONLINE", "OFFLINE", "RECOVERING"]))))
+            for node in nodes:
                 if node.status in {"OFFLINE", "RECOVERING"}:
                     result.append({"id": "node:" + node.id, "severity": "error", "code": "NODE_" + node.status,
                                    "node_id": node.id, "run_id": None, "message": f"{node.effective_name}: {node.status}", "timestamp": node.last_seen})
-                disk_alerts.extend(disk_capacity_alerts(node, moment, settings.heartbeat_timeout_seconds))
-            result.extend(sorted(disk_alerts, key=lambda alert: (-alert["details"]["usage_percent"], alert["id"])))
+            result.extend(disk_capacity_alerts(session, nodes, moment, settings.heartbeat_timeout_seconds))
             for run in session.scalars(select(Run).where(Run.deleted_at.is_(None), Run.state.in_(["FAILED", "UNKNOWN"])).order_by(Run.updated_at.desc()).limit(100)):
                 error = run.error or {"code": "EXECUTION_UNKNOWN", "message": "Awaiting agent reconciliation; GPU reservation is retained"}
                 result.append({"id": "run:" + run.id, "severity": "error", "code": error.get("code", "TRAINING_FAILED"),
@@ -861,7 +936,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         with db.write() as session:
             node = session.scalar(select(Node).where(Node.id == node_id).with_for_update())
             assert_agent_connected(node)
-            node.last_seen, node.gpus, node.metrics = now(), [gpu.model_dump() for gpu in body.gpus], body.metrics
+            received_at = now()
+            node.metrics = with_network_metrics(body.metrics, node.metrics, received_at, node.last_seen,
+                                                settings.heartbeat_timeout_seconds)
+            node.last_seen, node.gpus = received_at, [gpu.model_dump() for gpu in body.gpus]
             capture_sample(session, node)
             reported_ids = {active.attempt_id for active in body.active_attempts}
 

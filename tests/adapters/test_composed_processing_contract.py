@@ -296,6 +296,29 @@ def test_auto_prompt_does_not_require_a_metadata_feature_but_aux_stays_required(
         verify_composition_metadata(spec, info)
 
 
+def test_composition_maps_stage_progress_to_physical_scalar_and_preserves_legacy_digest(core):
+    base = {**profile()["processing"], "aux_keys": ["stage_progress_gt"]}
+    assert composition_digest({**base, "stage_progress_key": "stage_progress_gt"}) == composition_digest(base)
+    selected = {**base, "stage_progress_key": "labels.progress"}
+    assert normalize_composition(selected) == core.normalize_composition(selected)
+    assert composition_digest(selected) != composition_digest(base)
+    assert composition_digest(selected, norm_stats=True) == composition_digest(base, norm_stats=True)
+    info = metadata()
+    info["features"]["labels.progress"] = {"shape": [1], "dtype": "float32"}
+    assert verify_composition_metadata(selected, info) == selected
+    info["features"]["labels.progress"]["shape"] = [2]
+    with pytest.raises(ValueError, match="数值标量.*labels.progress"):
+        verify_composition_metadata(selected, info)
+
+
+@pytest.mark.parametrize("alias", ["observation.joints", "episode_index", "relative_advantage", "labels/progress", None])
+def test_both_composition_validators_reject_reused_or_unsafe_progress_source(core, alias):
+    spec = {**profile()["processing"], "aux_keys": ["stage_progress_gt"], "stage_progress_key": alias}
+    for normalize in (normalize_composition, core.normalize_composition):
+        with pytest.raises(ValueError, match="COMPOSITION_INVALID"):
+            normalize(spec)
+
+
 @pytest.mark.parametrize("field,value", [("robot_type", "other"), ("arm_mode", "bimanual"),
     ("action_representation", "joint"), ("action_dim", 7), ("state_dim", 10),
     ("rotation_representation", "quaternion"), ("action_mode", "delta"), ("cameras", [])])

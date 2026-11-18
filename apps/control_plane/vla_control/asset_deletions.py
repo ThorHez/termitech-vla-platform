@@ -18,6 +18,7 @@ from .policy_deployment_models import RESOURCE_STATES, PolicyDeployment
 from .remote_models import RemoteConnection, RemoteDeployment
 from .resource_authorization import bind_command_actor, request_user_id, require_active_actor
 from .schemas import InputModel
+from .serialization import asset_dict
 
 INSPECT = "ASSET_PURGE_INSPECT"
 PURGE = "ASSET_PURGE"
@@ -29,6 +30,8 @@ FINAL = {"DELETED", "MISSING"}
 DELIVERY_TIMEOUT = 10 * 60
 MAX_PROTECTED_PATHS = 10_000
 MAX_PROTECTED_PATHS_BYTES = 1024 * 1024
+RESTORE_SAFE_FAILURES = {"ASSET_PURGE_BUSY", "ASSET_PURGE_IDENTITY_CHANGED", "ASSET_PURGE_IN_USE", "ASSET_PURGE_INVALID"}
+RESTORE_CANCELLED = "ASSET_RESTORE_CANCELLED_COMMAND"
 
 
 class PurgeInput(InputModel):
@@ -36,10 +39,14 @@ class PurgeInput(InputModel):
     inspection_id: str = Field(min_length=1, max_length=36)
 
 
+class RestoreInput(InputModel):
+    expected_archived_at: str | None = Field(max_length=40)
+
+
 def record_archive(session, asset, request):
     if session.get(AssetDeletion, asset.id) is None:
         session.add(AssetDeletion(asset_id=asset.id, archived_at=now(),
-                                  archived_by_user_id=request_user_id(request)))
+                                  archived_by_user_id=request_user_id(request), previous_state=asset.state))
 
 
 def _path(value):
@@ -218,6 +225,58 @@ def _recovery_required(command):
             and (command.result or {}).get("error", {}).get("code") == "ASSET_PURGE_INDETERMINATE")
 
 
+def _restore_file_error(command):
+    if command is None:
+        return None
+    result = command.result or {}
+    if command.status == "APPLIED" and result.get("status") in FINAL:
+        return APIError(409, "ASSET_RESTORE_FILES_MISSING", "资产文件已永久删除或确认不存在，无法恢复登记")
+    if command.delivered_at is None:
+        return None
+    if command.status == "PENDING":
+        return APIError(409, "ASSET_RESTORE_PURGE_RUNNING", "文件删除已下发，请等待 Agent 返回确定结果")
+    if (command.status == "REJECTED" and result.get("staged") is not True
+            and (result.get("error") or {}).get("code") in RESTORE_SAFE_FAILURES):
+        return None
+    return APIError(409, "ASSET_RESTORE_PURGE_UNCERTAIN", "无法确认源文件仍在原位置，请先核对机器上的删除记录")
+
+
+def _restore_references(session, node_ids):
+    active_assets = list(session.execute(select(Asset.id, Asset.node_id, Asset.path).where(
+        Asset.node_id.in_(node_ids), Asset.state.not_in({"ARCHIVED", "UNAVAILABLE"}))))
+    purges = list(session.scalars(select(Command).where(
+        Command.node_id.in_(node_ids), Command.type == PURGE, Command.delivered_at.is_not(None))))
+    return active_assets, purges
+
+
+def _restore_error(asset, inspection, purge, references):
+    if (asset.metadata_json or {}).get("availability") == "removed":
+        return APIError(409, "ASSET_RESTORE_FILES_MISSING", "资产文件已被清理，无法恢复登记")
+    if error := _restore_file_error(purge):
+        return error
+    if inspection is not None and inspection.status == "APPLIED" and (inspection.result or {}).get("status") == "MISSING":
+        return APIError(409, "ASSET_RESTORE_FILES_MISSING", "Agent 已确认资产文件不存在，无法恢复登记")
+    path = _path(asset.path)
+    active_assets, purges = references
+    for other_id, other_node, other_path in active_assets:
+        if (other_id != asset.id and other_node == asset.node_id
+                and (other_path == asset.path or path is not None and path == _path(other_path))):
+            return APIError(409, "ASSET_RESTORE_PATH_CONFLICT", "原路径已有可用的资产登记，请先核对现有资产")
+    for command in purges:
+        target_id = command.payload.get("asset_id")
+        if target_id == asset.id or (command.created_at >= asset.created_at
+                and path is not None and _overlap(path, _path(command.payload.get("path")))):
+            if error := _restore_file_error(command):
+                return error
+    return None
+
+
+def _restored_state(asset, record):
+    if record.previous_state in {"AVAILABLE", "REGISTERED", "READY", "UNAVAILABLE"}:
+        return record.previous_state
+    return "READY" if asset.origin_attempt_id else "REGISTERED"
+
+
 def _enqueue(session, asset, command_type, request, **extra):
     command = Command(id=uid(), node_id=asset.node_id, type=command_type, status="PENDING", created_at=now(),
                       payload={"asset_id": asset.id, "path": asset.path, **extra})
@@ -273,6 +332,9 @@ def acknowledge(session, command, status, result):
     """Only a matching authenticated Agent result can release a delivered purge."""
     from .service import apply_ack
 
+    if (command.status == "REJECTED"
+            and ((command.result or {}).get("error") or {}).get("code") == RESTORE_CANCELLED):
+        return
     if command.delivered_at is None:
         if command.status == "REJECTED":
             return
@@ -303,16 +365,27 @@ def acknowledge(session, command, status, result):
     apply_ack(session, command, "REJECTED", stored)
 
 
-def _load(session, asset_id):
-    asset = session.scalar(select(Asset).where(Asset.id == asset_id).with_for_update())
+def _load(session, asset_id, *, lock_machine=False):
+    asset_query = select(Asset).where(Asset.id == asset_id)
+    asset = session.scalar(asset_query if lock_machine else asset_query.with_for_update())
     if asset is None or asset.state != "ARCHIVED":
         raise APIError(404, "ASSET_DELETION_NOT_FOUND", "找不到已删除的资产登记")
-    node = session.scalar(select(Node).where(Node.id == asset.node_id).with_for_update())
+    node = session.get(Node, asset.node_id)
+    node_ids = _machine_node_ids(session, node) if lock_machine else {asset.node_id}
+    nodes = session.scalars(select(Node).where(Node.id.in_(node_ids)).order_by(Node.id).with_for_update()
+                            .execution_options(populate_existing=True)).all()
+    node = next(item for item in nodes if item.id == asset.node_id)
+    if lock_machine:
+        # Agent checkpoint events hold Node before changing asset availability.
+        # AuthGuard serializes restore with the catalogue's other human writers.
+        asset = session.scalar(asset_query.with_for_update().execution_options(populate_existing=True))
+        if asset is None or asset.state != "ARCHIVED":
+            raise APIError(404, "ASSET_DELETION_NOT_FOUND", "找不到已删除的资产登记")
     record = session.get(AssetDeletion, asset.id)
     if record is None:
         record = AssetDeletion(asset_id=asset.id)
         session.add(record)
-    return asset, node, record
+    return asset, node, record, node_ids
 
 
 def register_routes(app, dependencies, db, settings):
@@ -329,25 +402,53 @@ def register_routes(app, dependencies, db, settings):
                      .where(Asset.state == "ARCHIVED")
                      .order_by(AssetDeletion.archived_at.desc().nulls_last(), Asset.created_at.desc(), Asset.id))
             rows = []
+            restore_references = {}
             for asset, node, deletion, actor, check, command in session.execute(query):
                 node_error = _node_error(node, settings.heartbeat_timeout_seconds)
                 status = _status(command)
                 blocked = "文件清理状态待核对，请由管理员检查机器上的暂存目录" if _recovery_required(command) else None
                 blocked = blocked or (node_error.message if node_error else None)
+                if node.id not in restore_references:
+                    restore_references[node.id] = _restore_references(session, _machine_node_ids(session, node))
+                restore_error = _restore_error(asset, check, command, restore_references[node.id])
                 rows.append({"id": asset.id, "name": asset.name, "kind": asset.kind, "node_id": node.id,
                              "node_name": node.effective_name, "path": asset.path,
                              "archived_at": deletion.archived_at if deletion else None, "archived_by": actor,
                              "inspection": _command_view(check), "file_deletion": _command_view(command),
                              "requires_new_inspection": _needs_new_inspection(command),
                              "can_purge": blocked is None and status not in FINAL | {"PENDING", "RUNNING"},
-                             "purge_block_reason": blocked})
+                             "purge_block_reason": blocked, "can_restore": restore_error is None,
+                             "restore_block_reason": restore_error.message if restore_error else None})
             return rows
+
+    @app.post("/api/v1/asset-deletions/{asset_id}/restore", dependencies=dependencies)
+    def restore(asset_id: str, body: RestoreInput, request: Request):
+        with db.write() as session:
+            require_active_actor(session, request, PERMISSION)
+            if request_user_id(request) is None:
+                raise APIError(403, "ASSET_RESTORE_ADMIN_SESSION_REQUIRED", "请使用管理员账户登录后恢复资产登记")
+            asset, _, record, node_ids = _load(session, asset_id, lock_machine=True)
+            if record.archived_at != body.expected_archived_at:
+                raise APIError(409, "ASSET_RESTORE_ARCHIVE_CHANGED", "删除记录已变化，请刷新台账后再恢复")
+            inspection = session.get(Command, record.inspection_command_id) if record.inspection_command_id else None
+            purge = session.get(Command, record.purge_command_id) if record.purge_command_id else None
+            if error := _restore_error(asset, inspection, purge, _restore_references(session, node_ids)):
+                raise error
+            for command in (inspection, purge):
+                if command is not None and command.status == "PENDING":
+                    _reject(command, {"code": RESTORE_CANCELLED, "message": "资产登记已恢复，此操作已取消"})
+            asset.state = _restored_state(asset, record)
+            if record in session.new:
+                session.expunge(record)
+            else:
+                session.delete(record)
+            return asset_dict(asset)
 
     @app.post("/api/v1/assets/{asset_id}/purge-inspections", dependencies=dependencies, status_code=202)
     def inspect_files(asset_id: str, request: Request):
         with db.write() as session:
             require_active_actor(session, request, PERMISSION)
-            asset, node, record = _load(session, asset_id)
+            asset, node, record, _ = _load(session, asset_id)
             purge = session.get(Command, record.purge_command_id) if record.purge_command_id else None
             if purge is not None and not _needs_new_inspection(purge):
                 raise APIError(409, "ASSET_PURGE_ALREADY_CONFIRMED", "文件删除已确认，重试会使用原文件检查记录")
@@ -369,7 +470,7 @@ def register_routes(app, dependencies, db, settings):
             require_active_actor(session, request, PERMISSION)
             if request_user_id(request) is None:
                 raise APIError(403, "ASSET_PURGE_ADMIN_SESSION_REQUIRED", "请使用管理员账户登录后删除机器文件")
-            asset, node, record = _load(session, asset_id)
+            asset, node, record, _ = _load(session, asset_id)
             if body.confirm_path != asset.path:
                 raise APIError(422, "ASSET_PURGE_CONFIRMATION_MISMATCH", "输入的路径与待删除资产的完整路径不一致")
             if body.inspection_id != record.inspection_command_id:

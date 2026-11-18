@@ -61,6 +61,7 @@ try {
     );
     assert.equal(paths.length, 1);
     assert.match(paths[0], /^\/api\/v1\/background-tasks\?/);
+    assert.equal(new URL(paths[0], 'https://example.test').searchParams.get('view'), 'summary');
   });
 
   await test('only a missing pagination endpoint loads both legacy sources and keeps fixed twenty-row pages', async () => {
@@ -71,7 +72,7 @@ try {
       assert.equal(options.signal, controller.signal);
       if (path.startsWith('/api/v1/background-tasks?'))
         return jsonResponse({ detail: 'Not Found' }, 404);
-      if (path === '/api/v1/runs') return jsonResponse(runs);
+      if (path === '/api/v1/runs?view=summary') return jsonResponse(runs);
       if (path === '/api/v1/asset-transfers?limit=200') return jsonResponse(transfers);
       throw new Error(`Unexpected path: ${path}`);
     };
@@ -80,7 +81,10 @@ try {
       nodes,
       controller.signal,
     );
-    assert.deepEqual(paths.slice(1).sort(), ['/api/v1/asset-transfers?limit=200', '/api/v1/runs']);
+    assert.deepEqual(paths.slice(1).sort(), [
+      '/api/v1/asset-transfers?limit=200',
+      '/api/v1/runs?view=summary',
+    ]);
     assert.equal(result.items.length, 20);
     assert.equal(result.total, 23);
     assert.equal(result.total_all, 23);
@@ -147,6 +151,42 @@ try {
     assert.deepEqual(empty.items, []);
   });
 
+  await test('machine scope accepts server proof and legacy fallback only fetches training', async () => {
+    const request = { ...initialBackgroundTaskQuery, nodeId: 'source', type: 'training' };
+    const matched = { kind: 'training', key: 'training:run-1', item: runs[1] };
+    const page = {
+      items: [matched],
+      node_id: 'source',
+      total: 1,
+      total_all: 1,
+      page: 1,
+      page_size: 20,
+      total_pages: 1,
+    };
+    for (const mode of ['scoped', 'unscoped', 'missing']) {
+      const paths = [];
+      globalThis.fetch = async (path) => {
+        paths.push(path);
+        if (path.startsWith('/api/v1/background-tasks?')) {
+          assert.equal(new URL(path, 'https://example.test').searchParams.get('node_id'), 'source');
+          if (mode === 'scoped') return jsonResponse(page);
+          if (mode === 'missing') return jsonResponse({}, 404);
+          return jsonResponse({ ...page, node_id: undefined });
+        }
+        assert.equal(path, '/api/v1/runs?view=summary');
+        return jsonResponse([...runs, { ...runs[0], id: 'other', node_id: 'target' }]);
+      };
+      const result = await fetchBackgroundTaskPage(request, nodes);
+      assert.equal(result.node_id, 'source');
+      assert.ok(
+        result.items.every(({ kind, item }) => kind === 'training' && item.node_id === 'source'),
+      );
+      assert.equal(paths.length, mode === 'scoped' ? 1 : 2);
+      if (mode === 'scoped') assert.deepEqual(result, page);
+      else assert.equal(result.total_all, 21);
+    }
+  });
+
   await test('permission, server and network failures remain errors without any legacy requests', async () => {
     for (const status of [403, 500]) {
       const paths = [];
@@ -177,7 +217,7 @@ try {
     globalThis.fetch = async (path) => {
       paths.push(path);
       if (path.startsWith('/api/v1/background-tasks?')) return jsonResponse({}, 404);
-      if (path === '/api/v1/runs')
+      if (path === '/api/v1/runs?view=summary')
         return jsonResponse(
           { error: { code: 'READ_FAILED', message: 'training source unavailable' } },
           500,

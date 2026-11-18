@@ -1,4 +1,5 @@
 import type { DatasetProfile } from './DatasetProfileForm';
+import type { NetworkMetrics, NetworkProcessReport } from './resourceHistoryData';
 
 export type JsonObject = Record<string, unknown>;
 export interface GpuReservation {
@@ -40,11 +41,16 @@ export interface Node {
   } | null;
   status: string;
   last_seen?: string | null;
+  asset_count?: number;
+  profile_count?: number;
   roots?: string[];
   output_root?: string;
   cache_root?: string | null;
   gpus?: Gpu[];
-  metrics?: JsonObject;
+  metrics?: JsonObject & {
+    network?: NetworkMetrics | null;
+    network_processes?: NetworkProcessReport;
+  };
 }
 export interface DatasetSourceValidation {
   id?: string | null;
@@ -60,6 +66,12 @@ export interface DatasetSourceValidation {
   source_fingerprint?: unknown;
   timestamp_contract?: { status?: string; checked_rows?: number } | null;
 }
+export interface StageAnnotationSource {
+  run_id: string;
+  run_name: string;
+  attempt_id: string;
+  step: number;
+}
 export interface Asset {
   id: string;
   registered_by_user_id?: string | null;
@@ -74,6 +86,8 @@ export interface Asset {
   norm_asset_id?: string | null;
   origin_attempt_id?: string | null;
   origin_run_id?: string | null;
+  stage_annotation_source?: StageAnnotationSource;
+  value_annotation_source?: StageAnnotationSource;
   created_at?: string;
   validation?: DatasetSourceValidation | null;
 }
@@ -439,12 +453,18 @@ export interface Template {
   runtime_adapter?: string;
   stages?: TrainingStageSpec[];
 }
-export type TrainingStage = 'value' | 'stage_progress' | 'offline_rl';
+export type TrainingStage =
+  | 'value'
+  | 'value_annotation'
+  | 'stage_progress'
+  | 'stage_annotation'
+  | 'offline_rl';
 export type TrainingNormalizationMethod = 'minmax' | 'quantile' | 'zscore';
 export interface TrainingStageSpec {
   id: TrainingStage;
   name: string;
   description: string;
+  backend?: 'jax' | 'pytorch';
   parameters?: Record<string, ParameterSpec | number> | ParameterSpec[];
   required_inputs?: string[] | Record<string, unknown>;
   default_entrypoint?: string;
@@ -544,7 +564,7 @@ export interface Attempt {
   gpu_uuids?: string[];
   latest_metrics?: JsonObject;
   resources?: JsonObject;
-  code_changed_during_run?: boolean;
+  code_changed_during_run?: boolean | null;
 }
 export interface Run {
   resume?: boolean;
@@ -581,6 +601,28 @@ export interface Run {
   queue_reason?: string | null;
   error?: { code?: string; message?: string };
 }
+export type RunSummary = Pick<
+  Run,
+  | 'id'
+  | 'name'
+  | 'node_id'
+  | 'profile_id'
+  | 'template_id'
+  | 'owner_user_id'
+  | 'state'
+  | 'created_at'
+  | 'updated_at'
+  | 'gpu_count'
+> & {
+  finished_at?: string | null;
+  parameters?: { steps?: number };
+  attempts?: Pick<
+    Attempt,
+    'id' | 'state' | 'status' | 'code_changed_during_run' | 'latest_metrics'
+  >[];
+  dataset_asset_ids?: string[];
+  resume_candidate?: boolean;
+};
 export interface Overview {
   nodes_online: number;
   nodes_total: number;
@@ -589,6 +631,7 @@ export interface Overview {
   runs_active: number;
   runs_failed: number;
   assets_total: number;
+  active_tasks?: { training: number; sync: number; total: number };
 }
 export interface Alert {
   id?: string;
@@ -669,6 +712,8 @@ export interface Logs {
 }
 export interface NodeDetail extends Node {
   assets?: Asset[];
+  asset_norms?: Asset[];
   profiles?: Profile[];
-  runs?: Run[];
+  runs?: RunSummary[];
+  active_training?: { count: number; profile_ids: string[] };
 }

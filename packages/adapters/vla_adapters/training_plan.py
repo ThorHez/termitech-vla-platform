@@ -21,7 +21,7 @@ if __package__:
     from .automatic_config import normalize_auto_config
     from .generated_config import configuration_snapshot, generated_training_config
     from .image_runtime import image_processing_contract
-    from .composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_action_loss_mask, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
+    from .composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_action_loss_mask, composition_aux_sources, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from .cache_contract import inspect_training_cache
     from .data_processors import processor_identity, validate_processor_instance
     from .dataset_bindings import validate_binding_assets
@@ -31,8 +31,9 @@ if __package__:
     from .submission_validation import (MODE, record_base_validation_failure, require_base_validation_results,
                                         require_cached_dataset_source, submission_evidence)
     from .entrypoints import read_entrypoint, validate_entrypoint
-    from .recap import RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, recap_model_matches, uses_torch_recap
-    from .recap_checkpoint import RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
+    from .recap import (ANNOTATION_STAGES, RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, VALUE_ANNOTATION,
+                        recap_data_stage, recap_model_matches, uses_jax_acp, uses_torch_recap)
+    from .recap_checkpoint import ACP_ORBAX_FORMAT, RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
     from .recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
     from .resume import normalize_resume_source
     from .runtime_options import normalize_normalization_method
@@ -40,7 +41,7 @@ else:
     from automatic_config import normalize_auto_config
     from generated_config import configuration_snapshot, generated_training_config
     from image_runtime import image_processing_contract
-    from composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_action_loss_mask, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
+    from composition_spec import COMPOSABLE_PROCESSOR, KAI0_PAD32_MODEL_TRANSFORM, SLOTS, composition_action_loss_mask, composition_aux_sources, composition_digest, normalize_composition, validate_composition_profile_input, verify_composition_metadata
     from cache_contract import inspect_training_cache
     from data_processors import processor_identity, validate_processor_instance
     from dataset_bindings import validate_binding_assets
@@ -50,8 +51,9 @@ else:
     from submission_validation import (MODE, record_base_validation_failure, require_base_validation_results,
                                        require_cached_dataset_source, submission_evidence)
     from entrypoints import read_entrypoint, validate_entrypoint
-    from recap import RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, recap_model_matches, uses_torch_recap
-    from recap_checkpoint import RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
+    from recap import (ANNOTATION_STAGES, RECAP_SUPERVISION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, VALUE_ANNOTATION,
+                       recap_data_stage, recap_model_matches, uses_jax_acp, uses_torch_recap)
+    from recap_checkpoint import ACP_ORBAX_FORMAT, RECAP_TORCH_COMMIT, RECAP_TORCH_FORMAT, recap_commit_matches, recap_weight_file, safetensors_header
     from recap_runtime import default_entrypoint, inspect_stage, stage_request, validate_stage_entrypoint
     from resume import normalize_resume_source
     from runtime_options import normalize_normalization_method
@@ -146,6 +148,12 @@ def training_entrypoint(config, spec):
     if multi and entry == (code / "scripts/train.py").resolve():
         raise ValueError("ENTRYPOINT_RECIPE_MISMATCH: 此配方包含多个数据集，请选择 scripts/train_multi_dataset.py 或兼容的混采入口")
     tree = ast.parse(read_entrypoint(entry))
+    if uses_torch_recap(spec) and spec.get("training_stage") == STAGE_PROGRESS and not any(
+            isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+                and target.id == "PLATFORM_STAGE_PROGRESS_TRAIN_ONLY_VERSION" for target in node.targets)
+            and isinstance(node.value, ast.Constant) and type(node.value.value) is int and node.value.value == 1
+            for node in tree.body):
+        raise ValueError("RECAP_STAGE_RUNTIME_UNAVAILABLE: 请更新训练代码到独立的阶段进度估计器训练入口")
     if spec.get("resume_source") is not None and (entry != code / "scripts/train.py" or not any(
             isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
                 and target.id == "PLATFORM_CHECKPOINT_RESUME_VERSION" for target in node.targets)
@@ -166,6 +174,11 @@ def training_entrypoint(config, spec):
             or len(positional) - len(arguments.defaults) > 1
             or any(default is None for default in arguments.kw_defaults)):
         raise ValueError("ENTRYPOINT_UNSUPPORTED: main 必须能接收一个 config 位置参数，且不能要求其他必填参数")
+    stage = spec.get("training_stage")
+    if stage in ANNOTATION_STAGES and arguments.kwarg is None:
+        keywords = {"output_dir", "n_step", "positive_ratio"} if stage == VALUE_ANNOTATION else {"output_dir"}
+        if not keywords <= {argument.arg for argument in arguments.args + arguments.kwonlyargs}:
+            raise ValueError("ENTRYPOINT_UNSUPPORTED: ReCap 标注入口需要支持数据输出和优势标注参数")
     return entry
 
 
@@ -177,14 +190,14 @@ def registered_task_features(path, info, spec, registered_profile, *, selected_c
         composition = normalize_composition(selected_composition)
         declared = [*declared, composition["prompt_key"]]
         claimed = {row["key"] for row in composition["state_fields"] + composition["cameras"]}
-        claimed.update([composition["action_key"], *composition["aux_keys"]])
+        claimed.update([composition["action_key"], *composition_aux_sources(composition).values()])
         automatic_task = not composition["prompt_key"] and not any(
             key == "task" or key.startswith("task/") for key in claimed)
     elif isinstance(registered_profile, dict) and isinstance(registered_profile.get("processing"), dict):
         composition = normalize_composition(registered_profile["processing"])
         declared = [*declared, composition["prompt_key"]]
         claimed = {row["key"] for row in composition["state_fields"] + composition["cameras"]}
-        claimed.update([composition["action_key"], *composition["aux_keys"]])
+        claimed.update([composition["action_key"], *composition_aux_sources(composition).values()])
         automatic_task = not composition["prompt_key"] and not any(
             key == "task" or key.startswith("task/") for key in claimed)
     task_declared = "task" in declared
@@ -281,7 +294,7 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
                 composition["state_history"] * sum(field["width"] for field in composition["state_fields"]) > action_dim):
             raise ValueError("COMPOSITION_MODEL_UNSUPPORTED: Pi0 展平状态宽度超过模型 action_dim，禁止截断")
         stage, _ = stage_request(spec)
-        stage = stage or "sft"
+        stage = recap_data_stage(stage) or "sft"
         if getattr(factory, "training_stage", None) != stage or not recap_model_matches(stage, model_type):
             raise ValueError("COMPOSITION_STAGE_UNSUPPORTED: 组合处理的模型/阶段与任务不一致")
         required_aux = RECAP_SUPERVISION.get(stage)
@@ -303,6 +316,8 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
             "acp_dropout": float(getattr(factory, "acp_dropout", .1)),
             "image_keys": image_keys, "depth_keys": depth_keys,
             "action_sequence_keys": [action_key] if len(actions) == 1 else [], "action_metadata_sha256": metadata_sha}
+        if stage == STAGE_PROGRESS and "stage_progress_key" in composition:
+            expected_runtime["stage_progress_key"] = composition["stage_progress_key"]
         if not isinstance(runtime, dict) or fingerprint(runtime) != fingerprint(expected_runtime):
             raise ValueError("COMPOSITION_RUNTIME_MISMATCH: 组合处理预检的模型/动作采样或元信息与登记证据不一致，请重新预检")
         source = next((Path(spec["code_dir"]) / relative for relative in
@@ -642,29 +657,72 @@ def _torch_recap_model_contract(checkpoint, spec, model_config):
             or (state is not None if model_config.pi05 else state != action_in)):
         raise ValueError("MODEL_FORMAT: PyTorch 检查点的 Pi0/Pi0.5 结构或 action_dim 与本次配置不匹配")
     stage = spec["training_stage"]
+    checkpoint_stage = recap_data_stage(stage)
     roles = set()
     if any(name.startswith("value_head.") for name in tensors):
         roles.add(STAGE_PROGRESS)
     if any(name.startswith(("value_fc1.", "value_fc2.", "final_norm.")) for name in tensors):
         roles.add("value")
-    if roles - {stage}:
+    if roles - {checkpoint_stage}:
         raise ValueError("MODEL_FORMAT: 所选 PyTorch 权重的估计器类型与本次 ReCap 阶段不匹配")
+    if stage in ANNOTATION_STAGES and checkpoint_stage == STAGE_PROGRESS:
+        width = action_in[0]
+        head_shapes = {"0.weight": [width, width], "0.bias": [width], "2.weight": [width, width],
+                       "2.bias": [width], "4.weight": [1, width], "4.bias": [1]}
+        if any(tensors.get("value_head." + key, {}).get("shape") != shape for key, shape in head_shapes.items()):
+            raise ValueError("MODEL_FORMAT: Stage Advantage 优势标注需要具有完整进度估计头的已训练检查点")
+    if stage == VALUE_ANNOTATION:
+        weights_shape = tensors.get("value_fc1.weight", {}).get("shape", [])
+        width = weights_shape[0] if weights_shape else 0
+        bins = getattr(model_config, "num_value_bins", None)
+        head_shapes = {"final_norm.weight": [width], "final_norm.bias": [width], "value_fc1.weight": [width, width],
+                       "value_fc1.bias": [width], "value_fc2.weight": [bins, width], "value_fc2.bias": [bins]}
+        if not width or type(bins) is not int or bins < 2 or any(
+                tensors.get(key, {}).get("shape") != shape for key, shape in head_shapes.items()):
+            raise ValueError("MODEL_FORMAT: 价值优势标注需要包含匹配的价值估计头的已训练检查点")
     if any(name.startswith("gripper_binary_head.") for name in tensors) and type(model_config).__name__ != "Pi0GripperConfig":
         raise ValueError("MODEL_FORMAT: 所选 PyTorch 权重包含二值夹爪头，请选择对应的 Pi0GripperConfig 配方")
     metadata = [{"path": str(weights), "sha256": header_sha, "scope": "safetensors_header"}]
+    scorer = {}
     commit = weights.parent / RECAP_TORCH_COMMIT
     if commit.exists() or commit.is_symlink():
         if commit.is_symlink():
             raise ValueError("MODEL_FORMAT: PyTorch ReCap 检查点记录不能使用符号链接")
         receipt, sha = read_json(commit, spec, limit=64 * 1024)
         step = receipt.get("step")
-        if (type(step) is not int or step < 0 or not recap_commit_matches(receipt, step)
-                or receipt.get("stage") not in (stage, "offline_rl")):
+        if (type(step) is not int or not 0 <= step < 2**53 or not recap_commit_matches(receipt, step)
+                or receipt.get("stage") not in ({checkpoint_stage} if stage in ANNOTATION_STAGES
+                                               else {stage, "offline_rl"})):
             raise ValueError("MODEL_FORMAT: 所选 PyTorch ReCap 检查点记录与本次阶段不匹配")
         metadata.append({"path": str(commit), "sha256": sha})
+        if stage in ANNOTATION_STAGES:
+            scorer["scorer_checkpoint"] = {"stage": checkpoint_stage, "step": step}
+    elif stage in ANNOTATION_STAGES:
+        raise ValueError("MODEL_FORMAT: ReCap 优势标注需要估计器训练的检查点提交记录")
     manifest = fingerprint([weights.name, size, modified, header_sha, metadata[1:]])
     return {"path": str(weights), "checkpoint_path": str(checkpoint), "metadata": metadata,
-            "parameter_bytes": size, "file_manifest_digest": manifest, "format": RECAP_TORCH_FORMAT}, size
+            "parameter_bytes": size, "file_manifest_digest": manifest, "format": RECAP_TORCH_FORMAT, **scorer}, size
+
+
+def _require_orbax_policy(document):
+    tree = document.get("tree_metadata")
+    if not isinstance(tree, dict):
+        raise ValueError("MODEL_FORMAT: ACP 需要可核验的 Orbax 策略权重树")
+    modules = set()
+    for raw_path, leaf in tree.items():
+        keys = leaf.get("key_metadata") if isinstance(leaf, dict) else None
+        if isinstance(keys, list) and all(isinstance(part, dict) and isinstance(part.get("key"), str) for part in keys):
+            path = tuple(part["key"] for part in keys)
+        else:
+            try:
+                path = ast.literal_eval(raw_path) if len(raw_path) < 2048 else None
+            except (ValueError, SyntaxError, RecursionError):
+                path = None
+        if isinstance(path, (tuple, list)) and len(path) > 1 and all(isinstance(part, str) for part in path):
+            modules.add(path[1] if path[0] == "params" else path[0])
+    estimators = {"value_fc1", "value_fc2", "value_head", "stage_progress_fc1", "stage_progress_fc2", "stage_progress_out"}
+    if not {"action_in_proj", "action_out_proj"} <= modules or modules & estimators:
+        raise ValueError("MODEL_FORMAT: ACP 需要 Orbax 动作策略权重，请选择兼容的策略检查点")
 
 
 def model_contract(spec, model_config=None):
@@ -685,15 +743,19 @@ def model_contract(spec, model_config=None):
     if "_METADATA" not in names or not (ocdbt and tensor_data or zarr):
         raise ValueError("MODEL_FORMAT: 模型需要完整的 Orbax params 元数据、数组清单和非空权重分片")
     metadata = []
+    jax_acp = uses_jax_acp(spec)
     for name in ("_METADATA", "_sharding"):
         if (params / name).is_file():
-            _, sha = read_json(params / name, spec)
+            document, sha = read_json(params / name, spec)
+            if jax_acp and name == "_METADATA":
+                _require_orbax_policy(document)
             metadata.append({"path": str(params / name), "sha256": sha})
     total_bytes = parameter_bytes
     if params != checkpoint:
         _, total_bytes, _ = file_manifest(checkpoint, spec)
     return {"path": str(params), "checkpoint_path": str(checkpoint), "metadata": metadata,
-            "parameter_bytes": parameter_bytes, "file_manifest_digest": manifest}, total_bytes
+            "parameter_bytes": parameter_bytes, "file_manifest_digest": manifest,
+            **({"format": ACP_ORBAX_FORMAT, "model_role": "policy"} if jax_acp else {})}, total_bytes
 
 
 def resume_checkpoint_contract(config, spec, model, datasets):
@@ -908,8 +970,12 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
         raise ValueError("INVALID_PATH: 自动预检缺少 Agent 受管目录")
     cache = inspect_training_cache(datasets, spec)
     passed("training_cache", f"数据集缓存可写，已核对 {len(cache['builders'])} 组 parquet builder 文件锁：{cache['datasets_cache']}")
-    storage = storage_estimate(config, model, reference)
-    if stage == STAGE_PROGRESS:
+    if stage in ANNOTATION_STAGES:
+        storage = {"required_bytes": 1024 ** 3, "reference_checkpoint_bytes": reference,
+                   "model_params_bytes": model["parameter_bytes"], "headroom_bytes": 1024 ** 3}
+    else:
+        storage = storage_estimate(config, model, reference)
+    if stage_contract is not None and "annotation" in stage_contract:
         _, dataset_bytes, digest = file_manifest(datasets[0]["path"], spec, max_entries=60000, timeout=15)
         storage["derived_dataset_bytes"] = dataset_bytes + 20 * datasets[0]["frames"]
         storage["required_bytes"] += math.ceil(storage["derived_dataset_bytes"] * 1.1)

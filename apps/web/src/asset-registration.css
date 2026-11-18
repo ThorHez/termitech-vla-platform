@@ -98,12 +98,12 @@
 }
 
 .asset-register-modal .path-autocomplete,
-.asset-register-modal .robot-type-field {
+.asset-register-modal .editable-choice-field {
   position: relative;
 }
 
 .asset-register-modal .path-autocomplete > .path-suggestion-panel,
-.asset-register-modal .robot-type-field > .path-suggestion-panel {
+.asset-register-modal .editable-choice-field > .path-suggestion-panel {
   position: absolute;
   z-index: 10;
   top: 54px;

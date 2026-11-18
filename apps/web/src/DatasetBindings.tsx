@@ -2,6 +2,7 @@ import { ChevronDown, Database, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import { Field } from './components';
+import { EditableChoiceField } from './EditableChoiceField';
 import {
   appendDatasetBinding,
   bindSharedNormalization,
@@ -20,8 +21,12 @@ import { DatasetProcessing, type DatasetProcessingMode } from './DatasetProcessi
 import {
   composedChoice,
   stageCompositionDraft,
+  stageProgressBindingKey,
   trainingProfileSeed,
+  updateStageProgressBinding,
 } from './ComposedDatasetProcessing';
+import { validStageProgressSourceKey } from './composedProcessing';
+import { isRecapAnnotationStage, isStageAdvantageStage } from './recap';
 import {
   createDatasetBindingDisclosure,
   datasetBindingDisclosureReducer,
@@ -51,6 +56,8 @@ export function DatasetBindings({
   assets,
   node,
   profile,
+  sampleCounts: suppliedSampleCounts,
+  datasetLabelIssues,
   onValidityChange,
   managedParameters = {},
   trainingStage = 'sft',
@@ -68,6 +75,8 @@ export function DatasetBindings({
   assets: Asset[];
   node?: Node;
   profile?: Profile;
+  sampleCounts?: ReturnType<typeof useDatasetSampleCounts>;
+  datasetLabelIssues?: ReadonlyMap<string, string>;
   onValidityChange?: (valid: boolean) => void;
   managedParameters?: Record<string, RecipeLiteral>;
   trainingStage?: 'sft' | TrainingStage;
@@ -118,7 +127,9 @@ export function DatasetBindings({
           !['ARCHIVED', 'UNAVAILABLE'].includes(asset.status || asset.state || ''),
       );
   const multipleDatasets = bindings.length > 1;
-  const singleDatasetStage = trainingStage === 'stage_progress';
+  const progressSourceRequired = isStageAdvantageStage(trainingStage);
+  const stageAnnotation = isRecapAnnotationStage(trainingStage);
+  const singleDatasetStage = progressSourceRequired || stageAnnotation;
   const sharedNormId = sharedNormalizationAssetId(bindings);
   const processingChoices = slots.length
     ? slots
@@ -140,15 +151,32 @@ export function DatasetBindings({
     if (readOnly || !showProcessing) return;
     let changed = false;
     const next = bindings.map((binding, index) => {
-      if (binding.processor) return binding;
-      const mode = processingModes[bindingKey(binding, index)];
-      if (mode && mode !== 'composed') return binding;
-      if (!mode && !automatic && !singleDatasetStage && binding.recipe_index !== undefined)
-        return binding;
       const dataset = assets.find(
         (asset) => asset.kind === 'DATASET' && asset.id === binding.dataset_asset_id,
       );
       if (!dataset) return binding;
+      if (
+        binding.processor &&
+        (!progressSourceRequired || binding.processor.name === 'ComposableDataConfig')
+      ) {
+        const composition = binding.processor.parameters.composition;
+        if (
+          progressSourceRequired &&
+          composition &&
+          typeof composition === 'object' &&
+          !Object.hasOwn(composition, 'stage_progress_key') &&
+          !stageProgressBindingKey(binding) &&
+          trainingProfileSeed(dataset).feature_keys?.includes('stage_progress_gt')
+        ) {
+          changed = true;
+          return updateStageProgressBinding(binding, dataset, 'stage_progress_gt');
+        }
+        return binding;
+      }
+      const mode = processingModes[bindingKey(binding, index)];
+      if (!singleDatasetStage && mode && mode !== 'composed') return binding;
+      if (!mode && !automatic && !singleDatasetStage && binding.recipe_index !== undefined)
+        return binding;
       const { recipe_index: _recipe, ...selection } = binding;
       changed = true;
       return {
@@ -204,7 +232,12 @@ export function DatasetBindings({
   useEffect(() => {
     validityRef.current?.(valid);
   }, [valid, onValidityChange]);
-  const sampleCounts = useDatasetSampleCounts(bindings, assets, node);
+  const localSampleCounts = useDatasetSampleCounts(
+    suppliedSampleCounts ? [] : bindings,
+    assets,
+    node,
+  );
+  const sampleCounts = suppliedSampleCounts ?? localSampleCounts;
   const samplingShares = datasetSamplingShares(bindings, sampleCounts.counts);
   const update = (
     index: number,
@@ -216,32 +249,39 @@ export function DatasetBindings({
       <div className="dataset-bindings-heading">
         <div>
           <Database size={16} />
-          <h3>训练数据集</h3>
+          <h3>{stageAnnotation ? '待标注数据集' : '训练数据集'}</h3>
           <span>{bindings.length} 个</span>
         </div>
       </div>
       <p className="field-hint">
-        本次训练只使用这里选择的已登记资产；配方中的目录仅作源码参考。
+        本次{stageAnnotation ? '标注' : '训练'}
+        只使用这里选择的已登记资产；配方中的目录仅作源码参考。
         {multipleDatasets
           ? '各组可以独立选择已登记的归一化参数作为来源参考。训练启动时按全部源数据与本次混采权重计算一份共享 norm_stats。'
           : '选择数据集后自动带出已绑定的归一化参数，也可手动更换。'}
-        {singleDatasetStage
-          ? 'Kai0 阶段进度训练使用一个带 stage_progress_gt 的数据集。'
-          : '新增数据集会复制第 1 组的处理配置与混采权重。选定数据集后会带出该数据集绑定的归一化参数。'}
+        {progressSourceRequired
+          ? 'Stage Advantage 使用一个数据集，需指定逐帧阶段进度所在的列。'
+          : trainingStage === 'offline_rl'
+            ? 'ACP 训练要求每组数据集都包含 is_positive。'
+            : !stageAnnotation &&
+              '新增数据集会复制第 1 组的处理配置与混采权重。选定数据集后会带出该数据集绑定的归一化参数。'}
       </p>
       {singleDatasetStage && bindings.length > 1 && (
         <p className="field-hint" role="alert">
-          请移除多余数据集，只保留一组用于 Kai0 阶段进度训练。
+          当前阶段只使用一组数据，请移除多余数据集。
         </p>
       )}
-      <p className="field-hint">
-        权重占比 = 本组权重 ÷ 总权重；样本数占比 = 本组帧数 ÷ 总帧数；预计采样占比 = 本组帧数 × 权重
-        ÷ 全部加权帧数。预计值适用于标准多数据集采样，实际批次会波动；自定义采样器以训练实现为准。
-        样本数来自当前元信息或最近一次有效登记校验，不乘动作预测长度。
-        <button type="button" className="text-link" onClick={sampleCounts.refresh}>
-          重新读取样本数
-        </button>
-      </p>
+      {!stageAnnotation && (
+        <p className="field-hint">
+          权重占比 = 本组权重 ÷ 总权重；样本数占比 = 本组帧数 ÷ 总帧数；预计采样占比 = 本组帧数 ×
+          权重 ÷
+          全部加权帧数。预计值适用于标准多数据集采样，实际批次会波动；自定义采样器以训练实现为准。
+          样本数来自当前元信息或最近一次有效登记校验，不乘动作预测长度。
+          <button type="button" className="text-link" onClick={sampleCounts.refresh}>
+            {trainingStage === 'offline_rl' ? '重新读取数据集元信息' : '重新读取样本数'}
+          </button>
+        </p>
+      )}
       {multipleDatasets && !readOnly && norms.length > 0 && (
         <div className="form-grid">
           <Field
@@ -275,6 +315,10 @@ export function DatasetBindings({
         const norm = norms.find((asset) => asset.id === binding.norm_asset_id);
         const share = samplingShares[index];
         const sampleCount = sampleCounts.counts[binding.dataset_asset_id];
+        const progressSource = progressSourceRequired ? stageProgressBindingKey(binding) : '';
+        const sourceFeatures = progressSourceRequired
+          ? readDatasetProfile(dataset?.metadata?.dataset_profile)?.feature_keys || []
+          : [];
         const sampleLabel =
           share.sampleCount === undefined
             ? sampleCount?.status === 'loading'
@@ -283,9 +327,12 @@ export function DatasetBindings({
             : `${share.sampleCount.toLocaleString('zh-CN')} 帧`;
         const expanded = disclosure.expanded.includes(index);
         const contentId = `${disclosureId}-dataset-${index}`;
+        const labelIssue = datasetLabelIssues?.get(binding.dataset_asset_id);
         const selectionIssues = [
           !dataset ? '请选择数据集' : '',
+          labelIssue || '',
           !norm ? '请选择归一化参数' : '',
+          progressSourceRequired && dataset && !progressSource.trim() ? '请填写阶段进度列' : '',
           !Number.isFinite(binding.weight) || binding.weight <= 0 ? '混采权重需大于 0' : '',
         ].filter(Boolean);
         const validation = automaticValidity[bindingKey(binding, index)];
@@ -351,10 +398,12 @@ export function DatasetBindings({
             <div className="dataset-binding-overview">
               <strong>{dataset ? `${dataset.name} · ${dataset.version}` : '尚未选择数据集'}</strong>
               <span>归一化：{norm ? `${norm.name} · ${norm.version}` : '未选择'}</span>
-              <span>
-                混采权重：{Number.isFinite(binding.weight) ? binding.weight : '未填写'}
-                {' · 权重占比' + samplingPercentText(share.weightPercent, share.weightIssue)}
-              </span>
+              {!stageAnnotation && (
+                <span>
+                  混采权重：{Number.isFinite(binding.weight) ? binding.weight : '未填写'}
+                  {' · 权重占比' + samplingPercentText(share.weightPercent, share.weightIssue)}
+                </span>
+              )}
               <span
                 title={
                   sampleCount?.status === 'ready'
@@ -363,15 +412,20 @@ export function DatasetBindings({
                 }
               >
                 样本数：{sampleLabel}
-                {' · 样本数占比' + samplingPercentText(share.samplePercent, share.sampleIssue)}
+                {!stageAnnotation &&
+                  ' · 样本数占比' + samplingPercentText(share.samplePercent, share.sampleIssue)}
               </span>
-              <span>
-                预计采样占比：{samplingPercentText(share.samplingPercent, share.samplingIssue)}
-                {sampleCount?.message && ` · ${sampleCount.message}`}
-              </span>
+              {!stageAnnotation && (
+                <span>
+                  预计采样占比：{samplingPercentText(share.samplingPercent, share.samplingIssue)}
+                  {sampleCount?.message && ` · ${sampleCount.message}`}
+                </span>
+              )}
               <span>处理方案：{processingLabel}</span>
               <span
                 className={`dataset-binding-status${issues.length ? ' error' : processingPending ? ' pending' : ''}`}
+                id={labelIssue ? `${contentId}-label-issue` : undefined}
+                role={labelIssue ? 'alert' : undefined}
               >
                 {issues.length
                   ? issues.join('；')
@@ -390,14 +444,14 @@ export function DatasetBindings({
             >
               {readOnly ? (
                 <p className="field-hint">
-                  数据集：{dataset?.name || '未选择'} · 归一化：{norm?.name || '未选择'} ·
-                  混采权重：
-                  {binding.weight}
+                  数据集：{dataset?.name || '未选择'} · 归一化：{norm?.name || '未选择'}
+                  {!stageAnnotation && ` · 混采权重：${binding.weight}`}
+                  {progressSourceRequired && ` · 阶段进度列：${progressSource || '未填写'}`}
                 </p>
               ) : (
                 <div className="form-grid">
                   <Field
-                    label={`数据集 ${index + 1}`}
+                    label={stageAnnotation ? '待标注数据集' : `数据集 ${index + 1}`}
                     required
                     hint={
                       dataset?.path ||
@@ -410,6 +464,8 @@ export function DatasetBindings({
                       ref={index === bindings.length - 1 ? lastDatasetSelect : undefined}
                       required
                       value={binding.dataset_asset_id}
+                      aria-invalid={labelIssue ? true : undefined}
+                      aria-describedby={labelIssue ? `${contentId}-label-issue` : undefined}
                       onChange={(event) => {
                         const nextBindings = selectTrainingDatasetBinding(
                           bindings,
@@ -441,6 +497,25 @@ export function DatasetBindings({
                       ))}
                     </select>
                   </Field>
+                  {progressSourceRequired && dataset && (
+                    <EditableChoiceField
+                      key={dataset.id}
+                      label="阶段进度列"
+                      hint="展开可查看已登记的候选列，也可手填实际列名。逐帧进度须为 0 到 1 的标量。"
+                      choices={sourceFeatures.filter(validStageProgressSourceKey)}
+                      value={progressSource}
+                      placeholder="例如 stage_progress_gt"
+                      invalid={
+                        !!progressSource.trim() && !validStageProgressSourceKey(progressSource)
+                      }
+                      onChange={(name) => {
+                        const updated = updateStageProgressBinding(binding, dataset, name);
+                        onChange(
+                          bindings.map((row, position) => (position === index ? updated : row)),
+                        );
+                      }}
+                    />
+                  )}
                   <Field
                     label={`${multipleDatasets ? '归一化参数参考' : '归一化参数'} ${index + 1}`}
                     required
@@ -473,29 +548,31 @@ export function DatasetBindings({
                       ))}
                     </select>
                   </Field>
-                  <Field
-                    label={`混采权重 ${index + 1}`}
-                    required
-                    hint={
-                      '每条样本的重复权重；实际来源占比还取决于样本数。' +
-                      `当前权重占比${samplingPercentText(share.weightPercent, share.weightIssue)}；` +
-                      `样本数 ${sampleLabel}，样本数占比${samplingPercentText(share.samplePercent, share.sampleIssue)}；` +
-                      `预计采样占比${samplingPercentText(share.samplingPercent, share.samplingIssue)}。`
-                    }
-                  >
-                    <input
-                      type="number"
+                  {!stageAnnotation && (
+                    <Field
+                      label={`混采权重 ${index + 1}`}
                       required
-                      min={0.000000000001}
-                      step="any"
-                      value={Number.isFinite(binding.weight) ? binding.weight : ''}
-                      onChange={(event) =>
-                        update(index, {
-                          weight: event.target.value === '' ? NaN : Number(event.target.value),
-                        })
+                      hint={
+                        '每条样本的重复权重；实际来源占比还取决于样本数。' +
+                        `当前权重占比${samplingPercentText(share.weightPercent, share.weightIssue)}；` +
+                        `样本数 ${sampleLabel}，样本数占比${samplingPercentText(share.samplePercent, share.sampleIssue)}；` +
+                        `预计采样占比${samplingPercentText(share.samplingPercent, share.samplingIssue)}。`
                       }
-                    />
-                  </Field>
+                    >
+                      <input
+                        type="number"
+                        required
+                        min={0.000000000001}
+                        step="any"
+                        value={Number.isFinite(binding.weight) ? binding.weight : ''}
+                        onChange={(event) =>
+                          update(index, {
+                            weight: event.target.value === '' ? NaN : Number(event.target.value),
+                          })
+                        }
+                      />
+                    </Field>
+                  )}
                 </div>
               )}
               {showProcessing && (

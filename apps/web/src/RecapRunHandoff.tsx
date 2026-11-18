@@ -6,6 +6,15 @@ import { CopyButton, ErrorNotice, Field, Modal, Panel } from './components';
 import { useData } from './data';
 import { RegisterAsset } from './pages';
 import {
+  isStageAdvantageDataset,
+  isStageAdvantageStage,
+  isValueAnnotationDataset,
+  stageAnnotationCheckpointLabel,
+  stageAnnotationSource,
+} from './recap';
+import { stageAdvantageCheckpoints } from './stageAdvantageHandoff';
+import type { RecapCheckpointHandoff } from './recapValueAnnotationHandoff';
+import {
   recapAnnotationCommand,
   recapAnnotationInputs,
   recapValueCheckpoints,
@@ -48,20 +57,24 @@ function acpSourceRows(run: Run, assets: Asset[]) {
 export function RecapRunHandoff({
   run,
   onAcp,
+  onStageHandoff,
 }: {
   run: Run;
   onAcp?: (run: Run, dataset: Asset) => void;
+  onStageHandoff?: (run: Run, handoff: RecapCheckpointHandoff) => void;
 }) {
   const { assets, runs, templates } = useData();
   const { can } = useAuth();
   const [showAnnotation, setShowAnnotation] = useState(false);
+  const [checkpointId, setCheckpointId] = useState('');
+  const [sourceIndex, setSourceIndex] = useState<number>();
   const stage = stageOf(run);
-  const finishedKai0 =
-    run.template_id === 'recap' && stage === 'stage_progress' && run.state === 'SUCCEEDED';
+  const finishedRecapStage =
+    run.template_id === 'recap' && stage !== 'offline_rl' && run.state === 'SUCCEEDED';
   const refreshAssets = assets.refresh;
   useEffect(() => {
-    if (finishedKai0) refreshAssets();
-  }, [finishedKai0, refreshAssets]);
+    if (finishedRecapStage) refreshAssets();
+  }, [finishedRecapStage, refreshAssets]);
   if (run.template_id !== 'recap') return null;
   const catalog = assets.data || [];
   if (stage === 'offline_rl') {
@@ -70,7 +83,7 @@ export function RecapRunHandoff({
         valueRunId(dataset) ||
         dataset.origin_run_id ||
         (dataset.origin_attempt_id &&
-        dataset.metadata?.registration_source === 'recap_stage_progress'
+        (isStageAdvantageDataset(dataset) || isValueAnnotationDataset(dataset))
           ? runs.data?.find((candidate) =>
               candidate.attempts?.some((attempt) => attempt.id === dataset.origin_attempt_id),
             )?.id
@@ -87,7 +100,11 @@ export function RecapRunHandoff({
                 {dataset.name} · {dataset.version}
               </span>
               <a className="text-link" href={`#/runs/${encodeURIComponent(origin)}`}>
-                查看上游训练作业
+                查看
+                {dataset.metadata?.registration_source === 'recap_stage_annotation' ||
+                isValueAnnotationDataset(dataset)
+                  ? '上游标注作业'
+                  : '上游训练作业'}
               </a>
             </div>
           ))}
@@ -95,17 +112,23 @@ export function RecapRunHandoff({
       </Panel>
     );
   }
-  if (run.state !== 'SUCCEEDED' || (stage !== 'value' && stage !== 'stage_progress')) return null;
+  if (
+    run.state !== 'SUCCEEDED' ||
+    (stage !== 'value' && stage !== 'value_annotation' && !isStageAdvantageStage(stage))
+  )
+    return null;
 
+  const recapTemplate = templates.data?.find(
+    ({ id, status }) => id === 'recap' && status === 'AVAILABLE',
+  );
   const canStartAcp =
     can('training.write') &&
     !!onAcp &&
-    templates.data?.some(
-      (template) =>
-        template.id === 'recap' &&
-        template.status === 'AVAILABLE' &&
-        template.stages?.some(({ id }) => id === 'offline_rl'),
-    );
+    recapTemplate?.stages?.some(({ id }) => id === 'offline_rl');
+  const canConfigureStage =
+    can('training.write') &&
+    !!onStageHandoff &&
+    recapTemplate?.stages?.some(({ id }) => id === 'stage_annotation');
   const successfulAttempts = new Set(
     run.attempts
       ?.filter((attempt) => (attempt.state ?? attempt.status) === 'SUCCEEDED')
@@ -127,60 +150,185 @@ export function RecapRunHandoff({
             available(asset) &&
             !!asset.origin_attempt_id &&
             successfulAttempts.has(asset.origin_attempt_id) &&
-            asset.metadata?.registration_source === 'recap_stage_progress',
+            (stage === 'value_annotation'
+              ? isValueAnnotationDataset(asset)
+              : isStageAdvantageDataset(asset)),
         );
   const hasCheckpoint = stage === 'value' && recapValueCheckpoints(run).length > 0;
-  if (!hasCheckpoint && !annotated.length) return null;
+  const checkpoints = canConfigureStage ? stageAdvantageCheckpoints(run) : [];
+  const catalogCheckpoint = (checkpoint: Asset) =>
+    catalog.find((asset) => asset.id === checkpoint.id && asset.node_id === run.node_id);
+  const stageCheckpoint = checkpoints.find(({ id }) => id === checkpointId) ?? checkpoints[0];
+  const selectedCatalogCheckpoint = stageCheckpoint && catalogCheckpoint(stageCheckpoint);
+  const stageCheckpointAvailable =
+    selectedCatalogCheckpoint && available(selectedCatalogCheckpoint);
+  const annotationCheckpointAvailable =
+    stageAnnotationSource(selectedCatalogCheckpoint)?.run_id === run.id;
+  const canConfigureValue =
+    stage === 'value' &&
+    can('training.write') &&
+    !!onStageHandoff &&
+    recapTemplate?.stages?.some(({ id }) => id === 'value_annotation');
+  const valueCheckpoints = canConfigureValue
+    ? recapValueCheckpoints(run).flatMap((checkpoint) => {
+        const selected = catalogCheckpoint(checkpoint);
+        return selected && stageAnnotationSource(selected, 'value_annotation')?.run_id === run.id
+          ? [selected]
+          : [];
+      })
+    : [];
+  const valueSources = valueCheckpoints.length ? recapAnnotationInputs(run, catalog) : [];
+  const valueCheckpoint =
+    valueCheckpoints.find(({ id }) => id === checkpointId) ?? valueCheckpoints[0];
+  const valueSource = valueSources.find(({ index }) => index === sourceIndex) ?? valueSources[0];
+  if (!hasCheckpoint && !annotated.length && !stageCheckpoint) return null;
 
   return (
-    <Panel
-      title={stage === 'value' ? '下一步：优势值标注' : '下一步：ACP 训练'}
-      subtitle={
-        stage === 'value'
-          ? '使用本次 Value 检查点标注数据，登记并关联派生数据后即可配置 ACP。'
-          : '本次 Kai0 作业生成的标注数据可直接带入 ACP。'
-      }
-      className="recap-handoff-panel"
-      action={
-        hasCheckpoint && (
-          <button
-            type="button"
-            className="button outline small"
-            onClick={() => setShowAnnotation(true)}
-          >
-            配置优势值标注
-            <ArrowRight size={14} />
-          </button>
-        )
-      }
-    >
-      {annotated.length > 0 && (
-        <div className="recap-handoff-rows">
-          {annotated.map((dataset) => (
-            <div className="recap-handoff-row" key={dataset.id}>
-              <Database size={16} aria-hidden="true" />
-              <span>
-                {dataset.name} · {dataset.version}
-              </span>
-              {canStartAcp && onAcp && (
+    <>
+      {stageCheckpoint && onStageHandoff && (
+        <Panel title="阶段进度检查点" className="recap-handoff-panel">
+          <Field label="本次作业的阶段进度检查点">
+            <select
+              value={stageCheckpoint.id}
+              onChange={(event) => setCheckpointId(event.target.value)}
+            >
+              {checkpoints.map((asset) => (
+                <option value={asset.id} key={asset.id}>
+                  {stageAnnotationCheckpointLabel(catalogCheckpoint(asset) ?? asset)}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <div className="recap-handoff-row">
+            <p>从所选权重开始新的训练作业。</p>
+            <button
+              type="button"
+              className="button outline small"
+              disabled={!stageCheckpointAvailable}
+              onClick={() =>
+                onStageHandoff(run, { stage: 'stage_progress', checkpoint: stageCheckpoint })
+              }
+            >
+              用此检查点继续训练
+            </button>
+            <button
+              type="button"
+              className="button primary small"
+              disabled={!annotationCheckpointAvailable}
+              onClick={() =>
+                onStageHandoff(run, { stage: 'stage_annotation', checkpoint: stageCheckpoint })
+              }
+            >
+              配置优势标注
+              <ArrowRight size={14} />
+            </button>
+          </div>
+          {stageCheckpointAvailable && !annotationCheckpointAvailable && (
+            <p className="field-hint">此检查点尚无可用于优势标注的训练来源记录。</p>
+          )}
+        </Panel>
+      )}
+      {(hasCheckpoint || annotated.length > 0) && (
+        <Panel
+          title={stage === 'value' ? '下一步：优势值标注' : '下一步：ACP 训练'}
+          subtitle={
+            stage === 'value'
+              ? valueCheckpoint && valueSource
+                ? '选择一个 Value 检查点和来源数据组，配置平台标注。'
+                : '使用本次 Value 检查点标注并关联派生数据。'
+              : '本次作业生成的标注数据可直接带入 JAX ACP。'
+          }
+          className="recap-handoff-panel"
+          action={
+            hasCheckpoint && (
+              <button
+                type="button"
+                className="button outline small"
+                onClick={() => setShowAnnotation(true)}
+              >
+                {valueCheckpoint && valueSource ? '手动标注与关联' : '配置优势值标注'}
+                <ArrowRight size={14} />
+              </button>
+            )
+          }
+        >
+          {valueCheckpoint && valueSource && onStageHandoff && (
+            <div className="recap-handoff-rows">
+              <div className="form-grid">
+                <Field label="本次作业的 Value 检查点">
+                  <select
+                    value={valueCheckpoint.id}
+                    onChange={(event) => setCheckpointId(event.target.value)}
+                  >
+                    {valueCheckpoints.map((asset) => (
+                      <option key={asset.id} value={asset.id}>
+                        {stageAnnotationCheckpointLabel(asset, 'value_annotation')}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="待标注数据组">
+                  <select
+                    value={valueSource.index}
+                    onChange={(event) => setSourceIndex(Number(event.target.value))}
+                  >
+                    {valueSources.map(({ asset, index }) => (
+                      <option key={index} value={index}>
+                        第 {index + 1} 组 · {asset.name} · {asset.version}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              </div>
+              <div className="recap-handoff-row">
                 <button
                   type="button"
                   className="button primary small"
-                  disabled={!catalog.some((asset) => asset.id === dataset.id && available(asset))}
-                  onClick={() => onAcp(run, dataset)}
+                  onClick={() =>
+                    onStageHandoff(run, {
+                      stage: 'value_annotation',
+                      checkpoint: valueCheckpoint,
+                      sourceIndex: valueSource.index,
+                    })
+                  }
                 >
-                  用此数据配置 ACP
+                  配置优势值标注
                   <ArrowRight size={14} />
                 </button>
-              )}
+              </div>
             </div>
-          ))}
-        </div>
+          )}
+          {annotated.length > 0 && (
+            <div className="recap-handoff-rows">
+              {annotated.map((dataset) => (
+                <div className="recap-handoff-row" key={dataset.id}>
+                  <Database size={16} aria-hidden="true" />
+                  <span>
+                    {dataset.name} · {dataset.version}
+                  </span>
+                  {canStartAcp && onAcp && (
+                    <button
+                      type="button"
+                      className="button primary small"
+                      disabled={
+                        !catalog.some((asset) => asset.id === dataset.id && available(asset))
+                      }
+                      onClick={() => onAcp(run, dataset)}
+                    >
+                      用此数据配置 ACP
+                      <ArrowRight size={14} />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {showAnnotation && hasCheckpoint && (
+            <RecapAnnotationDialog run={run} close={() => setShowAnnotation(false)} />
+          )}
+        </Panel>
       )}
-      {showAnnotation && hasCheckpoint && (
-        <RecapAnnotationDialog run={run} close={() => setShowAnnotation(false)} />
-      )}
-    </Panel>
+    </>
   );
 }
 

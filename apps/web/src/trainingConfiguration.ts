@@ -17,7 +17,7 @@ export const DEFAULT_AUTO_CONFIG: AutoTrainingConfig = {
 
 export const STATE_TOKEN_LAYOUT_LABELS: Record<StateTokenLayout, string> = {
   flat_state: '展平实际状态（默认）',
-  kai0_pad32: 'Kai0 兼容（32 维状态）',
+  kai0_pad32: '补齐到 32 维',
 };
 
 export function isStateTokenLayout(value: unknown): value is StateTokenLayout {
@@ -29,18 +29,26 @@ type StateTokenRequest = Pick<
   'template_id' | 'auto_config' | 'dataset_bindings' | 'training_stage'
 >;
 
-export function supportsStateTokenLayout(request: StateTokenRequest): boolean {
+export function showsStateTokenLayout(request: StateTokenRequest): boolean {
   return (
     request.template_id === 'openpi-sft' &&
     (request.training_stage === undefined || String(request.training_stage) === 'sft') &&
-    request.auto_config?.model_type === 'pi05' &&
+    request.auto_config?.model_type === 'pi05'
+  );
+}
+
+export function supportsStateTokenLayout(request: StateTokenRequest): boolean {
+  return (
+    showsStateTokenLayout(request) &&
     !!request.dataset_bindings?.length &&
     request.dataset_bindings.every((binding) => binding.processor?.name === 'ComposableDataConfig')
   );
 }
 
 export function kai0StateTokenLayoutError(request: StateTokenRequest): string | undefined {
-  if (request.auto_config?.action_dim !== 32) return 'Kai0 兼容要求模型动作维度为 32。';
+  if (!supportsStateTokenLayout(request))
+    return '补齐到 32 维要求每组数据的「数据处理方式」选择「自定义字段组合」。';
+  if (request.auto_config?.action_dim !== 32) return '补齐到 32 维要求模型动作维度为 32。';
   if (
     request.dataset_bindings?.some((binding) => {
       const composition = binding.processor?.parameters.composition;
@@ -57,7 +65,7 @@ export function kai0StateTokenLayoutError(request: StateTokenRequest): string | 
       );
     })
   )
-    return 'Kai0 兼容要求每组数据使用单帧、14 维状态。';
+    return '补齐到 32 维要求每组数据使用单帧、14 维状态。';
 }
 
 export function withoutStateTokenLayout(config: AutoTrainingConfig): AutoTrainingConfig {

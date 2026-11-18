@@ -161,13 +161,13 @@
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
-.dataset-profile-form.compact .robot-type-field > .field-hint:empty {
+.dataset-profile-form.compact .editable-choice-field > .field-hint:empty {
   display: none;
 }
 
 .dataset-profile-form.compact .field > input,
 .dataset-profile-form.compact .field select,
-.dataset-profile-form.compact .robot-type-control input {
+.dataset-profile-form.compact .editable-choice-control input {
   height: 34px;
   font-size: 11px;
 }

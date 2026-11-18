@@ -162,6 +162,7 @@ def generated_training_config(config, spec, *, entrypoint=None):
     output_root = str(Path(spec["output_dir"]).resolve())
     family = _recipe_family(spec, entrypoint)
     value_family = family == "value" or family == "recap_pytorch" and spec.get("training_stage") == "value"
+    progress_training = family == "recap_pytorch" and spec.get("training_stage") == "stage_progress"
     parameters = spec.get("parameters") or {}
     root_explicit = {"steps": "num_train_steps", "learning_rate": "lr_schedule", "warmup_steps": "lr_schedule",
                      "decay_steps": "lr_schedule", "decay_lr": "lr_schedule", "clip_gradient_norm": "optimizer"}
@@ -186,7 +187,7 @@ def generated_training_config(config, spec, *, entrypoint=None):
                 if known_root and not required and family != "custom":
                     if field.name in _VALUE_FIELDS and not value_family:
                         continue
-                    if field.name in _EVAL_FIELDS and not value_family and family != "mem":
+                    if field.name in _EVAL_FIELDS and not (value_family or progress_training or family == "mem"):
                         continue
                     if field.name in _PYTORCH_FIELDS and family not in {"pytorch", "recap_pytorch"}:
                         continue
@@ -197,8 +198,11 @@ def generated_training_config(config, spec, *, entrypoint=None):
                 pinned |= field.name in explicit_fields or field.name in {"name", "model", "data", "weight_loader", "optimizer", "lr_schedule"}
             if path == ("model",):
                 pinned |= field.name in {"pi05", "action_dim", "action_horizon"}
-                if spec.get("training_stage") == "stage_progress":
-                    pinned |= field.name in {"n_step", "positive_ratio", "stage_count"}
+                if spec.get("training_stage") in {"stage_progress", "stage_annotation"}:
+                    if field.name in {"n_step", "positive_ratio", "stage_count"}:
+                        if progress_training:
+                            continue
+                        pinned = True
             if (type(value).__module__ == "openpi.training.config"
                     and type(value).__name__ == "ComposableDataConfig" and family != "custom"):
                 if field.name == "acp_dropout" and not required and value.training_stage != "offline_rl":

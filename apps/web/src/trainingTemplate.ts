@@ -5,7 +5,11 @@ import {
 } from './trainingDraft';
 import type { Asset, JsonObject, Node, Profile } from './types';
 import { requestedGpuError } from './trainingGpuSelection';
-import { recapModelError, withoutLegacyRecapSettings } from './recap';
+import {
+  recapModelError,
+  recapSettingsMigrationMessage,
+  withoutLegacyRecapSettings,
+} from './recap';
 
 export const TRAINING_TEMPLATE_PROCESSING_MARKER = 'training_template.reuse_processing';
 
@@ -47,6 +51,8 @@ const snapshotKeys = new Set([
   'stageRecipeDefaults',
   'stageRecipeInfo',
   'recipeEditorDraft',
+  'recapPhase',
+  'recapPhases',
 ]);
 // These are transient wizard state, never template content or reusable approval.
 const transientKeys = new Set([
@@ -106,6 +112,7 @@ function clearDatasetReferences(snapshot: TrainingDraftSnapshot): TrainingDraftS
 /** Save settings and processor structure; every future run chooses its own data. */
 export function prepareTrainingTemplate(snapshot: TrainingDraftSnapshot): JsonObject {
   const next = clearDatasetReferences(cloneSnapshot(snapshot));
+  delete next.recapPhases;
   if (next.request.template_id === 'recap') {
     next.request = withoutLegacyRecapSettings(next.request);
     next.entrypointEdited = false;
@@ -121,10 +128,11 @@ export function applyTrainingTemplate(
   const decoded = decodeTrainingDraft(record?.content);
   if (!decoded) invalidTemplate();
   const snapshot = clearDatasetReferences(decoded);
+  delete snapshot.recapPhases;
   const issues: string[] = [];
   const request = withoutLegacyRecapSettings(snapshot.request);
   if (request !== snapshot.request) {
-    issues.push('模板已改用 PyTorch ReCap 入口，旧 FSDP 和 EMA 参数不再提交。');
+    issues.push(recapSettingsMigrationMessage(request.training_stage));
     snapshot.request = request;
     snapshot.entrypointEdited = false;
   }
@@ -176,7 +184,13 @@ export function applyTrainingTemplate(
       !model ||
       model.kind !== 'MODEL' ||
       model.node_id !== request.node_id ||
-      (!!modelState && modelState !== 'READY'))
+      (!!modelState &&
+        modelState !== 'READY' &&
+        !(
+          request.template_id === 'recap' &&
+          request.training_stage === 'offline_rl' &&
+          modelState === 'REGISTERED'
+        )))
   ) {
     issues.push('模板中的基础模型已不可用或不属于当前机器，请重新选择；不会自动替换模型。');
     request.inputs = {};

@@ -1,31 +1,19 @@
 """Real rsync receipts are consumed unchanged by controller and target Agent."""
 import dataclasses
-import importlib.util
 import json
-import os
 from pathlib import Path
-import signal
-import subprocess
 import sys
-import time
 from types import ModuleType, SimpleNamespace
 
-import psutil
 import pytest
 
 from vla_adapters.portable_policy import export_portable_policy, portable_digest
 from vla_agent.policy_deployment import _portable
 from vla_agent.safety import AgentError
+from vla_control.checkpoint_transfer_transport import TransferError, transfer_checkpoint
 from vla_control.checkpoint_transfers import _manifest
-from vla_control.checkpoint_transfer_transport import (
-    TransferError, _RECEIVER_SCRIPT, _RELAY_SCRIPT, _python_command, transfer_checkpoint,
-)
 
-
-HELPER = Path(__file__).with_name('test_checkpoint_transfer_transport.py')
-loader = importlib.util.spec_from_file_location('rsync_contract_test_helper', HELPER)
-helper = importlib.util.module_from_spec(loader)
-loader.loader.exec_module(helper)
+from .test_direct_asset_transfer import peers
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,7 +48,7 @@ def portable_configuration(root, monkeypatch):
     return {'config': exported, 'digest': portable_digest(exported)}
 
 
-def test_real_transfer_manifest_controller_and_target_agent_agree(tmp_path, monkeypatch):
+def test_real_transfer_manifest_controller_and_target_agent_agree(tmp_path, monkeypatch, peers):
     source = tmp_path / 'source'
     (source / 'params' / 'd').mkdir(parents=True)
     (source / 'params' / 'd' / 'weights').write_bytes(bytes(range(256)) * 1000)
@@ -69,7 +57,7 @@ def test_real_transfer_manifest_controller_and_target_agent_agree(tmp_path, monk
     (source / '训练信息.json').write_text('{"训练":"折叠衣服"}')
     package = portable_configuration(tmp_path / 'checkout', monkeypatch)
     contents = json.dumps(package, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
-    result = transfer_checkpoint(helper.LocalRemote(), helper.LocalRemote(), str(source), str(tmp_path / 'target'),
+    result = transfer_checkpoint(*peers, str(source), str(tmp_path / 'target'),
         'verified-transfer', [str(tmp_path)], [str(tmp_path)], extra_files={'termitech-policy.json': contents})
     assert _manifest(result['manifest'], package) == result['manifest']
     assert result['manifest_sha256'] == portable_digest(result['manifest'])
@@ -90,66 +78,22 @@ def test_real_transfer_manifest_controller_and_target_agent_agree(tmp_path, monk
     assert 'checksum' in str(failure.value)
 
 
-@pytest.mark.parametrize('termination', [signal.SIGINT, signal.SIGHUP])
-def test_receiver_signal_reaps_rsync_and_private_rsh_processes(tmp_path, termination):
-    import base64
-    target = tmp_path / 'partial'
-    target.mkdir()
-    command = _python_command(_RECEIVER_SCRIPT, {'path': str(target), 'relay': base64.b64encode(_RELAY_SCRIPT.encode()).decode()})
-    wrapper = subprocess.Popen(['/bin/sh', '-c', command], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    owned = []
-    try:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            owned = psutil.Process(wrapper.pid).children(recursive=True)
-            # Wait for both receiver and its real remote-shell helper, proving
-            # that terminating the wrapper must clean the separate child group.
-            if len(owned) >= 2:
-                break
-            time.sleep(.02)
-        assert len(owned) >= 2
-        os.kill(wrapper.pid, termination)
-        wrapper.wait(timeout=7)
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and any(child.is_running() and child.status() != psutil.STATUS_ZOMBIE for child in owned):
-            time.sleep(.02)
-        assert all(not child.is_running() or child.status() == psutil.STATUS_ZOMBIE for child in owned)
-    finally:
-        if wrapper.poll() is None:
-            os.killpg(wrapper.pid, signal.SIGTERM)
-            wrapper.wait(timeout=7)
-        wrapper.stdin.close()
-        wrapper.stdout.close()
-        wrapper.stderr.close()
+def test_cancel_stops_direct_rsync_and_retains_partial_checkpoint(tmp_path, peers):
+    source, target = tmp_path / 'source', tmp_path / 'target'
+    (source / 'params').mkdir(parents=True)
+    (source / 'params' / 'weights').write_bytes(b'weights')
+    (source / 'assets').mkdir()
+    (source / 'assets' / 'norm_stats.json').write_text('{"state":{}}')
+    source_remote, target_remote = peers
+    connection_attempt = tmp_path / 'connection-attempt'
+    target_remote.environment['DIRECT_FAKE_SSH_COUNT'] = str(connection_attempt)
+    target_remote.environment['DIRECT_FAKE_SSH_DELAY'] = '30'
 
-
-def test_cancel_closes_both_ssh_rsync_channels_without_orphans(tmp_path):
-    root, source, target = helper.checkpoint.__wrapped__(tmp_path)
-    source_remote, target_remote = helper.LocalRemote(), helper.LocalRemote()
-    cancelled, owned = False, []
-    def progress(event):
-        nonlocal cancelled, owned
-        if event['stage'] != 'TRANSFERRING' or cancelled:
-            return
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            owned = []
-            for remote in (source_remote, target_remote):
-                process = psutil.Process(remote.channels[-1].process.pid)
-                owned.extend([process, *process.children(recursive=True)])
-            if len(owned) >= 4:
-                break
-            time.sleep(.02)
-        assert len(owned) >= 4  # sender, receiver wrapper, rsync client and rsh
-        cancelled = True
     with pytest.raises(TransferError) as failure:
         transfer_checkpoint(source_remote, target_remote, str(source), str(target), 'cancel-owned',
-            [str(root)], [str(root)], progress=progress, cancelled=lambda:cancelled)
+            [str(tmp_path)], [str(tmp_path)], cancelled=connection_attempt.is_file)
     assert failure.value.code == 'TRANSFER_CANCELLED'
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline and any(child.is_running() and child.status() != psutil.STATUS_ZOMBIE for child in owned):
-        time.sleep(.02)
-    assert all(not child.is_running() or child.status() == psutil.STATUS_ZOMBIE for child in owned)
+    assert all(channel.exit_status_ready() for remote in peers for channel in remote.channels)
+    assert (source_remote.home / '.ssh' / 'authorized_keys').read_bytes() == b''
     assert not (target / 'cancel-owned').exists()
     assert (target / '.cancel-owned.partial').is_dir()

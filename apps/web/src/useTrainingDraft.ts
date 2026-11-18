@@ -335,7 +335,7 @@ export function useTrainingDraft(userId: string, templateId: string) {
     await flushRef.current();
   }, [request, stopTimer]);
   const replace = useCallback(
-    async (snapshot: TrainingDraftSnapshot) => {
+    async (snapshot: TrainingDraftSnapshot, { remount = true } = {}) => {
       const content = encodeScopedTrainingDraft(snapshot, templateId);
       // Save pending edits first; replacement is atomic and respects other devices.
       await flushRef.current();
@@ -358,12 +358,12 @@ export function useTrainingDraft(userId: string, templateId: string) {
         knownServer.current = true;
         snapshotRef.current = restored;
         clearLocal();
-        setInitialSnapshot(restored);
+        if (remount) setInitialSnapshot(restored);
         setHasContent(true);
         setUpdatedAt(result.updated_at || undefined);
         setError(undefined);
         setStatus('saved');
-        setGeneration((value) => value + 1);
+        if (remount) setGeneration((value) => value + 1);
       } catch (cause) {
         if (cause instanceof ApiError && cause.code === 'TRAINING_DRAFT_CONFLICT') {
           conflict.current = true;

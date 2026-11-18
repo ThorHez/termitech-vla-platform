@@ -71,7 +71,7 @@ export function recommendDatasetProcessor(
       contract.evidence !== 'static_repack' ||
       contract.arm_mode !== profile.arm_mode ||
       contract.action_representation !== profile.action_representation ||
-      contract.training_stage !== stage ||
+      contract.training_stage !== (stage === 'value_annotation' ? 'value' : stage) ||
       (modelFamily && contract.model_family && contract.model_family !== modelFamily) ||
       !contract.camera_keys.length ||
       contract.camera_keys.length !== cameraKeys.size ||

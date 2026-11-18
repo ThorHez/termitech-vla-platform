@@ -12,7 +12,7 @@ const server = await createServer({
   appType: 'custom',
 });
 try {
-  const { configurationConfirmed, generatedConfigAvailable, automaticConfigErrors, DEFAULT_AUTO_CONFIG, inferDatasetActionHorizon } = await server.ssrLoadModule('/src/trainingConfiguration.ts');
+  const { configurationConfirmed, generatedConfigAvailable, automaticConfigErrors, DEFAULT_AUTO_CONFIG, inferDatasetActionHorizon, showsStateTokenLayout, supportsStateTokenLayout, kai0StateTokenLayoutError, normalizeAutoConfig } = await server.ssrLoadModule('/src/trainingConfiguration.ts');
   const { GeneratedConfigReview } = await server.ssrLoadModule('/src/GeneratedConfigReview.tsx');
   const { DataProcessorPicker } = await server.ssrLoadModule('/src/DataProcessorPicker.tsx');
   const { DatasetBindings } = await server.ssrLoadModule('/src/DatasetBindings.tsx');
@@ -79,6 +79,26 @@ try {
     assert.deepEqual(automaticConfigErrors({ ...DEFAULT_AUTO_CONFIG, action_horizon: 1000, action_dim: 4096 }), []);
     for (const update of [{ action_horizon: 0 }, { action_horizon: 1001 }, { action_horizon: 1.5 }, { action_dim: 0 }, { action_dim: 4097 }, { action_dim: NaN }, { model_type: 'memory' }, { finetune_mode: 'unknown' }])
       assert.ok(automaticConfigErrors({ ...DEFAULT_AUTO_CONFIG, ...update }).length > 0);
+  });
+
+  await test('automatic Pi0.5 users can discover Kai0 compatibility before choosing field composition', () => {
+    const composed = { processor: { name: 'ComposableDataConfig', parameters: {
+      composition: { state_history: 1, state_fields: [{ width: 14 }] },
+    } } };
+    const other = { processor: { name: 'LerobotAgilexDataConfig', parameters: {} } };
+    const request = { template_id: 'openpi-sft', auto_config: {
+      ...DEFAULT_AUTO_CONFIG, state_token_layout: 'kai0_pad32',
+    }, dataset_bindings: [composed, other] };
+    assert.equal(showsStateTokenLayout(request), true);
+    assert.equal(supportsStateTokenLayout(request), false);
+    assert.match(kai0StateTokenLayoutError(request), /自定义字段组合/);
+    assert.equal(normalizeAutoConfig(request).state_token_layout, undefined);
+    request.dataset_bindings = [composed];
+    assert.equal(supportsStateTokenLayout(request), true);
+    assert.equal(kai0StateTokenLayoutError(request), undefined);
+    assert.equal(normalizeAutoConfig(request).state_token_layout, 'kai0_pad32');
+    assert.equal(showsStateTokenLayout({ ...request, template_id: 'recap' }), false);
+    assert.equal(showsStateTokenLayout({ ...request, auto_config: { ...request.auto_config, model_type: 'pi0' } }), false);
   });
 
   const action = (shape, extra = {}) => ({ key: 'actions', role: 'action', ...(shape === undefined ? {} : { shape }), ...extra });

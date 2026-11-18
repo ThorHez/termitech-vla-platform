@@ -11,12 +11,14 @@ import { isStateTokenLayout, supportsStateTokenLayout } from './trainingConfigur
 import { validTrainingGpuPolicy } from './trainingGpuPolicy';
 import type {
   Asset,
+  Attempt,
   AutoTrainingConfig,
   DatasetBinding,
   NormDataset,
   RecipeLiteral,
   Run,
   RunRequest,
+  RunSummary,
 } from './types';
 
 const terminalStates = new Set(['FAILED', 'CANCELLED', 'SUCCEEDED']);
@@ -58,14 +60,37 @@ export function retryableRun(run: Pick<Run, 'state'>): boolean {
   return terminalStates.has(run.state);
 }
 
-export function resumeCheckpoints(run: Run, userId: string, admin: boolean): Asset[] {
+type ResumeCheckpointRun = Pick<
+  Run,
+  | 'state'
+  | 'node_id'
+  | 'template_id'
+  | 'owner_user_id'
+  | 'dataset_bindings'
+  | 'entrypoint'
+  | 'code_expectation'
+  | 'outputs'
+> & {
+  resume_candidate?: boolean;
+  attempts?: Pick<Attempt, 'id' | 'state' | 'status' | 'code_changed_during_run'>[];
+};
+
+export function resumeCheckpoints(
+  run: ResumeCheckpointRun,
+  userId: string,
+  admin: boolean,
+  outputs = run.outputs ?? [],
+): Asset[] {
+  const supportsResume =
+    run.resume_candidate ??
+    ((run.dataset_bindings ?? run.code_expectation?.dataset_bindings ?? []).length <= 1 &&
+      !run.entrypoint &&
+      !run.code_expectation?.requested_entrypoint);
   if (
     run.template_id !== 'openpi-sft' ||
     !retryableRun(run) ||
     (!admin && run.owner_user_id !== userId) ||
-    (run.dataset_bindings ?? run.code_expectation?.dataset_bindings ?? []).length > 1 ||
-    run.entrypoint ||
-    run.code_expectation?.requested_entrypoint
+    !supportsResume
   )
     return [];
   const attempts = new Set(
@@ -77,7 +102,7 @@ export function resumeCheckpoints(run: Run, userId: string, admin: boolean): Ass
       )
       .map((attempt) => attempt.id),
   );
-  return (run.outputs ?? [])
+  return outputs
     .filter(
       (asset) =>
         asset.kind === 'MODEL' &&
@@ -91,6 +116,31 @@ export function resumeCheckpoints(run: Run, userId: string, admin: boolean): Ass
         asset.metadata.step >= 0,
     )
     .sort((a, b) => Number(b.metadata?.step) - Number(a.metadata?.step));
+}
+
+export function resumeCheckpointChoices(
+  runs: RunSummary[],
+  assets: Asset[],
+  userId: string,
+  admin: boolean,
+) {
+  const outputsByAttempt = new Map<string, Asset[]>();
+  for (const asset of assets) {
+    if (!asset.origin_attempt_id || asset.kind !== 'MODEL') continue;
+    const outputs = outputsByAttempt.get(asset.origin_attempt_id) ?? [];
+    outputs.push(asset);
+    outputsByAttempt.set(asset.origin_attempt_id, outputs);
+  }
+  return runs.flatMap((run: RunSummary & ResumeCheckpointRun) => {
+    // The unversioned list on older controllers includes its own output records.
+    const outputs =
+      run.outputs ?? run.attempts?.flatMap(({ id }) => outputsByAttempt.get(id) ?? []) ?? [];
+    return resumeCheckpoints(run, userId, admin, outputs).map((checkpoint) => ({
+      run,
+      checkpoint,
+      step: Number(checkpoint.metadata?.step),
+    }));
+  });
 }
 
 export function resumeTrainingRequest(
@@ -326,7 +376,13 @@ export function retryTrainingSnapshot(run: Run): TrainingDraftSnapshot {
   }
   const stage = setting('training_stage');
   if (run.template_id === 'recap') {
-    if (stage !== 'value' && stage !== 'stage_progress' && stage !== 'offline_rl')
+    if (
+      stage !== 'value' &&
+      stage !== 'value_annotation' &&
+      stage !== 'stage_progress' &&
+      stage !== 'stage_annotation' &&
+      stage !== 'offline_rl'
+    )
       throw new Error('原训练 ReCap 阶段记录不完整。');
     request.training_stage = stage;
     const config = setting('stage_config');

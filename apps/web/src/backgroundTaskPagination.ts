@@ -1,7 +1,7 @@
 import { ApiError, api } from './api';
 import { buildBackgroundTasks, filterBackgroundTasks } from './backgroundTaskEntries';
 import type { AssetTransfer } from './assetTransfer';
-import type { Node, Run } from './types';
+import type { Node, RunSummary } from './types';
 import type {
   BackgroundTask,
   BackgroundTaskStatus,
@@ -18,6 +18,7 @@ export interface BackgroundTaskPage {
   page_size: number;
   total_pages: number;
   history_limited?: boolean;
+  node_id?: string;
 }
 
 export interface BackgroundTaskQuery {
@@ -25,6 +26,7 @@ export interface BackgroundTaskQuery {
   type: BackgroundTaskType;
   status: BackgroundTaskStatus;
   query: string;
+  nodeId?: string;
 }
 
 export const initialBackgroundTaskQuery: BackgroundTaskQuery = {
@@ -34,14 +36,44 @@ export const initialBackgroundTaskQuery: BackgroundTaskQuery = {
   query: '',
 };
 
+export function backgroundTaskQueryFromSearch(search: string): BackgroundTaskQuery {
+  const params = new URLSearchParams(search);
+  const nodeId = params.get('node') || undefined;
+  const type = params.get('type');
+  const status = params.get('status');
+  const page = Number(params.get('page'));
+  return {
+    page: Number.isSafeInteger(page) && page > 0 ? page : 1,
+    type: nodeId || type === 'training' ? 'training' : type === 'data-sync' ? 'data-sync' : 'ALL',
+    status:
+      status === 'ACTIVE' || status === 'SUCCEEDED' || status === 'FAILED' || status === 'CANCELLED'
+        ? status
+        : 'ALL',
+    query: (params.get('q') || '').slice(0, 200),
+    nodeId,
+  };
+}
+
+export function backgroundTaskListPath(value: BackgroundTaskQuery) {
+  const query = new URLSearchParams();
+  if (value.nodeId) query.set('node', value.nodeId);
+  if (value.type !== 'ALL') query.set('type', value.type);
+  if (value.status !== 'ALL') query.set('status', value.status);
+  if (value.query.trim()) query.set('q', value.query.trim());
+  if (value.page > 1) query.set('page', String(value.page));
+  return query.size ? `/runs?${query}` : '/runs';
+}
+
 export function backgroundTaskPagePath(value: BackgroundTaskQuery) {
   const query = new URLSearchParams({
+    view: 'summary',
     page: String(value.page),
     page_size: String(BACKGROUND_TASK_PAGE_SIZE),
     type: value.type,
     status: value.status,
     q: value.query.trim(),
   });
+  if (value.nodeId) query.set('node_id', value.nodeId);
   return `/background-tasks?${query}`;
 }
 
@@ -78,11 +110,13 @@ export function backgroundTaskPageRange(
 }
 export function legacyBackgroundTaskPage(
   request: BackgroundTaskQuery,
-  runs: Run[],
+  runs: RunSummary[],
   transfers: AssetTransfer[],
   nodes: Node[] = [],
 ): BackgroundTaskPage {
-  const all = buildBackgroundTasks(runs, transfers);
+  const all = request.nodeId
+    ? buildBackgroundTasks(runs.filter((run) => run.node_id === request.nodeId))
+    : buildBackgroundTasks(runs, transfers);
   const filtered = filterBackgroundTasks(all, {
     type: request.type,
     status: request.status,
@@ -100,6 +134,7 @@ export function legacyBackgroundTaskPage(
     page_size: BACKGROUND_TASK_PAGE_SIZE,
     total_pages: totalPages,
     history_limited: true,
+    ...(request.nodeId ? { node_id: request.nodeId } : {}),
   };
 }
 
@@ -109,12 +144,25 @@ export async function fetchBackgroundTaskPage(
   signal?: AbortSignal,
 ): Promise<BackgroundTaskPage> {
   try {
-    return await api<BackgroundTaskPage>(backgroundTaskPagePath(request), { signal });
+    const page = await api<BackgroundTaskPage>(backgroundTaskPagePath(request), { signal });
+    if (
+      !request.nodeId ||
+      (page.node_id === request.nodeId &&
+        Array.isArray(page.items) &&
+        page.items.every(
+          (task) => task.kind === 'training' && task.item.node_id === request.nodeId,
+        ))
+    )
+      return page;
   } catch (error) {
     if (!(error instanceof ApiError) || error.status !== 404) throw error;
   }
+  if (request.nodeId) {
+    const runs = await api<RunSummary[]>('/runs?view=summary', { signal });
+    return legacyBackgroundTaskPage(request, runs, [], nodes);
+  }
   const [runs, transfers] = await Promise.all([
-    api<Run[]>('/runs', { signal }),
+    api<RunSummary[]>('/runs?view=summary', { signal }),
     api<AssetTransfer[]>('/asset-transfers?limit=200', { signal }),
   ]);
   return legacyBackgroundTaskPage(request, runs, transfers, nodes);

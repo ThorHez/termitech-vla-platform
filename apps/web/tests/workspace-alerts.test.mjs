@@ -13,7 +13,8 @@ const server = await createServer({
 });
 
 try {
-  const { AlertList } = await server.ssrLoadModule('/src/WorkspaceAlerts.tsx');
+  const { AlertList, WorkspaceAlerts } = await server.ssrLoadModule('/src/WorkspaceAlerts.tsx');
+  const { deduplicateDiskAlerts } = await server.ssrLoadModule('/src/workspaceAlertData.ts');
   const diskAlert = (i, details) => ({
     id: `disk:${i}`,
     code: 'DISK_CAPACITY_HIGH',
@@ -24,24 +25,57 @@ try {
     details,
   });
 
-  await test('all disk warnings appear before the regular alert preview', () => {
+  await test('the workspace previews the first four combined alerts in controller order', () => {
     const regular = Array.from({ length: 6 }, (_, i) => ({
       id: `training:${i}`,
       code: 'TRAINING_FAILED',
       message: `训练 ${i} 失败`,
       run_id: `training-${i}`,
     }));
-    const disks = Array.from({ length: 6 }, (_, i) => diskAlert(i));
+    const alerts = [diskAlert(0), regular[0], diskAlert(1), regular[1], diskAlert(2), regular[2]];
     const html = renderToStaticMarkup(
-      React.createElement(AlertList, { alerts: [...regular, ...disks] }),
+      React.createElement(WorkspaceAlerts, { alerts, enabled: true, refresh() {} }),
     );
-    assert.equal(html.match(/磁盘空间告警/g).length, 6);
-    assert.match(html, /机器 5 的磁盘 \/data5 已使用 94%/);
-    assert.ok(html.indexOf('机器 5 的磁盘') < html.indexOf('训练 0 失败'));
-    assert.match(html, /href="#\/nodes\/machine-5"/);
+    assert.equal(html.match(/class="alert-item"/g).length, 4);
+    assert.ok(html.indexOf('机器 0 的磁盘') < html.indexOf('训练 0 失败'));
+    assert.ok(html.indexOf('训练 0 失败') < html.indexOf('机器 1 的磁盘'));
+    assert.match(html, /href="#\/nodes\/machine-1"/);
     assert.match(html, /href="#\/runs\/training-0"/);
-    assert.doesNotMatch(html, /训练 4 失败/);
-    assert.match(html, /展开其余 2 条异常/);
+    assert.doesNotMatch(html, /机器 2 的磁盘|训练 2 失败/);
+    assert.match(html, /class="count-pill">6<\/span>/);
+    assert.match(html, /href="#\/alerts">查看全部/);
+    assert.doesNotMatch(html, /aria-expanded|收起/);
+  });
+
+  await test('the full-page link is available when all alerts already fit in the preview', () => {
+    const html = renderToStaticMarkup(
+      React.createElement(WorkspaceAlerts, {
+        alerts: Array.from({ length: 4 }, (_, i) => diskAlert(i)),
+        enabled: true,
+        refresh() {},
+      }),
+    );
+    assert.equal(html.match(/class="alert-item"/g).length, 4);
+    assert.match(html, /href="#\/alerts">查看全部/);
+  });
+
+  await test('disk dedup accepts equivalent canonical mounts on the same node only', () => {
+    const old = { ...diskAlert(0, { mountpoint: '/data' }), timestamp: '2026-11-14T02:00:00Z' };
+    const recent = {
+      ...old,
+      id: 'recent',
+      details: { mountpoint: '//data/./' },
+      timestamp: '2026-11-14T02:01:00Z',
+    };
+    const stale = { ...old, id: 'stale', timestamp: '2026-11-14T02:00:30Z' };
+    const otherNode = { ...recent, id: 'other', node_id: 'other-node' };
+    const invalid = { ...recent, id: 'invalid', details: { mountpoint: '/data/../data' } };
+    const legacy = { ...old, id: 'legacy', details: undefined };
+    const regular = { code: 'TRAINING_FAILED' };
+    assert.deepEqual(
+      deduplicateDiskAlerts([old, regular, recent, stale, otherNode, invalid, legacy]),
+      [recent, regular, otherNode, invalid, legacy],
+    );
   });
 
   await test('disk warnings show the mounted filesystem, usage, available capacity and total', () => {

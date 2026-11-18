@@ -134,6 +134,7 @@ export function ComposedProcessingEditor({
   normalizationOverride,
   purpose = 'training',
   disabled = false,
+  managedStageProgress = false,
 }: {
   value: ComposedProcessingSpec;
   profile: ProcessingProfileSeed;
@@ -143,6 +144,7 @@ export function ComposedProcessingEditor({
   normalizationOverride?: TrainingNormalizationMethod;
   purpose?: 'training' | 'norm';
   disabled?: boolean;
+  managedStageProgress?: boolean;
 }) {
   const set = <K extends keyof ComposedProcessingSpec>(key: K, next: ComposedProcessingSpec[K]) => {
     onFieldEdit?.('processing.' + key);
@@ -1001,7 +1003,9 @@ export function ComposedProcessingEditor({
         )}
         <div className="composed-aux">
           <strong>已有阶段监督字段</strong>
-          {COMPOSED_SUPERVISION_FIELDS.map((key) => (
+          {COMPOSED_SUPERVISION_FIELDS.filter(
+            (key) => !managedStageProgress || key !== 'stage_progress_gt',
+          ).map((key) => (
             <label className="checkbox-label" key={key}>
               <input
                 type="checkbox"

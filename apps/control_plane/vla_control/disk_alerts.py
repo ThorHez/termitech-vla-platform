@@ -3,7 +3,10 @@
 from datetime import datetime, timedelta
 from pathlib import PurePosixPath
 
+from sqlalchemy import select
+
 from .common import digest
+from .remote_models import RemoteConnection, RemoteDeployment
 
 THRESHOLD_PERCENT = 90
 MAX_SAMPLE_AGE = timedelta(minutes=3)
@@ -35,7 +38,7 @@ def _capacity(row):
     if any(type(value) is not int or not 0 <= value <= MAX_CAPACITY for value in (total, used, free)):
         return None
     available = used + free
-    if not 0 < available <= total or used * 100 < available * THRESHOLD_PERCENT:
+    if not 0 < available <= total:
         return None
     return {
         "total_bytes": total, "used_bytes": used, "free_bytes": free,
@@ -44,42 +47,73 @@ def _capacity(row):
     }
 
 
-def disk_capacity_alerts(node, moment, heartbeat_timeout_seconds):
+def _observed_mounts(node, moment, heartbeat_timeout_seconds):
     if node.status not in {"ONLINE", "RECOVERING"}:
-        return []
+        return
     last_seen = _timestamp(node.last_seen)
     if last_seen is None or moment - last_seen > timedelta(seconds=heartbeat_timeout_seconds):
-        return []
+        return
     report = (node.metrics or {}).get("disk_capacity")
     if not isinstance(report, dict):
-        return []
+        return
     sampled_at = _timestamp(report.get("sampled_at"))
     if (sampled_at is None or sampled_at > last_seen + CLOCK_SKEW or moment - sampled_at > MAX_SAMPLE_AGE):
-        return []
+        return
     mounts = report.get("mounts")
     if not isinstance(mounts, list) or len(mounts) > MAX_MOUNTS:
-        return []
+        return
 
-    alerts = {}
     for row in mounts:
         if not isinstance(row, dict) or row.get("error") is not None:
             continue
         mountpoint = _mountpoint(row.get("mountpoint"))
         details = _capacity(row)
-        if mountpoint is None or details is None:
+        if mountpoint is not None and details is not None:
+            yield mountpoint, details, sampled_at, last_seen
+
+
+def _machine_keys(session, node_ids):
+    """SSH keys may be cloned across machines. Require the endpoint too."""
+    query = (select(RemoteDeployment.node_id, RemoteConnection.host, RemoteConnection.port,
+                    RemoteConnection.fingerprint, RemoteDeployment.agent_config)
+             .join(RemoteConnection, RemoteConnection.id == RemoteDeployment.connection_id)
+             .where(RemoteDeployment.node_id.in_(node_ids), RemoteDeployment.state == "SUCCEEDED",
+                    RemoteConnection.fingerprint != "")
+             .order_by(RemoteDeployment.created_at.desc(), RemoteDeployment.id.desc()))
+    keys = {}
+    for node_id, host, port, fingerprint, config in session.execute(query):
+        if (config or {}).get("_operation", "install") in {"install", "upgrade"}:
+            keys.setdefault(node_id, "ssh:" + digest([host.casefold(), port, fingerprint]))
+    return keys
+
+
+def disk_capacity_alerts(session, nodes, moment, heartbeat_timeout_seconds):
+    if not nodes:
+        return []
+    latest = {}
+    machine_keys = _machine_keys(session, [node.id for node in nodes])
+    for node in nodes:
+        machine = machine_keys.get(node.id, "node:" + node.id)
+        for mountpoint, details, sampled_at, last_seen in _observed_mounts(node, moment, heartbeat_timeout_seconds):
+            key = machine, mountpoint
+            order = sampled_at, last_seen, node.id
+            if key not in latest or order >= latest[key][0]:
+                latest[key] = (order, node, details)
+
+    alerts = []
+    for (machine, mountpoint), ((sampled_at, _, _), node, details) in latest.items():
+        used, free = details["used_bytes"], details["free_bytes"]
+        if used * 100 < (used + free) * THRESHOLD_PERCENT:
             continue
-        previous = alerts.get(mountpoint)
-        if previous and previous["details"]["usage_percent"] >= details["usage_percent"]:
-            continue
-        alerts[mountpoint] = {
-            "id": "disk:" + node.id + ":" + digest(mountpoint),
+        alerts.append({
+            "id": "disk:" + digest([machine, mountpoint]),
             "severity": "warning",
             "code": "DISK_CAPACITY_HIGH",
             "title": "磁盘空间告警",
             "node_id": node.id,
             "run_id": None,
             "message": f"{node.effective_name} 的磁盘 {mountpoint} 已使用 {details['usage_percent']:g}%",
-            "timestamp": report["sampled_at"],
+            "timestamp": sampled_at.isoformat(),
             "details": {"mountpoint": mountpoint, **details},
-        }
-    return list(alerts.values())
+        })
+    return sorted(alerts, key=lambda alert: (-alert["details"]["usage_percent"], alert["id"]))

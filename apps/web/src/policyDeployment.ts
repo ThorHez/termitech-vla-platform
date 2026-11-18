@@ -163,7 +163,13 @@ function estimatorSourceStage(run?: Run) {
     run?.training_stage,
     run?.code_expectation?.training_stage,
     run?.code_expectation?.automatic_preflight?.plan.training_stage,
-  ].find((stage) => stage === 'value' || stage === 'stage_progress');
+  ].find(
+    (stage) =>
+      stage === 'value' ||
+      stage === 'value_annotation' ||
+      stage === 'stage_progress' ||
+      stage === 'stage_annotation',
+  );
 }
 
 export function deployableOutputs(run?: Run): Asset[] {
@@ -183,7 +189,9 @@ export function sourceDeploymentBlocker(run?: Run): string | undefined {
   if (!run) return undefined;
   const estimator = estimatorSourceStage(run);
   if (estimator === 'stage_progress')
-    return '此任务训练的是 Kai0 阶段进度估计器，请选择动作策略模型。';
+    return '此任务训练的是 Stage Advantage 估计器，请选择动作策略模型。';
+  if (estimator === 'stage_annotation' || estimator === 'value_annotation')
+    return '此任务生成标注数据，请选择产出动作策略模型的训练任务。';
   if (estimator === 'value') return '此任务训练的是价值模型，请选择动作策略模型。';
   if (run.template_id !== 'openpi-sft')
     return '当前支持 OpenPI 动作策略部署，请选择 OpenPI 训练任务。';

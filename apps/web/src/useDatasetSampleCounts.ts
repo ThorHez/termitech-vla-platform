@@ -9,6 +9,7 @@ export type DatasetSampleCount = {
   message?: string;
   checkedAt?: string;
   source?: 'validation' | 'metadata';
+  featureKeys?: string[];
 };
 
 const validCount = (value: unknown): value is number =>
@@ -16,11 +17,27 @@ const validCount = (value: unknown): value is number =>
 const pathKey = (path: string) => path.replace(/\/+$/u, '').replace(/\/\.\//gu, '/');
 const unavailable = (message: string): DatasetSampleCount => ({ status: 'unavailable', message });
 
+function validatedSampleCount(asset: Asset): DatasetSampleCount | undefined {
+  const validation = asset.validation;
+  if (
+    validation?.status === 'SUCCEEDED' &&
+    validation.timestamp_contract?.status === 'verified' &&
+    validCount(validation.timestamp_contract.checked_rows)
+  )
+    return {
+      status: 'ready',
+      count: validation.timestamp_contract.checked_rows,
+      checkedAt: validation.checked_at || validation.completed_at || undefined,
+      source: 'validation',
+    };
+}
+
 /** Account-local live metadata; changing weights never reads a dataset again. */
 export function useDatasetSampleCounts(
   bindings: readonly DatasetBinding[],
   assets: readonly Asset[],
   node?: Node,
+  inspectFeatures = false,
 ): { counts: Record<string, DatasetSampleCount>; refresh: () => void } {
   const { user, loading, expired, expiresAt } = useAuth();
   const authenticated = Boolean(user?.id && !loading && !expired);
@@ -35,6 +52,7 @@ export function useDatasetSampleCounts(
     const asset = selected[index];
     return JSON.stringify([
       owner,
+      inspectFeatures,
       node?.id,
       node?.status,
       id,
@@ -68,6 +86,10 @@ export function useDatasetSampleCounts(
   const initial: Record<string, DatasetSampleCount> = Object.fromEntries(
     ids.map((id, index) => {
       const asset = selected[index];
+      const cachedValidation =
+        asset && !forceRead && !cache.current.metadataOnly.has(identities[index])
+          ? validatedSampleCount(asset)
+          : undefined;
       let count: DatasetSampleCount;
       if (!authenticated) count = unavailable('请登录后读取数据集样本数。');
       else if (!asset || !node || asset.node_id !== node.id || !asset.path)
@@ -76,19 +98,8 @@ export function useDatasetSampleCounts(
         count = unavailable('数据集已归档或不可用。');
       else if (cache.current.values.has(identities[index]))
         count = cache.current.values.get(identities[index])!;
-      else if (
-        !forceRead &&
-        !cache.current.metadataOnly.has(identities[index]) &&
-        asset.validation?.status === 'SUCCEEDED' &&
-        asset.validation.timestamp_contract?.status === 'verified' &&
-        validCount(asset.validation.timestamp_contract?.checked_rows)
-      )
-        count = {
-          status: 'ready',
-          count: asset.validation.timestamp_contract.checked_rows,
-          checkedAt: asset.validation.checked_at || asset.validation.completed_at || undefined,
-          source: 'validation',
-        };
+      else if (cachedValidation && (!inspectFeatures || node.status !== 'ONLINE'))
+        count = cachedValidation;
       else if (node.status !== 'ONLINE') count = unavailable('机器离线，恢复连接后可读取样本数。');
       else count = { status: 'loading' };
       return [id, count];
@@ -135,7 +146,12 @@ export function useDatasetSampleCounts(
             asset_id: string;
             node_id: string;
             checked_at?: string;
-            dataset?: { status?: string; path?: string; total_frames?: unknown };
+            dataset?: {
+              status?: string;
+              path?: string;
+              total_frames?: unknown;
+              features?: unknown;
+            };
           }>(`/assets/${encodeURIComponent(asset.id)}/statistics`, {
             signal: AbortSignal.any([signal, AbortSignal.timeout(20000)]),
           });
@@ -148,20 +164,34 @@ export function useDatasetSampleCounts(
             result.node_id !== asset.node_id ||
             dataset?.status !== 'READY' ||
             !expectedPath ||
-            ![expectedPath, `${expectedPath}/meta/info.json`].includes(actualPath) ||
-            !validCount(dataset.total_frames)
+            ![expectedPath, `${expectedPath}/meta/info.json`].includes(actualPath)
           )
+            throw new Error('数据集样本数或来源与当前选择不一致，请重新读取。');
+          const features = dataset.features;
+          const featureKeys =
+            Array.isArray(features) &&
+            features.length > 0 &&
+            features.every((row) => row && typeof row.key === 'string' && row.key)
+              ? features.map((row) => row.key as string)
+              : undefined;
+          if (!validCount(dataset.total_frames) && !(inspectFeatures && featureKeys))
             throw new Error('数据集样本数或来源与当前选择不一致，请重新读取。');
           publish(asset.id, {
             status: 'ready',
-            count: dataset.total_frames,
+            count: validCount(dataset.total_frames) ? dataset.total_frames : undefined,
             source: 'metadata',
             checkedAt: typeof result.checked_at === 'string' ? result.checked_at : undefined,
+            featureKeys,
           });
         } catch (error) {
+          const fallback =
+            inspectFeatures &&
+            !cache.current.metadataOnly.has(identityById.get(asset.id)!) &&
+            validatedSampleCount(asset);
           publish(
             asset.id,
-            unavailable(error instanceof Error ? error.message : '读取样本数失败，请重试。'),
+            fallback ||
+              unavailable(error instanceof Error ? error.message : '读取样本数失败，请重试。'),
           );
         }
       }

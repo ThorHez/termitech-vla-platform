@@ -28,8 +28,11 @@ _SHARED_REQUEST_FIELDS = {
 _SHARED_SNAPSHOT_FIELDS = {
     "schema_version", "request", "step", "advanced_recipe", "edited_parameters",
     "edited_stage_parameters", "entrypoint_edited", "special_values",
-    "recipe_datasets", "recipe_defaults", "stage_recipe_defaults", "stage_recipe_info",
+    "recipe_datasets", "recipe_defaults", "stage_recipe_defaults", "stage_recipe_info", "recap_phase",
 }
+_RECAP_PHASE_STAGES = {"value": "value", "value_annotation": "value_annotation",
+                       "stage_progress": "stage_progress", "stage_annotation": "stage_annotation",
+                       "recap_acp": "offline_rl", "stage_advantage_acp": "offline_rl"}
 
 
 def _invalid(message="训练模板必须为受限 JSON 配置"):
@@ -154,6 +157,11 @@ def _validate_shareable_content(content):
             or request.get("stage_config") is not None and not _numeric_settings(request["stage_config"])
             or "gpu_count" not in request or type(request["gpu_count"]) not in {int, float, type(None)}):
         raise _invalid(message)
+    if "recap_phase" in content:
+        phase = content["recap_phase"]
+        if (type(phase) is not str or phase not in _RECAP_PHASE_STAGES or request["template_id"] != "recap"
+                or request.get("training_stage") != _RECAP_PHASE_STAGES[phase]):
+            raise _invalid(message)
     inputs = request.get("inputs")
     if type(inputs) is not dict or set(inputs) - {"model"} or any(type(value) is not str for value in inputs.values()):
         raise _invalid(message)

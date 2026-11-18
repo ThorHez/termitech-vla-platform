@@ -1,4 +1,4 @@
-"""The transport moves real rsync protocol bytes between isolated local peers."""
+"""Checkpoint verification and direct rsync between isolated local peers."""
 import hashlib
 import json
 import os
@@ -6,7 +6,6 @@ from pathlib import Path
 import select
 import shutil
 import signal
-import socket
 import subprocess
 import time
 
@@ -56,15 +55,6 @@ class LocalChannel:
         while value:
             size = os.write(self.process.stdin.fileno(), value)
             value = value[size:]
-
-    def send_ready(self):
-        return bool(select.select([], [self.process.stdin], [], 0)[1])
-
-    def send(self, value):
-        try:
-            return os.write(self.process.stdin.fileno(), value)
-        except BlockingIOError:
-            raise socket.timeout() from None
 
     def shutdown_write(self):
         if self.process.stdin and not self.process.stdin.closed:
@@ -122,8 +112,8 @@ class LocalRemote:
 
 @pytest.fixture
 def checkpoint(tmp_path):
-    if not shutil.which('rsync'):
-        pytest.skip('Real transport tests require rsync')
+    if any(shutil.which(binary) is None for binary in ('rsync', 'ssh-keygen')):
+        pytest.skip('Real checkpoint transfer tests require rsync and ssh-keygen')
     source = tmp_path / "source checkpoint';echo BAD; #"
     target = tmp_path / 'target'
     (source / 'params' / 'd').mkdir(parents=True)
@@ -135,24 +125,36 @@ def checkpoint(tmp_path):
     return tmp_path, source, target
 
 
-def transfer(checkpoint, **changes):
+def checkpoint_peers(root):
+    from .test_direct_asset_transfer import direct_local_pair
+
+    return direct_local_pair(root / 'direct-peers')
+
+
+def transfer(checkpoint, *, remotes=None, **changes):
     root, source, target = checkpoint
-    arguments = dict(source_remote=LocalRemote(), target_remote=LocalRemote(), source_path=str(source),
+    source_remote, target_remote = remotes if remotes is not None else checkpoint_peers(root)
+    arguments = dict(source_remote=source_remote, target_remote=target_remote, source_path=str(source),
         target_parent=str(target), transfer_id='transfer-123', source_roots=[str(root)], target_roots=[str(root)])
     arguments.update(changes)
     try:
         return transfer_checkpoint(**arguments)
     except BaseException:
-        for remote in (arguments['source_remote'],arguments['target_remote']):
+        for remote in (source_remote, target_remote):
             for channel in remote.channels:
                 if channel.stderr:
                     print(channel.stderr.decode(errors='replace'))
         raise
+    finally:
+        for remote in (source_remote, target_remote):
+            remote.close()
 
 
-def test_real_rsync_ssh_stream_bridge_complete_checkpoint_and_sidecar(checkpoint):
+def test_real_rsync_checkpoint_and_sidecar_use_only_control_messages_in_controller(checkpoint):
+    peers = checkpoint_peers(checkpoint[0])
     events = []
-    result = transfer(checkpoint, progress=events.append, extra_files={'termitech-policy.json': '{"config":{},"digest":"fixture"}'})
+    result = transfer(checkpoint, remotes=peers, progress=events.append,
+        extra_files={'termitech-policy.json': '{"config":{},"digest":"fixture"}'})
     root, source, target = checkpoint
     published = Path(result['target_path'])
     assert published == target / 'transfer-123'
@@ -169,8 +171,23 @@ def test_real_rsync_ssh_stream_bridge_complete_checkpoint_and_sidecar(checkpoint
     assert {event['bytes_total'] for event in events if 'bytes_total' in event} == {result['bytes_total']}
     assert {event['files_total'] for event in events if 'files_total' in event} == {result['files_total']}
     assert any(item['stage'] == 'TRANSFERRING' for item in events)
+    assert sum(channel.received_bytes for remote in peers for channel in remote.channels) < 32 * 1024
     assert not (target / '.transfer-123.partial').exists()
     assert not (root / 'BAD').exists()
+
+
+def test_checkpoint_direct_connection_failure_retains_partial_without_relay(checkpoint):
+    root, source, target = checkpoint
+    source_remote, target_remote = checkpoint_peers(root)
+    target_remote.environment['DIRECT_FAKE_SSH_FAILURE'] = '1'
+    with pytest.raises(TransferError) as error:
+        transfer(checkpoint, remotes=(source_remote, target_remote), extra_files={'termitech-policy.json': '{}'})
+
+    assert error.value.code == 'DIRECT_CONNECTION_UNAVAILABLE'
+    assert not (target / 'transfer-123').exists()
+    assert list((target / '.transfer-123.partial').iterdir()) == []
+    assert (source / 'params' / 'd' / 'weights').is_file()
+    assert (source_remote.home / '.ssh' / 'authorized_keys').read_bytes() == b''
 
 
 def test_train_state_directory_is_never_read_hashed_or_sent_but_model_assets_and_tokenizer_remain(checkpoint, monkeypatch):
@@ -408,3 +425,23 @@ def test_retry_reuses_identical_sidecar_but_never_overwrites_changed_configurati
     assert error.value.code == 'TRANSFER_SOURCE_CHANGED'
     result = transfer(checkpoint, extra_files=extras)
     assert transfer(checkpoint, extra_files=extras) == result
+
+
+def test_retry_excludes_verified_sidecar_bytes_from_direct_rsync_resume(checkpoint):
+    _, source, target = checkpoint
+    (source / 'params' / 'd' / 'weights').write_bytes(b'small model')
+    extras = {'termitech-policy.json': json.dumps({'config': 'x' * (16 * 1024)})}
+    partial = target / '.transfer-123.partial'
+
+    def corrupt(event):
+        if event['stage'] == 'VERIFYING':
+            (partial / 'params' / 'd' / 'weights').write_bytes(b'corrupted')
+
+    with pytest.raises(TransferError) as error:
+        transfer(checkpoint, progress=corrupt, extra_files=extras)
+    assert error.value.code == 'TRANSFER_CHECKSUM_MISMATCH'
+    assert (partial / 'termitech-policy.json').read_text() == extras['termitech-policy.json']
+
+    published = Path(transfer(checkpoint, extra_files=extras)['target_path'])
+    assert (published / 'params' / 'd' / 'weights').read_bytes() == b'small model'
+    assert (published / 'termitech-policy.json').read_text() == extras['termitech-policy.json']

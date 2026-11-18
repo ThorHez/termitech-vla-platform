@@ -16,8 +16,8 @@ import time
 from pathlib import Path
 
 from vla_adapters.dataset_bindings import validate_binding_assets
-from vla_adapters.recap import RECAP_TORCH_ENTRY, recap_contract_valid
-from vla_adapters.recap_checkpoint import recap_model_evidence_valid
+from vla_adapters.recap import ANNOTATION_STAGES, recap_contract_valid, recap_data_stage, recap_entrypoint_options, uses_jax_acp, uses_torch_recap
+from vla_adapters.recap_checkpoint import acp_model_evidence_valid, recap_model_evidence_valid
 from vla_adapters.norm_datasets import validate_norm_assets
 from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_adapters.runtime_options import validate_generated_normalization_method
@@ -290,14 +290,24 @@ def _wrapper_validation(config: dict, launch: dict, checks: list[dict]) -> dict:
             if canonical_digest(plan.get(field)) != canonical_digest(spec.get(field)):
                 raise ValueError("resolved execution plan does not match " + field)
         if spec.get("training_stage") is not None:
-            if not recap_contract_valid(spec["training_stage"], spec.get("stage_config"),
-                                        plan.get("recap_stage_contract"), plan.get("datasets"), require_pytorch=True):
+            stage = spec["training_stage"]
+            backend = spec.get("recap_backend")
+            datasets = plan.get("datasets")
+            if not (uses_torch_recap(spec) or uses_jax_acp(spec)):
+                raise ValueError("invalid ReCap runtime backend")
+            if not recap_contract_valid(stage, spec.get("stage_config"),
+                                        plan.get("recap_stage_contract"), datasets, expected_backend=backend,
+                                        bindings=spec.get("dataset_bindings")):
                 raise ValueError("missing ReCap phase model, loader or dataset field evidence")
             plan_inputs = plan.get("inputs")
-            if (spec.get("recap_backend") != "pytorch"
-                    or not isinstance(plan.get("entrypoint"), str) or not plan["entrypoint"].endswith("/" + RECAP_TORCH_ENTRY)
-                    or not isinstance(plan_inputs, dict) or not recap_model_evidence_valid(plan.get("model"), plan_inputs.get("model"))):
-                raise ValueError("missing ReCap PyTorch entrypoint or safetensors evidence")
+            allowed_entries = {str(Path(spec["code_dir"]) / relative) for relative in
+                               recap_entrypoint_options(stage, backend, len(datasets))}
+            model_path = plan_inputs.get("model") if isinstance(plan_inputs, dict) else None
+            scorer_stage = recap_data_stage(stage) if stage in ANNOTATION_STAGES else None
+            model_evidence = (acp_model_evidence_valid(plan.get("model"), model_path) if backend == "jax"
+                              else recap_model_evidence_valid(plan.get("model"), model_path, scoring_stage=scorer_stage))
+            if plan.get("entrypoint") not in allowed_entries or not model_evidence:
+                raise ValueError("missing ReCap phase entrypoint or checkpoint evidence")
         if plan.get("requested_entrypoint") != spec.get("entrypoint"):
             raise ValueError("resolved execution plan does not match requested training entrypoint")
         bindings = validate_binding_assets(spec.get("dataset_bindings"), spec.get("inputs", {}))
@@ -372,7 +382,9 @@ def _check_output_storage(config: dict, plan: dict, checks: list[dict]):
     except OSError as exc:
         raise AgentError("OUTPUT_NOT_WRITABLE", f"Agent 无法写入训练输出目录 {root}: {exc}") from exc
     required = storage["required_bytes"]
-    storage_scope = "含 checkpoint 和派生数据集" if "derived_dataset_bytes" in storage else "含 checkpoint 临时写入余量"
+    storage_scope = "含 checkpoint 临时写入余量"
+    if "derived_dataset_bytes" in storage:
+        storage_scope = "含派生数据集" if plan.get("training_stage") in ANNOTATION_STAGES else "含 checkpoint 和派生数据集"
     if free < required:
         raise AgentError("OUTPUT_SPACE_INSUFFICIENT", f"训练输出空间不足：可用 {free / 2**30:.2f} GiB，预计至少需要 {required / 2**30:.2f} GiB（{storage_scope}）")
     checks.append({"name": "output_storage", "ok": True,

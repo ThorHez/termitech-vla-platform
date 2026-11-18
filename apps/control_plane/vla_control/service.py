@@ -10,10 +10,13 @@ from vla_adapters.norm_datasets import normalize_norm_datasets, norm_inputs, val
 from vla_adapters.entrypoints import validate_entrypoint
 from vla_adapters.image_policy import composition_augmentation_codes, normalize_image_processing
 from vla_adapters.recipe_definitions import recipe_parameters, resolve_definition
-from vla_adapters.recap import (RECAP_TORCH_ENTRY, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, recap_contract_valid, recap_model_matches,
-    runtime_adapter_for, stage_progress_dataset_profile, stage_progress_outputs_match,
-    validate_recap_torch_selection, validate_stage_progress_selection, validate_training_stage)
-from vla_adapters.recap_checkpoint import recap_model_evidence_valid, recap_torch_artifact_valid
+from vla_adapters.recap import (ACP_STAGE, ANNOTATION_STAGES, STAGE_ANNOTATION, STAGE_PROGRESS, STAGE_PROGRESS_MODEL, VALUE_ANNOTATION,
+    recap_backend, recap_contract_valid, recap_data_stage, recap_entrypoint_options, recap_model_matches, runtime_adapter_for,
+    stage_annotation_outputs_match, stage_progress_dataset_profile, stage_progress_outputs_match,
+    validate_recap_selection, validate_stage_progress_selection, validate_training_stage,
+    value_annotation_dataset_profile, value_annotation_outputs_match)
+from vla_adapters.recap_checkpoint import (acp_artifact_valid, acp_model_evidence_valid,
+    recap_model_evidence_valid, recap_torch_artifact_valid)
 from vla_adapters.sample_evidence import validate_sample_evidence
 from vla_adapters.runtime_options import normalize_normalization_method, validate_generated_normalization_method
 from vla_protocol import canonical_digest
@@ -25,6 +28,8 @@ from .common import APIError, INPUT_KINDS, TERMINAL, absolute_path, digest, now,
 from .models import Allocation, Asset, Attempt, Command, Event, Node, Preview, Profile, Run
 from .norm_outputs import norm_outputs_error, reconcile_norm_outputs
 from .model_norm_outputs import bind_model_norm_outputs, model_norm_outputs_error
+from .model_formats import ORBAX_FORMAT, PYTORCH_FORMAT, normalize_model_format
+from .stage_annotation_sources import is_external_stage_annotation_checkpoint, stage_annotation_sources
 from .scheduler import enqueue, resolve_inputs
 from .training_resume import resume_preflight_error
 
@@ -140,6 +145,8 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
         raise APIError(422, code, messages[code]) from exc
     if data["gpu_count"] < template.get("min_gpus", 1):
         raise APIError(422, "GPU_REQUIRED", "The selected template requires a GPU")
+    if stage in ANNOTATION_STAGES and data["gpu_count"] != 1:
+        raise APIError(422, "RECAP_ANNOTATION_GPU_COUNT", "优势标注需要选择一张 GPU")
     if data["gpu_count"] > len(node.gpus):
         raise APIError(422, "GPU_CAPACITY_EXCEEDED", "Requested GPU count exceeds this node's reported devices")
     from .gpu_selection import requested_gpu_uuids
@@ -185,7 +192,8 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
         validate_state_token_layout(data.get("auto_config"), bindings, template_id=template["id"], training_stage=stage)
         validate_stage_progress_selection(stage, bindings, data.get("auto_config"))
         if template["id"] == "recap":
-            validate_recap_torch_selection(data.get("auto_config"), data.get("entrypoint"))
+            validate_recap_selection(data.get("auto_config"), data.get("entrypoint"), stage,
+                                     recap_backend(stage), len(bindings or []))
     except ValueError as exc:
         raise APIError(422, str(exc).split(":", 1)[0], str(exc)) from exc
     input_kinds = INPUT_KINDS
@@ -222,12 +230,25 @@ def validate_request(session, data: dict, require_online=True, *, frozen=False) 
             raise APIError(422, "ASSET_NODE_MISMATCH", "All assets and the runtime must be on the selected node")
         if asset.kind != input_kinds[role]:
             raise APIError(422, "ASSET_KIND_MISMATCH", "Asset type does not match the input role")
-        if (template["id"] == "recap" and role == "model"
-                and (asset.metadata_json or {}).get("format") in ("openpi-orbax", "orbax", "jax")):
-            raise APIError(422, "MODEL_FORMAT", "PyTorch ReCap 需要 model.safetensors，请选择 PyTorch 模型资产")
+        if template["id"] == "recap" and role == "model":
+            metadata = asset.metadata_json or {}
+            model_format = normalize_model_format(metadata.get("format"))
+            if stage == ACP_STAGE:
+                if model_format == PYTORCH_FORMAT:
+                    raise APIError(422, "MODEL_FORMAT", "ACP 训练需要 JAX / Orbax 动作策略检查点")
+                if metadata.get("model_role") not in (None, "policy"):
+                    raise APIError(422, "ACP_POLICY_REQUIRED", "请选择 JAX / Orbax 动作策略检查点")
+            elif model_format == ORBAX_FORMAT:
+                raise APIError(422, "MODEL_FORMAT", "PyTorch ReCap 需要 model.safetensors，请选择 PyTorch 模型资产")
         if asset.state not in {"REGISTERED", "READY"}:
             raise APIError(409, "INPUT_UNAVAILABLE", "An input asset is archived or unavailable")
         require_path(asset.path, node.roots)
+        if (stage in ANNOTATION_STAGES and role == "model"
+                and not is_external_stage_annotation_checkpoint(asset, stage)
+                and asset.id not in stage_annotation_sources(session, [asset], scorer_stage=recap_data_stage(stage))):
+            message = ("请选择本机已成功完成的 Value 训练所产出的可用检查点" if stage == VALUE_ANNOTATION
+                       else "请选择本机阶段进度训练产出的可用检查点，或已登记的 PyTorch 阶段进度模型")
+            raise APIError(422, "RECAP_ANNOTATION_MODEL_REQUIRED", message)
     return node, profile, parameters
 
 
@@ -466,12 +487,29 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
                     or not 1 <= len(identity["module"]) <= 512 or processor_source(identity.get("source")) is None):
                 return {"code": "DATA_PROCESSOR_MISMATCH", "message": "实际数据处理器或参数与本次选择不一致，请重新预检"}
     if request["template_id"] == "recap":
+        stage = request["training_stage"]
+        backend = recap_backend(stage)
         contract = plan.get("recap_stage_contract")
+        entrypoints = recap_entrypoint_options(stage, backend, len(datasets))
+        code_dir = snapshot.get("code_dir")
+        entry_valid = (isinstance(code_dir, str) and any(
+            plan["entrypoint"] == str(PurePosixPath(code_dir) / entry) for entry in entrypoints)
+            if stage == ACP_STAGE else any(plan["entrypoint"].endswith("/" + entry) for entry in entrypoints))
+        scoring_stage = recap_data_stage(stage) if stage in ANNOTATION_STAGES else None
+        model_valid = (acp_model_evidence_valid(model, inputs.get("model")) if stage == ACP_STAGE
+                       else recap_model_evidence_valid(model, inputs.get("model"), scoring_stage=scoring_stage))
         if (not any(check.get("name") == "recap_stage" and check.get("ok") is True for check in checks)
-                or not recap_contract_valid(request["training_stage"], request.get("stage_config"), contract, datasets, require_pytorch=True)
-                or not plan["entrypoint"].endswith("/" + RECAP_TORCH_ENTRY)
-                or not recap_model_evidence_valid(model, inputs.get("model"))):
+                or not recap_contract_valid(stage, request.get("stage_config"), contract, datasets,
+                                            expected_backend=backend, bindings=request.get("dataset_bindings"))
+                or not entry_valid
+                or not model_valid):
             return {"code": "AGENT_RECAP_STAGE_INVALID", "message": "Agent 未完成所选 ReCap 阶段的模型、数据加载器和数据字段检查，请更新 Agent 后重新预检"}
+        if scoring_stage:
+            scorer = session.get(Asset, resolved_inputs["model"]["id"])
+            if not is_external_stage_annotation_checkpoint(scorer, stage):
+                source = stage_annotation_sources(session, [scorer], scorer_stage=scoring_stage).get(scorer.id)
+                if source is None or model["scorer_checkpoint"]["step"] != source["step"]:
+                    return {"code": "RECAP_ANNOTATION_MODEL_REQUIRED", "message": "标注模型的检查点步数或训练来源已变化，请重新选择并预检"}
     def binding_paths_match(index, dataset):
         norm_input = inputs[f"norm_{index}"]
         norm_matches = (dataset["norm_asset_path"] == norm_input if "norm_asset_path" in dataset
@@ -512,7 +550,7 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
         expected_spec = (processor.get("parameters", {}).get("composition")
                          if isinstance(processor, dict) and processor.get("name") == "ComposableDataConfig" else None)
         if expected_spec is not None:
-            from vla_adapters.composition_spec import composition_digest, validate_composition_profile_input
+            from vla_adapters.composition_spec import composition_action_loss_mask, composition_digest, validate_composition_profile_input
             from .data_processors import _source as processor_source
             try:
                 validate_composition_profile_input(declared, expected_spec)
@@ -537,7 +575,7 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
                           "state_history": expected_spec["state_history"], "normalization": expected_spec["normalization"]}
             shape = dataset.get("actions_shape")
             sequence = [expected_spec["action_key"]] if shape == [raw_action] else []
-            mask = [1.] * raw_action + [0.] * (composed["action_dim"] - raw_action)
+            mask = composition_action_loss_mask(expected_spec["model_transform"], raw_action, composed["action_dim"])
             if (raw_action > composed["action_dim"] or type(composed.get("pi05")) is not bool
                     or any(canonical_digest(composed.get(key)) != canonical_digest(value) for key, value in dimensions.items())
                     or not isinstance(composed.get("action_metadata_sha256"), str)
@@ -547,7 +585,7 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
                     or shape not in ([raw_action], [composed["action_horizon"], raw_action])
                     or canonical_digest(composed.get("action_sequence_keys")) != canonical_digest(sequence)
                     or canonical_digest(composed.get("action_loss_mask")) != canonical_digest(mask)):
-                return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 未证明组合字段宽度、动作采样和真实动作损失掩码与本次训练数据绑定一致，请更新后重新预检"}
+                return {"code": "AGENT_COMPOSITION_UNSUPPORTED", "message": "Agent 未证明组合字段宽度、动作采样和动作损失掩码与本次训练配置一致，请更新后重新预检"}
             image_keys, depth_keys = composed.get("image_keys"), composed.get("depth_keys")
             slots = {"base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"}
             if (not isinstance(image_keys, list) or not isinstance(depth_keys, list)
@@ -793,8 +831,12 @@ def validated_output(node: Node, attempt: Attempt, run: Run, output) -> dict | N
         return None
     row = {"kind": kind, "name": name, "path": path, "version": version, "metadata": metadata}
     plan = run.code_expectation.get("automatic_preflight", {}).get("plan", {})
-    if ((plan.get("recap_stage_contract") or {}).get("backend") == "pytorch" and kind == "MODEL"
+    backend = (plan.get("recap_stage_contract") or {}).get("backend")
+    if (backend == "pytorch" and kind == "MODEL"
             and not recap_torch_artifact_valid(row, attempt.output_dir, plan.get("recipe"), plan.get("training_stage"))):
+        return None
+    if (backend == "jax" and plan.get("training_stage") == ACP_STAGE and kind == "MODEL"
+            and not acp_artifact_valid(row, attempt.output_dir, plan.get("recipe"))):
         return None
     return row
 
@@ -824,7 +866,8 @@ def register_outputs(session, node: Node, attempt: Attempt, outputs: list[dict],
             if asset.state == "UNAVAILABLE":
                 asset.state = "READY"
                 asset.metadata_json = {**asset.metadata_json, "availability": "available"}
-        if bind_model_norms and output["kind"] == "DATASET" and run.code_expectation.get("training_stage") == STAGE_PROGRESS:
+        if (bind_model_norms and output["kind"] == "DATASET"
+                and run.code_expectation.get("training_stage") in (*ANNOTATION_STAGES, STAGE_PROGRESS)):
             from .dataset_validations import store_derived_validation
             asset.norm_asset_id = run.inputs["norm_0"]
             asset.registered_by_user_id = run.owner_user_id
@@ -843,16 +886,18 @@ def mark_removed_outputs(session, node: Node, attempt: Attempt, paths, timestamp
     if valid_paths:
         for asset in session.scalars(select(Asset).where(Asset.origin_attempt_id == attempt.id,
                 Asset.node_id == node.id, Asset.kind == "MODEL", Asset.path.in_(valid_paths))):
-            asset.state = "UNAVAILABLE"
+            if asset.state != "ARCHIVED":
+                asset.state = "UNAVAILABLE"
             asset.metadata_json = {**asset.metadata_json, "availability": "removed", "removed_at": timestamp}
             # The model's embedded statistics disappear with this checkpoint.
             # Never alter unrelated input/default norms or another attempt's
             # assets even if a historical FK was populated incorrectly.
             norm = session.get(Asset, asset.norm_asset_id) if asset.norm_asset_id else None
             if (norm is not None and norm.kind == "NORM" and norm.node_id == node.id
-                    and norm.origin_attempt_id == attempt.id and norm.state != "ARCHIVED"
+                    and norm.origin_attempt_id == attempt.id
                     and PurePosixPath(norm.path) == PurePosixPath(asset.path) / "assets/shared/norm_stats.json"):
-                norm.state = "UNAVAILABLE"
+                if norm.state != "ARCHIVED":
+                    norm.state = "UNAVAILABLE"
                 norm.metadata_json = {**norm.metadata_json, "availability": "removed", "removed_at": timestamp}
             changed = True
     return changed
@@ -952,43 +997,60 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
     if event.type == "SUCCEEDED":
         outputs = data.get("outputs", [])
         plan = run.code_expectation.get("automatic_preflight", {}).get("plan", {})
-        torch_recap = (plan.get("recap_stage_contract") or {}).get("backend") == "pytorch"
+        recap = plan.get("recap_stage_contract") or {}
+        torch_recap = recap.get("backend") == "pytorch"
+        stage = run.code_expectation.get("training_stage")
+        annotation = stage in ANNOTATION_STAGES
+        legacy_combined = stage == STAGE_PROGRESS and recap.get("operation") != "train"
+        required_kind = "NORM" if run.template_id == "openpi-norm" else "DATASET" if annotation else "MODEL"
         if exit_code != 0 or not isinstance(outputs, list):
             failure = {"code": "OUTPUT_INCOMPLETE", "message": "Successful execution needs exit code zero and an output manifest"}
         elif run.template_id != "smoke" and not any(isinstance(o, dict) and o.get("kind") ==
-                ("NORM" if run.template_id == "openpi-norm" else "MODEL") for o in outputs):
+                required_kind for o in outputs):
             failure = {"code": "OUTPUT_INCOMPLETE", "message": "Task completed without its required artifact"}
         elif output_error := norm_outputs_error(session, node, run, outputs):
             failure = output_error
-        elif torch_recap and (len(outputs) != (2 if plan["training_stage"] == STAGE_PROGRESS else 1)
+        elif torch_recap and not annotation and (len(outputs) != (2 if legacy_combined else 1)
                 or sum(recap_torch_artifact_valid(output, attempt.output_dir, plan["recipe"], plan["training_stage"],
                                                 final_step=plan["parameters"]["steps"] - 1) for output in outputs) != 1):
             failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "PyTorch ReCap 缺少本次训练已提交的最终模型"}
-        elif (run.code_expectation.get("training_stage") == STAGE_PROGRESS and not stage_progress_outputs_match(
-                outputs, attempt.output_dir, run.inputs, run.code_expectation.get("automatic_preflight", {}).get("plan"))):
-            failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "Kai0 作业需要进度模型和本次训练生成的优势数据集"}
+        elif stage == ACP_STAGE and recap.get("backend") == "jax" and (len(outputs) != 1
+                or not acp_artifact_valid(outputs[0], attempt.output_dir, plan["recipe"],
+                                          final_step=plan["parameters"]["steps"] - 1)):
+            failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "ACP 缺少本次训练的最终 Orbax 策略检查点"}
+        elif legacy_combined and not stage_progress_outputs_match(outputs, attempt.output_dir, run.inputs, plan):
+            failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "Stage Advantage 作业需要进度模型和本次训练生成的优势数据集"}
+        elif stage == STAGE_ANNOTATION and not stage_annotation_outputs_match(outputs, attempt.output_dir, run.inputs, plan):
+            failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "阶段优势标注的输出与已选检查点或数据集不一致"}
+        elif stage == VALUE_ANNOTATION and not value_annotation_outputs_match(outputs, attempt.output_dir, run.inputs, plan):
+            failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "优势值标注的输出与已选检查点或数据集不一致"}
         else:
             for output in outputs:
                 row = validated_output(node, attempt, run, output)
                 if row is None:
                     failure = {"code": "OUTPUT_INVALID", "message": "Output manifest has an invalid kind or local path"}
                     break
-                if run.code_expectation.get("training_stage") == STAGE_PROGRESS and row["kind"] == "DATASET":
+                if (legacy_combined or annotation) and row["kind"] == "DATASET":
                     from .dataset_validations import validated_source_result
                     source_profile = run.code_expectation.get("dataset_profiles", {}).get("dataset_0")
-                    profile = stage_progress_dataset_profile(source_profile)
+                    if stage == VALUE_ANNOTATION:
+                        profile = value_annotation_dataset_profile(source_profile)
+                        registration_source = "recap_value_annotation"
+                    else:
+                        profile = stage_progress_dataset_profile(source_profile)
+                        registration_source = "recap_stage_annotation" if annotation else "recap_stage_progress"
                     metadata = row["metadata"]
-                    annotation = metadata["annotation"]
                     validation = validated_source_result(
                         {"path": row["path"], "profile_id": run.profile_id, "registered_profile": profile},
                         metadata.get("source_validation"))
-                    if (validation.get("error") or validation["timestamp_contract"]["checked_rows"] != annotation["frame_count"]
-                            or metadata.get("registration_source") != "recap_stage_progress"):
-                        failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "Kai0 派生数据集未通过基础数据校验"}
+                    if (validation.get("error")
+                            or validation["timestamp_contract"]["checked_rows"] != metadata["annotation"]["frame_count"]
+                            or metadata.get("registration_source") != registration_source):
+                        failure = {"code": "RECAP_STAGE_OUTPUT_INVALID", "message": "优势标注的派生数据集未通过基础数据校验"}
                         break
                     row["metadata"] = {key: metadata[key] for key in ("format", "registration_source",
                         "source_dataset_asset_id", "source_norm_asset_id", "source_manifest_digest",
-                        "scorer_checkpoint_path", "annotation", "annotation_sha256")
+                        "scorer_checkpoint_path", "scorer_model_asset_id", "annotation", "annotation_sha256")
                         if key in metadata}
                     if profile is not None:
                         row["metadata"]["dataset_profile"] = profile

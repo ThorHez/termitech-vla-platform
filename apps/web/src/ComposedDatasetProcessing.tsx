@@ -10,7 +10,7 @@ import {
   type ImageLayoutEdits,
 } from './imageLayout';
 import { useDatasetImageMetadata } from './useDatasetImageMetadata';
-import { recapStageSupervision, trainingStageLabels } from './recap';
+import { isStageAdvantageStage, recapStageSupervision, trainingStageLabels } from './recap';
 import { trainingNormalizationLabel } from './trainingNormalization';
 import {
   fillMissingCompositionRepresentations,
@@ -21,8 +21,12 @@ import {
   composedProcessingErrors,
   composedProcessingSummary,
   normalizeComposedProcessing,
+  stageProgressSourceKey,
   trainingCompositionDraft,
   trainingCompositionProfileErrors,
+  validStageProgressSourceKey,
+  withStageProgressSource,
+  withoutStageProgressSource,
   type ComposedProcessingSpec,
   type ProcessingProfileSeed,
 } from './composedProcessing';
@@ -79,6 +83,40 @@ export function stageCompositionDraft(
   if (purpose === 'training' && supervision && profile.feature_keys?.includes(supervision))
     spec.aux_keys.push(supervision);
   return spec;
+}
+
+export function stageProgressBindingKey(binding?: DatasetBinding): string {
+  return binding?.processor?.name === 'ComposableDataConfig'
+    ? stageProgressSourceKey(binding.processor.parameters.composition)
+    : '';
+}
+
+export function updateStageProgressBinding(
+  binding: DatasetBinding,
+  dataset: Asset,
+  sourceKey: string,
+): DatasetBinding {
+  const raw =
+    binding.processor?.name === 'ComposableDataConfig'
+      ? binding.processor.parameters.composition
+      : undefined;
+  const composition = editableDraft(raw)
+    ? raw
+    : stageCompositionDraft(trainingProfileSeed(dataset), 'stage_progress');
+  const { recipe_index: _recipe, ...row } = binding;
+  return { ...row, processor: composedChoice(withStageProgressSource(composition, sourceKey)) };
+}
+
+export function removeStageProgressBinding(binding: DatasetBinding): DatasetBinding {
+  if (binding.processor?.name !== 'ComposableDataConfig') return binding;
+  const raw = binding.processor.parameters.composition;
+  if (
+    !editableDraft(raw) ||
+    (!Object.hasOwn(raw, 'stage_progress_key') && !raw.aux_keys.includes('stage_progress_gt'))
+  )
+    return binding;
+  const { recipe_index: _recipe, ...row } = binding;
+  return { ...row, processor: composedChoice(withoutStageProgressSource(raw)) };
 }
 
 export function fillRunRepresentationDefaults(
@@ -198,10 +236,19 @@ export function compositionBindingState({
   const supervision = stage === 'sft' ? undefined : recapStageSupervision[stage];
   if (spec && stage !== 'sft' && supervision && !spec.aux_keys.includes(supervision))
     errors.push(
-      `${trainingStageLabels[stage]}需要在本次处理方案中声明真实 ${supervision} 辅助字段。`,
+      isStageAdvantageStage(stage)
+        ? '请选择或填写阶段进度列。'
+        : `${trainingStageLabels[stage]}需要在本次处理方案中声明真实 ${supervision} 辅助字段。`,
     );
-  if (spec && stage === 'stage_progress' && spec.model_transform !== 'standard')
-    errors.push('Kai0 阶段进度估计器需要标准模型变换。');
+  if (
+    spec &&
+    isStageAdvantageStage(stage) &&
+    spec.aux_keys.includes('stage_progress_gt') &&
+    !validStageProgressSourceKey(stageProgressSourceKey(spec))
+  )
+    errors.push('请选择或填写有效的阶段进度列名。');
+  if (spec && isStageAdvantageStage(stage) && spec.model_transform !== 'standard')
+    errors.push('Stage Advantage 估计器需要标准模型变换。');
   const expected = spec ? composedChoice(spec, purpose) : undefined;
   const matches =
     !!expected &&
@@ -240,7 +287,9 @@ export function ComposedDatasetProcessing(props: {
   const features = images.inspection?.features;
   const state = compositionBindingState({ ...props, imageFeatures: features });
   const spec = state.spec;
-  const supervision = props.stage === 'sft' ? undefined : recapStageSupervision[props.stage];
+  const progressStage = isStageAdvantageStage(props.stage);
+  const supervision =
+    props.stage === 'sft' || progressStage ? undefined : recapStageSupervision[props.stage];
   const profile = { ...trainingProfileSeed(props.dataset), image_features: features };
   const manualLayouts = useRef(new Set<string>());
   const manualRepresentations = useRef(new Set<string>());
@@ -375,7 +424,14 @@ export function ComposedDatasetProcessing(props: {
             <button
               type="button"
               className="button outline small"
-              onClick={() => update(stageCompositionDraft(profile, props.stage, props.purpose))}
+              onClick={() => {
+                const draft = stageCompositionDraft(profile, props.stage, props.purpose);
+                update(
+                  progressStage && spec
+                    ? withStageProgressSource(draft, stageProgressSourceKey(spec))
+                    : draft,
+                );
+              }}
             >
               从登记字段标签重建草稿
             </button>
@@ -383,7 +439,14 @@ export function ComposedDatasetProcessing(props: {
               <button
                 type="button"
                 className="button outline small"
-                onClick={() => update(legacy as ComposedProcessingSpec)}
+                onClick={() => {
+                  const imported = legacy as ComposedProcessingSpec;
+                  update(
+                    progressStage && spec
+                      ? withStageProgressSource(imported, stageProgressSourceKey(spec))
+                      : imported,
+                  );
+                }}
               >
                 导入资产中的历史组合方案
               </button>
@@ -397,7 +460,7 @@ export function ComposedDatasetProcessing(props: {
                 使用已有 {supervision} 字段
               </button>
             )}
-            {props.stage === 'stage_progress' && spec && spec.model_transform !== 'standard' && (
+            {progressStage && spec && spec.model_transform !== 'standard' && (
               <button
                 type="button"
                 className="button outline small"
@@ -413,6 +476,7 @@ export function ComposedDatasetProcessing(props: {
               profile={profile}
               normalizationOverride={props.normalizationOverride}
               purpose={props.purpose}
+              managedStageProgress={progressStage}
               onChange={update}
               onFieldEdit={(path) => {
                 const field = path.replace(/^processing\./, '');

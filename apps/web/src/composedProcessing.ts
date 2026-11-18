@@ -96,6 +96,7 @@ export interface ComposedProcessingSpec {
   normalization: 'quantile' | 'zscore';
   model_transform: 'standard' | 'flat_state' | 'kai0_pad32';
   aux_keys: (typeof COMPOSED_SUPERVISION_FIELDS)[number][];
+  stage_progress_key?: string;
 }
 export interface ProcessingProfileSeed {
   robot_type: string;
@@ -153,6 +154,7 @@ const ROOT_KEYS = [
   'normalization',
   'model_transform',
   'aux_keys',
+  'stage_progress_key',
 ];
 const OPTIONAL_ROOT_KEYS = [
   'position_unit',
@@ -162,6 +164,7 @@ const OPTIONAL_ROOT_KEYS = [
   'action_mode',
   'rotation_representation',
   'prompt_key',
+  'stage_progress_key',
 ];
 const STATE_KEYS = ['key', 'width', 'arm', 'kind', 'normalize'];
 const ACTION_KEYS = ['arm', 'kind', 'width', 'normalize'];
@@ -221,6 +224,57 @@ export const compositionSchemaKey = (value: unknown): value is string =>
     .trim()
     .split('/')
     .every((part) => part !== '' && part !== '.' && part !== '..');
+
+export function stageProgressSourceKey(value: unknown): string {
+  if (!object(value)) return '';
+  if (Object.hasOwn(value, 'stage_progress_key'))
+    return typeof value.stage_progress_key === 'string' ? value.stage_progress_key : '';
+  return Array.isArray(value.aux_keys) && value.aux_keys.includes('stage_progress_gt')
+    ? 'stage_progress_gt'
+    : '';
+}
+
+const RESERVED_STAGE_PROGRESS_KEYS = [
+  'index',
+  'episode_index',
+  'frame_index',
+  'task_index',
+  'timestamp',
+  'task',
+  'value_target',
+  'is_positive',
+  'absolute_value',
+  'absolute_advantage',
+  'relative_advantage',
+];
+
+export function validStageProgressSourceKey(value: unknown): value is string {
+  return (
+    compositionSchemaKey(value) &&
+    !value.includes('/') &&
+    !RESERVED_STAGE_PROGRESS_KEYS.includes(value.trim())
+  );
+}
+
+export function withStageProgressSource(
+  spec: ComposedProcessingSpec,
+  key: string,
+): ComposedProcessingSpec {
+  return {
+    ...spec,
+    stage_progress_key: key,
+    aux_keys: key.trim()
+      ? spec.aux_keys.includes('stage_progress_gt')
+        ? spec.aux_keys
+        : [...spec.aux_keys, 'stage_progress_gt']
+      : spec.aux_keys.filter((aux) => aux !== 'stage_progress_gt'),
+  };
+}
+
+export function withoutStageProgressSource(spec: ComposedProcessingSpec): ComposedProcessingSpec {
+  const { stage_progress_key: _source, ...remaining } = spec;
+  return { ...remaining, aux_keys: spec.aux_keys.filter((aux) => aux !== 'stage_progress_gt') };
+}
 const integer = (value: unknown, minimum: number, maximum: number): value is number =>
   typeof value === 'number' && Number.isInteger(value) && value >= minimum && value <= maximum;
 const finite = (value: unknown): value is number =>
@@ -269,6 +323,18 @@ export function composedProcessingErrors(
     errors.push('请填写真实动作字段名，不能填写文件路径或表达式。');
   if (!blankDeclaration(value.prompt_key) && !compositionSchemaKey(value.prompt_key))
     errors.push('任务文本字段需为真实字段名，不能填写文件路径或表达式；留空则自动读取。');
+  if (
+    purpose === 'training' &&
+    value.stage_progress_key !== undefined &&
+    value.stage_progress_key !== ''
+  ) {
+    if (!validStageProgressSourceKey(value.stage_progress_key))
+      errors.push(
+        '阶段进度列需使用数据中已有的列名。支持点号，不能使用文件路径、表达式或保留字段。',
+      );
+    if (!Array.isArray(value.aux_keys) || !value.aux_keys.includes('stage_progress_gt'))
+      errors.push('按阶段训练的组合方案需要声明 stage_progress_gt 监督字段。');
+  }
   if (!blankDeclaration(value.action_mode) && !choice(value.action_mode, ['absolute', 'delta']))
     errors.push('动作模式只支持绝对量或增量；可留空沿用原始数据。');
   if (
@@ -465,26 +531,45 @@ export function composedProcessingErrors(
     });
   }
   if (Array.isArray(value.state_fields) && Array.isArray(cameras)) {
-    const keys = [...value.state_fields, ...cameras].flatMap((field) =>
-      object(field) && typeof field.key === 'string' ? [field.key.trim()] : [],
+    const sources = [
+      ...value.state_fields.map((field, index) => ({ field, label: `状态真实字段 ${index + 1}` })),
+      ...cameras.map((field, index) => ({ field, label: `组合视觉字段 ${index + 1}` })),
+    ].flatMap(({ field, label }) =>
+      object(field) && typeof field.key === 'string' ? [{ key: field.key.trim(), label }] : [],
     );
-    const unique = new Set(keys);
+    const unique = new Set(sources.map(({ key }) => key));
+    const actionKey = String(value.action_key).trim();
     const promptKey = blankDeclaration(value.prompt_key) ? '' : String(value.prompt_key).trim();
     if (
-      unique.size !== keys.length ||
-      unique.has(String(value.action_key).trim()) ||
+      unique.size !== sources.length ||
+      unique.has(actionKey) ||
       unique.has(promptKey) ||
-      String(value.action_key).trim() === promptKey
+      actionKey === promptKey
     )
       errors.push('状态、视觉、动作和任务字段不能互相占用。');
-    if (
-      Array.isArray(value.aux_keys) &&
-      value.aux_keys.some(
-        (key) =>
-          unique.has(String(key)) || key === String(value.action_key).trim() || key === promptKey,
-      )
-    )
-      errors.push('辅助字段不能与其它输入字段重名。');
+    if (Array.isArray(value.aux_keys)) {
+      const inputs = [
+        ...sources,
+        { key: actionKey, label: '动作真实字段' },
+        { key: promptKey, label: '任务文本真实字段' },
+      ];
+      const stageKey = stageProgressSourceKey(value).trim();
+      const auxiliaries = [
+        ...value.aux_keys
+          .filter((key) => compositionSchemaKey(key) && key !== stageKey)
+          .map((key) => ({ key, label: '辅助监督字段' })),
+        { key: stageKey, label: '阶段进度列' },
+      ];
+      for (const { key, label } of auxiliaries) {
+        if (!key) continue;
+        const conflicts = inputs
+          .filter((input) => input.key === key)
+          .map((input) => `「${input.label}」`);
+        if (conflicts.length) {
+          errors.push(`「${label}」与${conflicts.join('、')}使用了同一列「${key}」。`);
+        }
+      }
+    }
   }
   return [...new Set(errors)];
 }
@@ -493,8 +578,11 @@ export function normalizeComposedProcessing(
   spec: ComposedProcessingSpec,
   purpose: 'training' | 'norm' = 'training',
 ): ComposedProcessingSpec {
+  const { stage_progress_key: rawStageProgressKey, ...remaining } = spec;
+  const stageProgressKey =
+    typeof rawStageProgressKey === 'string' ? rawStageProgressKey.trim() : undefined;
   return {
-    ...spec,
+    ...remaining,
     robot_model: spec.robot_model.trim(),
     action_key: spec.action_key.trim(),
     action_mode: blankDeclaration(spec.action_mode) ? '' : spec.action_mode,
@@ -517,6 +605,11 @@ export function normalizeComposedProcessing(
         : spec.cameras.map((camera) => ({ ...camera, key: camera.key.trim() })),
     gripper_range: spec.gripper_range == null ? null : [...spec.gripper_range],
     aux_keys: [...spec.aux_keys],
+    ...(purpose === 'training' &&
+    stageProgressKey !== undefined &&
+    stageProgressKey !== 'stage_progress_gt'
+      ? { stage_progress_key: stageProgressKey }
+      : {}),
   };
 }
 
