@@ -26,7 +26,7 @@
 
 权限支持独立用户、管理员/操作员/只读三种角色、限时会话、账号禁用和操作审计，参见[用户与权限](docs/users-and-permissions.md)。当前用户共享一个工作空间，项目级隔离、checkpoint 恢复和 Docker 训练执行尚未实现。已实现的 Runner 使用登记的本机 Python/uv/venv 环境。完整目标参见 [详细设计](docs/VLA训练平台详细设计V1.0.md)，当前接口参见 [实现契约](docs/implementation-contract.md)。
 
-HTTPS 支持 Caddy 自动申请/续期公网 IP 或域名证书、已有 PEM 证书和本机测试证书；管理入口校验 Host 与可信代理，参见 [HTTPS 配置](docs/https.md)。生成配置不会启动服务；此前暂停的公网中台仍保持停用。
+HTTPS 支持 Caddy 自动申请/续期公网 IP 或域名证书、已有 PEM 证书和本机测试证书；管理入口校验 Host 与可信代理，参见 [HTTPS 配置](docs/https.md)。2026-11-18 中台已迁移至 [222 的 8443 入口](https://58.251.254.222:8443)，使用需由客户端信任的私有 HTTPS 根证书；169 仅保留训练 Agent，原页面和后台已停止。当前路径、服务与备份说明见 [222 中台运维](docs/deployments/controller-222.md)。
 
 ## 仓库结构
 
