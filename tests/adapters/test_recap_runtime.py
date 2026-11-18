@@ -101,6 +101,38 @@ def test_value_stage_preserves_value_loader_and_selects_value_training(recap):
     assert next(row for row in checks if row["name"] == "recap_stage")["ok"] is True
 
 
+def test_recap_stage_accepts_verified_external_video_but_requires_inline_image_columns(recap):
+    base, spec, module, loaders = recap
+    camera = "observation.images.top_head"
+    factory = base.data.datasets[0]
+    factory.mapping["image"] = camera
+    root = Path(factory.repo_id)
+    metadata = root / "meta/info.json"
+    info = json.loads(metadata.read_text())
+    info["features"][camera] = {"dtype": "video", "shape": [224, 224, 3]}
+    info["video_path"] = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
+    metadata.write_text(json.dumps(info))
+    directory = root / "videos/chunk-000" / camera
+    directory.mkdir(parents=True)
+    for ep in range(info["total_episodes"] - 1):
+        (directory / f"episode_{ep:06d}.mp4").write_bytes(b"test video manifest")
+
+    config = resolve_config(base, spec, module, loaders)
+    with pytest.raises(ValueError, match="DATASET_VIDEO_MISSING"):
+        inspect_training_config(config, spec, checks=[])
+    (directory / f"episode_{info['total_episodes'] - 1:06d}.mp4").write_bytes(b"test video manifest")
+    plan = inspect_training_config(config, spec, checks=[])
+    receipt = plan["recap_stage_contract"]["datasets"][0]
+    assert camera not in receipt["required_columns"]
+    assert "value_target" in receipt["required_columns"]
+    assert plan["datasets"][0]["video_manifest_digest"]
+
+    info["features"][camera]["dtype"] = "image"
+    metadata.write_text(json.dumps(info))
+    with pytest.raises(ValueError, match=r"RECAP_DATA_SCHEMA_INVALID.*observation\.images\.top_head"):
+        inspect_training_config(config, spec, checks=[])
+
+
 def test_preflight_combines_source_and_recap_supervision_cache_misses(recap, monkeypatch):
     base, spec, module, loaders = recap
     config = resolve_config(base, spec, module, loaders)

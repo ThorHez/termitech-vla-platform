@@ -407,7 +407,7 @@ def _value_runtime_cache(spec):
                 raise ValueError(f"TRAINING_CACHE_UNWRITABLE: 无法清理价值训练 JAX 缓存探针 {probe}: {exc}") from exc
 
 
-def inspect_stage(config, spec, factories, datasets, base_validation_failures=None):
+def inspect_stage(config, spec, factories, datasets, base_validation_failures=None, *, verified_video_keys=None):
     stage, requested = stage_request(spec)
     if stage is None:
         return None
@@ -436,21 +436,25 @@ def inspect_stage(config, spec, factories, datasets, base_validation_failures=No
                 not 0 <= factory.acp_dropout <= 1):
             raise ValueError("RECAP_STAGE_RECIPE_MISMATCH: 配方中的 ACP 条件 dropout 必须在 0 到 1 之间")
         mapping = _factory_mapping(factory)
-        required = _mapping_columns(mapping)
+        mapped = set(_mapping_columns(mapping))
+        # LeRobot reads external video features from videos/*.mp4. The data
+        # contract has already verified their files and frozen the manifest.
+        required = mapped - (verified_video_keys or {}).get(dataset["path"], frozenset())
         required_supervision = RECAP_SUPERVISION[stage]
         if stage in STAGE_ADVANTAGE_STAGES:
             stage_progress_key = (dataset.get("composition", {}).get("spec", {})
                                   .get("stage_progress_key", STAGE_PROGRESS_COLUMN))
             if mapping.get(required_supervision) != stage_progress_key:
                 raise ValueError("RECAP_DATA_SCHEMA_UNSUPPORTED: 阶段进度物理列与冻结的数据处理配置不一致")
-            required = sorted(set(required) | set(STAGE_PROGRESS_ID_COLUMNS))
+            required.update(STAGE_PROGRESS_ID_COLUMNS)
             supervised = [stage_progress_key]
         else:
             if mapping.get(required_supervision) != required_supervision:
                 raise ValueError("RECAP_DATA_SCHEMA_UNSUPPORTED: 阶段监督字段必须保留标准列名")
             if stage == VALUE_ANNOTATION:
-                required = sorted(set(required) | set(STAGE_PROGRESS_ID_COLUMNS))
-            supervised = [key for key in ("value_target", "is_positive") if key in required]
+                required.update(STAGE_PROGRESS_ID_COLUMNS)
+            supervised = [key for key in ("value_target", "is_positive") if key in mapped]
+        required.update(supervised)
         try:
             cached = require_cached_supervision(dataset, spec)
             summary = cached["supervision_summary"]
@@ -462,13 +466,13 @@ def inspect_stage(config, spec, factories, datasets, base_validation_failures=No
                 raise
             continue
         for checked in cached["checked_files"]:
-            missing = sorted(set(required) - set(checked["columns"]))
+            missing = sorted(required - set(checked["columns"]))
             if missing:
                 raise ValueError("RECAP_DATA_SCHEMA_INVALID: " + checked["path"]
                                  + " 的基础校验证据缺少阶段数据列：" + ", ".join(missing))
         if "value_target" in supervised and not minimum <= summary["value_target"]["min"] <= summary["value_target"]["max"] <= maximum:
             raise ValueError(f"RECAP_LABEL_INVALID: {dataset['path']} 的 value_target 超出 [{minimum}, {maximum}]")
-        row = {"path": dataset["path"], "required_columns": required,
+        row = {"path": dataset["path"], "required_columns": sorted(required),
                "supervision_columns": supervised,
                "parquet_files": cached["parquet_files"], "checked_files": cached["checked_files"],
                "supervision_summary": {key: summary[key] for key in supervised},

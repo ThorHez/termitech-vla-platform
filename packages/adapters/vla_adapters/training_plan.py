@@ -239,7 +239,8 @@ def registered_task_features(path, info, spec, registered_profile, *, selected_c
         raise ValueError("DATASET_PROFILE_UNVERIFIABLE: 登记了派生 task 字段，但无法从真实 meta/tasks.jsonl 核实 task_index 到任务文本的映射；首版暂不支持 tasks.parquet") from exc
 
 
-def dataset_contract(factory, spec, registered_profile=None, *, model_config=None, binding=None, checks=None, norm_stats=False):
+def dataset_contract(factory, spec, registered_profile=None, *, model_config=None, binding=None, checks=None,
+                     norm_stats=False, verified_video_keys=None):
     path = local_path(factory.repo_id, spec)
     info, metadata_sha = read_json(path / "meta" / "info.json", spec)
     for key in ("total_frames", "total_episodes"):
@@ -351,12 +352,13 @@ def dataset_contract(factory, spec, registered_profile=None, *, model_config=Non
             for key in video_keys:
                 for episode in range(info["total_episodes"]):
                     relative = pattern.format(video_key=key, episode_index=episode, episode_chunk=episode // chunk_size)
-                    candidate = local_path(path / relative, spec)
-                    if not candidate.is_relative_to(path / "videos") or relative not in available:
+                    if relative not in available or not local_path(path / relative, spec).is_relative_to(path / "videos"):
                         raise ValueError(f"DATASET_VIDEO_MISSING: 缺少数据集视频：{relative}")
         except (KeyError, IndexError) as exc:
             raise ValueError("DATASET_VIDEO_UNSUPPORTED: 无法解析数据集视频路径模板") from exc
         video_evidence = {"video_bytes": video_bytes, "video_manifest_digest": video_manifest}
+        if verified_video_keys is not None:
+            verified_video_keys[str(path)] = frozenset(video_keys)
     return {"path": str(path), "metadata_sha256": metadata_sha, "frames": info["total_frames"],
             "episodes": info["total_episodes"], "factory": type(factory).__name__,
             "effective_fps": registered_profile["fps"] if isinstance(registered_profile, dict) and "fps" in registered_profile else info.get("fps"),
@@ -881,10 +883,12 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             raise ValueError("DATASET_BINDINGS_INVALID: 实际训练的数据目录与所选资产不一致")
     passed("recipe_configuration", f"已解析配方 {spec['recipe']}，{len(factories)} 个数据集；batch {config.batch_size} / {spec['gpu_count']} GPU")
     datasets = []
+    verified_video_keys = {}
     for index, (factory, (dataset_role, _)) in enumerate(zip(factories, roles)):
         data = dataset_contract(factory, spec, spec["inputs"][dataset_role].get("dataset_profile"),
                                 model_config=getattr(config, "model", None),
-                                binding=bindings[index] if bindings is not None else None, checks=checks)
+                                binding=bindings[index] if bindings is not None else None, checks=checks,
+                                verified_video_keys=verified_video_keys)
         data["dataset_asset_id"] = spec["inputs"][dataset_role].get("id")
         datasets.append(data)
     passed("data_contract", "已核对所有数据集的 LeRobot 元数据与 parquet 文件：" + "、".join(d["path"] for d in datasets)[:2000])
@@ -909,7 +913,8 @@ def inspect_training_config(config, spec, *, checks, fps_runtime=None):
             raise
     stage, stage_config = stage_request(spec)
     try:
-        stage_contract = inspect_stage(config, spec, factories, datasets, base_validation_failures)
+        stage_contract = inspect_stage(config, spec, factories, datasets, base_validation_failures,
+                                       verified_video_keys=verified_video_keys)
     except ValueError:
         require_base_validation_results(base_validation_failures, checks)
         raise
