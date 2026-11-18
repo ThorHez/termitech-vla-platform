@@ -5,6 +5,7 @@ import {
   selectBindingProcessor,
 } from './DataProcessorPicker';
 import { datasetProfileSummary, readDatasetProfile } from './DatasetProfileForm';
+import { datasetFieldRoleLabels } from './datasetFieldAnnotations';
 import { recommendDatasetProcessor } from './datasetRecommendations';
 import {
   ComposedDatasetProcessing,
@@ -127,22 +128,26 @@ export function DatasetProcessing(props: {
                       <td>
                         <code>{field.key}</code>
                       </td>
-                      <td>{field.role === 'state' ? '状态' : '动作'}</td>
+                      <td>{datasetFieldRoleLabels[field.role]}</td>
                       <td>
-                        {field.representation === 'unknown'
-                          ? '待确认'
-                          : field.representation === 'gripper'
-                            ? '夹爪开度'
-                            : field.representation === 'composite'
-                              ? '组合向量（多分量）'
-                              : field.representation.toUpperCase()}
+                        {field.role === 'label'
+                          ? '—'
+                          : field.representation === 'unknown'
+                            ? '待确认'
+                            : field.representation === 'gripper'
+                              ? '夹爪开度'
+                              : field.representation === 'composite'
+                                ? '组合向量（多分量）'
+                                : field.representation.toUpperCase()}
                       </td>
                       <td>
-                        {field.value_mode === 'unknown'
-                          ? '待确认'
-                          : field.value_mode === 'absolute'
-                            ? '绝对量'
-                            : '增量'}
+                        {field.role === 'label'
+                          ? '—'
+                          : field.value_mode === 'unknown'
+                            ? '待确认'
+                            : field.value_mode === 'absolute'
+                              ? '绝对量'
+                              : '增量'}
                       </td>
                       <td>{field.shape?.join(' × ') || '待读取'}</td>
                     </tr>

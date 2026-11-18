@@ -1,7 +1,6 @@
 """Database-backed scheduling; multiple workers share the same reservation locks."""
 
 import logging
-from copy import deepcopy
 import secrets
 import time
 
@@ -26,6 +25,7 @@ from .gpu_selection import requested_gpu_uuids
 from .gpu_reservations import reservation_owners
 from .account_lifecycle import lock_execution_guard, training_execution_authorized
 from .asset_deletions import file_purge_pending
+from .dataset_profiles import dataset_runtime_profile
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ def resolve_inputs(session, run_or_request) -> dict:
         asset = session.get(Asset, asset_id)
         result[role] = {"id": asset.id, "path": asset.path, "kind": asset.kind}
         if role in profiles:
-            result[role]["dataset_profile"] = deepcopy(profiles[role])
+            result[role]["dataset_profile"] = dataset_runtime_profile(profiles[role])
     return result
 
 

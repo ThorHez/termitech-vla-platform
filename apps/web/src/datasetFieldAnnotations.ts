@@ -1,6 +1,6 @@
 export interface DatasetFieldAnnotation {
   key: string;
-  role: 'state' | 'action';
+  role: 'state' | 'action' | 'label';
   representation: 'eef' | 'joint' | 'gripper' | 'composite' | 'unknown';
   value_mode: 'absolute' | 'delta' | 'unknown';
   component: 'position' | 'rotation' | 'joint' | 'gripper' | 'other';
@@ -10,6 +10,16 @@ export interface DatasetFieldAnnotation {
   names?: string[];
   horizon?: number;
 }
+
+export const datasetFieldRoleLabels = { state: '状态', action: '动作', label: '训练标签' };
+
+export const trainingLabelDefaults = {
+  role: 'label',
+  representation: 'unknown',
+  value_mode: 'unknown',
+  component: 'other',
+  arm: 'unknown',
+} as const;
 
 export function sourceActionHorizon(shape: unknown): number | undefined {
   if (
@@ -50,13 +60,19 @@ export function fieldAnnotationErrors(value: unknown): string[] {
       Array.isArray(row) ||
       Object.keys(row).some((key) => !allowed.has(key)) ||
       !text(row.key, 256) ||
-      !['state', 'action'].includes(row.role) ||
+      typeof row.role !== 'string' ||
+      !Object.hasOwn(datasetFieldRoleLabels, row.role) ||
       !['eef', 'joint', 'gripper', 'composite', 'unknown'].includes(row.representation) ||
       !['absolute', 'delta', 'unknown'].includes(row.value_mode) ||
       !['position', 'rotation', 'joint', 'gripper', 'other'].includes(row.component) ||
       !['left', 'right', 'shared', 'unknown'].includes(row.arm)
     )
       return [`请完整填写字段标签 ${index + 1}。`];
+    if (
+      row.role === 'label' &&
+      Object.entries(trainingLabelDefaults).some(([key, expected]) => row[key] !== expected)
+    )
+      return [`字段标签 ${index + 1} 的训练标签只能填写字段及原始信息。`];
     if (row.representation === 'gripper' && row.component !== 'gripper')
       return [`字段标签 ${index + 1} 的夹爪开度表示必须使用夹爪分量。`];
     if (row.representation === 'composite' && row.component !== 'other')

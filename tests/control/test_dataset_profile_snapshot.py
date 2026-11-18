@@ -101,6 +101,28 @@ def test_multiple_datasets_preserve_each_registered_profile_and_legacy_row(platf
     assert "dataset_profile" not in start["payload"]["inputs"]["dataset_1"]
 
 
+def test_training_labels_freeze_with_the_run_but_do_not_require_an_agent_upgrade(platform):
+    node = platform.register(adapter="openpi-sft", recipe="umi")
+    assets = inputs(platform, node)
+    label = {"key": "stage_progress_gt", "role": "label", "representation": "unknown",
+             "value_mode": "unknown", "component": "other", "arm": "unknown",
+             "shape": [1], "dtype": "float32"}
+    keys = [*profile().get("feature_keys", []), label["key"]]
+    description = describe(platform, assets["dataset"], feature_keys=keys, field_annotations=[label])
+    assert description["field_annotations"] == [label]
+    identifier, command, code = create_pending(platform, node, assets)
+    runtime_profile = {**description, "field_annotations": []}
+    assert command["payload"]["inputs"]["dataset"]["dataset_profile"] == runtime_profile
+    checked = acknowledge(platform, node, identifier, command, code)
+    assert checked["status"] == "READY", checked
+    response = submit(platform, identifier)
+    assert response.status_code == 201, response.text
+    assert response.json()["dataset_profiles"] == {"dataset": description}
+    assert platform.schedule() == 1
+    start = next(item for item in platform.commands(node) if item["type"] == "START")
+    assert start["payload"]["inputs"]["dataset"]["dataset_profile"] == runtime_profile
+
+
 @pytest.mark.parametrize("mutation,expected", [
     ("missing", "AGENT_DATASET_PROFILE_UNSUPPORTED"), ("null", "AGENT_DATASET_PROFILE_UNSUPPORTED"),
     ("changed", "DATASET_PROFILE_MISMATCH"), ("wrong_type", "DATASET_PROFILE_MISMATCH"),

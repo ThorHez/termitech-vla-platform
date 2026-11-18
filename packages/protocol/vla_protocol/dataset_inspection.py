@@ -14,6 +14,7 @@ TRIM = "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003
 SUGGESTION_FIELDS = {"format", "robot_type", "arm_mode", "action_representation", "cameras", "task_description",
                      "action_dim", "state_dim", "fps", "action_mode", "rotation_representation", "feature_keys", "field_annotations"}
 PROCESSING_FIELDS = {"action_key", "prompt_key", "state_history", "state_representation", "state_fields", "action_layout", "cameras"}
+TRAINING_LABEL_KEYS = frozenset({"stage_progress_gt", "progress_gt", "value_target", "is_positive"})
 
 
 def _fail():
@@ -95,11 +96,14 @@ def _camera(value, processing=False):
 
 def _annotation(value):
     _obj(value, {"key", "role", "representation", "value_mode", "component", "arm"}, {"shape", "dtype", "names", "horizon"})
-    result = {"key": _text(value["key"]), "role": _enum(value["role"], {"state", "action"}),
+    result = {"key": _text(value["key"]), "role": _enum(value["role"], {"state", "action", "label"}),
               "representation": _enum(value["representation"], {"eef", "joint", "gripper", "composite", "unknown"}),
               "value_mode": _enum(value["value_mode"], {"absolute", "delta", "unknown"}),
               "component": _enum(value["component"], {"position", "rotation", "joint", "gripper", "other"}),
               "arm": _enum(value["arm"], {"left", "right", "shared", "unknown"})}
+    if result["role"] == "label" and (result["representation"], result["value_mode"], result["component"], result["arm"]) != (
+            "unknown", "unknown", "other", "unknown"):
+        _fail()
     if result["representation"] == "gripper" and result["component"] != "gripper":
         _fail()
     if result["representation"] == "composite" and result["component"] != "other":

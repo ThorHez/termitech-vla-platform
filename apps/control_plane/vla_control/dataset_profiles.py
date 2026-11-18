@@ -47,7 +47,7 @@ class DatasetCamera(_ProfileModel):
 class DatasetFieldAnnotation(_ProfileModel):
     """Labels describe a source field; they never prescribe a training layout."""
     key: str = Field(min_length=1, max_length=256)
-    role: Literal["state", "action"]
+    role: Literal["state", "action", "label"]
     representation: Literal["eef", "joint", "gripper", "composite", "unknown"] = "unknown"
     value_mode: Literal["absolute", "delta", "unknown"] = "unknown"
     component: Literal["position", "rotation", "joint", "gripper", "other"] = "other"
@@ -65,7 +65,10 @@ class DatasetFieldAnnotation(_ProfileModel):
         return [_text(item) for item in value] if isinstance(value, list) else value
 
     @model_validator(mode="after")
-    def validate_gripper_representation(self):
+    def validate_role_semantics(self):
+        if self.role == "label" and (self.representation, self.value_mode, self.component, self.arm) != (
+                "unknown", "unknown", "other", "unknown"):
+            raise ValueError("训练标签不能声明机器人状态或动作语义")
         if self.representation == "gripper" and self.component != "gripper":
             raise ValueError("夹爪开度表示只允许用于夹爪分量")
         if self.representation == "composite" and self.component != "other":
@@ -152,6 +155,21 @@ class DatasetProfile(_ProfileModel):
 def normalize_dataset_profile(value) -> dict:
     """Validate a complete v1 description without importing training code."""
     return DatasetProfile.model_validate(value).model_dump(mode="json", exclude_none=True)
+
+
+def dataset_runtime_profile(profile):
+    """Send state/action facts to runners using the existing profile contract.
+
+    Registered label roles describe supervision for the UI. Runners verify
+    their actual source columns through the selected training configuration.
+    """
+    result = deepcopy(profile)
+    if isinstance(result, dict) and isinstance(result.get("field_annotations"), list):
+        result["field_annotations"] = [
+            row for row in result["field_annotations"]
+            if not isinstance(row, dict) or row.get("role") != "label"
+        ]
+    return result
 
 
 RECAP_ANNOTATION_SOURCE = "recap_annotation_source"

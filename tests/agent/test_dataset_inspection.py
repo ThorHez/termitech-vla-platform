@@ -146,6 +146,23 @@ def test_target_and_command_fields_are_excluded_from_state_candidates(tmp_path):
                if row["key"] in {"left_joint_target", "command_right_joint", "actions.left_joint", "left_joint_command"})
 
 
+def test_inspection_suggests_training_labels_without_adding_state_or_action_inputs(tmp_path):
+    path = dataset(tmp_path)
+    source = path / "meta/info.json"
+    info = json.loads(source.read_text())
+    for key, dtype in (("stage_progress_gt", "float32"), ("value_target", "float64"), ("is_positive", "bool")):
+        info["features"][key] = {"dtype": dtype, "shape": [1]}
+    info["features"]["left_joint_progress"] = {"dtype": "float32", "shape": [1], "role": "label"}
+    source.write_text(json.dumps(info))
+    result = read(path)
+    labels = [row for row in result["suggestions"]["field_annotations"] if row["role"] == "label"]
+    assert {row["key"] for row in labels} == {"stage_progress_gt", "value_target", "is_positive", "left_joint_progress"}
+    assert all(row["representation"] == "unknown" and "horizon" not in row for row in labels)
+    assert result["suggestions"]["state_dim"] == result["suggestions"]["action_dim"] == 7
+    assert [row["key"] for row in result["processing"]["state_fields"]] == ["observation.state"]
+    assert result["processing"]["action_key"] == "actions"
+
+
 def test_repeated_or_incomplete_coordinate_names_do_not_produce_action_layouts(tmp_path):
     path = dataset(tmp_path);source = path / "meta/info.json"
     info = json.loads(source.read_text())

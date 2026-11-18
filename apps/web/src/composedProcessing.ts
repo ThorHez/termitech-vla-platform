@@ -5,6 +5,7 @@ import {
   type ImageProcessingPolicy,
 } from './imageProcessingPolicy';
 import { fillMissingCompositionRepresentations } from './compositionRepresentationDefaults';
+import type { DatasetFieldAnnotation } from './datasetFieldAnnotations';
 
 export type Arm = 'left' | 'right';
 export type StateKind = 'position' | 'rotation' | 'joint' | 'gripper' | 'other';
@@ -121,17 +122,7 @@ export interface ProcessingProfileSeed {
   processing?: ComposedProcessingSpec;
 }
 
-export interface ProcessingFieldAnnotation {
-  key: string;
-  role: 'state' | 'action';
-  representation: 'eef' | 'joint' | 'gripper' | 'composite' | 'unknown';
-  value_mode: 'absolute' | 'delta' | 'unknown';
-  component: StateKind;
-  arm: Arm | 'shared' | 'unknown';
-  shape?: number[];
-  dtype?: string;
-  names?: string[];
-}
+type ProcessingFieldAnnotation = DatasetFieldAnnotation;
 
 const ROOT_KEYS = [
   'schema_version',

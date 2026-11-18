@@ -173,8 +173,10 @@ def verify_registered_dataset_profile(profile, info, *, derived_features=(), sel
             fail(str(exc))
         for row in annotations:
             feature = features.get(row["key"])
-            if not isinstance(feature, dict) or not re.fullmatch(r"(?:float|int|uint)(?:8|16|32|64)?|double|bfloat16", str(feature.get("dtype", ""))):
-                fail("状态或动作标签必须对应真实数值字段：" + row["key"])
+            dtype = feature.get("dtype") if isinstance(feature, dict) else None
+            if not (re.fullmatch(r"(?:float|int|uint)(?:8|16|32|64)?|double|bfloat16", str(dtype))
+                    or row["role"] == "label" and dtype == "bool"):
+                fail("字段标签必须对应真实且类型受支持的字段：" + row["key"])
             shape = feature.get("shape")
             if not isinstance(shape, list) or not shape or any(type(size) is not int or size <= 0 for size in shape):
                 fail("标签字段缺少真实形状：" + row["key"])

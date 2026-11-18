@@ -316,9 +316,17 @@ export function DatasetBindings({
         const share = samplingShares[index];
         const sampleCount = sampleCounts.counts[binding.dataset_asset_id];
         const progressSource = progressSourceRequired ? stageProgressBindingKey(binding) : '';
-        const sourceFeatures = progressSourceRequired
-          ? readDatasetProfile(dataset?.metadata?.dataset_profile)?.feature_keys || []
-          : [];
+        const datasetProfile = progressSourceRequired
+          ? readDatasetProfile(dataset?.metadata?.dataset_profile)
+          : undefined;
+        const sourceFeatures = [
+          ...new Set([
+            ...(datasetProfile?.field_annotations || [])
+              .filter(({ role }) => role === 'label')
+              .map(({ key }) => key),
+            ...(datasetProfile?.feature_keys || []),
+          ]),
+        ];
         const sampleLabel =
           share.sampleCount === undefined
             ? sampleCount?.status === 'loading'

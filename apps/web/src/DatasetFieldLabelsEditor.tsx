@@ -1,5 +1,10 @@
 import { Plus, Trash2 } from 'lucide-react';
-import { sourceActionHorizon, type DatasetFieldAnnotation } from './datasetFieldAnnotations';
+import {
+  datasetFieldRoleLabels,
+  sourceActionHorizon,
+  trainingLabelDefaults,
+  type DatasetFieldAnnotation,
+} from './datasetFieldAnnotations';
 import type { ImageLayoutFeature } from './imageLayout';
 import './dataset-field-annotations.css';
 
@@ -46,7 +51,7 @@ function FieldSourceMetadata({
         {' · '}
         {dtype || '类型未读取'}
       </span>
-      <strong>{dimension}</strong>
+      {row.role !== 'label' && <strong>{dimension}</strong>}
       <span className="dataset-field-source-origin">
         {feature ? '来源：当前数据集元数据' : '来源：字段标签记录'}
       </span>
@@ -78,9 +83,9 @@ export function DatasetFieldLabelsEditor({
     onChange(value.map((row, position) => (position === index ? { ...row, [key]: next } : row)));
   };
   return (
-    <section className="dataset-field-annotations" aria-label="状态与动作字段标签">
+    <section className="dataset-field-annotations" aria-label="状态与动作字段标签、训练标签">
       <div className="dataset-profile-section-title">
-        <strong>状态与动作字段标签</strong>
+        <strong>状态与动作字段标签、训练标签</strong>
         <span>{value.length} 项</span>
         <button
           type="button"
@@ -110,7 +115,7 @@ export function DatasetFieldLabelsEditor({
         已拼接的字段可选“组合向量（多分量）”，字段内部顺序与分块在新建训练中配置，不会自动猜测。
       </p>
       {!value.length ? (
-        <p className="field-hint">读取数据集后自动填入状态与动作字段，也可手动添加。</p>
+        <p className="field-hint">读取数据集后自动填入识别到的字段，也可手动添加。</p>
       ) : (
         <div className="dataset-field-labels-table">
           <table>
@@ -196,10 +201,16 @@ export function DatasetFieldLabelsEditor({
                         const role = event.target.value as DatasetFieldAnnotation['role'];
                         onFieldEdit?.(`field_annotations[${index}].role`);
                         onFieldEdit?.(`field_annotations[${index}].horizon`);
+                        if (role === 'label') {
+                          for (const key of Object.keys(trainingLabelDefaults)) {
+                            if (key !== 'role') onFieldEdit?.(`field_annotations[${index}].${key}`);
+                          }
+                        }
                         onChange(
                           value.map((item, position) => {
                             if (position !== index) return item;
                             const { horizon: _horizon, ...labels } = item;
+                            if (role === 'label') return { ...labels, ...trainingLabelDefaults };
                             const horizon =
                               role === 'action' ? sourceActionHorizon(item.shape) : undefined;
                             return {
@@ -211,135 +222,152 @@ export function DatasetFieldLabelsEditor({
                         );
                       }}
                     >
-                      <option value="state">状态</option>
-                      <option value="action">动作</option>
+                      {Object.entries(datasetFieldRoleLabels).map(([role, label]) => (
+                        <option key={role} value={role}>
+                          {label}
+                        </option>
+                      ))}
                     </select>
                   </td>
-                  <td>
-                    <select
-                      aria-label={`字段表示 ${index + 1}`}
-                      value={row.representation}
-                      disabled={disabled}
-                      onChange={(event) => {
-                        const representation = event.target
-                          .value as DatasetFieldAnnotation['representation'];
-                        const component =
-                          representation === 'gripper'
-                            ? 'gripper'
-                            : representation === 'composite'
-                              ? 'other'
-                              : row.representation === 'gripper' && row.component === 'gripper'
-                                ? 'other'
-                                : row.component;
-                        onFieldEdit?.(`field_annotations[${index}].representation`);
-                        if (component !== row.component)
-                          onFieldEdit?.(`field_annotations[${index}].component`);
-                        onChange(
-                          value.map((item, position) =>
-                            position === index ? { ...item, representation, component } : item,
-                          ),
-                        );
-                      }}
-                    >
-                      <option value="unknown">未知</option>
-                      <option value="eef">EEF</option>
-                      <option value="joint">Joint</option>
-                      <option value="gripper">夹爪开度</option>
-                      <option value="composite">组合向量（多分量）</option>
-                    </select>
-                  </td>
-                  <td>
-                    <select
-                      aria-label={`字段数值方式 ${index + 1}`}
-                      value={row.value_mode}
-                      disabled={disabled}
-                      onChange={(event) =>
-                        update(
-                          index,
-                          'value_mode',
-                          event.target.value as DatasetFieldAnnotation['value_mode'],
-                        )
-                      }
-                    >
-                      <option value="unknown">未知</option>
-                      <option value="absolute">绝对</option>
-                      <option value="delta">增量</option>
-                    </select>
-                  </td>
-                  <td>
-                    {row.role === 'action' ? (
-                      <input
-                        type="number"
-                        min={1}
-                        max={2 ** 31 - 1}
-                        step={1}
-                        aria-label={`动作 Horizon ${index + 1}`}
-                        title="数据中每条样本已有的动作序列长度；训练预测步数在训练配置中设置。"
-                        placeholder="待读取"
-                        value={row.horizon ?? sourceActionHorizon(row.shape) ?? ''}
-                        disabled={disabled}
-                        onChange={(event) => {
-                          onFieldEdit?.(`field_annotations[${index}].horizon`);
-                          const horizon =
-                            event.target.value === '' ? undefined : Number(event.target.value);
-                          onChange(
-                            value.map((item, position) => {
-                              if (position !== index) return item;
-                              const { horizon: _horizon, ...labels } = item;
-                              return { ...labels, ...(horizon !== undefined ? { horizon } : {}) };
-                            }),
-                          );
-                        }}
-                      />
-                    ) : (
-                      <span aria-label={`状态字段 ${index + 1} 无动作 Horizon`}>—</span>
-                    )}
-                  </td>
-                  <td>
-                    <select
-                      aria-label={`字段分量 ${index + 1}`}
-                      value={row.component}
-                      disabled={disabled || row.representation === 'composite'}
-                      onChange={(event) => {
-                        const component = event.target.value as DatasetFieldAnnotation['component'];
-                        const representation =
-                          row.representation === 'gripper' && component !== 'gripper'
-                            ? 'unknown'
-                            : row.representation;
-                        onFieldEdit?.(`field_annotations[${index}].component`);
-                        if (representation !== row.representation)
-                          onFieldEdit?.(`field_annotations[${index}].representation`);
-                        onChange(
-                          value.map((item, position) =>
-                            position === index ? { ...item, component, representation } : item,
-                          ),
-                        );
-                      }}
-                    >
-                      <option value="other">
-                        {row.representation === 'composite' ? '组合向量' : '其他'}
-                      </option>
-                      <option value="position">位置</option>
-                      <option value="rotation">旋转</option>
-                      <option value="joint">关节</option>
-                      <option value="gripper">夹爪</option>
-                    </select>
-                  </td>
-                  <td>
-                    <select
-                      aria-label={`字段归属 ${index + 1}`}
-                      value={row.arm}
-                      disabled={disabled}
-                      onChange={(event) =>
-                        update(index, 'arm', event.target.value as DatasetFieldAnnotation['arm'])
-                      }
-                    >
-                      <option value="unknown">未知</option>
-                      <option value="left">左臂</option>
-                      <option value="right">右臂</option>
-                      <option value="shared">共享</option>
-                    </select>
-                  </td>
+                  {row.role === 'label' ? (
+                    <td colSpan={5}>—</td>
+                  ) : (
+                    <>
+                      <td>
+                        <select
+                          aria-label={`字段表示 ${index + 1}`}
+                          value={row.representation}
+                          disabled={disabled}
+                          onChange={(event) => {
+                            const representation = event.target
+                              .value as DatasetFieldAnnotation['representation'];
+                            const component =
+                              representation === 'gripper'
+                                ? 'gripper'
+                                : representation === 'composite'
+                                  ? 'other'
+                                  : row.representation === 'gripper' && row.component === 'gripper'
+                                    ? 'other'
+                                    : row.component;
+                            onFieldEdit?.(`field_annotations[${index}].representation`);
+                            if (component !== row.component)
+                              onFieldEdit?.(`field_annotations[${index}].component`);
+                            onChange(
+                              value.map((item, position) =>
+                                position === index ? { ...item, representation, component } : item,
+                              ),
+                            );
+                          }}
+                        >
+                          <option value="unknown">未知</option>
+                          <option value="eef">EEF</option>
+                          <option value="joint">Joint</option>
+                          <option value="gripper">夹爪开度</option>
+                          <option value="composite">组合向量（多分量）</option>
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          aria-label={`字段数值方式 ${index + 1}`}
+                          value={row.value_mode}
+                          disabled={disabled}
+                          onChange={(event) =>
+                            update(
+                              index,
+                              'value_mode',
+                              event.target.value as DatasetFieldAnnotation['value_mode'],
+                            )
+                          }
+                        >
+                          <option value="unknown">未知</option>
+                          <option value="absolute">绝对</option>
+                          <option value="delta">增量</option>
+                        </select>
+                      </td>
+                      <td>
+                        {row.role === 'action' ? (
+                          <input
+                            type="number"
+                            min={1}
+                            max={2 ** 31 - 1}
+                            step={1}
+                            aria-label={`动作 Horizon ${index + 1}`}
+                            title="数据中每条样本已有的动作序列长度；训练预测步数在训练配置中设置。"
+                            placeholder="待读取"
+                            value={row.horizon ?? sourceActionHorizon(row.shape) ?? ''}
+                            disabled={disabled}
+                            onChange={(event) => {
+                              onFieldEdit?.(`field_annotations[${index}].horizon`);
+                              const horizon =
+                                event.target.value === '' ? undefined : Number(event.target.value);
+                              onChange(
+                                value.map((item, position) => {
+                                  if (position !== index) return item;
+                                  const { horizon: _horizon, ...labels } = item;
+                                  return {
+                                    ...labels,
+                                    ...(horizon !== undefined ? { horizon } : {}),
+                                  };
+                                }),
+                              );
+                            }}
+                          />
+                        ) : (
+                          <span aria-label={`状态字段 ${index + 1} 无动作 Horizon`}>—</span>
+                        )}
+                      </td>
+                      <td>
+                        <select
+                          aria-label={`字段分量 ${index + 1}`}
+                          value={row.component}
+                          disabled={disabled || row.representation === 'composite'}
+                          onChange={(event) => {
+                            const component = event.target
+                              .value as DatasetFieldAnnotation['component'];
+                            const representation =
+                              row.representation === 'gripper' && component !== 'gripper'
+                                ? 'unknown'
+                                : row.representation;
+                            onFieldEdit?.(`field_annotations[${index}].component`);
+                            if (representation !== row.representation)
+                              onFieldEdit?.(`field_annotations[${index}].representation`);
+                            onChange(
+                              value.map((item, position) =>
+                                position === index ? { ...item, component, representation } : item,
+                              ),
+                            );
+                          }}
+                        >
+                          <option value="other">
+                            {row.representation === 'composite' ? '组合向量' : '其他'}
+                          </option>
+                          <option value="position">位置</option>
+                          <option value="rotation">旋转</option>
+                          <option value="joint">关节</option>
+                          <option value="gripper">夹爪</option>
+                        </select>
+                      </td>
+                      <td>
+                        <select
+                          aria-label={`字段归属 ${index + 1}`}
+                          value={row.arm}
+                          disabled={disabled}
+                          onChange={(event) =>
+                            update(
+                              index,
+                              'arm',
+                              event.target.value as DatasetFieldAnnotation['arm'],
+                            )
+                          }
+                        >
+                          <option value="unknown">未知</option>
+                          <option value="left">左臂</option>
+                          <option value="right">右臂</option>
+                          <option value="shared">共享</option>
+                        </select>
+                      </td>
+                    </>
+                  )}
                   <td>
                     <button
                       type="button"

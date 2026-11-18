@@ -174,6 +174,25 @@ try {
     assert.ok(datasetProfileErrors({...source,field_annotations:[{...fields[0],horizon:1},fields[1]]}).length);
     assert.deepEqual(datasetProfileErrors({...source,field_annotations:[{...fields[1],shape:undefined,horizon:undefined}]}),[]);
   });
+  await test('stage progress labels survive registration without acquiring an action horizon or a state width', async () => {
+    const { trainingCompositionDraft } = await server.ssrLoadModule('/src/composedProcessing.ts');
+    const { mergeDatasetInspection } = await server.ssrLoadModule('/src/datasetInspectionHelpers.ts');
+    const state = { key: 'observation.state', role: 'state', representation: 'joint', value_mode: 'absolute', component: 'joint', arm: 'shared', shape: [14] };
+    const draft = { ...profile, feature_keys: ['observation.state', 'stage_progress_gt'], field_annotations: [state] };
+    const inspection = {
+      features: [{ key: 'stage_progress_gt', dtype: 'float32', shape: [1], names: [] }],
+      suggestions: { field_annotations: [state] },
+      processing: {},
+      evidence: [],
+    };
+    const { profile: inspected } = mergeDatasetInspection(draft, inspection, { initial: draft, registered: false, touched: new Set(), automatic: new Map() });
+    const registered = readDatasetProfile(normalizedDatasetProfile(inspected));
+    assert.equal(registered.field_annotations[1].role, 'label');
+    assert.deepEqual(trainingCompositionDraft(registered).state_fields.map(({ key, width }) => [key, width]), [['observation.state', 14]]);
+    const html = render(DatasetProfileForm, { value: registered, onChange() {} });
+    assert.match(html, /value="label" selected="">训练标签/);
+    assert.doesNotMatch(html, /字段表示 2|动作 Horizon 2|状态维度：1 维/);
+  });
   await test('standalone gripper opening labels round-trip independently from arm representation', () => {
     const field = {key:'observation.gripper_width',role:'state',representation:'gripper',value_mode:'unknown',component:'gripper',arm:'left',shape:[1]};
     const source = {...profile,field_annotations:[field]};

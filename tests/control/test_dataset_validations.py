@@ -114,6 +114,23 @@ def test_registration_queues_one_dataset_scoped_command_and_safe_ack_updates_onl
     assert create(platform, asset).json()["id"] != report["id"]
 
 
+def test_registration_keeps_training_labels_and_dispatches_to_existing_validation_agents(platform):
+    node = worker(platform)
+    profile = dataset_profile()
+    label = {"key": "stage_progress_gt", "role": "label", "shape": [1], "dtype": "float32"}
+    profile.setdefault("feature_keys", []).append(label["key"])
+    profile["field_annotations"] = [label]
+    asset = register(platform, node, metadata={"dataset_profile": profile})
+    saved = asset["metadata"]["dataset_profile"]
+    assert saved["field_annotations"][0]["role"] == "label"
+    command, = platform.commands(node)
+    assert command["payload"]["registered_profile"] == {**saved, "field_annotations": []}
+    assert ack(platform, node, asset["validation"], result(asset)).status_code == 200
+    assert get(platform, asset)["status"] == "SUCCEEDED"
+    detail = platform.client.get(f"/api/v1/assets/{asset['id']}", headers=ADMIN).json()
+    assert detail["metadata"]["dataset_profile"] == saved
+
+
 @pytest.mark.parametrize("registered_path,returned_path", [
     ("/machine/data/", "/machine/data"),
     ("/machine//data/./", "/machine/data"),

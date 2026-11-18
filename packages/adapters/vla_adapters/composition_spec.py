@@ -324,12 +324,15 @@ def normalize_field_annotations(value):
         if not isinstance(item, dict) or not required <= set(item) or set(item) - required - optional:
             _fail("字段标签缺少必填项或包含处理规则")
         row = {"key": _key(item["key"], "标签字段名")}
-        for key, choices in (("role", {"state", "action"}),
+        for key, choices in (("role", {"state", "action", "label"}),
                              ("representation", {"eef", "joint", "gripper", "composite", "unknown"}),
                              ("value_mode", {"absolute", "delta", "unknown"}),
                              ("component", STATE_KINDS),
                              ("arm", {"left", "right", "shared", "unknown"})):
             row[key] = _enum(item[key], choices, "字段标签 " + key)
+        if row["role"] == "label" and (row["representation"], row["value_mode"], row["component"], row["arm"]) != (
+                "unknown", "unknown", "other", "unknown"):
+            _fail("训练标签不能声明机器人状态或动作语义")
         if row["representation"] == "gripper" and row["component"] != "gripper":
             _fail("夹爪开度表示仅适用于夹爪分量")
         if row["representation"] == "composite" and row["component"] != "other":

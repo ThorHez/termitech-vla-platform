@@ -10,7 +10,7 @@ from pathlib import Path
 import re
 import stat
 
-from vla_protocol.dataset_inspection import MAX_FEATURES, MAX_RESULT_BYTES, TRIM, normalize_dataset_inspection
+from vla_protocol.dataset_inspection import MAX_FEATURES, MAX_RESULT_BYTES, TRAINING_LABEL_KEYS, TRIM, normalize_dataset_inspection
 
 from .safety import AgentError, allowed_path
 
@@ -180,13 +180,23 @@ def _field_annotations(info, features, warn):
     result = []
     for feature in features:
         key, names, shape = feature["key"], feature["names"], feature["shape"]
-        if not NUMERIC.fullmatch(feature["dtype"]) or not _safe_key(key) or not shape:
+        if not _safe_key(key) or not shape:
             continue
         raw = info["features"][key]
         explicit = declared.get(key, {})
+        role = next((value for value in (explicit.get("role"), raw.get("role"), raw.get("semantic"))
+                     if label(value, {"state", "action", "label"})), None)
+        numeric = NUMERIC.fullmatch(feature["dtype"])
+        if (role == "label" or role is None and key in TRAINING_LABEL_KEYS and shape == [1]) and (
+                numeric or feature["dtype"] == "bool"):
+            result.append({"key": key, "role": "label", "representation": "unknown", "value_mode": "unknown",
+                           "component": "other", "arm": "unknown", "shape": list(shape), "dtype": feature["dtype"],
+                           "names": list(names)})
+            continue
+        if not numeric or role == "label":
+            continue
         token = _tokens(key)
         component = _kind(key)
-        role = next((value for value in (explicit.get("role"), raw.get("role"), raw.get("semantic")) if label(value, {"state", "action"})), None)
         if role is None:
             if re.search(r"_(?:actions?|targets?|commands?|cmd)_", token):
                 role = "action"
@@ -249,7 +259,8 @@ def _field_annotations(info, features, warn):
                 if type(declared_horizon) is not int or declared_horizon != horizon:
                     warn("动作字段 " + key + " 的 horizon 声明与原始形状冲突，已沿用形状证据，请核对元信息。")
         result.append(annotation)
-    if any(row["representation"] == "unknown" or row["value_mode"] == "unknown" for row in result):
+    if any(row["role"] != "label" and (row["representation"] == "unknown" or row["value_mode"] == "unknown")
+           for row in result):
         warn("部分源字段的 EEF/Joint/夹爪开度或绝对/增量语义无法从元信息确定，已标为未知，请确认标签；不会按维数猜测。")
     return result
 
@@ -284,7 +295,10 @@ def _infer(info, features, tasks, warn):
             put(key, info[key], "元信息直接声明该语义，仍需与数据生成方核对", kind="metadata")
     if tasks:
         put("task_description", "\n".join(tasks)[:2000], "从任务元信息提取的任务文本示例，不能代替逐样本 prompt", kind="metadata")
-    numeric = {key: row for key, row in by_key.items() if NUMERIC.fullmatch(row["dtype"]) and _safe_key(key)}
+    annotations = _field_annotations(info, features, warn)
+    label_keys = {row["key"] for row in annotations if row["role"] == "label"}
+    numeric = {key: row for key, row in by_key.items()
+               if key not in label_keys and NUMERIC.fullmatch(row["dtype"]) and _safe_key(key)}
     candidates = [key for key in numeric if re.search(r"(?:^|[._/])actions?$", key)]
     action_key = next((key for key in ("actions", "action") if key in candidates), candidates[0] if len(candidates) == 1 else None)
     action = numeric.get(action_key)
@@ -405,9 +419,8 @@ def _infer(info, features, tasks, warn):
     if len(cameras) > 3:
         warn("组合处理当前最多使用三路 canonical 视觉槽，请明确选择需要训练的视觉。")
     warn("单位、坐标系、夹爪范围及归一化策略不会从维数或机器人名称自动推断。")
-    annotations = _field_annotations(info, features, warn)
     if annotations:
-        put("field_annotations", annotations, "仅标记原始状态与动作字段及其语义，不定义拼接顺序、归一化或模型映射", [row["key"] for row in annotations])
+        put("field_annotations", annotations, "登记原始状态、动作和训练标签，不定义拼接顺序、归一化或模型映射", [row["key"] for row in annotations])
     return suggestions, processing, evidence
 
 

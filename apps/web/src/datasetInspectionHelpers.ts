@@ -1,5 +1,9 @@
 import type { DatasetProfile } from './DatasetProfileForm';
-import { sourceActionHorizon, type DatasetFieldAnnotation } from './datasetFieldAnnotations';
+import {
+  sourceActionHorizon,
+  trainingLabelDefaults,
+  type DatasetFieldAnnotation,
+} from './datasetFieldAnnotations';
 import type { ComposedProcessingSpec } from './composedProcessing';
 
 export interface DatasetInspectionDTO {
@@ -165,8 +169,28 @@ function clearAutomaticAnnotations(profile: DatasetProfile, state: InspectionDra
 
 /** Older Agents supply source facts through the inspection DTO's bounded fields. */
 function inspectionAnnotations(inspection: DatasetInspectionDTO): DatasetFieldAnnotation[] {
-  if (inspection.suggestions.field_annotations)
-    return sourceAnnotationHorizons(inspection.suggestions.field_annotations, inspection);
+  const labels = new Map<string, DatasetFieldAnnotation>();
+  for (const feature of inspection.features) {
+    if (
+      ['stage_progress_gt', 'progress_gt', 'value_target', 'is_positive'].includes(feature.key) &&
+      /^(?:u?int(?:8|16|32|64)?|float(?:16|32|64)?|double|bool)$/.test(feature.dtype) &&
+      feature.shape.length === 1 &&
+      feature.shape[0] === 1
+    ) {
+      labels.set(feature.key, {
+        key: feature.key,
+        ...trainingLabelDefaults,
+        shape: copy(feature.shape),
+        dtype: feature.dtype,
+        names: copy(feature.names),
+      });
+    }
+  }
+  if (inspection.suggestions.field_annotations) {
+    const rows = sourceAnnotationHorizons(inspection.suggestions.field_annotations, inspection);
+    // An older Agent can omit these fields or mistake value_target for an action.
+    return [...rows.filter((row) => !labels.has(row.key)), ...labels.values()];
+  }
   const states = new Set(inspection.processing.state_fields?.map((row) => row.key));
   const actionKey = inspection.processing.action_key;
   const tokens = (key: string) => '_' + key.toLowerCase().replace(/[^a-z0-9]+/g, '_') + '_';
@@ -180,6 +204,8 @@ function inspectionAnnotations(inspection: DatasetInspectionDTO): DatasetFieldAn
   };
   return sourceAnnotationHorizons(
     inspection.features.flatMap((feature) => {
+      const label = labels.get(feature.key);
+      if (label) return [label];
       if (
         !/^(?:u?int(?:8|16|32|64)?|float(?:16|32|64)?|double|bool)$/.test(feature.dtype) ||
         !feature.shape.length

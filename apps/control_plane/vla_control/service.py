@@ -25,6 +25,7 @@ from vla_protocol.training_gpu_policy import (TRAINING_SHARED_GPU_CAPABILITY,
     normalize_training_gpu_policy, training_gpu_error)
 
 from .common import APIError, INPUT_KINDS, TERMINAL, absolute_path, digest, now, require_path, snapshot_identity, uid, under_root, valid_snapshot
+from .dataset_profiles import dataset_runtime_profile
 from .models import Allocation, Asset, Attempt, Command, Event, Node, Preview, Profile, Run
 from .norm_outputs import norm_outputs_error, reconcile_norm_outputs
 from .model_norm_outputs import bind_model_norm_outputs, model_norm_outputs_error
@@ -538,7 +539,7 @@ def automatic_preflight_error(session, request: dict, snapshot, checks) -> dict 
         if declared is not None:
             if dataset.get("registered_profile") is None:
                 return {"code": "AGENT_DATASET_PROFILE_UNSUPPORTED", "message": "Agent 未核验登记的数据集描述，请更新 Agent 并重新预检"}
-            if canonical_digest(dataset["registered_profile"]) != canonical_digest(declared):
+            if canonical_digest(dataset["registered_profile"]) != canonical_digest(dataset_runtime_profile(declared)):
                 return {"code": "DATASET_PROFILE_MISMATCH", "message": "Agent 实际核验的数据集描述与本次冻结登记不一致，请重新预检"}
             registered_fps = declared.get("fps")
             if type(registered_fps) in (int, float) and 0 < registered_fps <= 1000:
@@ -1041,7 +1042,8 @@ def reduce_event(session, node: Node, attempt: Attempt, event: Event) -> None:
                         registration_source = "recap_stage_annotation" if annotation else "recap_stage_progress"
                     metadata = row["metadata"]
                     validation = validated_source_result(
-                        {"path": row["path"], "profile_id": run.profile_id, "registered_profile": profile},
+                        {"path": row["path"], "profile_id": run.profile_id,
+                         "registered_profile": dataset_runtime_profile(profile)},
                         metadata.get("source_validation"))
                     if (validation.get("error")
                             or validation["timestamp_contract"]["checked_rows"] != metadata["annotation"]["frame_count"]

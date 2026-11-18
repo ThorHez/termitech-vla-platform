@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import object_session
 
 from .common import APIError, digest, now, offset_time, require_path, uid
-from .dataset_profiles import RECAP_ANNOTATION_SOURCE
+from .dataset_profiles import RECAP_ANNOTATION_SOURCE, dataset_runtime_profile
 from .models import Asset, Command, Node, Profile
 from .schemas import InputModel
 from .resource_authorization import bind_command_actor, execution_permission_authorized, require_active_actor
@@ -171,7 +171,8 @@ def validation_execution_authorized(session, command, *, allow_legacy=False):
                     and stored.get("profile_id") == command.payload.get("profile_id")
                     and stored.get("input_digest") == command.payload.get("input_digest")
                     and command.node_id == asset.node_id and command.payload.get("path") == asset.path
-                    and command.payload.get("registered_profile") == _metadata(asset).get("dataset_profile")
+                    and command.payload.get("registered_profile") == dataset_runtime_profile(
+                        _metadata(asset).get("dataset_profile"))
                     and input_digest(asset, profile, node) == command.payload.get("input_digest"))
     if source_id is None:
         return True
@@ -290,7 +291,7 @@ def queue_validation(session, asset, profile_id=None, *, heartbeat_timeout_secon
     if reason is None:
         command = Command(id=uid(), node_id=node.id, type=COMMAND, status="PENDING", created_at=timestamp,
             payload={"asset_id": asset.id, "path": asset.path, "profile_id": chosen.id,
-                     "registered_profile": deepcopy(_metadata(asset).get("dataset_profile")),
+                     "registered_profile": dataset_runtime_profile(_metadata(asset).get("dataset_profile")),
                      "input_digest": report["input_digest"], "expires_at": report["expires_at"]})
         if source_transfer_id is not None:
             command.payload = {**command.payload, "source_transfer_id": source_transfer_id}
